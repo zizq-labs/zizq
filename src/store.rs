@@ -22,8 +22,11 @@ pub enum StoreError {
     /// The underlying database (fjall) returned an error.
     Db(fjall::Error),
 
-    /// A job could not be serialized or deserialized.
-    Serde(serde_json::Error),
+    /// A job could not be serialized.
+    Serialize(rmp_serde::encode::Error),
+
+    /// A job could not be deserialized.
+    Deserialize(rmp_serde::decode::Error),
 
     /// A blocking task was cancelled or panicked.
     TaskJoin(task::JoinError),
@@ -36,7 +39,8 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::Db(e) => write!(f, "database error: {e}"),
-            StoreError::Serde(e) => write!(f, "serialization error: {e}"),
+            StoreError::Serialize(e) => write!(f, "serialization error: {e}"),
+            StoreError::Deserialize(e) => write!(f, "deserialization error: {e}"),
             StoreError::TaskJoin(e) => write!(f, "blocking task failed: {e}"),
             StoreError::Corruption(msg) => write!(f, "data corruption: {msg}"),
         }
@@ -51,9 +55,15 @@ impl From<fjall::Error> for StoreError {
     }
 }
 
-impl From<serde_json::Error> for StoreError {
-    fn from(e: serde_json::Error) -> Self {
-        StoreError::Serde(e)
+impl From<rmp_serde::encode::Error> for StoreError {
+    fn from(e: rmp_serde::encode::Error) -> Self {
+        StoreError::Serialize(e)
+    }
+}
+
+impl From<rmp_serde::decode::Error> for StoreError {
+    fn from(e: rmp_serde::decode::Error) -> Self {
+        StoreError::Deserialize(e)
     }
 }
 
@@ -164,7 +174,7 @@ impl Store {
             };
 
             let queue_key = job.queue_key();
-            let job_bytes = serde_json::to_vec(&job)?;
+            let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
@@ -206,7 +216,7 @@ impl Store {
                 ))
             })?;
 
-            let job: Job = serde_json::from_slice(&job_bytes)?;
+            let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
             // Atomically: remove from queue, add to working.
             let mut tx = db.write_tx();
