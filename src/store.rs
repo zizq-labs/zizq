@@ -198,6 +198,10 @@ impl Store {
         let working = self.working.clone();
 
         task::spawn_blocking(move || {
+            // Acquire the write lock before reading, so no other writer
+            // can take the same job between our read and the remove.
+            let mut tx = db.write_tx();
+
             // The first key in the queue keyspace is the highest-priority,
             // oldest job, because keys sort by priority (base-36) then by
             // job ID (scru128, time-ordered).
@@ -218,13 +222,41 @@ impl Store {
 
             let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-            // Atomically: remove from queue, add to working.
-            let mut tx = db.write_tx();
+            // Remove from queue, add to working.
             tx.remove(&queue, &*queue_key);
             tx.insert(&working, &*job_id, b"");
             tx.commit()?;
 
             Ok(Some(job))
+        })
+        .await?
+    }
+
+    /// Mark a job as successfully completed.
+    ///
+    /// Removes the job from both `working` and `jobs`. Returns `true` if the
+    /// job was found in `working`, `false` if it was not (e.g. already acked
+    /// or never existed).
+    pub async fn mark_completed(&self, id: &str) -> Result<bool, StoreError> {
+        let db = self.db.clone();
+        let jobs = self.jobs.clone();
+        let working = self.working.clone();
+        let id = id.to_string();
+
+        task::spawn_blocking(move || {
+            // Acquire the write lock before checking, so no other writer
+            // can remove the job between our check and the remove.
+            let mut tx = db.write_tx();
+
+            if working.get(&id)?.is_none() {
+                return Ok(false);
+            }
+
+            tx.remove(&working, &id);
+            tx.remove(&jobs, &id);
+            tx.commit()?;
+
+            Ok(true)
         })
         .await?
     }
@@ -392,5 +424,40 @@ mod tests {
 
         // Queue should now be empty.
         assert!(store.take_next_job().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_completed_removes_job() {
+        let store = test_store();
+        store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        let job = store.take_next_job().await.unwrap().unwrap();
+        assert!(store.mark_completed(&job.id).await.unwrap());
+
+        // Job should no longer be dequeue-able even if re-enqueue were attempted
+        // via crash recovery — it's gone from the jobs keyspace entirely.
+        assert!(store.take_next_job().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_completed_returns_false_for_unknown_id() {
+        let store = test_store();
+        assert!(!store.mark_completed("nonexistent").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_completed_returns_false_on_double_ack() {
+        let store = test_store();
+        store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        let job = store.take_next_job().await.unwrap().unwrap();
+        assert!(store.mark_completed(&job.id).await.unwrap());
+        assert!(!store.mark_completed(&job.id).await.unwrap());
     }
 }
