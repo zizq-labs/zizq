@@ -5,26 +5,104 @@
 //!
 //! Initializes the database and starts the HTTP server.
 
+use std::collections::HashSet;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use axum::http::{self, StatusCode};
+use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::store::Store;
+use crate::store::{Job, Store, StoreEvent};
 
 /// Default priority for jobs that don't specify one.
 ///
 /// Sits in the middle of the u16 range so there is equal room for higher
 /// and lower priority work.
 const DEFAULT_PRIORITY: u16 = 32_768;
+
+/// Default interval between heartbeat frames on idle streams.
+const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
+
+// --- Stream types ---
+
+/// Supported stream serialization formats, negotiated via Accept header.
+#[derive(Clone, Copy)]
+enum StreamFormat {
+    Sse,
+    NdJson,
+    MsgPackStream,
+}
+
+/// All stream content types we support.
+const SUPPORTED_STREAM_TYPES: &[&str] = &[
+    "text/event-stream",
+    "application/x-ndjson",
+    "application/vnd.zanxio.msgpack-stream",
+];
+
+/// Extractor that reads the `Accept` header and resolves a `StreamFormat`.
+struct StreamAccept(StreamFormat);
+
+impl<S> FromRequestParts<S> for StreamAccept
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match parts.headers.get(ACCEPT) {
+            None => Ok(StreamAccept(StreamFormat::NdJson)),
+            Some(value) => {
+                let value = value.to_str().unwrap_or("");
+                if value.contains("text/event-stream") {
+                    Ok(StreamAccept(StreamFormat::Sse))
+                } else if value.contains("application/vnd.zanxio.msgpack-stream")
+                    || value.contains("application/msgpack")
+                {
+                    Ok(StreamAccept(StreamFormat::MsgPackStream))
+                } else if value.contains("application/x-ndjson")
+                    || value.contains("application/json")
+                    || value.contains("*/*")
+                {
+                    Ok(StreamAccept(StreamFormat::NdJson))
+                } else {
+                    Err(respond(
+                        Format::Json,
+                        StatusCode::NOT_ACCEPTABLE,
+                        &UnsupportedFormatResponse {
+                            error: "not acceptable".into(),
+                            supported: SUPPORTED_STREAM_TYPES.to_vec(),
+                        },
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Messages sent over the stream channel.
+enum StreamMessage {
+    Job(Arc<Job>),
+    Heartbeat,
+}
 
 // --- Response types ---
 
@@ -92,6 +170,9 @@ const DATABASE_DIR: &str = "data";
 struct AppState {
     /// Persistent store for job queue operations.
     store: Store,
+
+    /// Interval between heartbeat frames on idle streams.
+    heartbeat_interval: Duration,
 }
 
 /// Arguments for the `serve` subcommand.
@@ -108,6 +189,10 @@ pub struct Args {
     /// Port to listen for HTTP connections on.
     #[arg(long, default_value_t = 7890, env = "ZANXIO_PORT")]
     port: u16,
+
+    /// Seconds between heartbeat frames on idle streams.
+    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECONDS, env = "ZANXIO_HEARTBEAT_SECONDS")]
+    heartbeat_seconds: u64,
 }
 
 // --- Content negotiation ---
@@ -194,6 +279,7 @@ where
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         // Determine the output format from Accept for error responses.
+        // We'll fall back on JSON as a last effort.
         let error_format = match req.headers().get(ACCEPT) {
             None => Format::Json,
             Some(v) => {
@@ -290,6 +376,80 @@ fn no_content() -> Response {
     res
 }
 
+// --- Stream framing ---
+
+/// Return a stream frame in newline delimited JSON format.
+///
+/// Heartbeat messages are empty (newline only).
+fn frame_ndjson(msg: &StreamMessage) -> Bytes {
+    match msg {
+        StreamMessage::Job(job) => {
+            let mut bytes = serde_json::to_vec(&**job).unwrap();
+            bytes.push(b'\n');
+            Bytes::from(bytes)
+        }
+        StreamMessage::Heartbeat => Bytes::from_static(b"\n"),
+    }
+}
+
+/// Return a stream frame in length-prefixed MessagePack format.
+///
+/// Heartbeat messages are empty (zero prefix, no data).
+fn frame_msgpack_stream(msg: &StreamMessage) -> Bytes {
+    match msg {
+        StreamMessage::Job(job) => {
+            let payload = rmp_serde::to_vec_named(&**job).unwrap();
+            let len = (payload.len() as u32).to_be_bytes();
+            let mut bytes = Vec::with_capacity(4 + payload.len());
+            bytes.extend_from_slice(&len);
+            bytes.extend_from_slice(&payload);
+            Bytes::from(bytes)
+        }
+        StreamMessage::Heartbeat => Bytes::from_static(&[0, 0, 0, 0]),
+    }
+}
+
+/// Return a SSE event containing the given stream message.
+///
+/// Heartbeats are just comments.
+fn frame_sse(msg: &StreamMessage) -> Result<Event, Infallible> {
+    match msg {
+        StreamMessage::Job(job) => Ok(Event::default().json_data(&**job).unwrap()),
+        StreamMessage::Heartbeat => Ok(Event::default().comment("heartbeat")),
+    }
+}
+
+// --- Stream response builders ---
+
+/// Create a SSE streaming response which emits a message for each event in the
+/// receiver channel.
+fn build_sse_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
+    let stream = ReceiverStream::new(rx).map(|msg| frame_sse(&msg));
+    Sse::new(stream).into_response()
+}
+
+/// Create a newline delimited JSON streaming response that emits a JSON
+/// message for every event on the receiver channel.
+fn build_ndjson_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
+    let stream = ReceiverStream::new(rx).map(|msg| Ok::<_, Infallible>(frame_ndjson(&msg)));
+    let mut res = Response::new(Body::from_stream(stream));
+    res.headers_mut()
+        .insert(CONTENT_TYPE, "application/x-ndjson".parse().unwrap());
+    res
+}
+
+/// Create a length-prefixed MessagePack streaming response that emits a
+/// MessagePack message for every event in the receiver channel.
+fn build_msgpack_stream_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
+    let stream = ReceiverStream::new(rx).map(|msg| Ok::<_, Infallible>(frame_msgpack_stream(&msg)));
+    let mut res = Response::new(Body::from_stream(stream));
+    res.headers_mut().insert(
+        CONTENT_TYPE,
+        "application/vnd.zanxio.msgpack-stream".parse().unwrap(),
+    );
+    res
+}
+
 // --- Router ---
 
 /// Build the axum router with all routes and shared state.
@@ -297,6 +457,7 @@ fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/jobs", post(enqueue))
+        .route("/jobs/stream", get(stream_jobs))
         .route("/jobs/{id}/success", post(mark_completed))
         .fallback(not_found)
         .with_state(state)
@@ -372,6 +533,100 @@ async fn mark_completed(
     }
 }
 
+/// Handle `GET /jobs/stream` — stream jobs to workers.
+async fn stream_jobs(
+    StreamAccept(fmt): StreamAccept,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    // Channel we'll use to emit events to the client. We reserve a slot
+    // before dequeuing a job, so we never take work we can't deliver.
+    let (tx, rx) = mpsc::channel::<StreamMessage>(1);
+
+    // Subscription to the store events broadcast channel which serves two
+    // purposes:
+    //
+    // 1. Waking the run loop while it is waiting on new jobs.
+    // 2. Receiving notifications about completed jobs so they can be removed
+    //    from the in_flight set.
+    let mut event_rx = state.store.subscribe();
+
+    tokio::spawn(async move {
+        // Maintain a set of in-flight job IDs. We need this because once we
+        // remove a job from the queue and return it to the client, the job
+        // will forever stay in the working queue until the client acknowledges
+        // or fails the job. If the client disconnects without doing this, we
+        // need to clean up any in-flight jobs by moving them back to the
+        // queue.
+        //
+        // In the extremely rare case of a crash or shutdown before the client
+        // finishes processing the job, recovery on server restart will move
+        // the job from the working set back into the queue.
+        let mut in_flight = HashSet::<String>::new();
+
+        loop {
+            // Drain any pending events.
+            while let Ok(event) = event_rx.try_recv() {
+                if let StoreEvent::JobCompleted(id) = event {
+                    in_flight.remove(&id);
+                }
+            }
+
+            // Wait until the client can accept a message before dequeuing.
+            // This ensures we never take a job we can't deliver.
+            let permit = match tx.reserve().await {
+                Ok(permit) => permit,
+                Err(_) => break, // client disconnected
+            };
+
+            match state.store.take_next_job().await {
+                Ok(Some(job)) => {
+                    in_flight.insert(job.id.clone());
+                    permit.send(StreamMessage::Job(Arc::new(job)));
+                }
+                Ok(None) => {
+                    // No job available. Release the slot and wait for a
+                    // store event or heartbeat timeout. Any enqueue that
+                    // happened between take_next_job() returning None and
+                    // entering recv() is already buffered in the broadcast
+                    // channel.
+                    drop(permit);
+                    tokio::select! {
+                        _ = tokio::time::sleep(state.heartbeat_interval) => {
+                            if tx.send(StreamMessage::Heartbeat).await.is_err() {
+                                break;
+                            }
+                        }
+                        event = event_rx.recv() => {
+                            if let Ok(StoreEvent::JobCompleted(id)) = event {
+                                in_flight.remove(&id);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, "take_next_job failed in stream");
+                    break;
+                }
+            }
+        }
+
+        // The client disconnected. If there were any in-flight jobs re-queue
+        // them so other clients can pick them up.
+        for id in &in_flight {
+            if let Err(e) = state.store.requeue(id).await {
+                tracing::error!(job_id = %id, %e, "requeue failed");
+            }
+        }
+    });
+
+    // Start streaming using any of the valid formats.
+    match fmt {
+        StreamFormat::Sse => build_sse_response(rx),
+        StreamFormat::NdJson => build_ndjson_response(rx),
+        StreamFormat::MsgPackStream => build_msgpack_stream_response(rx),
+    }
+}
+
 /// Fallback handler for unmatched routes.
 async fn not_found(AcceptFormat(fmt): AcceptFormat) -> Response {
     respond(
@@ -394,7 +649,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(root_dir = %root.display(), "store opened");
 
     // Initialize shared state accessible to all request handlers.
-    let state = Arc::new(AppState { store });
+    let state = Arc::new(AppState {
+        store,
+        heartbeat_interval: Duration::from_secs(args.heartbeat_seconds),
+    });
 
     // Set up the TCP socket for incoming connections.
     let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -463,7 +721,10 @@ mod tests {
         let store = Store::open(dir.path().join("data")).unwrap();
         // Leak the TempDir so it isn't cleaned up while the store is open.
         std::mem::forget(dir);
-        let state = Arc::new(AppState { store });
+        let state = Arc::new(AppState {
+            store,
+            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
+        });
         let router = app(state.clone());
         (state, router)
     }
@@ -810,5 +1071,267 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Streaming tests ---
+
+    async fn next_body_bytes(body: &mut axum::body::Body) -> Bytes {
+        use http_body_util::BodyExt as _;
+        body.frame().await.unwrap().unwrap().into_data().unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_delivers_pending_jobs_as_ndjson() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("q1", 0, serde_json::json!("first"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q2", 5, serde_json::json!("second"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // First job (priority 0, enqueued first).
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "q1");
+        assert_eq!(job["payload"], "first");
+        assert!(job["id"].is_string());
+
+        // Second job (priority 5).
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "q2");
+        assert_eq!(job["payload"], "second");
+    }
+
+    #[tokio::test]
+    async fn stream_waits_and_delivers_new_jobs() {
+        let (state, app) = test_state_and_app();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Enqueue after stream is open.
+        let enqueued = state
+            .store
+            .enqueue("default", 0, serde_json::json!("delayed"))
+            .await
+            .unwrap();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["id"], enqueued.id);
+        assert_eq!(job["payload"], "delayed");
+    }
+
+    #[tokio::test]
+    async fn stream_returns_sse_when_requested() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("default", 0, serde_json::json!("sse-test"))
+            .await
+            .unwrap();
+
+        let req = request_with_accept("GET", "/jobs/stream", "text/event-stream");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+
+        let mut body = res.into_body();
+        let bytes = next_body_bytes(&mut body).await;
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("data:"),
+            "SSE frame should contain 'data:' prefix"
+        );
+        // Extract the JSON from the data: line.
+        let data_line = text.lines().find(|l| l.starts_with("data:")).unwrap();
+        let json_str = data_line.strip_prefix("data:").unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(job["payload"], "sse-test");
+    }
+
+    #[tokio::test]
+    async fn stream_returns_msgpack_when_requested() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("default", 0, serde_json::json!("mp-test"))
+            .await
+            .unwrap();
+
+        let req = request_with_accept(
+            "GET",
+            "/jobs/stream",
+            "application/vnd.zanxio.msgpack-stream",
+        );
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/vnd.zanxio.msgpack-stream"
+        );
+
+        let mut body = res.into_body();
+        let bytes = next_body_bytes(&mut body).await;
+
+        // First 4 bytes are big-endian u32 length prefix.
+        assert!(bytes.len() > 4);
+        let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        assert_eq!(bytes.len(), 4 + len);
+
+        let job: serde_json::Value = rmp_serde::from_slice(&bytes[4..]).unwrap();
+        assert_eq!(job["payload"], "mp-test");
+    }
+
+    #[tokio::test]
+    async fn stream_returns_406_for_unsupported_accept() {
+        let req = request_with_accept("GET", "/jobs/stream", "text/xml");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["error"], "not acceptable");
+        let supported = body["supported"].as_array().unwrap();
+        assert!(supported.contains(&"text/event-stream".into()));
+        assert!(supported.contains(&"application/x-ndjson".into()));
+        assert!(supported.contains(&"application/vnd.zanxio.msgpack-stream".into()));
+    }
+
+    #[tokio::test]
+    async fn stream_sets_ndjson_content_type() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("default", 0, serde_json::json!("ct-test"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/x-ndjson"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_requeues_on_disconnect() {
+        let (state, app) = test_state_and_app();
+
+        let enqueued = state
+            .store
+            .enqueue("default", 0, serde_json::json!("requeue-me"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Read the job from the stream.
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["id"], enqueued.id);
+
+        // Drop the body to simulate client disconnect.
+        drop(body);
+
+        // The spawned task is waiting in select! for a notification or the
+        // 15s heartbeat. Enqueue a dummy job to trigger a notification,
+        // causing the task to attempt a send, discover the channel is closed,
+        // and requeue all in-flight jobs.
+        state
+            .store
+            .enqueue("default", 0, serde_json::json!("trigger"))
+            .await
+            .unwrap();
+
+        // Give the spawned task time to detect disconnect and requeue.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain jobs from queue — our original job should be among them.
+        let mut ids = Vec::new();
+        while let Some(job) = state.store.take_next_job().await.unwrap() {
+            ids.push(job.id);
+        }
+        assert!(
+            ids.contains(&enqueued.id),
+            "original job should have been requeued"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_requeue_acked_jobs_on_disconnect() {
+        let (state, app) = test_state_and_app();
+
+        let job_a = state
+            .store
+            .enqueue("default", 0, serde_json::json!("acked"))
+            .await
+            .unwrap();
+        let job_b = state
+            .store
+            .enqueue("default", 0, serde_json::json!("unacked"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Read both jobs from the stream.
+        let _ = next_body_bytes(&mut body).await;
+        let _ = next_body_bytes(&mut body).await;
+
+        // Ack the first job while the stream is still open.
+        assert!(state.store.mark_completed(&job_a.id).await.unwrap());
+
+        // Drop the body to simulate client disconnect.
+        drop(body);
+
+        // Trigger the spawned task to detect disconnect.
+        state
+            .store
+            .enqueue("default", 0, serde_json::json!("trigger"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Only the unacked job should be requeued, not the acked one.
+        let mut ids = Vec::new();
+        while let Some(job) = state.store.take_next_job().await.unwrap() {
+            ids.push(job.id);
+        }
+        assert!(
+            ids.contains(&job_b.id),
+            "unacked job should have been requeued"
+        );
+        assert!(
+            !ids.contains(&job_a.id),
+            "acked job should NOT have been requeued"
+        );
     }
 }

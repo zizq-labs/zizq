@@ -14,6 +14,7 @@ use std::fmt;
 
 use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use tokio::task;
 
 /// Error type returned by store operations.
@@ -102,6 +103,16 @@ impl Job {
     }
 }
 
+/// Events broadcast by the store when job state changes.
+#[derive(Debug, Clone)]
+pub enum StoreEvent {
+    /// A new job was enqueued (or requeued) and is available for processing.
+    JobEnqueued,
+
+    /// A job was successfully completed and removed.
+    JobCompleted(String),
+}
+
 /// Provides a handle to the persistent store.
 pub struct Store {
     /// Connection to the underlying database.
@@ -127,6 +138,13 @@ pub struct Store {
     /// keyspace when they are leased. In the event of crash recovery or worker
     /// disconnect jobs are returned to the queue keyspace again.
     working: SingleWriterTxKeyspace,
+
+    /// Broadcast channel for store events.
+    ///
+    /// Subscribers receive notifications when jobs are enqueued, completed,
+    /// or otherwise change state. Stream handlers use this both to wake up
+    /// when new work is available and to prune their in-flight tracking.
+    event_tx: broadcast::Sender<StoreEvent>,
 }
 
 impl Store {
@@ -140,11 +158,14 @@ impl Store {
         let queue = db.keyspace("queue", fjall::KeyspaceCreateOptions::default)?;
         let working = db.keyspace("working", fjall::KeyspaceCreateOptions::default)?;
 
+        let (event_tx, _) = broadcast::channel(1024);
+
         Ok(Self {
             db,
             jobs,
             queue,
-            working: working,
+            working,
+            event_tx,
         })
     }
 
@@ -152,6 +173,8 @@ impl Store {
     ///
     /// Generates a unique job ID, inserts the job into the `jobs` keyspace,
     /// and adds an entry to the `queue` keyspace for priority-ordered retrieval.
+    ///
+    /// Subscribers are notified.
     pub async fn enqueue(
         &self,
         queue_name: &str,
@@ -163,7 +186,8 @@ impl Store {
         let queue = self.queue.clone();
         let queue_name = queue_name.to_string();
 
-        task::spawn_blocking(move || {
+        let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
+            // Generate a new lexicographically increasing id.
             let id = scru128::new_string();
 
             let job = Job {
@@ -176,6 +200,7 @@ impl Store {
             let queue_key = job.queue_key();
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
+            // Atomically push the job into the jobs keyspace and to the queue.
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
             tx.insert(&queue, &queue_key, id.as_bytes());
@@ -183,7 +208,11 @@ impl Store {
 
             Ok(job)
         })
-        .await?
+        .await??;
+
+        let _ = self.event_tx.send(StoreEvent::JobEnqueued);
+
+        Ok(job)
     }
 
     /// Take the next job from the queue.
@@ -191,6 +220,8 @@ impl Store {
     /// Atomically removes the highest-priority (lowest number), oldest job
     /// from the `queue` keyspace and moves it to `working`. Returns `None`
     /// if the queue is empty.
+    ///
+    /// Subscribers are not notified.
     pub async fn take_next_job(&self) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
@@ -237,13 +268,16 @@ impl Store {
     /// Removes the job from both `working` and `jobs`. Returns `true` if the
     /// job was found in `working`, `false` if it was not (e.g. already acked
     /// or never existed).
+    ///
+    /// Subscribers are notified on success.
     pub async fn mark_completed(&self, id: &str) -> Result<bool, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let working = self.working.clone();
         let id = id.to_string();
+        let id_for_event = id.clone();
 
-        task::spawn_blocking(move || {
+        let completed = task::spawn_blocking(move || {
             // Acquire the write lock before checking, so no other writer
             // can remove the job between our check and the remove.
             let mut tx = db.write_tx();
@@ -258,7 +292,64 @@ impl Store {
 
             Ok(true)
         })
-        .await?
+        .await?;
+
+        if let Ok(true) = &completed {
+            // Best-effort: if no subscribers, the send error is harmless.
+            let _ = self.event_tx.send(StoreEvent::JobCompleted(id_for_event));
+        }
+
+        completed
+    }
+
+    /// Subscribe to store events.
+    pub fn subscribe(&self) -> broadcast::Receiver<StoreEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Atomically move a job from `working` back to `queue`.
+    ///
+    /// Looks up the job from the `jobs` keyspace to reconstruct its queue key.
+    /// Returns `true` if the job was actually requeued, `false` if it was
+    /// already acked (no longer in `working`).
+    ///
+    /// Subscribers are notified.
+    pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
+        let db = self.db.clone();
+        let jobs = self.jobs.clone();
+        let queue = self.queue.clone();
+        let working = self.working.clone();
+        let id = id.to_string();
+
+        let requeued = task::spawn_blocking(move || -> Result<bool, StoreError> {
+            let mut tx = db.write_tx();
+
+            if working.get(&id)?.is_none() {
+                return Ok(false);
+            }
+
+            // The job is still in working, so it must still be in the jobs
+            // keyspace (only mark_completed removes from both).
+            let job_bytes = jobs.get(&id)?.ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "job in working but missing from jobs keyspace: {id:?}",
+                ))
+            })?;
+            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+
+            tx.remove(&working, &id);
+            tx.insert(&queue, &job.queue_key(), id.as_bytes());
+            tx.commit()?;
+
+            Ok(true)
+        })
+        .await??;
+
+        if requeued {
+            let _ = self.event_tx.send(StoreEvent::JobEnqueued);
+        }
+
+        Ok(requeued)
     }
 }
 
@@ -497,5 +588,106 @@ mod tests {
         all_ids.sort();
         all_ids.dedup();
         assert_eq!(all_ids.len(), num_jobs);
+    }
+
+    #[tokio::test]
+    async fn requeue_returns_job_to_queue() {
+        let store = test_store();
+        let job = store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let taken = store.take_next_job().await.unwrap().unwrap();
+        assert_eq!(taken.id, job.id);
+
+        assert!(store.requeue(&taken.id).await.unwrap());
+
+        let retaken = store.take_next_job().await.unwrap().unwrap();
+        assert_eq!(retaken.id, job.id);
+    }
+
+    #[tokio::test]
+    async fn requeue_preserves_priority() {
+        let store = test_store();
+        let high = store
+            .enqueue("default", 1, serde_json::json!("high"))
+            .await
+            .unwrap();
+        store
+            .enqueue("default", 10, serde_json::json!("low"))
+            .await
+            .unwrap();
+
+        let taken = store.take_next_job().await.unwrap().unwrap();
+        assert_eq!(taken.id, high.id);
+
+        assert!(store.requeue(&taken.id).await.unwrap());
+
+        // Should get the high-priority job again, not the low-priority one.
+        let retaken = store.take_next_job().await.unwrap().unwrap();
+        assert_eq!(retaken.id, high.id);
+        assert_eq!(retaken.priority, 1);
+    }
+
+    #[tokio::test]
+    async fn requeue_skips_already_acked_job() {
+        let store = test_store();
+        store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let taken = store.take_next_job().await.unwrap().unwrap();
+        assert!(store.mark_completed(&taken.id).await.unwrap());
+
+        assert!(!store.requeue(&taken.id).await.unwrap());
+
+        // Queue should remain empty.
+        assert!(store.take_next_job().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_broadcasts_job_enqueued() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+
+        store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobEnqueued));
+    }
+
+    #[tokio::test]
+    async fn mark_completed_broadcasts_job_completed() {
+        let store = test_store();
+        let job = store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let taken = store.take_next_job().await.unwrap().unwrap();
+
+        let mut rx = store.subscribe();
+        store.mark_completed(&taken.id).await.unwrap();
+
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobCompleted(id) => assert_eq!(id, job.id),
+            other => panic!("expected JobCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn requeue_broadcasts_job_enqueued() {
+        let store = test_store();
+        store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let taken = store.take_next_job().await.unwrap().unwrap();
+
+        let mut rx = store.subscribe();
+        store.requeue(&taken.id).await.unwrap();
+
+        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobEnqueued));
     }
 }
