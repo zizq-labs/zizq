@@ -57,13 +57,14 @@ enum Command {
     Serve(serve::Args),
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     logging::init(&cli.log_format, &cli.log_level);
 
     match cli.command {
-        Some(Command::Serve(args)) => serve::run(args),
-        None => serve::run(serve::Args::parse_from(std::env::args())),
+        Some(Command::Serve(args)) => serve::run(args).await,
+        None => serve::run(serve::Args::parse_from(std::env::args())).await,
     }
 }
