@@ -1,15 +1,17 @@
 // Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Zanxio server entry point.
+//! Zanxio CLI entry point.
 //!
-//! Parses CLI arguments and initializes the server.
+//! Parses CLI arguments and dispatches to the appropriate subcommand.
 //!
 //! ```text
-//! Usage: zanxio [OPTIONS]
+//! Usage: zanxio [OPTIONS] [COMMAND]
+//!
+//! Commands:
+//!   serve    Start the server (default)
 //!
 //! Options:
-//!      --root-dir <ROOT_DIR>
 //!      --log-format <LOG_FORMAT>
 //!      --log-level <LOG_LEVEL>
 //!  -h, --help
@@ -19,49 +21,49 @@
 //! The following environment variables are also supported:
 //!
 //! ZANXIO_ROOT_DIR:      Same as --root-dir, specifies where Zanxio stores data
+//! ZANXIO_HOST:          Same as --host, specifies the address to bind to
+//! ZANXIO_PORT:          Same as --port, specifies the port to listen on
 //! ZANXIO_LOG_LEVEL:     Same as --log-level, specifies how verbose logs are
 //! ZANXIO_LOG_FILTER:    EnvFilter string for the tracing crate (overrides
 //!                       --log-level). This is useful when debugging
 //!                       dependencies.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 mod logging;
-
-/// Default location of the root directory if not otherwise specified.
-const DEFAULT_ROOT_DIR: &str = "./zanxio-root";
-
-/// Location of the internal database within the root directory.
-const DATABASE_DIR: &str = "data";
+mod serve;
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
 #[command(name = "zanxio", version, about = "A self-contained job queue server")]
-struct Args {
-    /// Root directory for all server data and configuration.
-    #[arg(long, default_value = DEFAULT_ROOT_DIR, env = "ZANXIO_ROOT_DIR")]
-    root_dir: String,
-
+struct Cli {
     /// Log output format.
-    #[arg(long, default_value = "pretty")]
+    #[arg(long, default_value = "pretty", global = true)]
     log_format: logging::LogFormat,
 
     /// Log level for zanxio.
-    #[arg(long, default_value = "info", env = "ZANXIO_LOG_LEVEL")]
+    #[arg(long, default_value = "info", env = "ZANXIO_LOG_LEVEL", global = true)]
     log_level: logging::LogLevel,
+
+    /// The subcommand that is to be arg parsed and executed.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Enum to handle the valid set of subcommands and their arguments.
+#[derive(Subcommand)]
+enum Command {
+    /// Start the server.
+    Serve(serve::Args),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    logging::init(&args.log_format, &args.log_level);
+    logging::init(&cli.log_format, &cli.log_level);
 
-    let root = std::path::Path::new(&args.root_dir);
-    std::fs::create_dir_all(root)?;
-
-    let _db = fjall::SingleWriterTxDatabase::builder(root.join(DATABASE_DIR)).open()?;
-
-    tracing::info!(root_dir = %root.display(), "database opened");
-
-    Ok(())
+    match cli.command {
+        Some(Command::Serve(args)) => serve::run(args),
+        None => serve::run(serve::Args::parse_from(std::env::args())),
+    }
 }
