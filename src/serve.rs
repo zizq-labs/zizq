@@ -16,29 +16,76 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use fjall::SingleWriterTxDatabase;
+use crate::store::Store;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
+/// Default priority for jobs that don't specify one.
+///
+/// Sits in the middle of the u16 range so there is equal room for higher
+/// and lower priority work.
+const DEFAULT_PRIORITY: u16 = 32_768;
+
 // --- Response types ---
 
+/// Response shape for the health check.
 #[derive(Serialize)]
 struct HealthResponse {
+    /// Status message.
     status: &'static str,
 }
 
+/// Response shape for all error responses.
 #[derive(Serialize)]
 struct ErrorResponse {
+    /// Error message.
     error: String,
 }
 
+/// Response shape for the 406 - not acceptable response.
 #[derive(Serialize)]
 struct NotAcceptableResponse {
+    /// Error message.
     error: String,
+
+    /// List of valid content types.
     acceptable: Vec<&'static str>,
+}
+
+/// Request shape for the job enqueue request.
+///
+/// Jobs are required to specify the queue that they target and a payload to be
+/// provided when dequeued. Priority is optional, defaulting to the center of
+/// the priority range.
+#[derive(Deserialize)]
+struct EnqueueRequest {
+    /// The queue name onto which this job is pushed.
+    queue: String,
+
+    /// Optional job priority (lower is higher priority).
+    priority: Option<u16>,
+
+    /// Arbitrary job payload provided to the client on dequeue.
+    payload: serde_json::Value,
+}
+
+/// Response shape for enqueue requests.
+#[derive(Serialize)]
+struct EnqueueResponse {
+    /// The unique identifier for this job.
+    ///
+    /// This identifier must be supplied when marking jobs as completed or
+    /// failed.
+    id: String,
+
+    /// The queue onto which this job was pushed.
+    queue: String,
+
+    /// The priority assigned to this job.
+    priority: u16,
 }
 
 /// Location of the internal database within the root directory.
@@ -46,8 +93,8 @@ const DATABASE_DIR: &str = "data";
 
 /// Shared server state, passed to all request handlers.
 struct AppState {
-    /// Shared database instance used by all request handlers.
-    _db: SingleWriterTxDatabase,
+    /// Persistent store for job queue operations.
+    store: Store,
 }
 
 /// Arguments for the `serve` subcommand.
@@ -72,12 +119,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let root = std::path::Path::new(&args.root_dir);
     std::fs::create_dir_all(root)?;
 
-    // Init/open the database (within the root dir).
-    let db = SingleWriterTxDatabase::builder(root.join(DATABASE_DIR)).open()?;
-    tracing::info!(root_dir = %root.display(), "database opened");
+    // Init/open the store (within the root dir).
+    let store = Store::open(root.join(DATABASE_DIR))?;
+    tracing::info!(root_dir = %root.display(), "store opened");
 
     // Initialize shared state accessible to all request handlers.
-    let state = Arc::new(AppState { _db: db });
+    let state = Arc::new(AppState { store });
 
     // Set up the TCP socket for incoming connections.
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -138,10 +185,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 /// Request handler function dispatched by hyper.
 ///
 /// This handles all routing to specific handlers.
-async fn handle<B>(
-    _state: Arc<AppState>,
-    req: Request<B>,
-) -> Result<Response<BoxBody>, Infallible> {
+async fn handle<B>(state: Arc<AppState>, req: Request<B>) -> Result<Response<BoxBody>, Infallible>
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
@@ -153,7 +201,11 @@ async fn handle<B>(
     }
 
     let res = match (method.as_str(), path.as_str()) {
+        // Check the health status of the server process.
         ("GET", "/health") => respond(StatusCode::OK, &HealthResponse { status: "ok" }),
+        // Enqueue a new job.
+        ("POST", "/jobs") => enqueue(state, req).await,
+        // Invalid path: 404.
         _ => respond(
             StatusCode::NOT_FOUND,
             &ErrorResponse {
@@ -170,6 +222,64 @@ async fn handle<B>(
     );
 
     Ok(res)
+}
+
+/// Handle `POST /jobs` — enqueue a new job.
+async fn enqueue<B>(state: Arc<AppState>, req: Request<B>) -> Response<BoxBody>
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
+    // Read and parse the request body.
+    let body = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return respond(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("failed to read body: {e}"),
+                },
+            );
+        }
+    };
+
+    let enqueue_req: EnqueueRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return respond(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid JSON: {e}"),
+                },
+            );
+        }
+    };
+
+    let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
+
+    match state
+        .store
+        .enqueue(&enqueue_req.queue, priority, enqueue_req.payload)
+        .await
+    {
+        Ok(job) => respond(
+            StatusCode::CREATED,
+            &EnqueueResponse {
+                id: job.id,
+                queue: job.queue,
+                priority: job.priority,
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "enqueue failed");
+            respond(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
 }
 
 /// Returns true if the request accepts JSON responses.
@@ -261,15 +371,13 @@ mod tests {
     use super::*;
     use http_body_util::Empty;
 
-    /// Create a temporary AppState with a fresh database for testing.
+    /// Create a temporary AppState with a fresh store for testing.
     fn test_state() -> Arc<AppState> {
         let dir = tempfile::tempdir().unwrap();
-        let db = SingleWriterTxDatabase::builder(dir.path().join("data"))
-            .open()
-            .unwrap();
-        // Leak the TempDir so it isn't cleaned up while the database is open.
+        let store = Store::open(dir.path().join("data")).unwrap();
+        // Leak the TempDir so it isn't cleaned up while the store is open.
         std::mem::forget(dir);
-        Arc::new(AppState { _db: db })
+        Arc::new(AppState { store })
     }
 
     fn empty_request(method: &str, uri: &str) -> Request<Empty<Bytes>> {
@@ -286,6 +394,15 @@ mod tests {
             .uri(uri)
             .header("accept", accept)
             .body(Empty::new())
+            .unwrap()
+    }
+
+    fn json_request(method: &str, uri: &str, body: &serde_json::Value) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(serde_json::to_vec(body).unwrap())))
             .unwrap()
     }
 
@@ -362,5 +479,84 @@ mod tests {
                 .unwrap()
                 .contains(&"application/json".into())
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_201() {
+        let state = test_state();
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_job_id() {
+        let state = test_state();
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = handle(state, req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["id"].is_string());
+        assert!(!body["id"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enqueue_defaults_priority() {
+        let state = test_state();
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = handle(state, req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["priority"], DEFAULT_PRIORITY);
+    }
+
+    #[tokio::test]
+    async fn enqueue_accepts_custom_queue_and_priority() {
+        let state = test_state();
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "emails", "priority": 5, "payload": "test"}),
+        );
+        let res = handle(state, req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["queue"], "emails");
+        assert_eq!(body["priority"], 5);
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_missing_queue() {
+        let state = test_state();
+        let req = json_request("POST", "/jobs", &serde_json::json!({"payload": "test"}));
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_invalid_json() {
+        let state = test_state();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .body(Full::new(Bytes::from("not json")))
+            .unwrap();
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }
