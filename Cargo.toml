@@ -1,0 +1,11 @@
+[package]
+name = "zanxio"
+version = "0.1.0"
+edition = "2024"
+license = "BUSL-1.1"
+
+[dependencies]
+fjall = "3.0.1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
