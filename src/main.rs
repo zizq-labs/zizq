@@ -32,6 +32,7 @@ use clap::{Parser, Subcommand};
 
 mod logging;
 mod serve;
+mod store;
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
