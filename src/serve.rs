@@ -24,7 +24,7 @@ use axum::routing::{get, post};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -184,6 +184,9 @@ struct AppState {
 
     /// Current number of in-flight jobs across all streams.
     global_in_flight: AtomicU64,
+
+    /// Cloneable receiver for graceful shutdown signaling.
+    shutdown: watch::Receiver<()>,
 }
 
 /// Arguments for the `serve` subcommand.
@@ -565,6 +568,7 @@ async fn stream_jobs(
     // 2. Receiving notifications about completed jobs so they can be removed
     //    from the in_flight set.
     let mut event_rx = state.store.subscribe();
+    let mut shutdown = state.shutdown.clone();
 
     tokio::spawn(async move {
         // Maintain a set of in-flight job IDs. We need this because once we
@@ -603,9 +607,12 @@ async fn stream_jobs(
                 // Wait until the client can accept a message before
                 // dequeuing. This ensures we never take a job we can't
                 // deliver.
-                let permit = match tx.reserve().await {
-                    Ok(permit) => permit,
-                    Err(_) => break, // client disconnected
+                let permit = tokio::select! {
+                    result = tx.reserve() => match result {
+                        Ok(permit) => permit,
+                        Err(_) => break, // client disconnected
+                    },
+                    _ = shutdown.changed() => break, // server shutting down
                 };
 
                 match state.store.take_next_job().await {
@@ -645,6 +652,7 @@ async fn stream_jobs(
                         }
                     }
                 }
+                _ = shutdown.changed() => break, // server shutting down
             }
         }
 
@@ -693,12 +701,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(root.join(DATABASE_DIR))?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
+    // Shutdown signal for long-lived stream tasks.
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+
     // Initialize shared state accessible to all request handlers.
     let state = Arc::new(AppState {
         store,
         heartbeat_interval: Duration::from_secs(args.heartbeat_seconds),
         working_limit: args.working_limit,
         global_in_flight: AtomicU64::new(0),
+        shutdown: shutdown_rx,
     });
 
     // Set up the TCP socket for incoming connections.
@@ -709,9 +721,14 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Zanxio {}", env!("CARGO_PKG_VERSION"));
     eprintln!("Accepting connections on {addr}");
 
-    // Start the server with graceful shutdown.
+    // Start the server with graceful shutdown. Signal the watch channel
+    // first so spawned stream tasks break out of their loops, allowing
+    // their connections to close.
     axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(());
+        })
         .await?;
 
     eprintln!("Server stopped.");
@@ -768,11 +785,15 @@ mod tests {
         let store = Store::open(dir.path().join("data")).unwrap();
         // Leak the TempDir so it isn't cleaned up while the store is open.
         std::mem::forget(dir);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        // Leak the sender so the shutdown signal is never triggered.
+        std::mem::forget(shutdown_tx);
         let state = Arc::new(AppState {
             store,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
             working_limit: 0,
             global_in_flight: AtomicU64::new(0),
+            shutdown: shutdown_rx,
         });
         let router = app(state.clone());
         (state, router)
@@ -1389,11 +1410,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         std::mem::forget(dir);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        std::mem::forget(shutdown_tx);
         let state = Arc::new(AppState {
             store,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
             working_limit: 2,
             global_in_flight: AtomicU64::new(0),
+            shutdown: shutdown_rx,
         });
         let router = app(state.clone());
 
