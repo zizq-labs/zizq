@@ -285,6 +285,7 @@ fn make_queue_key(priority: u16, job_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_store() -> Store {
         let dir = tempfile::tempdir().unwrap();
@@ -459,5 +460,42 @@ mod tests {
         let job = store.take_next_job().await.unwrap().unwrap();
         assert!(store.mark_completed(&job.id).await.unwrap());
         assert!(!store.mark_completed(&job.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn take_next_job_never_returns_duplicates_under_contention() {
+        let store = Arc::new(test_store());
+        let num_jobs = 50;
+
+        for i in 0..num_jobs {
+            store
+                .enqueue("default", 0, serde_json::json!(i))
+                .await
+                .unwrap();
+        }
+
+        // Spawn many concurrent workers all racing to take jobs.
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let mut taken = Vec::new();
+                while let Some(job) = store.take_next_job().await.unwrap() {
+                    taken.push(job.id);
+                }
+                taken
+            }));
+        }
+
+        let mut all_ids = Vec::new();
+        for handle in handles {
+            all_ids.extend(handle.await.unwrap());
+        }
+
+        // Every job should have been taken exactly once.
+        assert_eq!(all_ids.len(), num_jobs);
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), num_jobs);
     }
 }
