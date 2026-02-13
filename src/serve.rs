@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -37,6 +38,9 @@ const DEFAULT_PRIORITY: u16 = 32_768;
 
 /// Default interval between heartbeat frames on idle streams.
 const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
+
+/// Default maximum number of jobs in the working set across all streams.
+const DEFAULT_WORKING_LIMIT: u64 = 1024;
 
 // --- Stream types ---
 
@@ -173,6 +177,13 @@ struct AppState {
 
     /// Interval between heartbeat frames on idle streams.
     heartbeat_interval: Duration,
+
+    /// Maximum number of jobs in the working set across all streams.
+    /// 0 means no limit.
+    working_limit: u64,
+
+    /// Current number of in-flight jobs across all streams.
+    global_in_flight: AtomicU64,
 }
 
 /// Arguments for the `serve` subcommand.
@@ -193,6 +204,11 @@ pub struct Args {
     /// Seconds between heartbeat frames on idle streams.
     #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECONDS, env = "ZANXIO_HEARTBEAT_SECONDS")]
     heartbeat_seconds: u64,
+
+    /// Maximum number of jobs in the working set across all streams.
+    /// 0 means no limit.
+    #[arg(long, default_value_t = DEFAULT_WORKING_LIMIT, env = "ZANXIO_WORKING_LIMIT")]
+    working_limit: u64,
 }
 
 // --- Content negotiation ---
@@ -567,45 +583,67 @@ async fn stream_jobs(
             // Drain any pending events.
             while let Ok(event) = event_rx.try_recv() {
                 if let StoreEvent::JobCompleted(id) = event {
-                    in_flight.remove(&id);
+                    if in_flight.remove(&id) {
+                        let _ = state.global_in_flight.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(1)),
+                        );
+                    }
                 }
             }
 
-            // Wait until the client can accept a message before dequeuing.
-            // This ensures we never take a job we can't deliver.
-            let permit = match tx.reserve().await {
-                Ok(permit) => permit,
-                Err(_) => break, // client disconnected
-            };
+            // Only attempt to take a job if the global working limit
+            // hasn't been reached. This prevents rogue clients from
+            // hoarding unbounded work.
+            let can_take = state.working_limit == 0
+                || state.global_in_flight.load(Ordering::Relaxed) < state.working_limit;
 
-            match state.store.take_next_job().await {
-                Ok(Some(job)) => {
-                    in_flight.insert(job.id.clone());
-                    permit.send(StreamMessage::Job(Arc::new(job)));
-                }
-                Ok(None) => {
-                    // No job available. Release the slot and wait for a
-                    // store event or heartbeat timeout. Any enqueue that
-                    // happened between take_next_job() returning None and
-                    // entering recv() is already buffered in the broadcast
-                    // channel.
-                    drop(permit);
-                    tokio::select! {
-                        _ = tokio::time::sleep(state.heartbeat_interval) => {
-                            if tx.send(StreamMessage::Heartbeat).await.is_err() {
-                                break;
-                            }
-                        }
-                        event = event_rx.recv() => {
-                            if let Ok(StoreEvent::JobCompleted(id)) = event {
-                                in_flight.remove(&id);
-                            }
-                        }
+            if can_take {
+                // Wait until the client can accept a message before
+                // dequeuing. This ensures we never take a job we can't
+                // deliver.
+                let permit = match tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => break, // client disconnected
+                };
+
+                match state.store.take_next_job().await {
+                    Ok(Some(job)) => {
+                        in_flight.insert(job.id.clone());
+                        state.global_in_flight.fetch_add(1, Ordering::Relaxed);
+                        permit.send(StreamMessage::Job(Arc::new(job)));
+                        continue;
+                    }
+                    Ok(None) => drop(permit),
+                    Err(e) => {
+                        tracing::error!(%e, "take_next_job failed in stream");
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::error!(%e, "take_next_job failed in stream");
-                    break;
+            }
+
+            // No job available or at the working limit. Wait for a
+            // store event or heartbeat timeout. Any enqueue that
+            // happened between take_next_job() returning None and
+            // entering recv() is already buffered in the broadcast
+            // channel.
+            tokio::select! {
+                _ = tokio::time::sleep(state.heartbeat_interval) => {
+                    if tx.send(StreamMessage::Heartbeat).await.is_err() {
+                        break;
+                    }
+                }
+                event = event_rx.recv() => {
+                    if let Ok(StoreEvent::JobCompleted(id)) = event {
+                        if in_flight.remove(&id) {
+                            let _ = state.global_in_flight.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |v| Some(v.saturating_sub(1)),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -617,6 +655,13 @@ async fn stream_jobs(
                 tracing::error!(job_id = %id, %e, "requeue failed");
             }
         }
+
+        // Bulk decrement the global in-flight count.
+        let _ = state
+            .global_in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(in_flight.len() as u64))
+            });
     });
 
     // Start streaming using any of the valid formats.
@@ -652,6 +697,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         store,
         heartbeat_interval: Duration::from_secs(args.heartbeat_seconds),
+        working_limit: args.working_limit,
+        global_in_flight: AtomicU64::new(0),
     });
 
     // Set up the TCP socket for incoming connections.
@@ -724,6 +771,8 @@ mod tests {
         let state = Arc::new(AppState {
             store,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
+            working_limit: 0,
+            global_in_flight: AtomicU64::new(0),
         });
         let router = app(state.clone());
         (state, router)
@@ -1333,5 +1382,92 @@ mod tests {
             !ids.contains(&job_a.id),
             "acked job should NOT have been requeued"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_respects_working_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        std::mem::forget(dir);
+        let state = Arc::new(AppState {
+            store,
+            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
+            working_limit: 2,
+            global_in_flight: AtomicU64::new(0),
+        });
+        let router = app(state.clone());
+
+        // Enqueue 3 jobs.
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = router.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Read 2 jobs — should succeed since limit is 2.
+        let bytes = next_body_bytes(&mut body).await;
+        let job_a: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        let _ = next_body_bytes(&mut body).await;
+
+        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 2);
+
+        // Ack the first job to free a slot.
+        state
+            .store
+            .mark_completed(job_a["id"].as_str().unwrap())
+            .await
+            .unwrap();
+
+        // Third job should now be delivered.
+        let bytes = next_body_bytes(&mut body).await;
+        let job_c: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_c["payload"], "c");
+    }
+
+    #[tokio::test]
+    async fn stream_resets_global_counter_on_disconnect() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("x"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let _ = next_body_bytes(&mut body).await;
+        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 1);
+
+        // Disconnect.
+        drop(body);
+
+        // Trigger the spawned task to detect disconnect.
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("trigger"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 0);
     }
 }
