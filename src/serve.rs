@@ -208,6 +208,11 @@ where
         ("GET", "/health") => respond(format, StatusCode::OK, &HealthResponse { status: "ok" }),
         // Enqueue a new job.
         ("POST", "/jobs") => enqueue(format, state, req).await,
+        // Mark a job as successfully completed.
+        ("POST", p) if p.starts_with("/jobs/") && p.ends_with("/success") => {
+            let job_id = &p["/jobs/".len()..p.len() - "/success".len()];
+            mark_completed(format, state, job_id).await
+        }
         // Invalid path: 404.
         _ => respond(
             format,
@@ -286,6 +291,30 @@ where
         ),
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
+            respond(
+                format,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /jobs/{id}/success` — mark a job as completed.
+async fn mark_completed(format: Format, state: Arc<AppState>, job_id: &str) -> Response<BoxBody> {
+    match state.store.mark_completed(job_id).await {
+        Ok(true) => no_content(),
+        Ok(false) => respond(
+            format,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: "job not found in working set".into(),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "mark_completed failed");
             respond(
                 format,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -388,6 +417,13 @@ fn not_acceptable() -> Response<BoxBody> {
             supported: SUPPORTED_TYPES.to_vec(),
         },
     )
+}
+
+/// Return a 204 No Content response with an empty body.
+fn no_content() -> Response<BoxBody> {
+    let mut res = Response::new(full(Bytes::new()));
+    *res.status_mut() = StatusCode::NO_CONTENT;
+    res
 }
 
 /// Return a 415 Unsupported Media Type response.
@@ -773,5 +809,57 @@ mod tests {
         let res = handle(state, req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn success_returns_204() {
+        let state = test_state();
+
+        // Enqueue and take a job so it's in the working set.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = handle(state.clone(), req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap();
+
+        state.store.take_next_job().await.unwrap();
+
+        // Mark it as completed.
+        let req = empty_request("POST", &format!("/jobs/{job_id}/success"));
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn success_returns_404_for_unknown_job() {
+        let state = test_state();
+        let req = empty_request("POST", "/jobs/nonexistent/success");
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn success_returns_404_for_pending_job() {
+        let state = test_state();
+
+        // Enqueue but don't take — job is pending, not working.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = handle(state.clone(), req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap();
+
+        let req = empty_request("POST", &format!("/jobs/{job_id}/success"));
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }
