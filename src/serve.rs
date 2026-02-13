@@ -45,14 +45,14 @@ struct ErrorResponse {
     error: String,
 }
 
-/// Response shape for the 406 - not acceptable response.
+/// Response shape for content negotiation errors (406, 415).
 #[derive(Serialize)]
-struct NotAcceptableResponse {
+struct UnsupportedFormatResponse {
     /// Error message.
     error: String,
 
-    /// List of valid content types.
-    acceptable: Vec<&'static str>,
+    /// List of supported content types.
+    supported: Vec<&'static str>,
 }
 
 /// Request shape for the job enqueue request.
@@ -193,20 +193,24 @@ where
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    // Check content negotiation before routing.
-    if !accepts_json(req.headers()) {
-        let res = not_acceptable();
-        tracing::debug!(%method, %path, status = 406, "request");
-        return Ok(res);
-    }
+    // Determine response format from Accept header.
+    let format = match negotiate_accept(req.headers()) {
+        Some(f) => f,
+        None => {
+            let res = not_acceptable();
+            tracing::debug!(%method, %path, status = 406, "request");
+            return Ok(res);
+        }
+    };
 
     let res = match (method.as_str(), path.as_str()) {
         // Check the health status of the server process.
-        ("GET", "/health") => respond(StatusCode::OK, &HealthResponse { status: "ok" }),
+        ("GET", "/health") => respond(format, StatusCode::OK, &HealthResponse { status: "ok" }),
         // Enqueue a new job.
-        ("POST", "/jobs") => enqueue(state, req).await,
+        ("POST", "/jobs") => enqueue(format, state, req).await,
         // Invalid path: 404.
         _ => respond(
+            format,
             StatusCode::NOT_FOUND,
             &ErrorResponse {
                 error: "not found".into(),
@@ -225,16 +229,23 @@ where
 }
 
 /// Handle `POST /jobs` — enqueue a new job.
-async fn enqueue<B>(state: Arc<AppState>, req: Request<B>) -> Response<BoxBody>
+async fn enqueue<B>(format: Format, state: Arc<AppState>, req: Request<B>) -> Response<BoxBody>
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
-    // Read and parse the request body.
+    // Determine how to parse the body from Content-Type.
+    let input_format = match negotiate_content_type(req.headers()) {
+        Some(f) => f,
+        None => return unsupported_media_type(format),
+    };
+
+    // Read the request body (bytes).
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             return respond(
+                format,
                 StatusCode::BAD_REQUEST,
                 &ErrorResponse {
                     error: format!("failed to read body: {e}"),
@@ -243,26 +254,29 @@ where
         }
     };
 
-    let enqueue_req: EnqueueRequest = match serde_json::from_slice(&body) {
+    // Deserialize the request.
+    let enqueue_req: EnqueueRequest = match parse_body(input_format, &body) {
         Ok(r) => r,
-        Err(e) => {
+        Err(msg) => {
             return respond(
+                format,
                 StatusCode::BAD_REQUEST,
-                &ErrorResponse {
-                    error: format!("invalid JSON: {e}"),
-                },
+                &ErrorResponse { error: msg },
             );
         }
     };
 
     let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
 
+    // Delegate to the store instance to enqueue the job and return that job to
+    // the client.
     match state
         .store
         .enqueue(&enqueue_req.queue, priority, enqueue_req.payload)
         .await
     {
         Ok(job) => respond(
+            format,
             StatusCode::CREATED,
             &EnqueueResponse {
                 id: job.id,
@@ -273,6 +287,7 @@ where
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
             respond(
+                format,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &ErrorResponse {
                     error: "internal server error".into(),
@@ -282,29 +297,81 @@ where
     }
 }
 
-/// Returns true if the request accepts JSON responses.
+/// Supported serialization formats for requests and responses.
 ///
-/// Accepts if the Accept header is absent, contains `application/json`,
-/// or contains `*/*`.
-fn accepts_json(headers: &hyper::HeaderMap) -> bool {
-    match headers.get(hyper::header::ACCEPT) {
-        None => true,
-        Some(value) => {
-            let value = value.to_str().unwrap_or("");
-            value.contains("application/json") || value.contains("*/*")
+/// Currently both JSON and MessagePack formats are supported.
+/// The default format is JSON due to its widespread support and human
+/// readability but clients are recommended to use MessagePack in production
+/// workloads.
+#[derive(Clone, Copy)]
+enum Format {
+    Json,
+    MsgPack,
+}
+
+impl Format {
+    /// The MIME type for this format.
+    fn mime(self) -> &'static str {
+        match self {
+            Format::Json => "application/json",
+            Format::MsgPack => "application/msgpack",
         }
     }
 }
 
-/// Serialize a value as JSON and return it as an HTTP response.
-fn respond<T: Serialize>(status: StatusCode, body: &T) -> Response<BoxBody> {
-    let json = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    let mut res = Response::new(full(json));
+/// All content types we support.
+const SUPPORTED_TYPES: &[&str] = &["application/json", "application/msgpack"];
+
+/// Determine the response format from the Accept header.
+///
+/// Returns `None` if the client requested a format we don't support.
+/// Defaults to JSON when no Accept header is present (curl-friendly).
+fn negotiate_accept(headers: &hyper::HeaderMap) -> Option<Format> {
+    match headers.get(hyper::header::ACCEPT) {
+        None => Some(Format::Json),
+        Some(value) => {
+            let value = value.to_str().unwrap_or("");
+            if value.contains("application/msgpack") {
+                Some(Format::MsgPack)
+            } else if value.contains("application/json") || value.contains("*/*") {
+                Some(Format::Json)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Determine the request body format from the Content-Type header.
+///
+/// Returns `None` if the client sent a format we don't support.
+/// Defaults to JSON when no Content-Type header is present.
+fn negotiate_content_type(headers: &hyper::HeaderMap) -> Option<Format> {
+    match headers.get(hyper::header::CONTENT_TYPE) {
+        None => Some(Format::Json),
+        Some(value) => {
+            let value = value.to_str().unwrap_or("");
+            if value.contains("application/msgpack") {
+                Some(Format::MsgPack)
+            } else if value.contains("application/json") {
+                Some(Format::Json)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Serialize a value and return it as an HTTP response in the negotiated format.
+fn respond<T: Serialize>(format: Format, status: StatusCode, body: &T) -> Response<BoxBody> {
+    let bytes = match format {
+        Format::Json => serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec()),
+        Format::MsgPack => rmp_serde::to_vec_named(body).unwrap_or_else(|_| b"{}".to_vec()),
+    };
+    let mut res = Response::new(full(bytes));
     *res.status_mut() = status;
-    res.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
-    );
+    res.headers_mut()
+        .insert(hyper::header::CONTENT_TYPE, format.mime().parse().unwrap());
     res
 }
 
@@ -314,12 +381,35 @@ fn respond<T: Serialize>(status: StatusCode, body: &T) -> Response<BoxBody> {
 /// and the client clearly isn't getting what they asked for anyway.
 fn not_acceptable() -> Response<BoxBody> {
     respond(
+        Format::Json,
         StatusCode::NOT_ACCEPTABLE,
-        &NotAcceptableResponse {
+        &UnsupportedFormatResponse {
             error: "not acceptable".into(),
-            acceptable: vec!["application/json"],
+            supported: SUPPORTED_TYPES.to_vec(),
         },
     )
+}
+
+/// Return a 415 Unsupported Media Type response.
+fn unsupported_media_type(format: Format) -> Response<BoxBody> {
+    respond(
+        format,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        &UnsupportedFormatResponse {
+            error: "unsupported media type".into(),
+            supported: SUPPORTED_TYPES.to_vec(),
+        },
+    )
+}
+
+/// Deserialize a request body according to the negotiated format.
+fn parse_body<T: serde::de::DeserializeOwned>(format: Format, body: &[u8]) -> Result<T, String> {
+    match format {
+        Format::Json => serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}")),
+        Format::MsgPack => {
+            rmp_serde::from_slice(body).map_err(|e| format!("invalid MessagePack: {e}"))
+        }
+    }
 }
 
 /// Turn the provided data into a complete response sent in one chunk.
@@ -473,12 +563,26 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["error"], "not acceptable");
-        assert!(
-            body["acceptable"]
-                .as_array()
-                .unwrap()
-                .contains(&"application/json".into())
+        let supported = body["supported"].as_array().unwrap();
+        assert!(supported.contains(&"application/json".into()));
+        assert!(supported.contains(&"application/msgpack".into()));
+    }
+
+    #[tokio::test]
+    async fn accept_msgpack_returns_msgpack() {
+        let state = test_state();
+        let req = request_with_accept("GET", "/health", "application/msgpack");
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/msgpack"
         );
+
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "ok");
     }
 
     #[tokio::test]
@@ -554,6 +658,117 @@ mod tests {
             .method("POST")
             .uri("/jobs")
             .body(Full::new(Bytes::from("not json")))
+            .unwrap();
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_unsupported_content_type() {
+        let state = test_state();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/xml")
+            .body(Full::new(Bytes::from("<job/>")))
+            .unwrap();
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let supported = body["supported"].as_array().unwrap();
+        assert!(supported.contains(&"application/json".into()));
+        assert!(supported.contains(&"application/msgpack".into()));
+    }
+
+    #[tokio::test]
+    async fn enqueue_accepts_msgpack_request_body() {
+        #[derive(Serialize)]
+        struct MsgPackEnqueue {
+            queue: &'static str,
+            priority: u16,
+            payload: &'static str,
+        }
+
+        let state = test_state();
+        let body = rmp_serde::to_vec_named(&MsgPackEnqueue {
+            queue: "events",
+            priority: 3,
+            payload: "mp",
+        })
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/msgpack")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["queue"], "events");
+        assert_eq!(body["priority"], 3);
+    }
+
+    #[tokio::test]
+    async fn enqueue_msgpack_round_trip() {
+        #[derive(Serialize)]
+        struct MsgPackEnqueue {
+            queue: &'static str,
+            priority: u16,
+            payload: &'static str,
+        }
+
+        let state = test_state();
+        let body = rmp_serde::to_vec_named(&MsgPackEnqueue {
+            queue: "events",
+            priority: 7,
+            payload: "round-trip",
+        })
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/msgpack")
+            .header("accept", "application/msgpack")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        let res = handle(state, req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/msgpack"
+        );
+
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(body["queue"], "events");
+        assert_eq!(body["priority"], 7);
+        assert!(body["id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_msgpack_binary_payload() {
+        // Construct raw MessagePack with a binary (bin) type payload.
+        // serde_json::Value has no binary variant, so deserialization must fail.
+        let mut buf = Vec::new();
+        rmp::encode::write_map_len(&mut buf, 2).unwrap();
+        rmp::encode::write_str(&mut buf, "queue").unwrap();
+        rmp::encode::write_str(&mut buf, "default").unwrap();
+        rmp::encode::write_str(&mut buf, "payload").unwrap();
+        rmp::encode::write_bin(&mut buf, &[0x00, 0xff, 0xfe]).unwrap();
+
+        let state = test_state();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/msgpack")
+            .body(Full::new(Bytes::from(buf)))
             .unwrap();
         let res = handle(state, req).await.unwrap();
 

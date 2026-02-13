@@ -1378,6 +1378,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rmp",
  "rmp-serde",
  "scru128",
  "serde",
