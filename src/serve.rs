@@ -13,7 +13,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http::{self, AppState, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_WORKING_LIMIT};
+use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS};
 use crate::store::Store;
 
 /// Location of the internal database within the root directory.
@@ -35,13 +35,13 @@ pub struct Args {
     port: u16,
 
     /// Seconds between heartbeat frames on idle streams.
-    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECONDS, env = "ZANXIO_HEARTBEAT_SECONDS")]
-    heartbeat_seconds: u64,
+    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECONDS, env = "ZANXIO_HEARTBEAT_INTERVAL")]
+    heartbeat_interval: u64,
 
     /// Maximum number of jobs in the working set across all streams.
     /// 0 means no limit.
-    #[arg(long, default_value_t = DEFAULT_WORKING_LIMIT, env = "ZANXIO_WORKING_LIMIT")]
-    working_limit: u64,
+    #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, env = "ZANXIO_GLOBAL_WORKING_LIMIT")]
+    global_working_limit: u64,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -60,8 +60,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize shared state accessible to all request handlers.
     let state = Arc::new(AppState {
         store,
-        heartbeat_interval: Duration::from_secs(args.heartbeat_seconds),
-        working_limit: args.working_limit,
+        heartbeat_interval: Duration::from_secs(args.heartbeat_interval),
+        global_working_limit: args.global_working_limit,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx,
     });

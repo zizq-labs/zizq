@@ -39,7 +39,7 @@ const DEFAULT_PRIORITY: u16 = 32_768;
 pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
 
 /// Default maximum number of jobs in the working set across all streams.
-pub const DEFAULT_WORKING_LIMIT: u64 = 1024;
+pub const DEFAULT_GLOBAL_WORKING_LIMIT: u64 = 1024;
 
 // --- Stream types ---
 
@@ -347,7 +347,7 @@ pub struct AppState {
 
     /// Maximum number of jobs in the working set across all streams.
     /// 0 means no limit.
-    pub working_limit: u64,
+    pub global_working_limit: u64,
 
     /// Current number of in-flight jobs across all streams.
     pub global_in_flight: AtomicU64,
@@ -811,11 +811,33 @@ fn build_page_url(from: Option<&str>, order: Order, limit: u16) -> String {
     url
 }
 
+/// Default per-stream prefetch limit.
+///
+/// With a prefetch of 1, the server sends one job and waits for the client to
+/// acknowledge it before sending the next. Clients that can handle concurrent
+/// work should set `?prefetch=N` on the stream URL. 0 means unlimited.
+const DEFAULT_PREFETCH: usize = 1;
+
+/// Query parameters for `GET /jobs/stream`.
+#[derive(Deserialize)]
+struct StreamParams {
+    /// Maximum number of unacknowledged jobs to send before waiting.
+    /// 0 means unlimited. Defaults to 1.
+    #[serde(default = "default_prefetch")]
+    prefetch: usize,
+}
+
+fn default_prefetch() -> usize {
+    DEFAULT_PREFETCH
+}
+
 /// Handle `GET /jobs/stream` — stream jobs to workers.
 async fn stream_jobs(
     StreamAccept(fmt): StreamAccept,
     State(state): State<Arc<AppState>>,
+    Query(params): Query<StreamParams>,
 ) -> Response {
+    let prefetch = params.prefetch;
     // Channel we'll use to emit events to the client. We reserve a slot
     // before dequeuing a job, so we never take work we can't deliver.
     let (tx, rx) = mpsc::channel::<StreamMessage>(1);
@@ -862,11 +884,11 @@ async fn stream_jobs(
                 }
             }
 
-            // Only attempt to take a job if the global working limit
-            // hasn't been reached. This prevents rogue clients from
-            // hoarding unbounded work.
-            let can_take = state.working_limit == 0
-                || state.global_in_flight.load(Ordering::Relaxed) < state.working_limit;
+            // Only attempt to take a job if the per-stream prefetch
+            // limit AND the global working limit haven't been reached.
+            let can_take = (prefetch == 0 || in_flight.len() < prefetch)
+                && (state.global_working_limit == 0
+                    || state.global_in_flight.load(Ordering::Relaxed) < state.global_working_limit);
 
             if can_take {
                 // Wait until the client can accept a message before
@@ -984,7 +1006,7 @@ mod tests {
         let state = Arc::new(AppState {
             store,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
-            working_limit: 0,
+            global_working_limit: 0,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
         });
@@ -1676,7 +1698,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream");
+        let req = empty_request("GET", "/jobs/stream?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -1832,7 +1854,10 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream");
+        // Use prefetch=2 so the task attempts to reserve a second slot
+        // after sending the first job. When the body is dropped, the
+        // reserve() call detects the closed channel and triggers requeue.
+        let req = empty_request("GET", "/jobs/stream?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -1844,16 +1869,6 @@ mod tests {
 
         // Drop the body to simulate client disconnect.
         drop(body);
-
-        // The spawned task is waiting in select! for a notification or the
-        // 15s heartbeat. Enqueue a dummy job to trigger a notification,
-        // causing the task to attempt a send, discover the channel is closed,
-        // and requeue all in-flight jobs.
-        state
-            .store
-            .enqueue("default", 0, serde_json::json!("trigger"))
-            .await
-            .unwrap();
 
         // Give the spawned task time to detect disconnect and requeue.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1884,7 +1899,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream");
+        let req = empty_request("GET", "/jobs/stream?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -1898,12 +1913,7 @@ mod tests {
         // Drop the body to simulate client disconnect.
         drop(body);
 
-        // Trigger the spawned task to detect disconnect.
-        state
-            .store
-            .enqueue("default", 0, serde_json::json!("trigger"))
-            .await
-            .unwrap();
+        // Give the spawned task time to detect disconnect and requeue.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Only the unacked job should be requeued, not the acked one.
@@ -1931,7 +1941,7 @@ mod tests {
         let state = Arc::new(AppState {
             store,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
-            working_limit: 2,
+            global_working_limit: 2,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
         });
@@ -1954,11 +1964,11 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream");
+        let req = empty_request("GET", "/jobs/stream?prefetch=3");
         let res = router.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
-        // Read 2 jobs — should succeed since limit is 2.
+        // Read 2 jobs — should succeed since working_limit is 2.
         let bytes = next_body_bytes(&mut body).await;
         let job_a: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
@@ -1981,6 +1991,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_defaults_to_prefetch_one() {
+        let (state, app) = test_state_and_app();
+
+        // Enqueue 2 jobs.
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        // Stream with default prefetch (1).
+        let req = empty_request("GET", "/jobs/stream");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // First job should arrive.
+        let bytes = next_body_bytes(&mut body).await;
+        let job_a: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_a["payload"], "a");
+
+        // Second job should NOT arrive until the first is acked.
+        // Ack the first job.
+        state
+            .store
+            .mark_completed(job_a["id"].as_str().unwrap())
+            .await
+            .unwrap();
+
+        // Now the second job should come through.
+        let bytes = next_body_bytes(&mut body).await;
+        let job_b: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_b["payload"], "b");
+    }
+
+    #[tokio::test]
+    async fn stream_prefetch_allows_multiple_in_flight() {
+        let (state, app) = test_state_and_app();
+
+        // Enqueue 3 jobs.
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // Stream with prefetch=2.
+        let req = empty_request("GET", "/jobs/stream?prefetch=2");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Should get 2 jobs without any acks.
+        let bytes = next_body_bytes(&mut body).await;
+        let job_a: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_a["payload"], "a");
+
+        let bytes = next_body_bytes(&mut body).await;
+        let job_b: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_b["payload"], "b");
+
+        // Third job should be held back. Ack one to free a slot.
+        state
+            .store
+            .mark_completed(job_a["id"].as_str().unwrap())
+            .await
+            .unwrap();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let job_c: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_c["payload"], "c");
+    }
+
+    #[tokio::test]
+    async fn stream_prefetch_zero_means_unlimited() {
+        let (state, app) = test_state_and_app();
+
+        // Enqueue 3 jobs.
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // Stream with prefetch=0 (unlimited).
+        let req = empty_request("GET", "/jobs/stream?prefetch=0");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // All 3 jobs should arrive without any acks.
+        let bytes = next_body_bytes(&mut body).await;
+        let job: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job["payload"], "a");
+
+        let bytes = next_body_bytes(&mut body).await;
+        let job: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job["payload"], "b");
+
+        let bytes = next_body_bytes(&mut body).await;
+        let job: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job["payload"], "c");
+    }
+
+    #[tokio::test]
     async fn stream_resets_global_counter_on_disconnect() {
         let (state, app) = test_state_and_app();
 
@@ -1990,7 +2135,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream");
+        let req = empty_request("GET", "/jobs/stream?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -2000,12 +2145,7 @@ mod tests {
         // Disconnect.
         drop(body);
 
-        // Trigger the spawned task to detect disconnect.
-        state
-            .store
-            .enqueue("q", 0, serde_json::json!("trigger"))
-            .await
-            .unwrap();
+        // Give the spawned task time to detect disconnect.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 0);
