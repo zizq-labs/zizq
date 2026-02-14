@@ -34,11 +34,11 @@ pub struct Args {
     #[arg(long, default_value_t = 7890, env = "ZANXIO_PORT")]
     port: u16,
 
-    /// Seconds between heartbeat frames on idle streams.
+    /// Seconds between heartbeat frames on idle take connections.
     #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECONDS, env = "ZANXIO_HEARTBEAT_INTERVAL")]
     heartbeat_interval: u64,
 
-    /// Maximum number of jobs in the working set across all streams.
+    /// Maximum number of jobs in the working set across all connections.
     /// 0 means no limit.
     #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, env = "ZANXIO_GLOBAL_WORKING_LIMIT")]
     global_working_limit: u64,
@@ -54,7 +54,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(root.join(DATABASE_DIR))?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
-    // Shutdown signal for long-lived stream tasks.
+    // Shutdown signal for long-lived take tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     // Initialize shared state accessible to all request handlers.
@@ -75,7 +75,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Accepting connections on {addr}");
 
     // Start the server with graceful shutdown. Signal the watch channel
-    // first so spawned stream tasks break out of their loops, allowing
+    // first so spawned take tasks break out of their loops, allowing
     // their connections to close.
     axum::serve(listener, http::app(state))
         .with_graceful_shutdown(async move {

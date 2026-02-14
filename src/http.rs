@@ -3,7 +3,7 @@
 
 //! HTTP layer for the Zanxio server.
 //!
-//! Defines the router, request handlers, content negotiation, stream framing,
+//! Defines the router, request handlers, content negotiation, take framing,
 //! and all request/response types.
 
 use std::collections::HashSet;
@@ -35,33 +35,33 @@ use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
 /// and lower priority work.
 const DEFAULT_PRIORITY: u16 = 32_768;
 
-/// Default interval between heartbeat frames on idle streams.
+/// Default interval between heartbeat frames on idle take connections.
 pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
 
-/// Default maximum number of jobs in the working set across all streams.
+/// Default maximum number of jobs in the working set across all connections.
 pub const DEFAULT_GLOBAL_WORKING_LIMIT: u64 = 1024;
 
-// --- Stream types ---
+// --- Take types ---
 
-/// Supported stream serialization formats, negotiated via Accept header.
+/// Supported serialization formats for the take endpoint, negotiated via Accept header.
 #[derive(Clone, Copy)]
-enum StreamFormat {
+enum TakeFormat {
     Sse,
     NdJson,
     MsgPackStream,
 }
 
-/// All stream content types we support.
-const SUPPORTED_STREAM_TYPES: &[&str] = &[
+/// All content types supported by the take endpoint.
+const SUPPORTED_TAKE_TYPES: &[&str] = &[
     "text/event-stream",
     "application/x-ndjson",
     "application/vnd.zanxio.msgpack-stream",
 ];
 
-/// Extractor that reads the `Accept` header and resolves a `StreamFormat`.
-struct StreamAccept(StreamFormat);
+/// Extractor that reads the `Accept` header and resolves a `TakeFormat` for the take endpoint.
+struct TakeAccept(TakeFormat);
 
-impl<S> FromRequestParts<S> for StreamAccept
+impl<S> FromRequestParts<S> for TakeAccept
 where
     S: Send + Sync,
 {
@@ -72,27 +72,27 @@ where
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
         match parts.headers.get(ACCEPT) {
-            None => Ok(StreamAccept(StreamFormat::NdJson)),
+            None => Ok(TakeAccept(TakeFormat::NdJson)),
             Some(value) => {
                 let value = value.to_str().unwrap_or("");
                 if value.contains("text/event-stream") {
-                    Ok(StreamAccept(StreamFormat::Sse))
+                    Ok(TakeAccept(TakeFormat::Sse))
                 } else if value.contains("application/vnd.zanxio.msgpack-stream")
                     || value.contains("application/msgpack")
                 {
-                    Ok(StreamAccept(StreamFormat::MsgPackStream))
+                    Ok(TakeAccept(TakeFormat::MsgPackStream))
                 } else if value.contains("application/x-ndjson")
                     || value.contains("application/json")
                     || value.contains("*/*")
                 {
-                    Ok(StreamAccept(StreamFormat::NdJson))
+                    Ok(TakeAccept(TakeFormat::NdJson))
                 } else {
                     Err(respond(
                         Format::Json,
                         StatusCode::NOT_ACCEPTABLE,
                         &UnsupportedFormatResponse {
                             error: "not acceptable".into(),
-                            supported: SUPPORTED_STREAM_TYPES.to_vec(),
+                            supported: SUPPORTED_TAKE_TYPES.to_vec(),
                         },
                     ))
                 }
@@ -101,8 +101,8 @@ where
     }
 }
 
-/// Messages sent over the stream channel.
-enum StreamMessage {
+/// Messages sent over the take channel.
+enum TakeMessage {
     Job(Arc<Job>), // http::Job
     Heartbeat,
 }
@@ -342,14 +342,14 @@ pub struct AppState {
     /// Persistent store for job queue operations.
     pub store: Store,
 
-    /// Interval between heartbeat frames on idle streams.
+    /// Interval between heartbeat frames on idle take connections.
     pub heartbeat_interval: Duration,
 
-    /// Maximum number of jobs in the working set across all streams.
+    /// Maximum number of jobs in the working set across all connections.
     /// 0 means no limit.
     pub global_working_limit: u64,
 
-    /// Current number of in-flight jobs across all streams.
+    /// Current number of in-flight jobs across all connections.
     pub global_in_flight: AtomicU64,
 
     /// Cloneable receiver for graceful shutdown signaling.
@@ -537,28 +537,28 @@ fn no_content() -> Response {
     res
 }
 
-// --- Stream framing ---
+// --- Take framing ---
 
-/// Return a stream frame in newline delimited JSON format.
+/// Return a take frame in newline delimited JSON format.
 ///
 /// Heartbeat messages are empty (newline only).
-fn frame_ndjson(msg: &StreamMessage) -> Bytes {
+fn frame_ndjson(msg: &TakeMessage) -> Bytes {
     match msg {
-        StreamMessage::Job(job) => {
+        TakeMessage::Job(job) => {
             let mut bytes = serde_json::to_vec(&**job).unwrap();
             bytes.push(b'\n');
             Bytes::from(bytes)
         }
-        StreamMessage::Heartbeat => Bytes::from_static(b"\n"),
+        TakeMessage::Heartbeat => Bytes::from_static(b"\n"),
     }
 }
 
-/// Return a stream frame in length-prefixed MessagePack format.
+/// Return a take frame in length-prefixed MessagePack format.
 ///
 /// Heartbeat messages are empty (zero prefix, no data).
-fn frame_msgpack_stream(msg: &StreamMessage) -> Bytes {
+fn frame_msgpack_stream(msg: &TakeMessage) -> Bytes {
     match msg {
-        StreamMessage::Job(job) => {
+        TakeMessage::Job(job) => {
             let payload = rmp_serde::to_vec_named(&**job).unwrap();
             let len = (payload.len() as u32).to_be_bytes();
             let mut bytes = Vec::with_capacity(4 + payload.len());
@@ -566,32 +566,32 @@ fn frame_msgpack_stream(msg: &StreamMessage) -> Bytes {
             bytes.extend_from_slice(&payload);
             Bytes::from(bytes)
         }
-        StreamMessage::Heartbeat => Bytes::from_static(&[0, 0, 0, 0]),
+        TakeMessage::Heartbeat => Bytes::from_static(&[0, 0, 0, 0]),
     }
 }
 
-/// Return a SSE event containing the given stream message.
+/// Return a SSE event containing the given take message.
 ///
 /// Heartbeats are just comments.
-fn frame_sse(msg: &StreamMessage) -> Result<Event, Infallible> {
+fn frame_sse(msg: &TakeMessage) -> Result<Event, Infallible> {
     match msg {
-        StreamMessage::Job(job) => Ok(Event::default().json_data(&**job).unwrap()),
-        StreamMessage::Heartbeat => Ok(Event::default().comment("heartbeat")),
+        TakeMessage::Job(job) => Ok(Event::default().json_data(&**job).unwrap()),
+        TakeMessage::Heartbeat => Ok(Event::default().comment("heartbeat")),
     }
 }
 
-// --- Stream response builders ---
+// --- Take response builders ---
 
-/// Create a SSE streaming response which emits a message for each event in the
+/// Create a SSE response which emits a message for each event in the
 /// receiver channel.
-fn build_sse_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
+fn build_sse_response(rx: mpsc::Receiver<TakeMessage>) -> Response {
     let stream = ReceiverStream::new(rx).map(|msg| frame_sse(&msg));
     Sse::new(stream).into_response()
 }
 
-/// Create a newline delimited JSON streaming response that emits a JSON
-/// message for every event on the receiver channel.
-fn build_ndjson_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
+/// Create a newline delimited JSON response that emits a JSON message for
+/// every event on the receiver channel.
+fn build_ndjson_response(rx: mpsc::Receiver<TakeMessage>) -> Response {
     let stream = ReceiverStream::new(rx).map(|msg| Ok::<_, Infallible>(frame_ndjson(&msg)));
     let mut res = Response::new(Body::from_stream(stream));
     res.headers_mut()
@@ -599,9 +599,9 @@ fn build_ndjson_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
     res
 }
 
-/// Create a length-prefixed MessagePack streaming response that emits a
-/// MessagePack message for every event in the receiver channel.
-fn build_msgpack_stream_response(rx: mpsc::Receiver<StreamMessage>) -> Response {
+/// Create a length-prefixed MessagePack response that emits a MessagePack
+/// message for every event in the receiver channel.
+fn build_msgpack_stream_response(rx: mpsc::Receiver<TakeMessage>) -> Response {
     let stream = ReceiverStream::new(rx).map(|msg| Ok::<_, Infallible>(frame_msgpack_stream(&msg)));
     let mut res = Response::new(Body::from_stream(stream));
     res.headers_mut().insert(
@@ -618,7 +618,7 @@ pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/jobs", get(list_jobs).post(enqueue))
-        .route("/jobs/stream", get(stream_jobs))
+        .route("/jobs/take", get(take_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
         .fallback(not_found)
@@ -811,16 +811,16 @@ fn build_page_url(from: Option<&str>, order: Order, limit: u16) -> String {
     url
 }
 
-/// Default per-stream prefetch limit.
+/// Default per-connection prefetch limit.
 ///
 /// With a prefetch of 1, the server sends one job and waits for the client to
 /// acknowledge it before sending the next. Clients that can handle concurrent
-/// work should set `?prefetch=N` on the stream URL. 0 means unlimited.
+/// work should set `?prefetch=N` on the take URL. 0 means unlimited.
 const DEFAULT_PREFETCH: usize = 1;
 
-/// Query parameters for `GET /jobs/stream`.
+/// Query parameters for `GET /jobs/take`.
 #[derive(Deserialize)]
-struct StreamParams {
+struct TakeParams {
     /// Maximum number of unacknowledged jobs to send before waiting.
     /// 0 means unlimited. Defaults to 1.
     #[serde(default = "default_prefetch")]
@@ -831,16 +831,16 @@ fn default_prefetch() -> usize {
     DEFAULT_PREFETCH
 }
 
-/// Handle `GET /jobs/stream` — stream jobs to workers.
-async fn stream_jobs(
-    StreamAccept(fmt): StreamAccept,
+/// Handle `GET /jobs/take` — take jobs from the queue and deliver to workers.
+async fn take_jobs(
+    TakeAccept(fmt): TakeAccept,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StreamParams>,
+    Query(params): Query<TakeParams>,
 ) -> Response {
     let prefetch = params.prefetch;
     // Channel we'll use to emit events to the client. We reserve a slot
     // before dequeuing a job, so we never take work we can't deliver.
-    let (tx, rx) = mpsc::channel::<StreamMessage>(1);
+    let (tx, rx) = mpsc::channel::<TakeMessage>(1);
 
     // Subscription to the store events broadcast channel which serves two
     // purposes:
@@ -884,7 +884,7 @@ async fn stream_jobs(
                 }
             }
 
-            // Only attempt to take a job if the per-stream prefetch
+            // Only attempt to take a job if the per-connection prefetch
             // limit AND the global working limit haven't been reached.
             let can_take = (prefetch == 0 || in_flight.len() < prefetch)
                 && (state.global_working_limit == 0
@@ -906,7 +906,7 @@ async fn stream_jobs(
                     Ok(Some(job)) => {
                         in_flight.insert(job.id.clone());
                         state.global_in_flight.fetch_add(1, Ordering::Relaxed);
-                        permit.send(StreamMessage::Job(Arc::new(Job::from(job))));
+                        permit.send(TakeMessage::Job(Arc::new(Job::from(job))));
                         // Reset the heartbeat timer since we just sent
                         // data — the client knows we're alive.
                         heartbeat_sleep
@@ -916,7 +916,7 @@ async fn stream_jobs(
                     }
                     Ok(None) => drop(permit),
                     Err(e) => {
-                        tracing::error!(%e, "take_next_job failed in stream");
+                        tracing::error!(%e, "take_next_job failed");
                         break;
                     }
                 }
@@ -929,7 +929,7 @@ async fn stream_jobs(
             // channel.
             tokio::select! {
                 _ = &mut heartbeat_sleep => {
-                    if tx.send(StreamMessage::Heartbeat).await.is_err() {
+                    if tx.send(TakeMessage::Heartbeat).await.is_err() {
                         break;
                     }
                     // Reset for the next heartbeat.
@@ -968,11 +968,11 @@ async fn stream_jobs(
             });
     });
 
-    // Start streaming using any of the valid formats.
+    // Build the response in the negotiated format.
     match fmt {
-        StreamFormat::Sse => build_sse_response(rx),
-        StreamFormat::NdJson => build_ndjson_response(rx),
-        StreamFormat::MsgPackStream => build_msgpack_stream_response(rx),
+        TakeFormat::Sse => build_sse_response(rx),
+        TakeFormat::NdJson => build_ndjson_response(rx),
+        TakeFormat::MsgPackStream => build_msgpack_stream_response(rx),
     }
 }
 
@@ -1676,7 +1676,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
-    // --- Streaming tests ---
+    // --- GET /jobs/take tests ---
 
     async fn next_body_bytes(body: &mut axum::body::Body) -> Bytes {
         use http_body_util::BodyExt as _;
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_delivers_pending_jobs_as_ndjson() {
+    async fn take_delivers_pending_jobs_as_ndjson() {
         let (state, app) = test_state_and_app();
 
         state
@@ -1698,7 +1698,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream?prefetch=2");
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -1721,14 +1721,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_waits_and_delivers_new_jobs() {
+    async fn take_waits_and_delivers_new_jobs() {
         let (state, app) = test_state_and_app();
 
-        let req = empty_request("GET", "/jobs/stream");
+        let req = empty_request("GET", "/jobs/take");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
-        // Enqueue after stream is open.
+        // Enqueue after take connection is open.
         let enqueued = state
             .store
             .enqueue("default", 0, serde_json::json!("delayed"))
@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_returns_sse_when_requested() {
+    async fn take_returns_sse_when_requested() {
         let (state, app) = test_state_and_app();
 
         state
@@ -1753,7 +1753,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = request_with_accept("GET", "/jobs/stream", "text/event-stream");
+        let req = request_with_accept("GET", "/jobs/take", "text/event-stream");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(
@@ -1777,7 +1777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_returns_msgpack_when_requested() {
+    async fn take_returns_msgpack_when_requested() {
         let (state, app) = test_state_and_app();
 
         state
@@ -1788,7 +1788,7 @@ mod tests {
 
         let req = request_with_accept(
             "GET",
-            "/jobs/stream",
+            "/jobs/take",
             "application/vnd.zanxio.msgpack-stream",
         );
         let res = app.oneshot(req).await.unwrap();
@@ -1812,8 +1812,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_returns_406_for_unsupported_accept() {
-        let req = request_with_accept("GET", "/jobs/stream", "text/xml");
+    async fn take_returns_406_for_unsupported_accept() {
+        let req = request_with_accept("GET", "/jobs/take", "text/xml");
         let res = test_app().oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
@@ -1826,7 +1826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_sets_ndjson_content_type() {
+    async fn take_sets_ndjson_content_type() {
         let (state, app) = test_state_and_app();
 
         state
@@ -1835,7 +1835,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream");
+        let req = empty_request("GET", "/jobs/take");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(
@@ -1845,7 +1845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_requeues_on_disconnect() {
+    async fn take_requeues_on_disconnect() {
         let (state, app) = test_state_and_app();
 
         let enqueued = state
@@ -1857,11 +1857,11 @@ mod tests {
         // Use prefetch=2 so the task attempts to reserve a second slot
         // after sending the first job. When the body is dropped, the
         // reserve() call detects the closed channel and triggers requeue.
-        let req = empty_request("GET", "/jobs/stream?prefetch=2");
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
-        // Read the job from the stream.
+        // Read the job from the response.
         let bytes = next_body_bytes(&mut body).await;
         let line = std::str::from_utf8(&bytes).unwrap().trim();
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -1885,7 +1885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_does_not_requeue_acked_jobs_on_disconnect() {
+    async fn take_does_not_requeue_acked_jobs_on_disconnect() {
         let (state, app) = test_state_and_app();
 
         let job_a = state
@@ -1899,15 +1899,15 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream?prefetch=2");
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
-        // Read both jobs from the stream.
+        // Read both jobs from the response.
         let _ = next_body_bytes(&mut body).await;
         let _ = next_body_bytes(&mut body).await;
 
-        // Ack the first job while the stream is still open.
+        // Ack the first job while the connection is still open.
         assert!(state.store.mark_completed(&job_a.id).await.unwrap());
 
         // Drop the body to simulate client disconnect.
@@ -1932,7 +1932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_respects_working_limit() {
+    async fn take_respects_working_limit() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         std::mem::forget(dir);
@@ -1964,7 +1964,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream?prefetch=3");
+        let req = empty_request("GET", "/jobs/take?prefetch=3");
         let res = router.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -1991,7 +1991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_defaults_to_prefetch_one() {
+    async fn take_defaults_to_prefetch_one() {
         let (state, app) = test_state_and_app();
 
         // Enqueue 2 jobs.
@@ -2006,8 +2006,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Stream with default prefetch (1).
-        let req = empty_request("GET", "/jobs/stream");
+        // Take with default prefetch (1).
+        let req = empty_request("GET", "/jobs/take");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -2033,7 +2033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_prefetch_allows_multiple_in_flight() {
+    async fn take_prefetch_allows_multiple_in_flight() {
         let (state, app) = test_state_and_app();
 
         // Enqueue 3 jobs.
@@ -2053,8 +2053,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Stream with prefetch=2.
-        let req = empty_request("GET", "/jobs/stream?prefetch=2");
+        // Take with prefetch=2.
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -2083,7 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_prefetch_zero_means_unlimited() {
+    async fn take_prefetch_zero_means_unlimited() {
         let (state, app) = test_state_and_app();
 
         // Enqueue 3 jobs.
@@ -2103,8 +2103,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Stream with prefetch=0 (unlimited).
-        let req = empty_request("GET", "/jobs/stream?prefetch=0");
+        // Take with prefetch=0 (unlimited).
+        let req = empty_request("GET", "/jobs/take?prefetch=0");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
@@ -2126,7 +2126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_resets_global_counter_on_disconnect() {
+    async fn take_resets_global_counter_on_disconnect() {
         let (state, app) = test_state_and_app();
 
         state
@@ -2135,7 +2135,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/stream?prefetch=2");
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
