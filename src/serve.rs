@@ -477,6 +477,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/jobs", post(enqueue))
         .route("/jobs/stream", get(stream_jobs))
+        .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
         .fallback(not_found)
         .with_state(state)
@@ -541,6 +542,34 @@ async fn mark_completed(
         ),
         Err(e) => {
             tracing::error!(%e, "mark_completed failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `GET /jobs/{id}` — look up a job by ID.
+async fn get_job(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.get_job(&id).await {
+        Ok(Some(job)) => respond(fmt, StatusCode::OK, &job),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: "job not found".into(),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "get_job failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1090,6 +1119,87 @@ mod tests {
         let res = test_app().oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_pending_job() {
+        let (_, app) = test_state_and_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "emails", "priority": 5, "payload": {"to": "a@b.c"}}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = created["id"].as_str().unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{job_id}"));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["id"], job_id);
+        assert_eq!(body["queue"], "emails");
+        assert_eq!(body["priority"], 5);
+        assert_eq!(body["payload"]["to"], "a@b.c");
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_working_job() {
+        let (state, app) = test_state_and_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = created["id"].as_str().unwrap();
+
+        // Take the job so it moves to working.
+        state.store.take_next_job().await.unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{job_id}"));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["id"], job_id);
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_404_for_completed_job() {
+        let (state, app) = test_state_and_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "default", "payload": "test"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = created["id"].as_str().unwrap();
+
+        state.store.take_next_job().await.unwrap();
+        state.store.mark_completed(job_id).await.unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{job_id}"));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_404_for_unknown_id() {
+        let req = empty_request("GET", "/jobs/nonexistent");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

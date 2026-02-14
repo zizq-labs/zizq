@@ -302,6 +302,23 @@ impl Store {
         completed
     }
 
+    /// Look up a job by ID.
+    ///
+    /// Returns `None` if the job does not exist (or has been completed).
+    pub async fn get_job(&self, id: &str) -> Result<Option<Job>, StoreError> {
+        let jobs = self.jobs.clone();
+        let id = id.to_string();
+
+        task::spawn_blocking(move || {
+            let Some(bytes) = jobs.get(&id)? else {
+                return Ok(None);
+            };
+            let job: Job = rmp_serde::from_slice(&bytes)?;
+            Ok(Some(job))
+        })
+        .await?
+    }
+
     /// Subscribe to store events.
     pub fn subscribe(&self) -> broadcast::Receiver<StoreEvent> {
         self.event_tx.subscribe()
@@ -689,5 +706,38 @@ mod tests {
         store.requeue(&taken.id).await.unwrap();
 
         assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobEnqueued));
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_enqueued_job() {
+        let store = test_store();
+        let enqueued = store
+            .enqueue("default", 0, serde_json::json!("hello"))
+            .await
+            .unwrap();
+
+        let job = store.get_job(&enqueued.id).await.unwrap().unwrap();
+        assert_eq!(job.id, enqueued.id);
+        assert_eq!(job.queue, "default");
+        assert_eq!(job.payload, serde_json::json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_none_for_unknown_id() {
+        let store = test_store();
+        assert!(store.get_job("nonexistent").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_none_after_completion() {
+        let store = test_store();
+        let enqueued = store
+            .enqueue("default", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        store.take_next_job().await.unwrap();
+        store.mark_completed(&enqueued.id).await.unwrap();
+
+        assert!(store.get_job(&enqueued.id).await.unwrap().is_none());
     }
 }
