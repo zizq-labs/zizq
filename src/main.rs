@@ -30,6 +30,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod http;
 mod logging;
 mod serve;
 mod store;
