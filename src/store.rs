@@ -11,8 +11,9 @@
 //! - `working`: tracks in-flight jobs, keyed by job ID.
 
 use std::fmt;
+use std::ops::Bound;
 
-use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
+use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::task;
@@ -157,6 +158,82 @@ impl Job {
     pub fn queue_key(&self) -> String {
         make_queue_key(self.priority, &self.id)
     }
+}
+
+/// Direction for scanning the jobs keyspace when listing jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDirection {
+    /// Oldest first (ascending by job ID).
+    Asc,
+
+    /// Newest first (descending by job ID).
+    Desc,
+}
+
+impl ScanDirection {
+    /// Return the opposite direction.
+    pub fn reverse(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+/// Options for listing jobs with cursor-based pagination in `Store::list_jobs`.
+#[derive(Debug, Clone)]
+pub struct ListJobsOptions {
+    /// Cursor: start after this job ID (exclusive). `None` means start from
+    /// the beginning (asc) or end (desc).
+    pub from: Option<String>,
+
+    /// Scan direction.
+    pub direction: ScanDirection,
+
+    /// Maximum number of jobs to return.
+    pub limit: usize,
+}
+
+impl ListJobsOptions {
+    /// Create default options (ascending, no cursor, limit 50).
+    pub fn new() -> Self {
+        Self {
+            from: None,
+            direction: ScanDirection::Asc,
+            limit: 50,
+        }
+    }
+
+    /// Set the cursor from which to paginate and return `self`.
+    pub fn from(mut self, cursor: impl Into<String>) -> Self {
+        self.from = Some(cursor.into());
+        self
+    }
+
+    /// Set the direction in which to paginate and return `self`.
+    pub fn direction(mut self, direction: ScanDirection) -> Self {
+        self.direction = direction;
+        self
+    }
+
+    /// Set the maximum number of records to return and return `self`.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+/// A page of jobs returned by `Store::list_jobs`.
+#[derive(Debug)]
+pub struct ListJobsPage {
+    /// The jobs on this page.
+    pub jobs: Vec<Job>,
+
+    /// Options to fetch the next page, or `None` if this is the last page.
+    pub next: Option<ListJobsOptions>,
+
+    /// Options to fetch the previous page, or `None` if this is the first page.
+    pub prev: Option<ListJobsOptions>,
 }
 
 /// Events broadcast by the store when job state changes.
@@ -430,6 +507,138 @@ impl Store {
         }
 
         Ok(requeued)
+    }
+
+    /// List jobs with cursor-based pagination.
+    ///
+    /// Returns a page of jobs along with options for fetching the next and
+    /// previous pages. Internally over-selects by one to determine whether
+    /// more results exist in the scan direction.
+    ///
+    /// # Examples
+    ///
+    /// Fetch the first page with default options:
+    ///
+    /// ```ignore
+    /// let page = store.list_jobs(ListJobsOptions::new()).await?;
+    /// for job in &page.jobs {
+    ///     println!("{}: {}", job.id, job.queue);
+    /// }
+    /// ```
+    ///
+    /// Paginate through all jobs:
+    ///
+    /// ```ignore
+    /// let mut opts = ListJobsOptions::new().limit(100);
+    /// loop {
+    ///     let page = store.list_jobs(opts).await?;
+    ///     for job in &page.jobs {
+    ///         process(job);
+    ///     }
+    ///     match page.next {
+    ///         Some(next) => opts = next,
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Fetch the most recent 10 jobs:
+    ///
+    /// ```ignore
+    /// let page = store
+    ///     .list_jobs(ListJobsOptions::new().direction(ScanDirection::Desc).limit(10))
+    ///     .await?;
+    /// ```
+    pub async fn list_jobs(&self, opts: ListJobsOptions) -> Result<ListJobsPage, StoreError> {
+        let db = self.db.clone();
+        let jobs_ks = self.jobs.clone();
+
+        task::spawn_blocking(move || {
+            let snapshot = db.read_tx();
+            // We take 1 more job than requested so that we know if there's a
+            // next page or not.
+            let fetch = opts.limit + 1;
+            let mut rows = Vec::with_capacity(fetch);
+
+            match opts.direction {
+                ScanDirection::Asc => {
+                    // The remaining set of records is simply a range scan
+                    // forwards or backwards from the cursor.
+                    let range = match &opts.from {
+                        Some(cursor) => snapshot.range::<&str, _>(
+                            &jobs_ks,
+                            (Bound::Excluded(cursor.as_str()), Bound::Unbounded),
+                        ),
+                        None => snapshot.range::<&str, _>(&jobs_ks, ..),
+                    };
+
+                    // We take(fetch) records from the iterator to get the page
+                    // plus one extra.
+                    for entry in range.take(fetch) {
+                        let (_, value) = entry.into_inner()?;
+                        let job: Job = rmp_serde::from_slice(&value)?;
+                        rows.push(job);
+                    }
+                }
+                ScanDirection::Desc => {
+                    // See comments above for the ScanDirection::Asc arm.
+                    let range = match &opts.from {
+                        Some(cursor) => snapshot.range::<&str, _>(
+                            &jobs_ks,
+                            (Bound::Unbounded, Bound::Excluded(cursor.as_str())),
+                        ),
+                        None => snapshot.range::<&str, _>(&jobs_ks, ..),
+                    };
+
+                    for entry in range.rev().take(fetch) {
+                        let (_, value) = entry.into_inner()?;
+                        let job: Job = rmp_serde::from_slice(&value)?;
+                        rows.push(job);
+                    }
+                }
+            }
+
+            // If we got more rows than the requested limit, we know there's a
+            // next page, and we can just discard that extra row now.
+            let has_more = rows.len() > opts.limit;
+            if has_more {
+                rows.truncate(opts.limit);
+            }
+
+            // Next page: exists if over-select found an extra row.
+            let next = if has_more {
+                let last_id = &rows.last().unwrap().id;
+                Some(
+                    ListJobsOptions::new()
+                        .from(last_id.clone())
+                        .direction(opts.direction)
+                        .limit(opts.limit),
+                )
+            } else {
+                None
+            };
+
+            // Previous page: exists if a cursor was provided (we came from
+            // somewhere).
+            let prev = if opts.from.is_some() && !rows.is_empty() {
+                let first_id = &rows.first().unwrap().id;
+                Some(
+                    ListJobsOptions::new()
+                        .from(first_id.clone())
+                        .direction(opts.direction.reverse())
+                        .limit(opts.limit),
+                )
+            } else {
+                None
+            };
+
+            Ok(ListJobsPage {
+                jobs: rows,
+                next,
+                prev,
+            })
+        })
+        .await?
     }
 }
 
@@ -806,5 +1015,220 @@ mod tests {
         store.mark_completed(&enqueued.id).await.unwrap();
 
         assert!(store.get_job(&enqueued.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_all_in_asc_order() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        assert_eq!(page.jobs.len(), 3);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert_eq!(page.jobs[2].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_all_in_desc_order() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().direction(ScanDirection::Desc))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 3);
+        assert_eq!(page.jobs[0].id, c.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert_eq!(page.jobs[2].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_respects_limit() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_cursor_is_exclusive_asc() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().from(&a.id))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[1].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_cursor_is_exclusive_desc() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .from(&c.id)
+                    .direction(ScanDirection::Desc),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[1].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_empty_store() {
+        let store = test_store();
+        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        assert!(page.jobs.is_empty());
+        assert!(page.next.is_none());
+        assert!(page.prev.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_cursor_past_end() {
+        let store = test_store();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().from(&c.id))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+        assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_includes_working_jobs() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        store.take_next_job().await.unwrap();
+
+        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[0].status, u8::from(JobStatus::Working));
+        assert_eq!(page.jobs[1].status, u8::from(JobStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_excludes_completed_jobs() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        let taken = store.take_next_job().await.unwrap().unwrap();
+        store.mark_completed(&taken.id).await.unwrap();
+
+        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, b.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_next_present_when_more_results() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+
+        let next = page.next.unwrap();
+        assert_eq!(next.from.as_deref(), Some(b.id.as_str()));
+        assert_eq!(next.direction, ScanDirection::Asc);
+        assert_eq!(next.limit, 2);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_next_absent_on_last_page() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_prev_absent_on_first_page() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+
+        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        assert!(page.prev.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_prev_present_when_cursor_provided() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().from(&a.id).limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+
+        let prev = page.prev.unwrap();
+        assert_eq!(prev.from.as_deref(), Some(b.id.as_str()));
+        assert_eq!(prev.direction, ScanDirection::Desc);
+        assert_eq!(prev.limit, 2);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_next_page_returns_remaining() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        // First page.
+        let page1 = store
+            .list_jobs(ListJobsOptions::new().limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page1.jobs.len(), 2);
+
+        // Follow next to get second page.
+        let page2 = store.list_jobs(page1.next.unwrap()).await.unwrap();
+        assert_eq!(page2.jobs.len(), 1);
+        assert_eq!(page2.jobs[0].id, c.id);
+        assert!(page2.next.is_none());
     }
 }
