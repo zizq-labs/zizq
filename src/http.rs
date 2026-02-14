@@ -109,6 +109,50 @@ enum StreamMessage {
 
 // --- Job type ---
 
+/// Lifecycle status of a job as returned in API responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    /// The job is in the store, but is scheduled to be queued at a later time.
+    Scheduled,
+
+    /// The job is in the priority queue ready to be worked.
+    Ready,
+
+    /// The job is currently being processed by a worker.
+    Working,
+
+    /// The job was successfully completed by a worker.
+    Completed,
+
+    /// The job failed too many times and exhausted its retry policy.
+    Dead,
+}
+
+impl From<store::JobStatus> for JobStatus {
+    fn from(s: store::JobStatus) -> Self {
+        match s {
+            store::JobStatus::Scheduled => Self::Scheduled,
+            store::JobStatus::Ready => Self::Ready,
+            store::JobStatus::Working => Self::Working,
+            store::JobStatus::Completed => Self::Completed,
+            store::JobStatus::Dead => Self::Dead,
+        }
+    }
+}
+
+impl From<JobStatus> for store::JobStatus {
+    fn from(s: JobStatus) -> Self {
+        match s {
+            JobStatus::Scheduled => Self::Scheduled,
+            JobStatus::Ready => Self::Ready,
+            JobStatus::Working => Self::Working,
+            JobStatus::Completed => Self::Completed,
+            JobStatus::Dead => Self::Dead,
+        }
+    }
+}
+
 /// HTTP representation of a job.
 ///
 /// Mirrors `store::Job` for now, but exists as a separate type so the HTTP
@@ -125,6 +169,9 @@ pub struct Job {
     /// Priority (lower number = higher priority).
     pub priority: u16,
 
+    /// Current lifecycle status.
+    pub status: JobStatus,
+
     /// Arbitrary payload provided by the client.
     pub payload: serde_json::Value,
 }
@@ -135,6 +182,9 @@ impl From<store::Job> for Job {
             id: job.id,
             queue: job.queue,
             priority: job.priority,
+            status: store::JobStatus::try_from(job.status)
+                .unwrap_or(store::JobStatus::Ready)
+                .into(),
             payload: job.payload,
         }
     }
@@ -147,6 +197,7 @@ impl From<Job> for store::Job {
             queue: job.queue,
             priority: job.priority,
             payload: job.payload,
+            status: store::JobStatus::from(job.status).into(),
         }
     }
 }
@@ -1076,6 +1127,7 @@ mod tests {
         assert_eq!(body["id"], job_id);
         assert_eq!(body["queue"], "emails");
         assert_eq!(body["priority"], 5);
+        assert_eq!(body["status"], "ready");
         assert_eq!(body["payload"]["to"], "a@b.c");
     }
 
@@ -1101,6 +1153,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["id"], job_id);
+        assert_eq!(body["status"], "working");
     }
 
     #[tokio::test]
@@ -1216,6 +1269,7 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["queue"], "q1");
         assert_eq!(job["payload"], "first");
+        assert_eq!(job["status"], "working");
         assert!(job["id"].is_string());
 
         // Second job (priority 5).
@@ -1224,6 +1278,7 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["queue"], "q2");
         assert_eq!(job["payload"], "second");
+        assert_eq!(job["status"], "working");
     }
 
     #[tokio::test]
@@ -1246,6 +1301,7 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["id"], enqueued.id);
         assert_eq!(job["payload"], "delayed");
+        assert_eq!(job["status"], "working");
     }
 
     #[tokio::test]
@@ -1278,6 +1334,7 @@ mod tests {
         let json_str = data_line.strip_prefix("data:").unwrap().trim();
         let job: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(job["payload"], "sse-test");
+        assert_eq!(job["status"], "working");
     }
 
     #[tokio::test]
@@ -1312,6 +1369,7 @@ mod tests {
 
         let job: serde_json::Value = rmp_serde::from_slice(&bytes[4..]).unwrap();
         assert_eq!(job["payload"], "mp-test");
+        assert_eq!(job["status"], "working");
     }
 
     #[tokio::test]

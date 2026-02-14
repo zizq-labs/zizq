@@ -74,6 +74,50 @@ impl From<task::JoinError> for StoreError {
     }
 }
 
+/// Lifecycle status of a job.
+///
+/// Stored as a `u8` in the job record. The enum provides type-safe access
+/// in Rust code while keeping storage compact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobStatus {
+    /// The job is in the store, but is scheduled to be queued at a later time.
+    Scheduled = 0,
+
+    /// The job is in the priority queue ready to be worked.
+    Ready = 1,
+
+    /// The job is currently being processed by a worker.
+    Working = 2,
+
+    /// The job was successfully completed by a worker.
+    Completed = 3,
+
+    /// The job failed too many times and exhausted its retry policy.
+    Dead = 4,
+}
+
+impl From<JobStatus> for u8 {
+    fn from(s: JobStatus) -> Self {
+        s as u8
+    }
+}
+
+impl TryFrom<u8> for JobStatus {
+    type Error = u8;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Scheduled),
+            1 => Ok(Self::Ready),
+            2 => Ok(Self::Working),
+            3 => Ok(Self::Completed),
+            4 => Ok(Self::Dead),
+            other => Err(other),
+        }
+    }
+}
+
 /// A job stored in the queue keyspace.
 ///
 /// Jobs are identified using scru128 because it is time-sequenced and high
@@ -99,6 +143,10 @@ pub struct Job {
     /// Arbitrary payload provided by the client.
     #[serde(rename = "p")]
     pub payload: serde_json::Value,
+
+    /// Current lifecycle status, stored as a u8 which converts to `JobStatus`.
+    #[serde(rename = "s")]
+    pub status: u8,
 }
 
 impl Job {
@@ -203,6 +251,7 @@ impl Store {
                 queue: queue_name,
                 priority,
                 payload,
+                status: JobStatus::Ready.into(),
             };
 
             let queue_key = job.queue_key();
@@ -259,11 +308,14 @@ impl Store {
                 ))
             })?;
 
-            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            job.status = JobStatus::Working.into();
+            let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Remove from queue, add to working.
+            // Remove from queue, add to working, update job record.
             tx.remove(&queue, &*queue_key);
             tx.insert(&working, &*job_id, b"");
+            tx.insert(&jobs, &*job_id, &job_bytes);
             tx.commit()?;
 
             Ok(Some(job))
@@ -360,10 +412,13 @@ impl Store {
                     "job in working but missing from jobs keyspace: {id:?}",
                 ))
             })?;
-            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            job.status = JobStatus::Ready.into();
+            let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             tx.remove(&working, &id);
             tx.insert(&queue, &job.queue_key(), id.as_bytes());
+            tx.insert(&jobs, &id, &job_bytes);
             tx.commit()?;
 
             Ok(true)
@@ -421,6 +476,7 @@ mod tests {
         assert!(!job.id.is_empty());
         assert_eq!(job.queue, "default");
         assert_eq!(job.priority, 0);
+        assert_eq!(job.status, u8::from(JobStatus::Ready));
         assert_eq!(job.payload, serde_json::json!({"task": "test"}));
     }
 
@@ -501,6 +557,7 @@ mod tests {
 
         let job = store.take_next_job().await.unwrap().unwrap();
         assert_eq!(job.priority, 1);
+        assert_eq!(job.status, u8::from(JobStatus::Working));
         assert_eq!(job.payload, serde_json::json!("high"));
     }
 
@@ -652,6 +709,7 @@ mod tests {
         let retaken = store.take_next_job().await.unwrap().unwrap();
         assert_eq!(retaken.id, high.id);
         assert_eq!(retaken.priority, 1);
+        assert_eq!(retaken.status, u8::from(JobStatus::Working));
     }
 
     #[tokio::test]
@@ -727,6 +785,7 @@ mod tests {
         let job = store.get_job(&enqueued.id).await.unwrap().unwrap();
         assert_eq!(job.id, enqueued.id);
         assert_eq!(job.queue, "default");
+        assert_eq!(job.status, u8::from(JobStatus::Ready));
         assert_eq!(job.payload, serde_json::json!("hello"));
     }
 
