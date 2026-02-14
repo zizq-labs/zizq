@@ -842,6 +842,12 @@ async fn stream_jobs(
         // the job from the working set back into the queue.
         let mut in_flight = HashSet::<String>::new();
 
+        // Pin the heartbeat timer outside the loop so it isn't reset
+        // when broadcast events wake the select. It is only reset
+        // after a heartbeat is actually sent.
+        let heartbeat_sleep = tokio::time::sleep(state.heartbeat_interval);
+        tokio::pin!(heartbeat_sleep);
+
         loop {
             // Drain any pending events.
             while let Ok(event) = event_rx.try_recv() {
@@ -879,6 +885,11 @@ async fn stream_jobs(
                         in_flight.insert(job.id.clone());
                         state.global_in_flight.fetch_add(1, Ordering::Relaxed);
                         permit.send(StreamMessage::Job(Arc::new(Job::from(job))));
+                        // Reset the heartbeat timer since we just sent
+                        // data — the client knows we're alive.
+                        heartbeat_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + state.heartbeat_interval);
                         continue;
                     }
                     Ok(None) => drop(permit),
@@ -895,10 +906,14 @@ async fn stream_jobs(
             // entering recv() is already buffered in the broadcast
             // channel.
             tokio::select! {
-                _ = tokio::time::sleep(state.heartbeat_interval) => {
+                _ = &mut heartbeat_sleep => {
                     if tx.send(StreamMessage::Heartbeat).await.is_err() {
                         break;
                     }
+                    // Reset for the next heartbeat.
+                    heartbeat_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + state.heartbeat_interval);
                 }
                 event = event_rx.recv() => {
                     if let Ok(StoreEvent::JobCompleted(id)) = event {
