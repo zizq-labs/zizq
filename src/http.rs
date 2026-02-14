@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::store::{Job, Store, StoreEvent};
+use crate::store::{self, Store, StoreEvent};
 
 /// Default priority for jobs that don't specify one.
 ///
@@ -103,8 +103,52 @@ where
 
 /// Messages sent over the stream channel.
 enum StreamMessage {
-    Job(Arc<Job>),
+    Job(Arc<Job>), // http::Job
     Heartbeat,
+}
+
+// --- Job type ---
+
+/// HTTP representation of a job.
+///
+/// Mirrors `store::Job` for now, but exists as a separate type so the HTTP
+/// layer can evolve independently (e.g. adding virtual fields, renaming, or
+/// changing serialization) without affecting storage.
+#[derive(Debug, Clone, Serialize)]
+pub struct Job {
+    /// Unique job identifier.
+    pub id: String,
+
+    /// Queue this job belongs to.
+    pub queue: String,
+
+    /// Priority (lower number = higher priority).
+    pub priority: u16,
+
+    /// Arbitrary payload provided by the client.
+    pub payload: serde_json::Value,
+}
+
+impl From<store::Job> for Job {
+    fn from(job: store::Job) -> Self {
+        Self {
+            id: job.id,
+            queue: job.queue,
+            priority: job.priority,
+            payload: job.payload,
+        }
+    }
+}
+
+impl From<Job> for store::Job {
+    fn from(job: Job) -> Self {
+        Self {
+            id: job.id,
+            queue: job.queue,
+            priority: job.priority,
+            payload: job.payload,
+        }
+    }
 }
 
 // --- Response types ---
@@ -531,7 +575,7 @@ async fn get_job(
     Path(id): Path<String>,
 ) -> Response {
     match state.store.get_job(&id).await {
-        Ok(Some(job)) => respond(fmt, StatusCode::OK, &job),
+        Ok(Some(job)) => respond(fmt, StatusCode::OK, &Job::from(job)),
         Ok(None) => respond(
             fmt,
             StatusCode::NOT_FOUND,
@@ -619,7 +663,7 @@ async fn stream_jobs(
                     Ok(Some(job)) => {
                         in_flight.insert(job.id.clone());
                         state.global_in_flight.fetch_add(1, Ordering::Relaxed);
-                        permit.send(StreamMessage::Job(Arc::new(job)));
+                        permit.send(StreamMessage::Job(Arc::new(Job::from(job))));
                         continue;
                     }
                     Ok(None) => drop(permit),
@@ -1021,8 +1065,7 @@ mod tests {
             &serde_json::json!({"queue": "emails", "priority": 5, "payload": {"to": "a@b.c"}}),
         );
         let res = app.clone().oneshot(req).await.unwrap();
-        let created: serde_json::Value =
-            serde_json::from_str(&response_body(res).await).unwrap();
+        let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
         let req = empty_request("GET", &format!("/jobs/{job_id}"));
@@ -1046,8 +1089,7 @@ mod tests {
             &serde_json::json!({"queue": "default", "payload": "test"}),
         );
         let res = app.clone().oneshot(req).await.unwrap();
-        let created: serde_json::Value =
-            serde_json::from_str(&response_body(res).await).unwrap();
+        let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
         // Take the job so it moves to working.
@@ -1071,8 +1113,7 @@ mod tests {
             &serde_json::json!({"queue": "default", "payload": "test"}),
         );
         let res = app.clone().oneshot(req).await.unwrap();
-        let created: serde_json::Value =
-            serde_json::from_str(&response_body(res).await).unwrap();
+        let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
         state.store.take_next_job().await.unwrap();

@@ -78,18 +78,26 @@ impl From<task::JoinError> for StoreError {
 ///
 /// Jobs are identified using scru128 because it is time-sequenced and high
 /// entropy.
+///
+/// Serialized field names are reduced to single letters to save space while
+/// permitting schema evolution. It's marginal relative to the payload sizes
+/// but it's an easy reduction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     /// Unique job identifier (scru128).
+    #[serde(rename = "i")]
     pub id: String,
 
     /// Queue this job belongs to.
+    #[serde(rename = "q")]
     pub queue: String,
 
     /// Priority (lower number = higher priority).
+    #[serde(rename = "n")]
     pub priority: u16,
 
     /// Arbitrary payload provided by the client.
+    #[serde(rename = "p")]
     pub payload: serde_json::Value,
 }
 
