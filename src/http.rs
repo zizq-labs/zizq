@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
-use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use axum::http::{self, StatusCode};
 use axum::response::IntoResponse;
@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::store::{self, Store, StoreEvent};
+use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
 
 /// Default priority for jobs that don't specify one.
 ///
@@ -243,6 +243,82 @@ struct EnqueueRequest {
 
     /// Arbitrary job payload provided to the client on dequeue.
     payload: serde_json::Value,
+}
+
+/// Query parameters for `GET /jobs`.
+#[derive(Deserialize)]
+struct ListJobsParams {
+    /// Cursor: start after this job ID (exclusive).
+    from: Option<String>,
+
+    /// Sort order: "asc" (oldest first) or "desc" (newest first).
+    #[serde(default)]
+    order: Order,
+
+    /// Maximum number of jobs to return (1–200, default 50).
+    limit: Option<u16>,
+}
+
+/// Sort order for job listings.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Order {
+    Asc,
+    Desc,
+}
+
+impl Default for Order {
+    fn default() -> Self {
+        Self::Asc
+    }
+}
+
+impl From<Order> for ScanDirection {
+    fn from(o: Order) -> Self {
+        match o {
+            Order::Asc => Self::Asc,
+            Order::Desc => Self::Desc,
+        }
+    }
+}
+
+impl From<ScanDirection> for Order {
+    fn from(d: ScanDirection) -> Self {
+        match d {
+            ScanDirection::Asc => Self::Asc,
+            ScanDirection::Desc => Self::Desc,
+        }
+    }
+}
+
+/// Default page size for job listings.
+const DEFAULT_PAGE_LIMIT: u16 = 50;
+
+/// Maximum page size for job listings.
+const MAX_PAGE_LIMIT: u16 = 200;
+
+/// Response shape for paginated job listings.
+#[derive(Serialize)]
+struct ListJobsResponse {
+    /// The jobs on this page in the requested order.
+    jobs: Vec<Job>,
+
+    /// Information about self, next, prev pages.
+    pages: ListJobsPages,
+}
+
+/// Pagination links in a job listing response.
+#[derive(Serialize)]
+struct ListJobsPages {
+    /// URL for the current page.
+    #[serde(rename = "self")]
+    self_url: String,
+
+    /// URL for the next page, or null if this is the last page.
+    next: Option<String>,
+
+    /// URL for the previous page, or null if this is the first page.
+    prev: Option<String>,
 }
 
 /// Response shape for enqueue requests.
@@ -541,7 +617,7 @@ fn build_msgpack_stream_response(rx: mpsc::Receiver<StreamMessage>) -> Response 
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/jobs", post(enqueue))
+        .route("/jobs", get(list_jobs).post(enqueue))
         .route("/jobs/stream", get(stream_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
@@ -645,6 +721,94 @@ async fn get_job(
             )
         }
     }
+}
+
+/// Handle `GET /jobs` — list jobs with cursor-based pagination.
+async fn list_jobs(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<ListJobsParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(e) => {
+            return respond(
+                Format::Json,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid query parameters: {e}"),
+                },
+            );
+        }
+    };
+
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if limit < 1 || limit > MAX_PAGE_LIMIT {
+        return respond(
+            fmt,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: format!("limit must be between 1 and {MAX_PAGE_LIMIT}"),
+            },
+        );
+    }
+
+    let opts = ListJobsOptions {
+        from: params.from.clone(),
+        direction: params.order.into(),
+        limit: limit as usize,
+    };
+
+    match state.store.list_jobs(opts).await {
+        Ok(page) => {
+            let self_url = build_page_url(params.from.as_deref(), params.order, limit);
+            let next = page
+                .next
+                .map(|o| build_page_url(o.from.as_deref(), o.direction.into(), limit));
+            let prev = page
+                .prev
+                .map(|o| build_page_url(o.from.as_deref(), o.direction.into(), limit));
+
+            let jobs = page.jobs.into_iter().map(Job::from).collect();
+
+            respond(
+                fmt,
+                StatusCode::OK,
+                &ListJobsResponse {
+                    jobs,
+                    pages: ListJobsPages {
+                        self_url,
+                        next,
+                        prev,
+                    },
+                },
+            )
+        }
+        Err(e) => {
+            tracing::error!(%e, "list_jobs failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Build a pagination URL for the jobs listing endpoint.
+fn build_page_url(from: Option<&str>, order: Order, limit: u16) -> String {
+    let mut url = String::from("/jobs?");
+    if let Some(cursor) = from {
+        url.push_str(&format!("from={cursor}&"));
+    }
+    let order_str = match order {
+        Order::Asc => "asc",
+        Order::Desc => "desc",
+    };
+    url.push_str(&format!("order={order_str}&limit={limit}"));
+    url
 }
 
 /// Handle `GET /jobs/stream` — stream jobs to workers.
@@ -1185,6 +1349,244 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
+
+    // --- GET /jobs tests ---
+
+    #[tokio::test]
+    async fn list_jobs_returns_empty_page() {
+        let req = empty_request("GET", "/jobs");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"], serde_json::json!([]));
+        assert!(body["pages"]["next"].is_null());
+        assert!(body["pages"]["prev"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_jobs_with_status() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["status"], "ready");
+        assert_eq!(jobs[0]["payload"], "a");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_json_content_type() {
+        let req = empty_request("GET", "/jobs");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_msgpack_when_requested() {
+        let (state, app) = test_state_and_app();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        let req = request_with_accept("GET", "/jobs", "application/msgpack");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/msgpack"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jobs_paginates_with_limit() {
+        let (state, app) = test_state_and_app();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?limit=2");
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(body["pages"]["next"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_next_page_returns_remaining() {
+        let (state, app) = test_state_and_app();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // First page.
+        let req = empty_request("GET", "/jobs?limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let next_url = body["pages"]["next"].as_str().unwrap();
+
+        // Second page via next URL.
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["payload"], "c");
+        assert!(body["pages"]["next"].is_null());
+        assert!(body["pages"]["prev"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_desc_order() {
+        let (state, app) = test_state_and_app();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?order=desc");
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["payload"], "b");
+        assert_eq!(jobs[1]["payload"], "a");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_from_cursor() {
+        let (state, app) = test_state_and_app();
+        let a = state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", &format!("/jobs?from={}", a.id));
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["payload"], "b");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_self_url_present() {
+        let req = empty_request("GET", "/jobs");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["pages"]["self"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_invalid_order() {
+        let req = empty_request("GET", "/jobs?order=sideways");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid query parameters")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_non_numeric_limit() {
+        let req = empty_request("GET", "/jobs?limit=abc");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_limit_zero() {
+        let req = empty_request("GET", "/jobs?limit=0");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("limit"));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_limit_over_max() {
+        let req = empty_request("GET", "/jobs?limit=201");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("limit"));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_accepts_max_limit() {
+        let req = empty_request("GET", "/jobs?limit=200");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // --- POST /jobs/{id}/success tests ---
 
     #[tokio::test]
     async fn success_returns_204() {
