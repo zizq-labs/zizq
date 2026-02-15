@@ -4,11 +4,12 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! three keyspaces:
+//! four keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `ready_jobs_by_priority`: partial priority index of ready jobs, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
+//! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 
 use std::fmt;
 use std::ops::Bound;
@@ -282,6 +283,12 @@ pub struct Store {
     /// `jobs` keyspace.
     jobs_by_status: SingleWriterTxKeyspace,
 
+    /// Queue membership index.
+    ///
+    /// Keyed by `{queue_name}\0{job_id}` with empty values. Enables
+    /// efficient lookup of all jobs belonging to one or more queues.
+    jobs_by_queue: SingleWriterTxKeyspace,
+
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
@@ -298,10 +305,13 @@ impl Store {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let db = SingleWriterTxDatabase::builder(path).open()?;
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
-        let ready_jobs_by_priority =
-            db.keyspace("ready_jobs_by_priority", fjall::KeyspaceCreateOptions::default)?;
+        let ready_jobs_by_priority = db.keyspace(
+            "ready_jobs_by_priority",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
         let jobs_by_status =
             db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
+        let jobs_by_queue = db.keyspace("jobs_by_queue", fjall::KeyspaceCreateOptions::default)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -310,6 +320,7 @@ impl Store {
             jobs,
             ready_jobs_by_priority,
             jobs_by_status,
+            jobs_by_queue,
             event_tx,
         })
     }
@@ -330,6 +341,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue = self.jobs_by_queue.clone();
         let queue_name = queue_name.to_string();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
@@ -346,6 +358,7 @@ impl Store {
 
             let priority_key = job.priority_key();
             let status_key = make_status_key(JobStatus::Ready, &id);
+            let queue_key = make_queue_key(&job.queue, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Atomically push the job into the jobs keyspace and indexes.
@@ -353,6 +366,7 @@ impl Store {
             tx.insert(&jobs, &id, &job_bytes);
             tx.insert(&ready_jobs_by_priority, &priority_key, id.as_bytes());
             tx.insert(&jobs_by_status, &status_key, b"");
+            tx.insert(&jobs_by_queue, &queue_key, b"");
             tx.commit()?;
 
             Ok(job)
@@ -429,6 +443,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue = self.jobs_by_queue.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
 
@@ -437,13 +452,25 @@ impl Store {
             // can remove the job between our check and the remove.
             let mut tx = db.write_tx();
 
-            let status_key = make_status_key(JobStatus::Working, &id);
-            if jobs_by_status.get(&status_key)?.is_none() {
+            let job_bytes = match jobs.get(&id)? {
+                Some(bytes) => bytes,
+                None => return Ok(false), // No such job. Already completed?
+            };
+
+            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+
+            // Can't mark a job as completed if it's no currently working.
+            if job.status != JobStatus::Working as u8 {
                 return Ok(false);
             }
 
+            // Clean up all indexes.
+            let status_key = make_status_key(JobStatus::Working, &id);
+            let queue_key = make_queue_key(&job.queue, &id);
+
             tx.remove(&jobs, &id);
             tx.remove(&jobs_by_status, &status_key);
+            tx.remove(&jobs_by_queue, &queue_key);
             tx.commit()?;
 
             Ok(true)
@@ -727,6 +754,15 @@ const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + job_id.len());
     key.push(status as u8);
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
+/// Build a queue membership index key: `{queue_name}\0{job_id}`.
+fn make_queue_key(queue_name: &str, job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(queue_name.len() + 1 + job_id.len());
+    key.extend_from_slice(queue_name.as_bytes());
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
