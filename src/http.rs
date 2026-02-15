@@ -8,6 +8,9 @@
 
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::fmt;
+use std::hash::Hash;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -110,7 +113,7 @@ enum TakeMessage {
 // --- Job type ---
 
 /// Lifecycle status of a job as returned in API responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     /// The job is in the store, but is scheduled to be queued at a later time.
@@ -150,6 +153,95 @@ impl From<JobStatus> for store::JobStatus {
             JobStatus::Completed => Self::Completed,
             JobStatus::Dead => Self::Dead,
         }
+    }
+}
+
+impl fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scheduled => f.write_str("scheduled"),
+            Self::Ready => f.write_str("ready"),
+            Self::Working => f.write_str("working"),
+            Self::Completed => f.write_str("completed"),
+            Self::Dead => f.write_str("dead"),
+        }
+    }
+}
+
+impl FromStr for JobStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "scheduled" => Ok(Self::Scheduled),
+            "ready" => Ok(Self::Ready),
+            "working" => Ok(Self::Working),
+            "completed" => Ok(Self::Completed),
+            "dead" => Ok(Self::Dead),
+            other => Err(format!("unknown status: {other}")),
+        }
+    }
+}
+
+// --- SemicolonSet ---
+
+/// A set of values deserialized from a semicolon-delimited query parameter.
+///
+/// For example, `?status=ready;working` deserializes into a
+/// `SemicolonSet<JobStatus>` containing `{Ready, Working}`.
+///
+/// An absent or empty parameter deserializes as an empty set.
+#[derive(Debug, Clone)]
+struct SemicolonSet<T: Eq + Hash>(HashSet<T>);
+
+impl<T: Eq + Hash> Default for SemicolonSet<T> {
+    fn default() -> Self {
+        Self(HashSet::new())
+    }
+}
+
+impl<T: Eq + Hash> std::ops::Deref for SemicolonSet<T> {
+    type Target = HashSet<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Eq + Hash + fmt::Display + Ord> fmt::Display for SemicolonSet<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts: Vec<_> = self.0.iter().collect();
+        parts.sort();
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                f.write_str(";")?;
+            }
+            write!(f, "{part}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de, T> Deserialize<'de> for SemicolonSet<T>
+where
+    T: Eq + Hash + FromStr,
+    T::Err: fmt::Display,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            return Ok(Self(HashSet::new()));
+        }
+        let mut set = HashSet::new();
+        for part in s.split(';') {
+            let value = part
+                .parse()
+                .map_err(serde::de::Error::custom)?;
+            set.insert(value);
+        }
+        Ok(Self(set))
     }
 }
 
@@ -258,8 +350,13 @@ struct ListJobsParams {
     /// Maximum number of jobs to return (1–200, default 50).
     limit: Option<u16>,
 
-    /// Optional status filter (e.g. "ready", "working").
-    status: Option<JobStatus>,
+    /// Status filter, semicolon-delimited (e.g. "ready;working").
+    #[serde(default)]
+    status: SemicolonSet<JobStatus>,
+
+    /// Queue filter, semicolon-delimited (e.g. "emails;webhooks").
+    #[serde(default)]
+    queue: SemicolonSet<String>,
 }
 
 /// Sort order for job listings.
@@ -762,8 +859,12 @@ async fn list_jobs(
     if let Some(from) = &params.from {
         opts = opts.from(from.clone());
     }
-    if let Some(status) = params.status {
-        opts = opts.status(status.into());
+    if !params.status.is_empty() {
+        let statuses = params.status.iter().map(|s| store::JobStatus::from(*s)).collect();
+        opts = opts.statuses(statuses);
+    }
+    if !params.queue.is_empty() {
+        opts = opts.queues(params.queue.0.clone());
     }
 
     match state.store.list_jobs(opts).await {
@@ -772,14 +873,16 @@ async fn list_jobs(
                 params.from.as_deref(),
                 params.order,
                 limit,
-                params.status,
+                &params.status,
+                &params.queue,
             );
             let next = page.next.map(|o| {
                 build_page_url(
                     o.from.as_deref(),
                     o.direction.into(),
                     limit,
-                    params.status,
+                    &params.status,
+                    &params.queue,
                 )
             });
             let prev = page.prev.map(|o| {
@@ -787,7 +890,8 @@ async fn list_jobs(
                     o.from.as_deref(),
                     o.direction.into(),
                     limit,
-                    params.status,
+                    &params.status,
+                    &params.queue,
                 )
             });
 
@@ -820,16 +924,24 @@ async fn list_jobs(
 }
 
 /// Build a pagination URL for the jobs listing endpoint.
-fn build_page_url(from: Option<&str>, order: Order, limit: u16, status: Option<JobStatus>) -> String {
+fn build_page_url(
+    from: Option<&str>,
+    order: Order,
+    limit: u16,
+    statuses: &SemicolonSet<JobStatus>,
+    queues: &SemicolonSet<String>,
+) -> String {
     let mut url = String::from("/jobs?");
     if let Some(cursor) = from {
         url.push_str(&format!("from={cursor}&"));
     }
     let order = serde_json::to_value(order).unwrap();
     url.push_str(&format!("order={}&limit={limit}", order.as_str().unwrap()));
-    if let Some(s) = status {
-        let s = serde_json::to_value(s).unwrap();
-        url.push_str(&format!("&status={}", s.as_str().unwrap()));
+    if !statuses.is_empty() {
+        url.push_str(&format!("&status={statuses}"));
+    }
+    if !queues.is_empty() {
+        url.push_str(&format!("&queue={queues}"));
     }
     url
 }
@@ -1738,6 +1850,180 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0]["payload"], "c");
         assert_eq!(jobs[0]["status"], "ready");
+    }
+
+    // --- GET /jobs semicolon-delimited filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_multiple_statuses() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // Take the first job so it becomes working.
+        state.store.take_next_job().await.unwrap();
+
+        let req = empty_request("GET", "/jobs?status=ready;working");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_multi_status_preserves_in_pagination() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("q", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        state.store.take_next_job().await.unwrap();
+
+        let req = empty_request("GET", "/jobs?status=ready;working&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        // The next URL should contain both statuses.
+        assert!(next_url.contains("status="));
+        assert!(next_url.contains("ready"));
+        assert!(next_url.contains("working"));
+
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_queue() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?queue=emails");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["queue"], "emails");
+        assert_eq!(jobs[1]["queue"], "emails");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_multiple_queues() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?queue=emails;webhooks");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["payload"], "a");
+        assert_eq!(jobs[1]["payload"], "c");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_filter_preserves_in_pagination() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?queue=emails&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        assert!(next_url.contains("queue=emails"));
+
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["jobs"][0]["payload"], "c");
     }
 
     // --- POST /jobs/{id}/success tests ---

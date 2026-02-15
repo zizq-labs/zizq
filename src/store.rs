@@ -82,7 +82,7 @@ impl From<task::JoinError> for StoreError {
 ///
 /// Stored as a `u8` in the job record. The enum provides type-safe access
 /// in Rust code while keeping storage compact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum JobStatus {
     /// The job is in the store, but is scheduled to be queued at a later time.
@@ -196,9 +196,9 @@ pub struct ListJobsOptions {
     /// Maximum number of jobs to return.
     pub limit: usize,
 
-    /// Optional status filter. When set, only jobs with this status are
-    /// returned, using the status index for efficient lookup.
-    pub status: Option<JobStatus>,
+    /// Optional status filter. When non-empty, only jobs with one of these
+    /// statuses are returned, using the status index for efficient lookup.
+    pub statuses: HashSet<JobStatus>,
 
     /// Optional queue filter. When non-empty, only jobs belonging to one of
     /// these queues are returned, using the queue index.
@@ -212,7 +212,7 @@ impl ListJobsOptions {
             from: None,
             direction: ScanDirection::Asc,
             limit: 50,
-            status: None,
+            statuses: HashSet::new(),
             queues: HashSet::new(),
         }
     }
@@ -236,8 +236,10 @@ impl ListJobsOptions {
     }
 
     /// Filter by job status and return `self`.
-    pub fn status(mut self, status: JobStatus) -> Self {
-        self.status = Some(status);
+    ///
+    /// An empty set means "all statuses".
+    pub fn statuses(mut self, statuses: HashSet<JobStatus>) -> Self {
+        self.statuses = statuses;
         self
     }
 
@@ -736,64 +738,113 @@ impl Store {
                     let job: Job = rmp_serde::from_slice(&job_bytes)?;
                     rows.push(job);
                 }
-            } else if let Some(status) = opts.status {
-                // Use the status index: scan keys in
-                // [{status}\0{cursor}..{status+1}\0) and look up each job.
-                let prefix = status as u8;
-                let next_prefix = prefix + 1;
+            } else if !opts.statuses.is_empty() {
+                // Status filter: k-way merge across status ranges in the
+                // index. One iterator per status, merged via a BinaryHeap
+                // so we pull exactly `fetch` items total.
+                let mut job_ids: Vec<Vec<u8>> = Vec::with_capacity(fetch);
 
-                match opts.direction {
-                    ScanDirection::Asc => {
+                // Build range bounds for each status.
+                // Key format: {status_u8}\0{job_id}, prefix_len is always 2.
+                let status_info: Vec<_> = opts
+                    .statuses
+                    .iter()
+                    .map(|status| {
+                        let prefix = *status as u8;
+                        let next_prefix = prefix + 1;
                         let start = match &opts.from {
                             Some(cursor) => {
-                                let key = make_status_key(status, cursor);
-                                Bound::Excluded(key)
+                                Bound::Excluded(make_status_key(*status, cursor))
                             }
                             None => Bound::Included(vec![prefix, 0]),
                         };
                         let end = Bound::Excluded(vec![next_prefix, 0]);
+                        (start, end)
+                    })
+                    .collect();
 
-                        let range = snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end));
+                // Status index prefix length is always 2 ({status_u8}\0).
+                const STATUS_PREFIX_LEN: usize = 2;
 
-                        for entry in range.take(fetch) {
-                            let (key, _) = entry.into_inner()?;
-                            // Key is {status}\0{job_id} — extract job_id.
-                            let job_id = &key[2..];
-                            let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
-                                StoreError::Corruption(format!(
-                                    "job in jobs_by_status but missing from jobs keyspace: {:?}",
-                                    String::from_utf8_lossy(job_id),
-                                ))
-                            })?;
-                            let job: Job = rmp_serde::from_slice(&job_bytes)?;
-                            rows.push(job);
+                match opts.direction {
+                    ScanDirection::Asc => {
+                        let mut iters: Vec<_> = status_info
+                            .iter()
+                            .map(|(start, end)| {
+                                snapshot.range::<Vec<u8>, _>(
+                                    &jobs_by_status,
+                                    (start.clone(), end.clone()),
+                                )
+                            })
+                            .collect();
+
+                        let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> =
+                            BinaryHeap::new();
+                        for (i, iter) in iters.iter_mut().enumerate() {
+                            if let Some(entry) = iter.next() {
+                                let (key, _) = entry.into_inner()?;
+                                let job_id = key[STATUS_PREFIX_LEN..].to_vec();
+                                heap.push(Reverse((job_id, i)));
+                            }
+                        }
+
+                        while let Some(Reverse((job_id, i))) = heap.pop() {
+                            job_ids.push(job_id);
+                            if job_ids.len() >= fetch {
+                                break;
+                            }
+                            if let Some(entry) = iters[i].next() {
+                                let (key, _) = entry.into_inner()?;
+                                let next_id = key[STATUS_PREFIX_LEN..].to_vec();
+                                heap.push(Reverse((next_id, i)));
+                            }
                         }
                     }
                     ScanDirection::Desc => {
-                        let end = match &opts.from {
-                            Some(cursor) => {
-                                let key = make_status_key(status, cursor);
-                                Bound::Excluded(key)
+                        let mut iters: Vec<_> = status_info
+                            .iter()
+                            .map(|(start, end)| {
+                                snapshot
+                                    .range::<Vec<u8>, _>(
+                                        &jobs_by_status,
+                                        (start.clone(), end.clone()),
+                                    )
+                                    .rev()
+                            })
+                            .collect();
+
+                        let mut heap: BinaryHeap<(Vec<u8>, usize)> = BinaryHeap::new();
+                        for (i, iter) in iters.iter_mut().enumerate() {
+                            if let Some(entry) = iter.next() {
+                                let (key, _) = entry.into_inner()?;
+                                let job_id = key[STATUS_PREFIX_LEN..].to_vec();
+                                heap.push((job_id, i));
                             }
-                            None => Bound::Excluded(vec![next_prefix, 0]),
-                        };
-                        let start = Bound::Included(vec![prefix, 0]);
+                        }
 
-                        let range = snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end));
-
-                        for entry in range.rev().take(fetch) {
-                            let (key, _) = entry.into_inner()?;
-                            let job_id = &key[2..];
-                            let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
-                                StoreError::Corruption(format!(
-                                    "job in jobs_by_status but missing from jobs keyspace: {:?}",
-                                    String::from_utf8_lossy(job_id),
-                                ))
-                            })?;
-                            let job: Job = rmp_serde::from_slice(&job_bytes)?;
-                            rows.push(job);
+                        while let Some((job_id, i)) = heap.pop() {
+                            job_ids.push(job_id);
+                            if job_ids.len() >= fetch {
+                                break;
+                            }
+                            if let Some(entry) = iters[i].next() {
+                                let (key, _) = entry.into_inner()?;
+                                let next_id = key[STATUS_PREFIX_LEN..].to_vec();
+                                heap.push((next_id, i));
+                            }
                         }
                     }
+                }
+
+                for job_id in &job_ids {
+                    let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
+                        StoreError::Corruption(format!(
+                            "job in jobs_by_status but missing from jobs keyspace: {:?}",
+                            String::from_utf8_lossy(job_id),
+                        ))
+                    })?;
+                    let job: Job = rmp_serde::from_slice(&job_bytes)?;
+                    rows.push(job);
                 }
             } else {
                 // No filter — scan the jobs keyspace directly.
@@ -840,13 +891,12 @@ impl Store {
 
             // Build next/prev options, preserving all filters.
             let make_opts = |cursor: &str, direction: ScanDirection| {
-                let mut o = ListJobsOptions::new()
+                ListJobsOptions::new()
                     .from(cursor.to_string())
                     .direction(direction)
                     .limit(opts.limit)
-                    .queues(opts.queues.clone());
-                o.status = opts.status;
-                o
+                    .statuses(opts.statuses.clone())
+                    .queues(opts.queues.clone())
             };
 
             // Next page: exists if over-select found an extra row.
@@ -1496,7 +1546,7 @@ mod tests {
         store.take_next_job().await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Ready))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Ready])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -1513,7 +1563,7 @@ mod tests {
         store.take_next_job().await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -1527,7 +1577,7 @@ mod tests {
         store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
@@ -1541,7 +1591,7 @@ mod tests {
         let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Ready).limit(2))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Ready])).limit(2))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 2);
@@ -1565,7 +1615,7 @@ mod tests {
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
-                    .status(JobStatus::Ready)
+                    .statuses(HashSet::from([JobStatus::Ready]))
                     .direction(ScanDirection::Desc),
             )
             .await
@@ -1584,7 +1634,7 @@ mod tests {
 
         // Now working.
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -1593,13 +1643,13 @@ mod tests {
         store.requeue(&a.id).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Ready))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Ready])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -1614,7 +1664,7 @@ mod tests {
         let taken = store.take_next_job().await.unwrap().unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -1622,7 +1672,7 @@ mod tests {
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
@@ -1801,5 +1851,81 @@ mod tests {
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, b.id);
+    }
+
+    // --- list_jobs multi-status filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_multiple_statuses() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        // Take a and b so they become Working.
+        store.take_next_job().await.unwrap();
+        store.take_next_job().await.unwrap();
+
+        // Filter by Ready + Working — should get all 3.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 3);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert_eq!(page.jobs[2].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_multi_status_desc_order() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        store.take_next_job().await.unwrap(); // a -> working
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working]))
+                    .direction(ScanDirection::Desc),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[1].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_multi_status_with_pagination() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        store.take_next_job().await.unwrap(); // a -> working
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working]))
+                    .limit(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert!(page.next.is_some());
+
+        let page2 = store.list_jobs(page.next.unwrap()).await.unwrap();
+        assert_eq!(page2.jobs.len(), 1);
+        assert_eq!(page2.jobs[0].id, c.id);
+        assert!(page2.next.is_none());
     }
 }
