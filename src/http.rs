@@ -732,12 +732,34 @@ async fn health(AcceptFormat(fmt): AcceptFormat) -> Response {
     respond(fmt, StatusCode::OK, &HealthResponse { status: "ok" })
 }
 
+/// Validate a queue name, returning an error message if invalid.
+///
+/// Queue names must be non-empty and must not contain `;` (used as a
+/// delimiter in query parameters) or null bytes (used as key separators
+/// in internal indexes).
+fn validate_queue_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("queue name must not be empty".into());
+    }
+    if name.contains(';') {
+        return Err("queue name must not contain ';'".into());
+    }
+    if name.contains('\0') {
+        return Err("queue name must not contain null bytes".into());
+    }
+    Ok(())
+}
+
 /// Handle `POST /jobs` — enqueue a new job.
 async fn enqueue(
     AcceptFormat(fmt): AcceptFormat,
     State(state): State<Arc<AppState>>,
     NegotiatedBody(enqueue_req): NegotiatedBody<EnqueueRequest>,
 ) -> Response {
+    if let Err(msg) = validate_queue_name(&enqueue_req.queue) {
+        return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
+    }
+
     let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
 
     match state
@@ -1440,6 +1462,34 @@ mod tests {
         let res = test_app().oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_queue_name_with_semicolon() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "a;b", "payload": "x"}),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains(";"));
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_empty_queue_name() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "", "payload": "x"}),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("empty"));
     }
 
     #[tokio::test]
