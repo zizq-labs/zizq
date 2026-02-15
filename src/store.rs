@@ -17,6 +17,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
+use std::time::SystemTime;
 
 use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,11 @@ pub struct Job {
     /// Current lifecycle status, stored as a u8 which converts to `JobStatus`.
     #[serde(rename = "s")]
     pub status: u8,
+
+    /// When the job becomes eligible to run (milliseconds since Unix epoch).
+    #[serde(rename = "r")]
+    #[serde(default)]
+    pub ready_at: u64,
 }
 
 impl Job {
@@ -491,12 +497,18 @@ impl Store {
             // Generate a new lexicographically increasing id.
             let id = scru128::new_string();
 
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
             let job = Job {
                 id: id.clone(),
                 queue: queue_name,
                 priority,
                 payload,
                 status: JobStatus::Ready.into(),
+                ready_at: now,
             };
 
             let priority_key = job.priority_key();

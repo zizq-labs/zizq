@@ -269,6 +269,9 @@ pub struct Job {
 
     /// Arbitrary payload provided by the client.
     pub payload: serde_json::Value,
+
+    /// When the job becomes eligible to run (milliseconds since Unix epoch).
+    pub ready_at: u64,
 }
 
 impl From<store::Job> for Job {
@@ -281,6 +284,7 @@ impl From<store::Job> for Job {
                 .unwrap_or(store::JobStatus::Ready)
                 .into(),
             payload: job.payload,
+            ready_at: job.ready_at,
         }
     }
 }
@@ -293,6 +297,7 @@ impl From<Job> for store::Job {
             priority: job.priority,
             payload: job.payload,
             status: store::JobStatus::from(job.status).into(),
+            ready_at: job.ready_at,
         }
     }
 }
