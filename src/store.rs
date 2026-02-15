@@ -7,7 +7,7 @@
 //! three keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
-//! - `queue`: sorted pending index, keyed by `{priority_b36:4}\0{job_id}`.
+//! - `ready_jobs_by_priority`: partial priority index of ready jobs, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 
 use std::fmt;
@@ -151,12 +151,12 @@ pub struct Job {
 }
 
 impl Job {
-    /// Derive the queue keyspace key for this job.
+    /// Derive the priority index key for this job.
     ///
     /// This is a pure function of `priority` and `id`, so it doesn't need
     /// to be stored.
-    pub fn queue_key(&self) -> String {
-        make_queue_key(self.priority, &self.id)
+    pub fn priority_key(&self) -> String {
+        make_priority_key(self.priority, &self.id)
     }
 }
 
@@ -269,12 +269,11 @@ pub struct Store {
     /// priority ordered.
     jobs: SingleWriterTxKeyspace,
 
-    /// Reference to the queue keyspace.
+    /// Partial index of ready jobs, ordered by priority then job ID.
     ///
-    /// Entries in this keyspace are keyed by priority, then job ID, which
-    /// naturally provides the priority ordering, then FIFO within each
-    /// priority.
-    queue: SingleWriterTxKeyspace,
+    /// Only jobs in the `Ready` state appear here. Taking a job removes it
+    /// from this index; requeueing adds it back.
+    ready_jobs_by_priority: SingleWriterTxKeyspace,
 
     /// Reference to the status index keyspace.
     ///
@@ -299,7 +298,8 @@ impl Store {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let db = SingleWriterTxDatabase::builder(path).open()?;
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
-        let queue = db.keyspace("queue", fjall::KeyspaceCreateOptions::default)?;
+        let ready_jobs_by_priority =
+            db.keyspace("ready_jobs_by_priority", fjall::KeyspaceCreateOptions::default)?;
         let jobs_by_status =
             db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
 
@@ -308,7 +308,7 @@ impl Store {
         Ok(Self {
             db,
             jobs,
-            queue,
+            ready_jobs_by_priority,
             jobs_by_status,
             event_tx,
         })
@@ -328,7 +328,7 @@ impl Store {
     ) -> Result<Job, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
-        let queue = self.queue.clone();
+        let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let queue_name = queue_name.to_string();
 
@@ -344,14 +344,14 @@ impl Store {
                 status: JobStatus::Ready.into(),
             };
 
-            let queue_key = job.queue_key();
+            let priority_key = job.priority_key();
             let status_key = make_status_key(JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Atomically push the job into the jobs keyspace and to the queue.
+            // Atomically push the job into the jobs keyspace and indexes.
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
-            tx.insert(&queue, &queue_key, id.as_bytes());
+            tx.insert(&ready_jobs_by_priority, &priority_key, id.as_bytes());
             tx.insert(&jobs_by_status, &status_key, b"");
             tx.commit()?;
 
@@ -364,17 +364,17 @@ impl Store {
         Ok(job)
     }
 
-    /// Take the next job from the queue.
+    /// Take the next job from the priority index.
     ///
     /// Atomically removes the highest-priority (lowest number), oldest job
-    /// from the `queue` keyspace and marks it as working. Returns `None` if
-    /// the queue is empty.
+    /// from the `ready_jobs_by_priority` keyspace and marks it as working. Returns
+    /// `None` if the queue is empty.
     ///
     /// Subscribers are not notified.
     pub async fn take_next_job(&self) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
-        let queue = self.queue.clone();
+        let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
 
         task::spawn_blocking(move || {
@@ -382,20 +382,20 @@ impl Store {
             // can take the same job between our read and the remove.
             let mut tx = db.write_tx();
 
-            // The first key in the queue keyspace is the highest-priority,
+            // The first key in the priority index is the highest-priority,
             // oldest job, because keys sort by priority (base-36) then by
             // job ID (scru128, time-ordered).
-            let entry = match queue.first_key_value() {
+            let entry = match ready_jobs_by_priority.first_key_value() {
                 Some(entry) => entry,
                 None => return Ok(None),
             };
 
-            let (queue_key, job_id) = entry.into_inner()?;
+            let (priority_key, job_id) = entry.into_inner()?;
 
             // Look up the full job data from the source of truth.
             let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
                 StoreError::Corruption(format!(
-                    "job in queue but missing from jobs keyspace: {:?}",
+                    "job in ready_jobs_by_priority but missing from jobs keyspace: {:?}",
                     String::from_utf8_lossy(&job_id),
                 ))
             })?;
@@ -406,8 +406,8 @@ impl Store {
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Remove from queue, update job record and status index.
-            tx.remove(&queue, &*queue_key);
+            // Remove from priority index, update job record and status index.
+            tx.remove(&ready_jobs_by_priority, &*priority_key);
             tx.insert(&jobs, &*job_id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
@@ -490,7 +490,7 @@ impl Store {
     pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
-        let queue = self.queue.clone();
+        let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let id = id.to_string();
 
@@ -512,7 +512,7 @@ impl Store {
             let new_status_key = make_status_key(JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            tx.insert(&queue, &job.queue_key(), id.as_bytes());
+            tx.insert(&ready_jobs_by_priority, &job.priority_key(), id.as_bytes());
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
@@ -732,13 +732,13 @@ fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
     key
 }
 
-/// Build a queue key that sorts by priority then by job ID.
+/// Build a priority index key that sorts by priority then by job ID.
 ///
 /// The priority is encoded as a 4-character base-36 string (covers the full
 /// u16 range: 65535 = "1ekf") so that lexicographic ordering matches numeric
 /// ordering. The job ID (scru128, already base-36) provides uniqueness and
 /// time-ordering within the same priority level.
-fn make_queue_key(priority: u16, job_id: &str) -> String {
+fn make_priority_key(priority: u16, job_id: &str) -> String {
     let mut buf = [b'0'; 4];
     let mut n = priority as u32;
     for i in (0..4).rev() {
@@ -792,7 +792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_queue_key_reflects_priority() {
+    async fn enqueue_priority_key_reflects_priority() {
         let store = test_store();
         let low = store
             .enqueue("default", 10, serde_json::json!(null))
@@ -804,7 +804,7 @@ mod tests {
             .unwrap();
 
         // Higher priority (lower number) should sort first lexicographically.
-        assert!(high.queue_key() < low.queue_key());
+        assert!(high.priority_key() < low.priority_key());
     }
 
     #[tokio::test]
