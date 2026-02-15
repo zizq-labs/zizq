@@ -236,6 +236,9 @@ where
         }
         let mut set = HashSet::new();
         for part in s.split(';') {
+            if part.is_empty() {
+                continue;
+            }
             let value = part
                 .parse()
                 .map_err(serde::de::Error::custom)?;
@@ -982,6 +985,11 @@ struct TakeParams {
     /// 0 means unlimited. Defaults to 1.
     #[serde(default = "default_prefetch")]
     prefetch: usize,
+
+    /// Queue filter, semicolon-delimited (e.g. "emails;webhooks").
+    /// Empty means all queues.
+    #[serde(default)]
+    queue: SemicolonSet<String>,
 }
 
 fn default_prefetch() -> usize {
@@ -995,6 +1003,7 @@ async fn take_jobs(
     Query(params): Query<TakeParams>,
 ) -> Response {
     let prefetch = params.prefetch;
+    let queues = params.queue.0;
     // Channel we'll use to emit events to the client. We reserve a slot
     // before dequeuing a job, so we never take work we can't deliver.
     let (tx, rx) = mpsc::channel::<TakeMessage>(1);
@@ -1059,7 +1068,7 @@ async fn take_jobs(
                     _ = shutdown.changed() => break, // server shutting down
                 };
 
-                match state.store.take_next_job(&HashSet::new()).await {
+                match state.store.take_next_job(&queues).await {
                     Ok(Some(job)) => {
                         in_flight.insert(job.id.clone());
                         state.global_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -1490,6 +1499,29 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert!(body["error"].as_str().unwrap().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn semicolon_set_ignores_trailing_semicolons() {
+        let (_, app) = test_state_and_app();
+
+        // Enqueue jobs in two queues.
+        for queue in &["emails", "webhooks"] {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({"queue": queue, "payload": "x"}),
+            );
+            app.clone().oneshot(req).await.unwrap();
+        }
+
+        // Trailing semicolon should be ignored — same as ?queue=emails;webhooks
+        let req = empty_request("GET", "/jobs?queue=emails;webhooks;");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2709,5 +2741,106 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn take_filters_by_single_queue() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/take?queue=reports");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "reports");
+        assert_eq!(job["payload"], "b");
+    }
+
+    #[tokio::test]
+    async fn take_filters_by_multiple_queues() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/take?queue=emails;webhooks&prefetch=2");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "emails");
+
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "webhooks");
+    }
+
+    #[tokio::test]
+    async fn take_queue_filter_skips_other_queues() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        // Take only from emails — reports job should remain ready.
+        let req = empty_request("GET", "/jobs/take?queue=emails");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "emails");
+        drop(body);
+
+        // Give the spawned task time to detect disconnect and requeue.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The reports job should still be available via unfiltered take.
+        let req = empty_request("GET", "/jobs/take");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["queue"], "reports");
     }
 }
