@@ -509,12 +509,8 @@ impl Store {
             // Atomically push the job into the jobs keyspace and indexes.
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
-            tx.insert(&ready_jobs_by_priority, &priority_key, id.as_bytes());
-            tx.insert(
-                &ready_jobs_by_queue_and_priority,
-                &queue_priority_key,
-                id.as_bytes(),
-            );
+            tx.insert(&ready_jobs_by_priority, &priority_key, b"");
+            tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
             tx.insert(&jobs_by_status, &status_key, b"");
             tx.insert(&jobs_by_queue, &queue_key, b"");
             tx.insert(&jobs_by_queue_and_status, &queue_status_key, b"");
@@ -532,32 +528,80 @@ impl Store {
     /// Take the next job from the priority index.
     ///
     /// Atomically removes the highest-priority (lowest number), oldest job
-    /// from the `ready_jobs_by_priority` keyspace and marks it as working. Returns
-    /// `None` if the queue is empty.
+    /// and marks it as working. Returns `None` if no ready jobs match.
+    ///
+    /// When `queues` is non-empty, only jobs in the specified queues are
+    /// considered, using a k-way merge across per-queue priority ranges.
+    /// When empty, all ready jobs are candidates.
     ///
     /// Subscribers are not notified.
-    pub async fn take_next_job(&self) -> Result<Option<Job>, StoreError> {
+    pub async fn take_next_job(
+        &self,
+        queues: &HashSet<String>,
+    ) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
+        let queues = queues.clone();
 
         task::spawn_blocking(move || {
             // Acquire the write lock before reading, so no other writer
             // can take the same job between our read and the remove.
             let mut tx = db.write_tx();
 
-            // The first key in the priority index is the highest-priority,
-            // oldest job, because keys sort by priority (base-36) then by
-            // job ID (scru128, time-ordered).
-            let entry = match ready_jobs_by_priority.first_key_value() {
-                Some(entry) => entry,
-                None => return Ok(None),
-            };
+            // Find the highest-priority, oldest ready job, returning
+            // (priority_key, job_id) as raw bytes for index manipulation.
+            let (priority_key, job_id): (Vec<u8>, Vec<u8>) = if queues.is_empty() {
+                // Unfiltered: the first key in the global priority index.
+                let entry = match ready_jobs_by_priority.first_key_value() {
+                    Some(entry) => entry,
+                    None => return Ok(None),
+                };
+                let (k, _) = entry.into_inner()?;
+                let priority_key = k.to_vec();
+                let job_id = priority_key[5..].to_vec();
+                (priority_key, job_id)
+            } else {
+                // Queue-filtered: k-way merge across per-queue priority
+                // ranges with limit 1 to find the single best candidate.
+                // We create a read snapshot for range iteration; the write
+                // lock we already hold ensures consistency.
+                let snapshot = db.read_tx();
+                let mut sources: Vec<MergeSource<'_>> = Vec::new();
+                for queue_name in &queues {
+                    let prefix_len = queue_name.len() + 1;
+                    let mut start_key = Vec::with_capacity(prefix_len);
+                    start_key.extend_from_slice(queue_name.as_bytes());
+                    start_key.push(0);
+                    let start = Bound::Included(start_key);
+                    let mut end_key = Vec::with_capacity(prefix_len);
+                    end_key.extend_from_slice(queue_name.as_bytes());
+                    end_key.push(1);
+                    let end = Bound::Excluded(end_key);
 
-            let (priority_key, job_id) = entry.into_inner()?;
+                    sources.push(range_source!(
+                        snapshot.range::<Vec<u8>, _>(
+                            &ready_jobs_by_queue_and_priority,
+                            (start, end),
+                        ),
+                        prefix_len
+                    ));
+                }
+
+                let mut ids = kway_merge(sources, ScanDirection::Asc, 1)?;
+                if ids.is_empty() {
+                    return Ok(None);
+                }
+
+                // The merge result is {priority_b36:4}\0{job_id} — this is
+                // also the key in ready_jobs_by_priority.
+                let priority_key = ids.remove(0);
+                let job_id = priority_key[5..].to_vec();
+                (priority_key, job_id)
+            };
 
             // Look up the full job data from the source of truth.
             let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
@@ -578,9 +622,9 @@ impl Store {
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Remove from priority indexes, update job record and status indexes.
-            tx.remove(&ready_jobs_by_priority, &*priority_key);
+            tx.remove(&ready_jobs_by_priority, &priority_key);
             tx.remove(&ready_jobs_by_queue_and_priority, &queue_priority_key);
-            tx.insert(&jobs, &*job_id, &job_bytes);
+            tx.insert(&jobs, &job_id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
             tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
@@ -709,12 +753,8 @@ impl Store {
             let new_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            tx.insert(&ready_jobs_by_priority, &job.priority_key(), id.as_bytes());
-            tx.insert(
-                &ready_jobs_by_queue_and_priority,
-                &queue_priority_key,
-                id.as_bytes(),
-            );
+            tx.insert(&ready_jobs_by_priority, &job.priority_key(), b"");
+            tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
@@ -1118,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_returns_none_when_empty() {
         let store = test_store();
-        let job = store.take_next_job().await.unwrap();
+        let job = store.take_next_job(&HashSet::new()).await.unwrap();
         assert!(job.is_none());
     }
 
@@ -1138,7 +1178,7 @@ mod tests {
             .await
             .unwrap();
 
-        let job = store.take_next_job().await.unwrap().unwrap();
+        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert_eq!(job.priority, 1);
         assert_eq!(job.status, u8::from(JobStatus::Working));
         assert_eq!(job.payload, serde_json::json!("high"));
@@ -1156,7 +1196,7 @@ mod tests {
             .await
             .unwrap();
 
-        let job = store.take_next_job().await.unwrap().unwrap();
+        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert_eq!(job.id, first.id);
     }
 
@@ -1172,15 +1212,15 @@ mod tests {
             .await
             .unwrap();
 
-        let first = store.take_next_job().await.unwrap().unwrap();
-        let second = store.take_next_job().await.unwrap().unwrap();
+        let first = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let second = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
 
         assert_ne!(first.id, second.id);
         assert_eq!(first.payload, serde_json::json!("a"));
         assert_eq!(second.payload, serde_json::json!("b"));
 
         // Queue should now be empty.
-        assert!(store.take_next_job().await.unwrap().is_none());
+        assert!(store.take_next_job(&HashSet::new()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1191,12 +1231,12 @@ mod tests {
             .await
             .unwrap();
 
-        let job = store.take_next_job().await.unwrap().unwrap();
+        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert!(store.mark_completed(&job.id).await.unwrap());
 
         // Job should no longer be dequeue-able even if re-enqueue were attempted
         // via crash recovery — it's gone from the jobs keyspace entirely.
-        assert!(store.take_next_job().await.unwrap().is_none());
+        assert!(store.take_next_job(&HashSet::new()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1213,7 +1253,7 @@ mod tests {
             .await
             .unwrap();
 
-        let job = store.take_next_job().await.unwrap().unwrap();
+        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert!(store.mark_completed(&job.id).await.unwrap());
         assert!(!store.mark_completed(&job.id).await.unwrap());
     }
@@ -1236,7 +1276,7 @@ mod tests {
             let store = store.clone();
             handles.push(tokio::spawn(async move {
                 let mut taken = Vec::new();
-                while let Some(job) = store.take_next_job().await.unwrap() {
+                while let Some(job) = store.take_next_job(&HashSet::new()).await.unwrap() {
                     taken.push(job.id);
                 }
                 taken
@@ -1255,6 +1295,78 @@ mod tests {
         assert_eq!(all_ids.len(), num_jobs);
     }
 
+    // --- take_next_job queue filter tests ---
+
+    #[tokio::test]
+    async fn take_next_job_filters_by_single_queue() {
+        let store = test_store();
+        store.enqueue("emails", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("reports", 0, serde_json::json!("b")).await.unwrap();
+        store.enqueue("emails", 0, serde_json::json!("c")).await.unwrap();
+
+        let queues = HashSet::from(["reports".into()]);
+        let job = store.take_next_job(&queues).await.unwrap().unwrap();
+        assert_eq!(job.id, b.id);
+        assert_eq!(job.queue, "reports");
+
+        // No more reports jobs.
+        assert!(store.take_next_job(&queues).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_next_job_filters_by_multiple_queues() {
+        let store = test_store();
+        let a = store.enqueue("emails", 0, serde_json::json!("a")).await.unwrap();
+        store.enqueue("reports", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("webhooks", 0, serde_json::json!("c")).await.unwrap();
+
+        let queues = HashSet::from(["emails".into(), "webhooks".into()]);
+        let first = store.take_next_job(&queues).await.unwrap().unwrap();
+        assert_eq!(first.id, a.id);
+
+        let second = store.take_next_job(&queues).await.unwrap().unwrap();
+        assert_eq!(second.id, c.id);
+
+        assert!(store.take_next_job(&queues).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_next_job_queue_filter_respects_priority() {
+        let store = test_store();
+        store.enqueue("emails", 10, serde_json::json!("low")).await.unwrap();
+        let high = store.enqueue("emails", 1, serde_json::json!("high")).await.unwrap();
+
+        let queues = HashSet::from(["emails".into()]);
+        let job = store.take_next_job(&queues).await.unwrap().unwrap();
+        assert_eq!(job.id, high.id);
+        assert_eq!(job.priority, 1);
+    }
+
+    #[tokio::test]
+    async fn take_next_job_queue_filter_returns_none_for_empty_queue() {
+        let store = test_store();
+        store.enqueue("emails", 0, serde_json::json!("a")).await.unwrap();
+
+        let queues = HashSet::from(["reports".into()]);
+        assert!(store.take_next_job(&queues).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_next_job_queue_filter_picks_best_across_queues() {
+        let store = test_store();
+        store.enqueue("emails", 10, serde_json::json!("low")).await.unwrap();
+        let high = store
+            .enqueue("webhooks", 1, serde_json::json!("high"))
+            .await
+            .unwrap();
+
+        let queues = HashSet::from(["emails".into(), "webhooks".into()]);
+        let job = store.take_next_job(&queues).await.unwrap().unwrap();
+        assert_eq!(job.id, high.id);
+        assert_eq!(job.queue, "webhooks");
+        assert_eq!(job.priority, 1);
+    }
+
     #[tokio::test]
     async fn requeue_returns_job_to_queue() {
         let store = test_store();
@@ -1262,12 +1374,12 @@ mod tests {
             .enqueue("default", 0, serde_json::json!("a"))
             .await
             .unwrap();
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert_eq!(taken.id, job.id);
 
         assert!(store.requeue(&taken.id).await.unwrap());
 
-        let retaken = store.take_next_job().await.unwrap().unwrap();
+        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert_eq!(retaken.id, job.id);
     }
 
@@ -1283,13 +1395,13 @@ mod tests {
             .await
             .unwrap();
 
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert_eq!(taken.id, high.id);
 
         assert!(store.requeue(&taken.id).await.unwrap());
 
         // Should get the high-priority job again, not the low-priority one.
-        let retaken = store.take_next_job().await.unwrap().unwrap();
+        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert_eq!(retaken.id, high.id);
         assert_eq!(retaken.priority, 1);
         assert_eq!(retaken.status, u8::from(JobStatus::Working));
@@ -1302,13 +1414,13 @@ mod tests {
             .enqueue("default", 0, serde_json::json!("a"))
             .await
             .unwrap();
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         assert!(store.mark_completed(&taken.id).await.unwrap());
 
         assert!(!store.requeue(&taken.id).await.unwrap());
 
         // Queue should remain empty.
-        assert!(store.take_next_job().await.unwrap().is_none());
+        assert!(store.take_next_job(&HashSet::new()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1331,7 +1443,7 @@ mod tests {
             .enqueue("default", 0, serde_json::json!("a"))
             .await
             .unwrap();
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
 
         let mut rx = store.subscribe();
         store.mark_completed(&taken.id).await.unwrap();
@@ -1349,7 +1461,7 @@ mod tests {
             .enqueue("default", 0, serde_json::json!("a"))
             .await
             .unwrap();
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
 
         let mut rx = store.subscribe();
         store.requeue(&taken.id).await.unwrap();
@@ -1385,7 +1497,7 @@ mod tests {
             .enqueue("default", 0, serde_json::json!("a"))
             .await
             .unwrap();
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
         store.mark_completed(&enqueued.id).await.unwrap();
 
         assert!(store.get_job(&enqueued.id).await.unwrap().is_none());
@@ -1500,7 +1612,7 @@ mod tests {
         let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
         store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
 
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert_eq!(page.jobs.len(), 2);
@@ -1515,7 +1627,7 @@ mod tests {
         store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
         let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
 
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
@@ -1615,7 +1727,7 @@ mod tests {
         let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
 
         // Take the first job so it becomes Working.
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Ready])))
@@ -1632,7 +1744,7 @@ mod tests {
         let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
         store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
 
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
@@ -1706,7 +1818,7 @@ mod tests {
         let store = test_store();
         let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
 
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Now working.
         let page = store
@@ -1737,7 +1849,7 @@ mod tests {
         let store = test_store();
         store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
 
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
@@ -1918,7 +2030,7 @@ mod tests {
             .await
             .unwrap();
 
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store
@@ -1939,8 +2051,8 @@ mod tests {
         let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
 
         // Take a and b so they become Working.
-        store.take_next_job().await.unwrap();
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Filter by Ready + Working — should get all 3.
         let page = store
@@ -1962,7 +2074,7 @@ mod tests {
         let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
         let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
 
-        store.take_next_job().await.unwrap(); // a -> working
+        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
 
         let page = store
             .list_jobs(
@@ -1996,7 +2108,7 @@ mod tests {
             .unwrap();
 
         // Take a so it becomes Working.
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Only ready jobs in the emails queue.
         let page = store
@@ -2056,8 +2168,8 @@ mod tests {
             .unwrap();
 
         // Take a and b so they become Working.
-        store.take_next_job().await.unwrap();
-        store.take_next_job().await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Ready + Working in emails + webhooks (excludes reports).
         let page = store
@@ -2089,7 +2201,7 @@ mod tests {
             .await
             .unwrap();
 
-        store.take_next_job().await.unwrap(); // a -> working
+        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
 
         let page = store
             .list_jobs(
@@ -2173,7 +2285,7 @@ mod tests {
             .await
             .unwrap();
 
-        store.take_next_job().await.unwrap(); // a -> working
+        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
 
         // Working in emails.
         let page = store
@@ -2223,7 +2335,7 @@ mod tests {
             .await
             .unwrap();
 
-        let taken = store.take_next_job().await.unwrap().unwrap();
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store
@@ -2256,7 +2368,7 @@ mod tests {
         let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
         let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
 
-        store.take_next_job().await.unwrap(); // a -> working
+        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
 
         let page = store
             .list_jobs(

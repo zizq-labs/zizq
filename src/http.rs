@@ -1059,7 +1059,7 @@ async fn take_jobs(
                     _ = shutdown.changed() => break, // server shutting down
                 };
 
-                match state.store.take_next_job().await {
+                match state.store.take_next_job(&HashSet::new()).await {
                     Ok(Some(job)) => {
                         in_flight.insert(job.id.clone());
                         state.global_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -1531,7 +1531,7 @@ mod tests {
         let job_id = created["id"].as_str().unwrap();
 
         // Take the job so it moves to working.
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         let req = empty_request("GET", &format!("/jobs/{job_id}"));
         let res = app.oneshot(req).await.unwrap();
@@ -1555,7 +1555,7 @@ mod tests {
         let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
         state.store.mark_completed(job_id).await.unwrap();
 
         let req = empty_request("GET", &format!("/jobs/{job_id}"));
@@ -1824,7 +1824,7 @@ mod tests {
             .unwrap();
 
         // Take the first job so it becomes working.
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         let req = empty_request("GET", "/jobs?status=ready");
         let res = app.clone().oneshot(req).await.unwrap();
@@ -1925,7 +1925,7 @@ mod tests {
             .unwrap();
 
         // Take the first job so it becomes working.
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         let req = empty_request("GET", "/jobs?status=ready;working");
         let res = app.oneshot(req).await.unwrap();
@@ -1956,7 +1956,7 @@ mod tests {
             .await
             .unwrap();
 
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         let req = empty_request("GET", "/jobs?status=ready;working&limit=2");
         let res = app.clone().oneshot(req).await.unwrap();
@@ -2099,7 +2099,7 @@ mod tests {
             .unwrap();
 
         // Take a so it becomes working.
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Only ready jobs in emails queue.
         let req = empty_request("GET", "/jobs?queue=emails&status=ready");
@@ -2172,7 +2172,7 @@ mod tests {
             .unwrap();
 
         // Take a so it becomes working.
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Ready + working in emails + reports (excludes webhooks).
         let req =
@@ -2203,7 +2203,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = body["id"].as_str().unwrap();
 
-        state.store.take_next_job().await.unwrap();
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Mark it as completed.
         let req = empty_request("POST", &format!("/jobs/{job_id}/success"));
@@ -2435,7 +2435,7 @@ mod tests {
 
         // Drain jobs from queue — our original job should be among them.
         let mut ids = Vec::new();
-        while let Some(job) = state.store.take_next_job().await.unwrap() {
+        while let Some(job) = state.store.take_next_job(&HashSet::new()).await.unwrap() {
             ids.push(job.id);
         }
         assert!(
@@ -2478,7 +2478,7 @@ mod tests {
 
         // Only the unacked job should be requeued, not the acked one.
         let mut ids = Vec::new();
-        while let Some(job) = state.store.take_next_job().await.unwrap() {
+        while let Some(job) = state.store.take_next_job(&HashSet::new()).await.unwrap() {
             ids.push(job.id);
         }
         assert!(
