@@ -9,7 +9,7 @@
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `queue`: sorted pending index, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `working`: tracks in-flight jobs, keyed by job ID.
-//! - `status_idx`: status index, keyed by `{status_u8}\0{job_id}`.
+//! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 
 use std::fmt;
 use std::ops::Bound;
@@ -289,7 +289,7 @@ pub struct Store {
     /// Keyed by `{status_u8}\0{job_id}` with empty values. Enables efficient
     /// range scans for jobs in a particular status without scanning the entire
     /// `jobs` keyspace.
-    status_idx: SingleWriterTxKeyspace,
+    jobs_by_status: SingleWriterTxKeyspace,
 
     /// Broadcast channel for store events.
     ///
@@ -309,7 +309,7 @@ impl Store {
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
         let queue = db.keyspace("queue", fjall::KeyspaceCreateOptions::default)?;
         let working = db.keyspace("working", fjall::KeyspaceCreateOptions::default)?;
-        let status_idx = db.keyspace("status_idx", fjall::KeyspaceCreateOptions::default)?;
+        let jobs_by_status = db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -318,7 +318,7 @@ impl Store {
             jobs,
             queue,
             working,
-            status_idx,
+            jobs_by_status,
             event_tx,
         })
     }
@@ -338,7 +338,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
-        let status_idx = self.status_idx.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
         let queue_name = queue_name.to_string();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
@@ -361,7 +361,7 @@ impl Store {
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
             tx.insert(&queue, &queue_key, id.as_bytes());
-            tx.insert(&status_idx, &status_key, b"");
+            tx.insert(&jobs_by_status, &status_key, b"");
             tx.commit()?;
 
             Ok(job)
@@ -385,7 +385,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
         let working = self.working.clone();
-        let status_idx = self.status_idx.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
 
         task::spawn_blocking(move || {
             // Acquire the write lock before reading, so no other writer
@@ -421,8 +421,8 @@ impl Store {
             tx.remove(&queue, &*queue_key);
             tx.insert(&working, &*job_id, b"");
             tx.insert(&jobs, &*job_id, &job_bytes);
-            tx.remove(&status_idx, &old_status_key);
-            tx.insert(&status_idx, &new_status_key, b"");
+            tx.remove(&jobs_by_status, &old_status_key);
+            tx.insert(&jobs_by_status, &new_status_key, b"");
             tx.commit()?;
 
             Ok(Some(job))
@@ -441,7 +441,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let working = self.working.clone();
-        let status_idx = self.status_idx.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
 
@@ -458,7 +458,7 @@ impl Store {
 
             tx.remove(&working, &id);
             tx.remove(&jobs, &id);
-            tx.remove(&status_idx, &status_key);
+            tx.remove(&jobs_by_status, &status_key);
             tx.commit()?;
 
             Ok(true)
@@ -507,7 +507,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
         let working = self.working.clone();
-        let status_idx = self.status_idx.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
         let id = id.to_string();
 
         let requeued = task::spawn_blocking(move || -> Result<bool, StoreError> {
@@ -533,8 +533,8 @@ impl Store {
             tx.remove(&working, &id);
             tx.insert(&queue, &job.queue_key(), id.as_bytes());
             tx.insert(&jobs, &id, &job_bytes);
-            tx.remove(&status_idx, &old_status_key);
-            tx.insert(&status_idx, &new_status_key, b"");
+            tx.remove(&jobs_by_status, &old_status_key);
+            tx.insert(&jobs_by_status, &new_status_key, b"");
             tx.commit()?;
 
             Ok(true)
@@ -591,7 +591,7 @@ impl Store {
     pub async fn list_jobs(&self, opts: ListJobsOptions) -> Result<ListJobsPage, StoreError> {
         let db = self.db.clone();
         let jobs_ks = self.jobs.clone();
-        let status_idx = self.status_idx.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
 
         task::spawn_blocking(move || {
             let snapshot = db.read_tx();
@@ -620,7 +620,7 @@ impl Store {
                         let end = Bound::Excluded(vec![next_prefix, 0]);
 
                         let range = snapshot.range::<Vec<u8>, _>(
-                            &status_idx,
+                            &jobs_by_status,
                             (start, end),
                         );
 
@@ -630,7 +630,7 @@ impl Store {
                             let job_id = &key[2..];
                             let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
                                 StoreError::Corruption(format!(
-                                    "job in status_idx but missing from jobs keyspace: {:?}",
+                                    "job in jobs_by_status but missing from jobs keyspace: {:?}",
                                     String::from_utf8_lossy(job_id),
                                 ))
                             })?;
@@ -651,7 +651,7 @@ impl Store {
                         let start = Bound::Included(vec![prefix, 0]);
 
                         let range = snapshot.range::<Vec<u8>, _>(
-                            &status_idx,
+                            &jobs_by_status,
                             (start, end),
                         );
 
@@ -660,7 +660,7 @@ impl Store {
                             let job_id = &key[2..];
                             let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
                                 StoreError::Corruption(format!(
-                                    "job in status_idx but missing from jobs keyspace: {:?}",
+                                    "job in jobs_by_status but missing from jobs keyspace: {:?}",
                                     String::from_utf8_lossy(job_id),
                                 ))
                             })?;
