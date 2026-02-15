@@ -314,6 +314,104 @@ pub struct Store {
     event_tx: broadcast::Sender<StoreEvent>,
 }
 
+// --- K-way merge helpers ---
+
+/// A source of job IDs for k-way merging. Returns `Some(Ok(id))` for the
+/// next ID, `Some(Err(e))` on error, or `None` when exhausted.
+type MergeSource<'a> = Box<dyn FnMut() -> Option<Result<Vec<u8>, StoreError>> + 'a>;
+
+/// Wrap a fjall range iterator into a `MergeSource`.
+///
+/// Each entry's key has a `prefix_len`-byte prefix followed by the job ID.
+/// This macro exists because forward and reverse iterators are different
+/// types in Rust, so a generic function cannot accept both without boxing
+/// the iterator itself. The macro monomorphizes over the concrete iterator
+/// type while producing the same `MergeSource` closure.
+macro_rules! range_source {
+    ($iter:expr, $prefix_len:expr) => {{
+        let mut iter = $iter;
+        let prefix_len = $prefix_len;
+        Box::new(move || {
+            iter.next().map(|e| {
+                let (key, _) = e.into_inner()?;
+                Ok(key[prefix_len..].to_vec())
+            })
+        }) as MergeSource<'_>
+    }};
+}
+
+/// Merge multiple sorted sources of job IDs using a binary heap, collecting
+/// up to `limit` IDs in the requested order.
+///
+/// For ascending, uses a min-heap (via `Reverse`). For descending, uses a
+/// max-heap. Each source must already yield IDs in the matching order.
+fn kway_merge(
+    mut sources: Vec<MergeSource<'_>>,
+    direction: ScanDirection,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut result = Vec::with_capacity(limit);
+
+    match direction {
+        ScanDirection::Asc => {
+            let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
+            for (i, src) in sources.iter_mut().enumerate() {
+                if let Some(id) = src() {
+                    heap.push(Reverse((id?, i)));
+                }
+            }
+            while let Some(Reverse((id, i))) = heap.pop() {
+                result.push(id);
+                if result.len() >= limit {
+                    break;
+                }
+                if let Some(next) = sources[i]() {
+                    heap.push(Reverse((next?, i)));
+                }
+            }
+        }
+        ScanDirection::Desc => {
+            let mut heap: BinaryHeap<(Vec<u8>, usize)> = BinaryHeap::new();
+            for (i, src) in sources.iter_mut().enumerate() {
+                if let Some(id) = src() {
+                    heap.push((id?, i));
+                }
+            }
+            while let Some((id, i)) = heap.pop() {
+                result.push(id);
+                if result.len() >= limit {
+                    break;
+                }
+                if let Some(next) = sources[i]() {
+                    heap.push((next?, i));
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Look up full job records by ID, returning an error if any ID is missing
+/// from the `jobs` keyspace (data corruption).
+fn load_jobs_by_ids(
+    jobs_ks: &SingleWriterTxKeyspace,
+    ids: &[Vec<u8>],
+    index_name: &str,
+    rows: &mut Vec<Job>,
+) -> Result<(), StoreError> {
+    for id in ids {
+        let bytes = jobs_ks.get(id)?.ok_or_else(|| {
+            StoreError::Corruption(format!(
+                "job in {index_name} but missing from jobs keyspace: {:?}",
+                String::from_utf8_lossy(id),
+            ))
+        })?;
+        rows.push(rmp_serde::from_slice(&bytes)?);
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open or create a store at the given path.
     ///
@@ -627,18 +725,12 @@ impl Store {
             let mut rows = Vec::with_capacity(fetch);
 
             if !opts.queues.is_empty() {
-                // Queue filter: k-way merge across queue ranges in the
-                // index. One iterator per queue, merged via a BinaryHeap
-                // so we pull exactly `fetch` items total.
-                let mut job_ids: Vec<Vec<u8>> = Vec::with_capacity(fetch);
-
-                // Build range bounds and prefix lengths for each queue.
-                // Bounds are consumed by range(), so we pair them with
-                // the prefix length needed to extract job IDs from keys.
-                let queue_info: Vec<_> = opts
+                // Queue filter: k-way merge across per-queue ranges.
+                let sources: Vec<MergeSource<'_>> = opts
                     .queues
                     .iter()
                     .map(|queue_name| {
+                        let prefix_len = queue_name.len() + 1;
                         let start = match &opts.from {
                             Some(cursor) => {
                                 Bound::Excluded(make_queue_key(queue_name, cursor))
@@ -649,203 +741,68 @@ impl Store {
                         end_key.extend_from_slice(queue_name.as_bytes());
                         end_key.push(1);
                         let end = Bound::Excluded(end_key);
-                        // prefix_len = queue_name + \0 separator
-                        (start, end, queue_name.len() + 1)
-                    })
-                    .collect();
 
-                match opts.direction {
-                    ScanDirection::Asc => {
-                        let mut iters: Vec<_> = queue_info
-                            .iter()
-                            .map(|(start, end, _)| {
+                        match opts.direction {
+                            ScanDirection::Asc => range_source!(
                                 snapshot.range::<Vec<u8>, _>(
                                     &jobs_by_queue,
-                                    (start.clone(), end.clone()),
-                                )
-                            })
-                            .collect();
-
-                        // Seed min-heap with first entry from each iterator.
-                        let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> =
-                            BinaryHeap::new();
-                        for (i, iter) in iters.iter_mut().enumerate() {
-                            if let Some(entry) = iter.next() {
-                                let (key, _) = entry.into_inner()?;
-                                let job_id = key[queue_info[i].2..].to_vec();
-                                heap.push(Reverse((job_id, i)));
-                            }
-                        }
-
-                        // Pop smallest, advance that iterator.
-                        while let Some(Reverse((job_id, i))) = heap.pop() {
-                            job_ids.push(job_id);
-                            if job_ids.len() >= fetch {
-                                break;
-                            }
-                            if let Some(entry) = iters[i].next() {
-                                let (key, _) = entry.into_inner()?;
-                                let next_id = key[queue_info[i].2..].to_vec();
-                                heap.push(Reverse((next_id, i)));
-                            }
-                        }
-                    }
-                    ScanDirection::Desc => {
-                        let mut iters: Vec<_> = queue_info
-                            .iter()
-                            .map(|(start, end, _)| {
+                                    (start, end),
+                                ),
+                                prefix_len
+                            ),
+                            ScanDirection::Desc => range_source!(
                                 snapshot
                                     .range::<Vec<u8>, _>(
                                         &jobs_by_queue,
-                                        (start.clone(), end.clone()),
+                                        (start, end),
                                     )
-                                    .rev()
-                            })
-                            .collect();
-
-                        // Seed max-heap with first entry from each iterator.
-                        let mut heap: BinaryHeap<(Vec<u8>, usize)> = BinaryHeap::new();
-                        for (i, iter) in iters.iter_mut().enumerate() {
-                            if let Some(entry) = iter.next() {
-                                let (key, _) = entry.into_inner()?;
-                                let job_id = key[queue_info[i].2..].to_vec();
-                                heap.push((job_id, i));
-                            }
+                                    .rev(),
+                                prefix_len
+                            ),
                         }
+                    })
+                    .collect();
 
-                        // Pop largest, advance that iterator.
-                        while let Some((job_id, i)) = heap.pop() {
-                            job_ids.push(job_id);
-                            if job_ids.len() >= fetch {
-                                break;
-                            }
-                            if let Some(entry) = iters[i].next() {
-                                let (key, _) = entry.into_inner()?;
-                                let next_id = key[queue_info[i].2..].to_vec();
-                                heap.push((next_id, i));
-                            }
-                        }
-                    }
-                }
-
-                for job_id in &job_ids {
-                    let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
-                        StoreError::Corruption(format!(
-                            "job in jobs_by_queue but missing from jobs keyspace: {:?}",
-                            String::from_utf8_lossy(job_id),
-                        ))
-                    })?;
-                    let job: Job = rmp_serde::from_slice(&job_bytes)?;
-                    rows.push(job);
-                }
+                let ids = kway_merge(sources, opts.direction, fetch)?;
+                load_jobs_by_ids(&jobs_ks, &ids, "jobs_by_queue", &mut rows)?;
             } else if !opts.statuses.is_empty() {
-                // Status filter: k-way merge across status ranges in the
-                // index. One iterator per status, merged via a BinaryHeap
-                // so we pull exactly `fetch` items total.
-                let mut job_ids: Vec<Vec<u8>> = Vec::with_capacity(fetch);
-
-                // Build range bounds for each status.
-                // Key format: {status_u8}\0{job_id}, prefix_len is always 2.
-                let status_info: Vec<_> = opts
+                // Status filter: k-way merge across per-status ranges.
+                let sources: Vec<MergeSource<'_>> = opts
                     .statuses
                     .iter()
                     .map(|status| {
                         let prefix = *status as u8;
-                        let next_prefix = prefix + 1;
                         let start = match &opts.from {
                             Some(cursor) => {
                                 Bound::Excluded(make_status_key(*status, cursor))
                             }
                             None => Bound::Included(vec![prefix, 0]),
                         };
-                        let end = Bound::Excluded(vec![next_prefix, 0]);
-                        (start, end)
-                    })
-                    .collect();
+                        let end = Bound::Excluded(vec![prefix + 1, 0]);
 
-                // Status index prefix length is always 2 ({status_u8}\0).
-                const STATUS_PREFIX_LEN: usize = 2;
-
-                match opts.direction {
-                    ScanDirection::Asc => {
-                        let mut iters: Vec<_> = status_info
-                            .iter()
-                            .map(|(start, end)| {
+                        match opts.direction {
+                            ScanDirection::Asc => range_source!(
                                 snapshot.range::<Vec<u8>, _>(
                                     &jobs_by_status,
-                                    (start.clone(), end.clone()),
-                                )
-                            })
-                            .collect();
-
-                        let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> =
-                            BinaryHeap::new();
-                        for (i, iter) in iters.iter_mut().enumerate() {
-                            if let Some(entry) = iter.next() {
-                                let (key, _) = entry.into_inner()?;
-                                let job_id = key[STATUS_PREFIX_LEN..].to_vec();
-                                heap.push(Reverse((job_id, i)));
-                            }
-                        }
-
-                        while let Some(Reverse((job_id, i))) = heap.pop() {
-                            job_ids.push(job_id);
-                            if job_ids.len() >= fetch {
-                                break;
-                            }
-                            if let Some(entry) = iters[i].next() {
-                                let (key, _) = entry.into_inner()?;
-                                let next_id = key[STATUS_PREFIX_LEN..].to_vec();
-                                heap.push(Reverse((next_id, i)));
-                            }
-                        }
-                    }
-                    ScanDirection::Desc => {
-                        let mut iters: Vec<_> = status_info
-                            .iter()
-                            .map(|(start, end)| {
+                                    (start, end),
+                                ),
+                                2
+                            ),
+                            ScanDirection::Desc => range_source!(
                                 snapshot
                                     .range::<Vec<u8>, _>(
                                         &jobs_by_status,
-                                        (start.clone(), end.clone()),
+                                        (start, end),
                                     )
-                                    .rev()
-                            })
-                            .collect();
-
-                        let mut heap: BinaryHeap<(Vec<u8>, usize)> = BinaryHeap::new();
-                        for (i, iter) in iters.iter_mut().enumerate() {
-                            if let Some(entry) = iter.next() {
-                                let (key, _) = entry.into_inner()?;
-                                let job_id = key[STATUS_PREFIX_LEN..].to_vec();
-                                heap.push((job_id, i));
-                            }
+                                    .rev(),
+                                2
+                            ),
                         }
+                    })
+                    .collect();
 
-                        while let Some((job_id, i)) = heap.pop() {
-                            job_ids.push(job_id);
-                            if job_ids.len() >= fetch {
-                                break;
-                            }
-                            if let Some(entry) = iters[i].next() {
-                                let (key, _) = entry.into_inner()?;
-                                let next_id = key[STATUS_PREFIX_LEN..].to_vec();
-                                heap.push((next_id, i));
-                            }
-                        }
-                    }
-                }
-
-                for job_id in &job_ids {
-                    let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
-                        StoreError::Corruption(format!(
-                            "job in jobs_by_status but missing from jobs keyspace: {:?}",
-                            String::from_utf8_lossy(job_id),
-                        ))
-                    })?;
-                    let job: Job = rmp_serde::from_slice(&job_bytes)?;
-                    rows.push(job);
-                }
+                let ids = kway_merge(sources, opts.direction, fetch)?;
+                load_jobs_by_ids(&jobs_ks, &ids, "jobs_by_status", &mut rows)?;
             } else {
                 // No filter — scan the jobs keyspace directly.
                 match opts.direction {
