@@ -4,11 +4,12 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! three keyspaces:
+//! four keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `queue`: sorted pending index, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `working`: tracks in-flight jobs, keyed by job ID.
+//! - `status_idx`: status index, keyed by `{status_u8}\0{job_id}`.
 
 use std::fmt;
 use std::ops::Bound;
@@ -192,15 +193,20 @@ pub struct ListJobsOptions {
 
     /// Maximum number of jobs to return.
     pub limit: usize,
+
+    /// Optional status filter. When set, only jobs with this status are
+    /// returned, using the status index for efficient lookup.
+    pub status: Option<JobStatus>,
 }
 
 impl ListJobsOptions {
-    /// Create default options (ascending, no cursor, limit 50).
+    /// Create default options (ascending, no cursor, no status filter, limit 50).
     pub fn new() -> Self {
         Self {
             from: None,
             direction: ScanDirection::Asc,
             limit: 50,
+            status: None,
         }
     }
 
@@ -219,6 +225,12 @@ impl ListJobsOptions {
     /// Set the maximum number of records to return and return `self`.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Filter by job status and return `self`.
+    pub fn status(mut self, status: JobStatus) -> Self {
+        self.status = Some(status);
         self
     }
 }
@@ -272,10 +284,17 @@ pub struct Store {
     /// disconnect jobs are returned to the queue keyspace again.
     working: SingleWriterTxKeyspace,
 
+    /// Reference to the status index keyspace.
+    ///
+    /// Keyed by `{status_u8}\0{job_id}` with empty values. Enables efficient
+    /// range scans for jobs in a particular status without scanning the entire
+    /// `jobs` keyspace.
+    status_idx: SingleWriterTxKeyspace,
+
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
-    /// or otherwise change state. Stream handlers use this both to wake up
+    /// or otherwise change state. Take handlers use this both to wake up
     /// when new work is available and to prune their in-flight tracking.
     event_tx: broadcast::Sender<StoreEvent>,
 }
@@ -290,6 +309,7 @@ impl Store {
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
         let queue = db.keyspace("queue", fjall::KeyspaceCreateOptions::default)?;
         let working = db.keyspace("working", fjall::KeyspaceCreateOptions::default)?;
+        let status_idx = db.keyspace("status_idx", fjall::KeyspaceCreateOptions::default)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -298,6 +318,7 @@ impl Store {
             jobs,
             queue,
             working,
+            status_idx,
             event_tx,
         })
     }
@@ -317,6 +338,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
+        let status_idx = self.status_idx.clone();
         let queue_name = queue_name.to_string();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
@@ -332,12 +354,14 @@ impl Store {
             };
 
             let queue_key = job.queue_key();
+            let status_key = make_status_key(JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Atomically push the job into the jobs keyspace and to the queue.
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
             tx.insert(&queue, &queue_key, id.as_bytes());
+            tx.insert(&status_idx, &status_key, b"");
             tx.commit()?;
 
             Ok(job)
@@ -361,6 +385,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
         let working = self.working.clone();
+        let status_idx = self.status_idx.clone();
 
         task::spawn_blocking(move || {
             // Acquire the write lock before reading, so no other writer
@@ -386,13 +411,18 @@ impl Store {
             })?;
 
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let old_status_key = make_status_key(JobStatus::Ready, &job.id);
             job.status = JobStatus::Working.into();
+            let new_status_key = make_status_key(JobStatus::Working, &job.id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Remove from queue, add to working, update job record.
+            // Remove from queue, add to working, update job record and
+            // status index.
             tx.remove(&queue, &*queue_key);
             tx.insert(&working, &*job_id, b"");
             tx.insert(&jobs, &*job_id, &job_bytes);
+            tx.remove(&status_idx, &old_status_key);
+            tx.insert(&status_idx, &new_status_key, b"");
             tx.commit()?;
 
             Ok(Some(job))
@@ -411,6 +441,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let working = self.working.clone();
+        let status_idx = self.status_idx.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
 
@@ -423,8 +454,11 @@ impl Store {
                 return Ok(false);
             }
 
+            let status_key = make_status_key(JobStatus::Working, &id);
+
             tx.remove(&working, &id);
             tx.remove(&jobs, &id);
+            tx.remove(&status_idx, &status_key);
             tx.commit()?;
 
             Ok(true)
@@ -473,6 +507,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
         let working = self.working.clone();
+        let status_idx = self.status_idx.clone();
         let id = id.to_string();
 
         let requeued = task::spawn_blocking(move || -> Result<bool, StoreError> {
@@ -490,12 +525,16 @@ impl Store {
                 ))
             })?;
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let old_status_key = make_status_key(JobStatus::Working, &id);
             job.status = JobStatus::Ready.into();
+            let new_status_key = make_status_key(JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             tx.remove(&working, &id);
             tx.insert(&queue, &job.queue_key(), id.as_bytes());
             tx.insert(&jobs, &id, &job_bytes);
+            tx.remove(&status_idx, &old_status_key);
+            tx.insert(&status_idx, &new_status_key, b"");
             tx.commit()?;
 
             Ok(true)
@@ -552,6 +591,7 @@ impl Store {
     pub async fn list_jobs(&self, opts: ListJobsOptions) -> Result<ListJobsPage, StoreError> {
         let db = self.db.clone();
         let jobs_ks = self.jobs.clone();
+        let status_idx = self.status_idx.clone();
 
         task::spawn_blocking(move || {
             let snapshot = db.read_tx();
@@ -560,40 +600,107 @@ impl Store {
             let fetch = opts.limit + 1;
             let mut rows = Vec::with_capacity(fetch);
 
-            match opts.direction {
-                ScanDirection::Asc => {
-                    // The remaining set of records is simply a range scan
-                    // forwards or backwards from the cursor.
-                    let range = match &opts.from {
-                        Some(cursor) => snapshot.range::<&str, _>(
-                            &jobs_ks,
-                            (Bound::Excluded(cursor.as_str()), Bound::Unbounded),
-                        ),
-                        None => snapshot.range::<&str, _>(&jobs_ks, ..),
-                    };
+            if let Some(status) = opts.status {
+                // Use the status index: scan keys in
+                // [{status}\0{cursor}..{status+1}\0) and look up each job.
+                let prefix = status as u8;
+                let next_prefix = prefix + 1;
 
-                    // We take(fetch) records from the iterator to get the page
-                    // plus one extra.
-                    for entry in range.take(fetch) {
-                        let (_, value) = entry.into_inner()?;
-                        let job: Job = rmp_serde::from_slice(&value)?;
-                        rows.push(job);
+                match opts.direction {
+                    ScanDirection::Asc => {
+                        let start = match &opts.from {
+                            Some(cursor) => {
+                                let key = make_status_key(status, cursor);
+                                Bound::Excluded(key)
+                            }
+                            None => {
+                                Bound::Included(vec![prefix, 0])
+                            }
+                        };
+                        let end = Bound::Excluded(vec![next_prefix, 0]);
+
+                        let range = snapshot.range::<Vec<u8>, _>(
+                            &status_idx,
+                            (start, end),
+                        );
+
+                        for entry in range.take(fetch) {
+                            let (key, _) = entry.into_inner()?;
+                            // Key is {status}\0{job_id} — extract job_id.
+                            let job_id = &key[2..];
+                            let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
+                                StoreError::Corruption(format!(
+                                    "job in status_idx but missing from jobs keyspace: {:?}",
+                                    String::from_utf8_lossy(job_id),
+                                ))
+                            })?;
+                            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+                            rows.push(job);
+                        }
+                    }
+                    ScanDirection::Desc => {
+                        let end = match &opts.from {
+                            Some(cursor) => {
+                                let key = make_status_key(status, cursor);
+                                Bound::Excluded(key)
+                            }
+                            None => {
+                                Bound::Excluded(vec![next_prefix, 0])
+                            }
+                        };
+                        let start = Bound::Included(vec![prefix, 0]);
+
+                        let range = snapshot.range::<Vec<u8>, _>(
+                            &status_idx,
+                            (start, end),
+                        );
+
+                        for entry in range.rev().take(fetch) {
+                            let (key, _) = entry.into_inner()?;
+                            let job_id = &key[2..];
+                            let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
+                                StoreError::Corruption(format!(
+                                    "job in status_idx but missing from jobs keyspace: {:?}",
+                                    String::from_utf8_lossy(job_id),
+                                ))
+                            })?;
+                            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+                            rows.push(job);
+                        }
                     }
                 }
-                ScanDirection::Desc => {
-                    // See comments above for the ScanDirection::Asc arm.
-                    let range = match &opts.from {
-                        Some(cursor) => snapshot.range::<&str, _>(
-                            &jobs_ks,
-                            (Bound::Unbounded, Bound::Excluded(cursor.as_str())),
-                        ),
-                        None => snapshot.range::<&str, _>(&jobs_ks, ..),
-                    };
+            } else {
+                // No status filter — scan the jobs keyspace directly.
+                match opts.direction {
+                    ScanDirection::Asc => {
+                        let range = match &opts.from {
+                            Some(cursor) => snapshot.range::<&str, _>(
+                                &jobs_ks,
+                                (Bound::Excluded(cursor.as_str()), Bound::Unbounded),
+                            ),
+                            None => snapshot.range::<&str, _>(&jobs_ks, ..),
+                        };
 
-                    for entry in range.rev().take(fetch) {
-                        let (_, value) = entry.into_inner()?;
-                        let job: Job = rmp_serde::from_slice(&value)?;
-                        rows.push(job);
+                        for entry in range.take(fetch) {
+                            let (_, value) = entry.into_inner()?;
+                            let job: Job = rmp_serde::from_slice(&value)?;
+                            rows.push(job);
+                        }
+                    }
+                    ScanDirection::Desc => {
+                        let range = match &opts.from {
+                            Some(cursor) => snapshot.range::<&str, _>(
+                                &jobs_ks,
+                                (Bound::Unbounded, Bound::Excluded(cursor.as_str())),
+                            ),
+                            None => snapshot.range::<&str, _>(&jobs_ks, ..),
+                        };
+
+                        for entry in range.rev().take(fetch) {
+                            let (_, value) = entry.into_inner()?;
+                            let job: Job = rmp_serde::from_slice(&value)?;
+                            rows.push(job);
+                        }
                     }
                 }
             }
@@ -605,15 +712,20 @@ impl Store {
                 rows.truncate(opts.limit);
             }
 
+            // Build next/prev options, preserving the status filter.
+            let make_opts = |cursor: &str, direction: ScanDirection| {
+                let mut o = ListJobsOptions::new()
+                    .from(cursor.to_string())
+                    .direction(direction)
+                    .limit(opts.limit);
+                o.status = opts.status;
+                o
+            };
+
             // Next page: exists if over-select found an extra row.
             let next = if has_more {
                 let last_id = &rows.last().unwrap().id;
-                Some(
-                    ListJobsOptions::new()
-                        .from(last_id.clone())
-                        .direction(opts.direction)
-                        .limit(opts.limit),
-                )
+                Some(make_opts(last_id, opts.direction))
             } else {
                 None
             };
@@ -622,12 +734,7 @@ impl Store {
             // somewhere).
             let prev = if opts.from.is_some() && !rows.is_empty() {
                 let first_id = &rows.first().unwrap().id;
-                Some(
-                    ListJobsOptions::new()
-                        .from(first_id.clone())
-                        .direction(opts.direction.reverse())
-                        .limit(opts.limit),
-                )
+                Some(make_opts(first_id, opts.direction.reverse()))
             } else {
                 None
             };
@@ -644,6 +751,15 @@ impl Store {
 
 /// Base-36 alphabet (0-9, a-z) for compact, lexicographically sortable keys.
 const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Build a status index key: `{status_byte}\0{job_id}`.
+fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + job_id.len());
+    key.push(status as u8);
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
 
 /// Build a queue key that sorts by priority then by job ID.
 ///
@@ -1230,5 +1346,149 @@ mod tests {
         assert_eq!(page2.jobs.len(), 1);
         assert_eq!(page2.jobs[0].id, c.id);
         assert!(page2.next.is_none());
+    }
+
+    // --- list_jobs status filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_ready_status() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        // Take the first job so it becomes Working.
+        store.take_next_job().await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Ready))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[0].status, u8::from(JobStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_working_status() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        store.take_next_job().await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[0].status, u8::from(JobStatus::Working));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_status_filter_empty_when_none_match() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_status_filter_with_pagination() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Ready).limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert!(page.next.is_some());
+
+        // Follow next page — should preserve the status filter.
+        let page2 = store.list_jobs(page.next.unwrap()).await.unwrap();
+        assert_eq!(page2.jobs.len(), 1);
+        assert_eq!(page2.jobs[0].id, c.id);
+        assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_status_filter_desc_order() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .status(JobStatus::Ready)
+                    .direction(ScanDirection::Desc),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[1].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_status_filter_reflects_requeue() {
+        let store = test_store();
+        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+
+        store.take_next_job().await.unwrap();
+
+        // Now working.
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+
+        // Requeue — should move back to ready.
+        store.requeue(&a.id).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Ready))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_status_filter_reflects_completion() {
+        let store = test_store();
+        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+
+        let taken = store.take_next_job().await.unwrap().unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+
+        store.mark_completed(&taken.id).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().status(JobStatus::Working))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
     }
 }

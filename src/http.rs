@@ -757,6 +757,7 @@ async fn list_jobs(
         from: params.from.clone(),
         direction: params.order.into(),
         limit: limit as usize,
+        status: None,
     };
 
     match state.store.list_jobs(opts).await {
