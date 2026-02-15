@@ -4,12 +4,13 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! four keyspaces:
+//! five keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `ready_jobs_by_priority`: partial priority index of ready jobs, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
+//! - `jobs_by_queue_and_status`: compound index, keyed by `{queue_name}\0{status_u8}\0{job_id}`.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -306,6 +307,12 @@ pub struct Store {
     /// efficient lookup of all jobs belonging to one or more queues.
     jobs_by_queue: SingleWriterTxKeyspace,
 
+    /// Compound queue + status index.
+    ///
+    /// Keyed by `{queue_name}\0{status_u8}\0{job_id}` with empty values.
+    /// Enables efficient combined filtering by queue and status.
+    jobs_by_queue_and_status: SingleWriterTxKeyspace,
+
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
@@ -427,6 +434,10 @@ impl Store {
         let jobs_by_status =
             db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
         let jobs_by_queue = db.keyspace("jobs_by_queue", fjall::KeyspaceCreateOptions::default)?;
+        let jobs_by_queue_and_status = db.keyspace(
+            "jobs_by_queue_and_status",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -436,6 +447,7 @@ impl Store {
             ready_jobs_by_priority,
             jobs_by_status,
             jobs_by_queue,
+            jobs_by_queue_and_status,
             event_tx,
         })
     }
@@ -457,6 +469,7 @@ impl Store {
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let queue_name = queue_name.to_string();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
@@ -474,6 +487,7 @@ impl Store {
             let priority_key = job.priority_key();
             let status_key = make_status_key(JobStatus::Ready, &id);
             let queue_key = make_queue_key(&job.queue, &id);
+            let queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Atomically push the job into the jobs keyspace and indexes.
@@ -482,6 +496,7 @@ impl Store {
             tx.insert(&ready_jobs_by_priority, &priority_key, id.as_bytes());
             tx.insert(&jobs_by_status, &status_key, b"");
             tx.insert(&jobs_by_queue, &queue_key, b"");
+            tx.insert(&jobs_by_queue_and_status, &queue_status_key, b"");
             tx.commit()?;
 
             Ok(job)
@@ -505,6 +520,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         task::spawn_blocking(move || {
             // Acquire the write lock before reading, so no other writer
@@ -531,8 +547,12 @@ impl Store {
 
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
             let old_status_key = make_status_key(JobStatus::Ready, &job.id);
+            let old_queue_status_key =
+                make_queue_status_key(&job.queue, JobStatus::Ready, &job.id);
             job.status = JobStatus::Working.into();
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
+            let new_queue_status_key =
+                make_queue_status_key(&job.queue, JobStatus::Working, &job.id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Remove from priority index, update job record and status index.
@@ -540,6 +560,8 @@ impl Store {
             tx.insert(&jobs, &*job_id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
+            tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
+            tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
             tx.commit()?;
 
             Ok(Some(job))
@@ -559,6 +581,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
 
@@ -582,10 +605,13 @@ impl Store {
             // Clean up all indexes.
             let status_key = make_status_key(JobStatus::Working, &id);
             let queue_key = make_queue_key(&job.queue, &id);
+            let queue_status_key =
+                make_queue_status_key(&job.queue, JobStatus::Working, &id);
 
             tx.remove(&jobs, &id);
             tx.remove(&jobs_by_status, &status_key);
             tx.remove(&jobs_by_queue, &queue_key);
+            tx.remove(&jobs_by_queue_and_status, &queue_status_key);
             tx.commit()?;
 
             Ok(true)
@@ -634,6 +660,7 @@ impl Store {
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let id = id.to_string();
 
         let requeued = task::spawn_blocking(move || -> Result<bool, StoreError> {
@@ -650,14 +677,20 @@ impl Store {
                 StoreError::Corruption(format!("working job missing from jobs keyspace: {id:?}",))
             })?;
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let old_queue_status_key =
+                make_queue_status_key(&job.queue, JobStatus::Working, &id);
             job.status = JobStatus::Ready.into();
             let new_status_key = make_status_key(JobStatus::Ready, &id);
+            let new_queue_status_key =
+                make_queue_status_key(&job.queue, JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             tx.insert(&ready_jobs_by_priority, &job.priority_key(), id.as_bytes());
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
+            tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
+            tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
             tx.commit()?;
 
             Ok(true)
@@ -716,6 +749,7 @@ impl Store {
         let jobs_ks = self.jobs.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         task::spawn_blocking(move || {
             let snapshot = db.read_tx();
@@ -724,7 +758,63 @@ impl Store {
             let fetch = opts.limit + 1;
             let mut rows = Vec::with_capacity(fetch);
 
-            if !opts.queues.is_empty() {
+            if !opts.queues.is_empty() && !opts.statuses.is_empty() {
+                // Combined queue + status filter: k-way merge across the
+                // Cartesian product of (queues × statuses).
+                let mut sources: Vec<MergeSource<'_>> = Vec::new();
+                for queue_name in &opts.queues {
+                    for status in &opts.statuses {
+                        let prefix_len = queue_name.len() + 3;
+                        let start = match &opts.from {
+                            Some(cursor) => Bound::Excluded(make_queue_status_key(
+                                queue_name, *status, cursor,
+                            )),
+                            None => {
+                                let mut key =
+                                    Vec::with_capacity(queue_name.len() + 3);
+                                key.extend_from_slice(queue_name.as_bytes());
+                                key.push(0);
+                                key.push(*status as u8);
+                                key.push(0);
+                                Bound::Included(key)
+                            }
+                        };
+                        let mut end_key =
+                            Vec::with_capacity(queue_name.len() + 2);
+                        end_key.extend_from_slice(queue_name.as_bytes());
+                        end_key.push(0);
+                        end_key.push(*status as u8 + 1);
+                        let end = Bound::Excluded(end_key);
+
+                        sources.push(match opts.direction {
+                            ScanDirection::Asc => range_source!(
+                                snapshot.range::<Vec<u8>, _>(
+                                    &jobs_by_queue_and_status,
+                                    (start, end),
+                                ),
+                                prefix_len
+                            ),
+                            ScanDirection::Desc => range_source!(
+                                snapshot
+                                    .range::<Vec<u8>, _>(
+                                        &jobs_by_queue_and_status,
+                                        (start, end),
+                                    )
+                                    .rev(),
+                                prefix_len
+                            ),
+                        });
+                    }
+                }
+
+                let ids = kway_merge(sources, opts.direction, fetch)?;
+                load_jobs_by_ids(
+                    &jobs_ks,
+                    &ids,
+                    "jobs_by_queue_and_status",
+                    &mut rows,
+                )?;
+            } else if !opts.queues.is_empty() {
                 // Queue filter: k-way merge across per-queue ranges.
                 let sources: Vec<MergeSource<'_>> = opts
                     .queues
@@ -899,6 +989,17 @@ fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
 fn make_queue_key(queue_name: &str, job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(queue_name.len() + 1 + job_id.len());
     key.extend_from_slice(queue_name.as_bytes());
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
+/// Build a compound queue + status index key: `{queue_name}\0{status_u8}\0{job_id}`.
+fn make_queue_status_key(queue_name: &str, status: JobStatus, job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(queue_name.len() + 3 + job_id.len());
+    key.extend_from_slice(queue_name.as_bytes());
+    key.push(0);
+    key.push(status as u8);
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
@@ -1856,6 +1957,278 @@ mod tests {
         assert_eq!(page.jobs.len(), 2);
         assert_eq!(page.jobs[0].id, b.id);
         assert_eq!(page.jobs[1].id, a.id);
+    }
+
+    // --- list_jobs combined queue + status filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_queue_and_status() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let _c = store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // Take a so it becomes Working.
+        store.take_next_job().await.unwrap();
+
+        // Only ready jobs in the emails queue.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, _c.id);
+
+        // Working jobs in emails queue.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, a.id);
+
+        // Ready jobs in reports queue.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["reports".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, b.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_multiple_queues_and_statuses() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("webhooks", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue("reports", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+        let d = store
+            .enqueue("emails", 0, serde_json::json!("d"))
+            .await
+            .unwrap();
+
+        // Take a and b so they become Working.
+        store.take_next_job().await.unwrap();
+        store.take_next_job().await.unwrap();
+
+        // Ready + Working in emails + webhooks (excludes reports).
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into(), "webhooks".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 3);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert_eq!(page.jobs[2].id, d.id);
+
+        // Verify reports/c is excluded.
+        assert!(page.jobs.iter().all(|j| j.id != c.id));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_desc_order() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("emails", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        store.take_next_job().await.unwrap(); // a -> working
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working]))
+                    .direction(ScanDirection::Desc),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[1].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_with_pagination() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("emails", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready]))
+                    .limit(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert!(page.next.is_some());
+
+        // Follow next — should preserve both queue and status filters.
+        let next = page.next.unwrap();
+        assert!(!next.queues.is_empty());
+        assert!(!next.statuses.is_empty());
+
+        let page2 = store.list_jobs(next).await.unwrap();
+        assert_eq!(page2.jobs.len(), 1);
+        assert_eq!(page2.jobs[0].id, c.id);
+        assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_empty_when_none_match() {
+        let store = test_store();
+        store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_reflects_requeue() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        store.take_next_job().await.unwrap(); // a -> working
+
+        // Working in emails.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+
+        // Requeue — should move back to ready.
+        store.requeue(&a.id).await.unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_reflects_completion() {
+        let store = test_store();
+        store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("emails", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        let taken = store.take_next_job().await.unwrap().unwrap();
+        store.mark_completed(&taken.id).await.unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, b.id);
+
+        // Working should be empty after completion.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .statuses(HashSet::from([JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
     }
 
     #[tokio::test]

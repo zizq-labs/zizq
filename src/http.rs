@@ -2026,6 +2026,117 @@ mod tests {
         assert_eq!(body["jobs"][0]["payload"], "c");
     }
 
+    // --- list_jobs combined queue + status filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_queue_and_status() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // Take a so it becomes working.
+        state.store.take_next_job().await.unwrap();
+
+        // Only ready jobs in emails queue.
+        let req = empty_request("GET", "/jobs?queue=emails&status=ready");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["payload"], "c");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_preserves_in_pagination() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?queue=emails&status=ready&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        // The next URL should contain both queue and status filters.
+        assert!(next_url.contains("queue=emails"));
+        assert!(next_url.contains("status=ready"));
+
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["jobs"][0]["payload"], "c");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_and_status_multiple_values() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        // Take a so it becomes working.
+        state.store.take_next_job().await.unwrap();
+
+        // Ready + working in emails + reports (excludes webhooks).
+        let req =
+            empty_request("GET", "/jobs?queue=emails;reports&status=ready;working");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["payload"], "a"); // emails, working
+        assert_eq!(jobs[1]["payload"], "b"); // reports, ready
+    }
+
     // --- POST /jobs/{id}/success tests ---
 
     #[tokio::test]
