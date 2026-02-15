@@ -4,11 +4,10 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! four keyspaces:
+//! three keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `queue`: sorted pending index, keyed by `{priority_b36:4}\0{job_id}`.
-//! - `working`: tracks in-flight jobs, keyed by job ID.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 
 use std::fmt;
@@ -277,13 +276,6 @@ pub struct Store {
     /// priority.
     queue: SingleWriterTxKeyspace,
 
-    /// Reference to the working jobs keyspace.
-    ///
-    /// Jobs are atomically moved from the queue keyspace to the working
-    /// keyspace when they are leased. In the event of crash recovery or worker
-    /// disconnect jobs are returned to the queue keyspace again.
-    working: SingleWriterTxKeyspace,
-
     /// Reference to the status index keyspace.
     ///
     /// Keyed by `{status_u8}\0{job_id}` with empty values. Enables efficient
@@ -308,8 +300,8 @@ impl Store {
         let db = SingleWriterTxDatabase::builder(path).open()?;
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
         let queue = db.keyspace("queue", fjall::KeyspaceCreateOptions::default)?;
-        let working = db.keyspace("working", fjall::KeyspaceCreateOptions::default)?;
-        let jobs_by_status = db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
+        let jobs_by_status =
+            db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -317,7 +309,6 @@ impl Store {
             db,
             jobs,
             queue,
-            working,
             jobs_by_status,
             event_tx,
         })
@@ -376,15 +367,14 @@ impl Store {
     /// Take the next job from the queue.
     ///
     /// Atomically removes the highest-priority (lowest number), oldest job
-    /// from the `queue` keyspace and moves it to `working`. Returns `None`
-    /// if the queue is empty.
+    /// from the `queue` keyspace and marks it as working. Returns `None` if
+    /// the queue is empty.
     ///
     /// Subscribers are not notified.
     pub async fn take_next_job(&self) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
-        let working = self.working.clone();
         let jobs_by_status = self.jobs_by_status.clone();
 
         task::spawn_blocking(move || {
@@ -416,10 +406,8 @@ impl Store {
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Remove from queue, add to working, update job record and
-            // status index.
+            // Remove from queue, update job record and status index.
             tx.remove(&queue, &*queue_key);
-            tx.insert(&working, &*job_id, b"");
             tx.insert(&jobs, &*job_id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
@@ -432,15 +420,14 @@ impl Store {
 
     /// Mark a job as successfully completed.
     ///
-    /// Removes the job from both `working` and `jobs`. Returns `true` if the
-    /// job was found in `working`, `false` if it was not (e.g. already acked
-    /// or never existed).
+    /// Removes the job from the `jobs` keyspace and removes associated index
+    /// entries. Returns `true` if the job was found in the working state,
+    /// `false` if it was not (e.g. already acked or never existed).
     ///
     /// Subscribers are notified on success.
     pub async fn mark_completed(&self, id: &str) -> Result<bool, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
-        let working = self.working.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
@@ -450,13 +437,11 @@ impl Store {
             // can remove the job between our check and the remove.
             let mut tx = db.write_tx();
 
-            if working.get(&id)?.is_none() {
+            let status_key = make_status_key(JobStatus::Working, &id);
+            if jobs_by_status.get(&status_key)?.is_none() {
                 return Ok(false);
             }
 
-            let status_key = make_status_key(JobStatus::Working, &id);
-
-            tx.remove(&working, &id);
             tx.remove(&jobs, &id);
             tx.remove(&jobs_by_status, &status_key);
             tx.commit()?;
@@ -495,42 +480,38 @@ impl Store {
         self.event_tx.subscribe()
     }
 
-    /// Atomically move a job from `working` back to `queue`.
+    /// Atomically move a working job back to the priority queue.
     ///
     /// Looks up the job from the `jobs` keyspace to reconstruct its queue key.
     /// Returns `true` if the job was actually requeued, `false` if it was
-    /// already acked (no longer in `working`).
+    /// already acked (no longer in the working state).
     ///
     /// Subscribers are notified.
     pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let queue = self.queue.clone();
-        let working = self.working.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let id = id.to_string();
 
         let requeued = task::spawn_blocking(move || -> Result<bool, StoreError> {
             let mut tx = db.write_tx();
 
-            if working.get(&id)?.is_none() {
+            let old_status_key = make_status_key(JobStatus::Working, &id);
+            if jobs_by_status.get(&old_status_key)?.is_none() {
                 return Ok(false);
             }
 
-            // The job is still in working, so it must still be in the jobs
+            // The job is still working, so it must still be in the jobs
             // keyspace (only mark_completed removes from both).
             let job_bytes = jobs.get(&id)?.ok_or_else(|| {
-                StoreError::Corruption(format!(
-                    "job in working but missing from jobs keyspace: {id:?}",
-                ))
+                StoreError::Corruption(format!("working job missing from jobs keyspace: {id:?}",))
             })?;
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
-            let old_status_key = make_status_key(JobStatus::Working, &id);
             job.status = JobStatus::Ready.into();
             let new_status_key = make_status_key(JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            tx.remove(&working, &id);
             tx.insert(&queue, &job.queue_key(), id.as_bytes());
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
@@ -613,16 +594,11 @@ impl Store {
                                 let key = make_status_key(status, cursor);
                                 Bound::Excluded(key)
                             }
-                            None => {
-                                Bound::Included(vec![prefix, 0])
-                            }
+                            None => Bound::Included(vec![prefix, 0]),
                         };
                         let end = Bound::Excluded(vec![next_prefix, 0]);
 
-                        let range = snapshot.range::<Vec<u8>, _>(
-                            &jobs_by_status,
-                            (start, end),
-                        );
+                        let range = snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end));
 
                         for entry in range.take(fetch) {
                             let (key, _) = entry.into_inner()?;
@@ -644,16 +620,11 @@ impl Store {
                                 let key = make_status_key(status, cursor);
                                 Bound::Excluded(key)
                             }
-                            None => {
-                                Bound::Excluded(vec![next_prefix, 0])
-                            }
+                            None => Bound::Excluded(vec![next_prefix, 0]),
                         };
                         let start = Bound::Included(vec![prefix, 0]);
 
-                        let range = snapshot.range::<Vec<u8>, _>(
-                            &jobs_by_status,
-                            (start, end),
-                        );
+                        let range = snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end));
 
                         for entry in range.rev().take(fetch) {
                             let (key, _) = entry.into_inner()?;
