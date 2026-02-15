@@ -4,10 +4,11 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! five keyspaces:
+//! six keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `ready_jobs_by_priority`: partial priority index of ready jobs, keyed by `{priority_b36:4}\0{job_id}`.
+//! - `ready_jobs_by_queue_and_priority`: per-queue partial priority index of ready jobs, keyed by `{queue_name}\0{priority_b36:4}\0{job_id}`.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 //! - `jobs_by_queue_and_status`: compound index, keyed by `{queue_name}\0{status_u8}\0{job_id}`.
@@ -294,6 +295,13 @@ pub struct Store {
     /// from this index; requeueing adds it back.
     ready_jobs_by_priority: SingleWriterTxKeyspace,
 
+    /// Per-queue partial index of ready jobs, ordered by priority then job ID.
+    ///
+    /// Keyed by `{queue_name}\0{priority_b36:4}\0{job_id}` with job ID as
+    /// value. Same lifecycle as `ready_jobs_by_priority` but partitioned by
+    /// queue, enabling queue-filtered take via k-way merge.
+    ready_jobs_by_queue_and_priority: SingleWriterTxKeyspace,
+
     /// Reference to the status index keyspace.
     ///
     /// Keyed by `{status_u8}\0{job_id}` with empty values. Enables efficient
@@ -431,6 +439,10 @@ impl Store {
             "ready_jobs_by_priority",
             fjall::KeyspaceCreateOptions::default,
         )?;
+        let ready_jobs_by_queue_and_priority = db.keyspace(
+            "ready_jobs_by_queue_and_priority",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
         let jobs_by_status =
             db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
         let jobs_by_queue = db.keyspace("jobs_by_queue", fjall::KeyspaceCreateOptions::default)?;
@@ -445,6 +457,7 @@ impl Store {
             db,
             jobs,
             ready_jobs_by_priority,
+            ready_jobs_by_queue_and_priority,
             jobs_by_status,
             jobs_by_queue,
             jobs_by_queue_and_status,
@@ -455,7 +468,8 @@ impl Store {
     /// Enqueue a new job.
     ///
     /// Generates a unique job ID, inserts the job into the `jobs` keyspace,
-    /// and adds an entry to the `queue` keyspace for priority-ordered retrieval.
+    /// and adds an entry to the `ready_jobs_*` keyspaces for priority-ordered
+    /// retrieval.
     ///
     /// Subscribers are notified.
     pub async fn enqueue(
@@ -467,6 +481,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
+        let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
@@ -485,6 +500,7 @@ impl Store {
             };
 
             let priority_key = job.priority_key();
+            let queue_priority_key = make_queue_priority_key(&job.queue, priority, &id);
             let status_key = make_status_key(JobStatus::Ready, &id);
             let queue_key = make_queue_key(&job.queue, &id);
             let queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
@@ -494,6 +510,11 @@ impl Store {
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
             tx.insert(&ready_jobs_by_priority, &priority_key, id.as_bytes());
+            tx.insert(
+                &ready_jobs_by_queue_and_priority,
+                &queue_priority_key,
+                id.as_bytes(),
+            );
             tx.insert(&jobs_by_status, &status_key, b"");
             tx.insert(&jobs_by_queue, &queue_key, b"");
             tx.insert(&jobs_by_queue_and_status, &queue_status_key, b"");
@@ -519,6 +540,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
+        let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
@@ -547,16 +569,17 @@ impl Store {
 
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
             let old_status_key = make_status_key(JobStatus::Ready, &job.id);
-            let old_queue_status_key =
-                make_queue_status_key(&job.queue, JobStatus::Ready, &job.id);
+            let old_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &job.id);
+            let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &job.id);
             job.status = JobStatus::Working.into();
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
             let new_queue_status_key =
                 make_queue_status_key(&job.queue, JobStatus::Working, &job.id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Remove from priority index, update job record and status index.
+            // Remove from priority indexes, update job record and status indexes.
             tx.remove(&ready_jobs_by_priority, &*priority_key);
+            tx.remove(&ready_jobs_by_queue_and_priority, &queue_priority_key);
             tx.insert(&jobs, &*job_id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
@@ -605,8 +628,7 @@ impl Store {
             // Clean up all indexes.
             let status_key = make_status_key(JobStatus::Working, &id);
             let queue_key = make_queue_key(&job.queue, &id);
-            let queue_status_key =
-                make_queue_status_key(&job.queue, JobStatus::Working, &id);
+            let queue_status_key = make_queue_status_key(&job.queue, JobStatus::Working, &id);
 
             tx.remove(&jobs, &id);
             tx.remove(&jobs_by_status, &status_key);
@@ -650,7 +672,9 @@ impl Store {
 
     /// Atomically move a working job back to the priority queue.
     ///
-    /// Looks up the job from the `jobs` keyspace to reconstruct its queue key.
+    /// Looks up the job from the `jobs` keyspace to reconstruct its
+    /// prioritised queue keys.
+    ///
     /// Returns `true` if the job was actually requeued, `false` if it was
     /// already acked (no longer in the working state).
     ///
@@ -659,6 +683,7 @@ impl Store {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
+        let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let id = id.to_string();
@@ -677,15 +702,19 @@ impl Store {
                 StoreError::Corruption(format!("working job missing from jobs keyspace: {id:?}",))
             })?;
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
-            let old_queue_status_key =
-                make_queue_status_key(&job.queue, JobStatus::Working, &id);
+            let old_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Working, &id);
+            let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &id);
             job.status = JobStatus::Ready.into();
             let new_status_key = make_status_key(JobStatus::Ready, &id);
-            let new_queue_status_key =
-                make_queue_status_key(&job.queue, JobStatus::Ready, &id);
+            let new_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             tx.insert(&ready_jobs_by_priority, &job.priority_key(), id.as_bytes());
+            tx.insert(
+                &ready_jobs_by_queue_and_priority,
+                &queue_priority_key,
+                id.as_bytes(),
+            );
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
@@ -766,12 +795,11 @@ impl Store {
                     for status in &opts.statuses {
                         let prefix_len = queue_name.len() + 3;
                         let start = match &opts.from {
-                            Some(cursor) => Bound::Excluded(make_queue_status_key(
-                                queue_name, *status, cursor,
-                            )),
+                            Some(cursor) => {
+                                Bound::Excluded(make_queue_status_key(queue_name, *status, cursor))
+                            }
                             None => {
-                                let mut key =
-                                    Vec::with_capacity(queue_name.len() + 3);
+                                let mut key = Vec::with_capacity(queue_name.len() + 3);
                                 key.extend_from_slice(queue_name.as_bytes());
                                 key.push(0);
                                 key.push(*status as u8);
@@ -779,8 +807,7 @@ impl Store {
                                 Bound::Included(key)
                             }
                         };
-                        let mut end_key =
-                            Vec::with_capacity(queue_name.len() + 2);
+                        let mut end_key = Vec::with_capacity(queue_name.len() + 2);
                         end_key.extend_from_slice(queue_name.as_bytes());
                         end_key.push(0);
                         end_key.push(*status as u8 + 1);
@@ -788,18 +815,13 @@ impl Store {
 
                         sources.push(match opts.direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(
-                                    &jobs_by_queue_and_status,
-                                    (start, end),
-                                ),
+                                snapshot
+                                    .range::<Vec<u8>, _>(&jobs_by_queue_and_status, (start, end),),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(
-                                        &jobs_by_queue_and_status,
-                                        (start, end),
-                                    )
+                                    .range::<Vec<u8>, _>(&jobs_by_queue_and_status, (start, end),)
                                     .rev(),
                                 prefix_len
                             ),
@@ -808,12 +830,7 @@ impl Store {
                 }
 
                 let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(
-                    &jobs_ks,
-                    &ids,
-                    "jobs_by_queue_and_status",
-                    &mut rows,
-                )?;
+                load_jobs_by_ids(&jobs_ks, &ids, "jobs_by_queue_and_status", &mut rows)?;
             } else if !opts.queues.is_empty() {
                 // Queue filter: k-way merge across per-queue ranges.
                 let sources: Vec<MergeSource<'_>> = opts
@@ -822,9 +839,7 @@ impl Store {
                     .map(|queue_name| {
                         let prefix_len = queue_name.len() + 1;
                         let start = match &opts.from {
-                            Some(cursor) => {
-                                Bound::Excluded(make_queue_key(queue_name, cursor))
-                            }
+                            Some(cursor) => Bound::Excluded(make_queue_key(queue_name, cursor)),
                             None => Bound::Included(make_queue_key(queue_name, "")),
                         };
                         let mut end_key = Vec::with_capacity(queue_name.len() + 1);
@@ -834,18 +849,12 @@ impl Store {
 
                         match opts.direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(
-                                    &jobs_by_queue,
-                                    (start, end),
-                                ),
+                                snapshot.range::<Vec<u8>, _>(&jobs_by_queue, (start, end),),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(
-                                        &jobs_by_queue,
-                                        (start, end),
-                                    )
+                                    .range::<Vec<u8>, _>(&jobs_by_queue, (start, end),)
                                     .rev(),
                                 prefix_len
                             ),
@@ -863,27 +872,19 @@ impl Store {
                     .map(|status| {
                         let prefix = *status as u8;
                         let start = match &opts.from {
-                            Some(cursor) => {
-                                Bound::Excluded(make_status_key(*status, cursor))
-                            }
+                            Some(cursor) => Bound::Excluded(make_status_key(*status, cursor)),
                             None => Bound::Included(vec![prefix, 0]),
                         };
                         let end = Bound::Excluded(vec![prefix + 1, 0]);
 
                         match opts.direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(
-                                    &jobs_by_status,
-                                    (start, end),
-                                ),
+                                snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end),),
                                 2
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(
-                                        &jobs_by_status,
-                                        (start, end),
-                                    )
+                                    .range::<Vec<u8>, _>(&jobs_by_status, (start, end),)
                                     .rev(),
                                 2
                             ),
@@ -1002,6 +1003,19 @@ fn make_queue_status_key(queue_name: &str, status: JobStatus, job_id: &str) -> V
     key.push(status as u8);
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
+/// Build a per-queue priority index key: `{queue_name}\0{priority_b36:4}\0{job_id}`.
+///
+/// Within a single queue prefix, entries sort by priority then FIFO — the
+/// same ordering as `ready_jobs_by_priority` but scoped to one queue.
+fn make_queue_priority_key(queue_name: &str, priority: u16, job_id: &str) -> Vec<u8> {
+    let priority_str = make_priority_key(priority, job_id);
+    let mut key = Vec::with_capacity(queue_name.len() + 1 + priority_str.len());
+    key.extend_from_slice(queue_name.as_bytes());
+    key.push(0);
+    key.extend_from_slice(priority_str.as_bytes());
     key
 }
 
@@ -1649,7 +1663,11 @@ mod tests {
         let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Ready])).limit(2))
+            .list_jobs(
+                ListJobsOptions::new()
+                    .statuses(HashSet::from([JobStatus::Ready]))
+                    .limit(2),
+            )
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 2);
