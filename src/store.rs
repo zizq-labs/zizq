@@ -11,6 +11,8 @@
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
 
@@ -197,16 +199,21 @@ pub struct ListJobsOptions {
     /// Optional status filter. When set, only jobs with this status are
     /// returned, using the status index for efficient lookup.
     pub status: Option<JobStatus>,
+
+    /// Optional queue filter. When non-empty, only jobs belonging to one of
+    /// these queues are returned, using the queue index.
+    pub queues: HashSet<String>,
 }
 
 impl ListJobsOptions {
-    /// Create default options (ascending, no cursor, no status filter, limit 50).
+    /// Create default options (ascending, no cursor, no filters, limit 50).
     pub fn new() -> Self {
         Self {
             from: None,
             direction: ScanDirection::Asc,
             limit: 50,
             status: None,
+            queues: HashSet::new(),
         }
     }
 
@@ -231,6 +238,14 @@ impl ListJobsOptions {
     /// Filter by job status and return `self`.
     pub fn status(mut self, status: JobStatus) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    /// Filter by queue membership and return `self`.
+    ///
+    /// An empty set means "all queues".
+    pub fn queues(mut self, queues: HashSet<String>) -> Self {
+        self.queues = queues;
         self
     }
 }
@@ -600,6 +615,7 @@ impl Store {
         let db = self.db.clone();
         let jobs_ks = self.jobs.clone();
         let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue = self.jobs_by_queue.clone();
 
         task::spawn_blocking(move || {
             let snapshot = db.read_tx();
@@ -608,7 +624,119 @@ impl Store {
             let fetch = opts.limit + 1;
             let mut rows = Vec::with_capacity(fetch);
 
-            if let Some(status) = opts.status {
+            if !opts.queues.is_empty() {
+                // Queue filter: k-way merge across queue ranges in the
+                // index. One iterator per queue, merged via a BinaryHeap
+                // so we pull exactly `fetch` items total.
+                let mut job_ids: Vec<Vec<u8>> = Vec::with_capacity(fetch);
+
+                // Build range bounds and prefix lengths for each queue.
+                // Bounds are consumed by range(), so we pair them with
+                // the prefix length needed to extract job IDs from keys.
+                let queue_info: Vec<_> = opts
+                    .queues
+                    .iter()
+                    .map(|queue_name| {
+                        let start = match &opts.from {
+                            Some(cursor) => {
+                                Bound::Excluded(make_queue_key(queue_name, cursor))
+                            }
+                            None => Bound::Included(make_queue_key(queue_name, "")),
+                        };
+                        let mut end_key = Vec::with_capacity(queue_name.len() + 1);
+                        end_key.extend_from_slice(queue_name.as_bytes());
+                        end_key.push(1);
+                        let end = Bound::Excluded(end_key);
+                        // prefix_len = queue_name + \0 separator
+                        (start, end, queue_name.len() + 1)
+                    })
+                    .collect();
+
+                match opts.direction {
+                    ScanDirection::Asc => {
+                        let mut iters: Vec<_> = queue_info
+                            .iter()
+                            .map(|(start, end, _)| {
+                                snapshot.range::<Vec<u8>, _>(
+                                    &jobs_by_queue,
+                                    (start.clone(), end.clone()),
+                                )
+                            })
+                            .collect();
+
+                        // Seed min-heap with first entry from each iterator.
+                        let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> =
+                            BinaryHeap::new();
+                        for (i, iter) in iters.iter_mut().enumerate() {
+                            if let Some(entry) = iter.next() {
+                                let (key, _) = entry.into_inner()?;
+                                let job_id = key[queue_info[i].2..].to_vec();
+                                heap.push(Reverse((job_id, i)));
+                            }
+                        }
+
+                        // Pop smallest, advance that iterator.
+                        while let Some(Reverse((job_id, i))) = heap.pop() {
+                            job_ids.push(job_id);
+                            if job_ids.len() >= fetch {
+                                break;
+                            }
+                            if let Some(entry) = iters[i].next() {
+                                let (key, _) = entry.into_inner()?;
+                                let next_id = key[queue_info[i].2..].to_vec();
+                                heap.push(Reverse((next_id, i)));
+                            }
+                        }
+                    }
+                    ScanDirection::Desc => {
+                        let mut iters: Vec<_> = queue_info
+                            .iter()
+                            .map(|(start, end, _)| {
+                                snapshot
+                                    .range::<Vec<u8>, _>(
+                                        &jobs_by_queue,
+                                        (start.clone(), end.clone()),
+                                    )
+                                    .rev()
+                            })
+                            .collect();
+
+                        // Seed max-heap with first entry from each iterator.
+                        let mut heap: BinaryHeap<(Vec<u8>, usize)> = BinaryHeap::new();
+                        for (i, iter) in iters.iter_mut().enumerate() {
+                            if let Some(entry) = iter.next() {
+                                let (key, _) = entry.into_inner()?;
+                                let job_id = key[queue_info[i].2..].to_vec();
+                                heap.push((job_id, i));
+                            }
+                        }
+
+                        // Pop largest, advance that iterator.
+                        while let Some((job_id, i)) = heap.pop() {
+                            job_ids.push(job_id);
+                            if job_ids.len() >= fetch {
+                                break;
+                            }
+                            if let Some(entry) = iters[i].next() {
+                                let (key, _) = entry.into_inner()?;
+                                let next_id = key[queue_info[i].2..].to_vec();
+                                heap.push((next_id, i));
+                            }
+                        }
+                    }
+                }
+
+                for job_id in &job_ids {
+                    let job_bytes = jobs_ks.get(job_id)?.ok_or_else(|| {
+                        StoreError::Corruption(format!(
+                            "job in jobs_by_queue but missing from jobs keyspace: {:?}",
+                            String::from_utf8_lossy(job_id),
+                        ))
+                    })?;
+                    let job: Job = rmp_serde::from_slice(&job_bytes)?;
+                    rows.push(job);
+                }
+            } else if let Some(status) = opts.status {
                 // Use the status index: scan keys in
                 // [{status}\0{cursor}..{status+1}\0) and look up each job.
                 let prefix = status as u8;
@@ -668,7 +796,7 @@ impl Store {
                     }
                 }
             } else {
-                // No status filter — scan the jobs keyspace directly.
+                // No filter — scan the jobs keyspace directly.
                 match opts.direction {
                     ScanDirection::Asc => {
                         let range = match &opts.from {
@@ -710,12 +838,13 @@ impl Store {
                 rows.truncate(opts.limit);
             }
 
-            // Build next/prev options, preserving the status filter.
+            // Build next/prev options, preserving all filters.
             let make_opts = |cursor: &str, direction: ScanDirection| {
                 let mut o = ListJobsOptions::new()
                     .from(cursor.to_string())
                     .direction(direction)
-                    .limit(opts.limit);
+                    .limit(opts.limit)
+                    .queues(opts.queues.clone());
                 o.status = opts.status;
                 o
             };
@@ -1497,5 +1626,180 @@ mod tests {
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
+    }
+
+    // --- list_jobs queue filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_single_queue() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().queues(HashSet::from(["emails".into()])))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_multiple_queues() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new().queues(HashSet::from(["emails".into(), "webhooks".into()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_filter_merges_in_order() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("webhooks", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+        let d = store
+            .enqueue("webhooks", 0, serde_json::json!("d"))
+            .await
+            .unwrap();
+
+        // Ascending: interleaved by job ID (time order).
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new().queues(HashSet::from(["emails".into(), "webhooks".into()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 4);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert_eq!(page.jobs[2].id, c.id);
+        assert_eq!(page.jobs[3].id, d.id);
+
+        // Descending: reverse order.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into(), "webhooks".into()]))
+                    .direction(ScanDirection::Desc),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 4);
+        assert_eq!(page.jobs[0].id, d.id);
+        assert_eq!(page.jobs[1].id, c.id);
+        assert_eq!(page.jobs[2].id, b.id);
+        assert_eq!(page.jobs[3].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_filter_empty_when_none_match() {
+        let store = test_store();
+        store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().queues(HashSet::from(["reports".into()])))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_filter_with_pagination() {
+        let store = test_store();
+        let a = store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("reports", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue("emails", 0, serde_json::json!("c"))
+            .await
+            .unwrap();
+
+        let queues = HashSet::from(["emails".into(), "reports".into()]);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().queues(queues).limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert!(page.next.is_some());
+
+        // Follow next page — should preserve the queue filter.
+        let page2 = store.list_jobs(page.next.unwrap()).await.unwrap();
+        assert_eq!(page2.jobs.len(), 1);
+        assert_eq!(page2.jobs[0].id, c.id);
+        assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_queue_filter_reflects_completion() {
+        let store = test_store();
+        store
+            .enqueue("emails", 0, serde_json::json!("a"))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue("emails", 0, serde_json::json!("b"))
+            .await
+            .unwrap();
+
+        let taken = store.take_next_job().await.unwrap().unwrap();
+        store.mark_completed(&taken.id).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().queues(HashSet::from(["emails".into()])))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, b.id);
     }
 }
