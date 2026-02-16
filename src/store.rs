@@ -4,11 +4,12 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! six keyspaces:
+//! seven keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
 //! - `ready_jobs_by_priority`: partial priority index of ready jobs, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `ready_jobs_by_queue_and_priority`: per-queue partial priority index of ready jobs, keyed by `{queue_name}\0{priority_b36:4}\0{job_id}`.
+//! - `scheduled_jobs_by_ready_at`: partial index of scheduled jobs, keyed by `{ready_at_be_u64}\0{job_id}`.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 //! - `jobs_by_queue_and_status`: compound index, keyed by `{queue_name}\0{status_u8}\0{job_id}`.
@@ -161,16 +162,6 @@ pub struct Job {
     pub ready_at: u64,
 }
 
-impl Job {
-    /// Derive the priority index key for this job.
-    ///
-    /// This is a pure function of `priority` and `id`, so it doesn't need
-    /// to be stored.
-    pub fn priority_key(&self) -> String {
-        make_priority_key(self.priority, &self.id)
-    }
-}
-
 /// Direction for scanning the jobs keyspace when listing jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanDirection {
@@ -273,6 +264,47 @@ pub struct ListJobsPage {
     pub prev: Option<ListJobsOptions>,
 }
 
+/// Options for enqueuing a new job.
+pub struct EnqueueOptions {
+    /// Queue this job belongs to.
+    pub queue: String,
+
+    /// Arbitrary payload provided by the client.
+    pub payload: serde_json::Value,
+
+    /// Priority (lower number = higher priority). Defaults to 0.
+    pub priority: u16,
+
+    /// When the job becomes eligible to run (milliseconds since Unix epoch).
+    /// `None` means immediately.
+    pub ready_at: Option<u64>,
+}
+
+impl EnqueueOptions {
+    /// Create options with required fields; priority defaults to 0, ready_at
+    /// to now.
+    pub fn new(queue: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            queue: queue.into(),
+            payload,
+            priority: 0,
+            ready_at: None,
+        }
+    }
+
+    /// Set the job priority and return `self`.
+    pub fn priority(mut self, priority: u16) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set the ready_at timestamp and return `self`.
+    pub fn ready_at(mut self, ready_at: u64) -> Self {
+        self.ready_at = Some(ready_at);
+        self
+    }
+}
+
 /// Events broadcast by the store when job state changes.
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
@@ -307,6 +339,13 @@ pub struct Store {
     /// value. Same lifecycle as `ready_jobs_by_priority` but partitioned by
     /// queue, enabling queue-filtered take via k-way merge.
     ready_jobs_by_queue_and_priority: SingleWriterTxKeyspace,
+
+    /// Partial index of scheduled jobs, ordered by ready_at then job ID.
+    ///
+    /// Keyed by `{ready_at_be_u64}\0{job_id}` with empty values. Only jobs
+    /// in the `Scheduled` state appear here. A background task scans this
+    /// index to promote jobs to `Ready` once their time arrives.
+    scheduled_jobs_by_ready_at: SingleWriterTxKeyspace,
 
     /// Reference to the status index keyspace.
     ///
@@ -449,6 +488,10 @@ impl Store {
             "ready_jobs_by_queue_and_priority",
             fjall::KeyspaceCreateOptions::default,
         )?;
+        let scheduled_jobs_by_ready_at = db.keyspace(
+            "scheduled_jobs_by_ready_at",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
         let jobs_by_status =
             db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
         let jobs_by_queue = db.keyspace("jobs_by_queue", fjall::KeyspaceCreateOptions::default)?;
@@ -464,6 +507,7 @@ impl Store {
             jobs,
             ready_jobs_by_priority,
             ready_jobs_by_queue_and_priority,
+            scheduled_jobs_by_ready_at,
             jobs_by_status,
             jobs_by_queue,
             jobs_by_queue_and_status,
@@ -473,66 +517,90 @@ impl Store {
 
     /// Enqueue a new job.
     ///
-    /// Generates a unique job ID, inserts the job into the `jobs` keyspace,
-    /// and adds an entry to the `ready_jobs_*` keyspaces for priority-ordered
-    /// retrieval.
+    /// Generates a unique job ID and inserts the job into the `jobs`
+    /// keyspace plus the appropriate indexes. If `ready_at` is in the
+    /// future the job enters the `Scheduled` state and is indexed in
+    /// `scheduled_jobs_by_ready_at`; otherwise it goes straight to `Ready`
+    /// and into the priority indexes.
     ///
-    /// Subscribers are notified.
-    pub async fn enqueue(
-        &self,
-        queue_name: &str,
-        priority: u16,
-        payload: serde_json::Value,
-    ) -> Result<Job, StoreError> {
+    /// Subscribers are notified when a job enters the ready state.
+    pub async fn enqueue(&self, opts: EnqueueOptions) -> Result<Job, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
+        let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
-        let queue_name = queue_name.to_string();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
-            // Generate a new lexicographically increasing id.
             let id = scru128::new_string();
 
+            // Get the current time which is both a default `ready_at` and a
+            // point of comparison to know if the job should be scheduled or
+            // should be queued immediately.
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
 
-            let job = Job {
-                id: id.clone(),
-                queue: queue_name,
-                priority,
-                payload,
-                status: JobStatus::Ready.into(),
-                ready_at: now,
+            // Read the `ready_at` timestamp, defaulting to now if not present.
+            let ready_at = opts.ready_at.unwrap_or(now);
+
+            // We need to check this in a couple of spots: if the job is ready
+            // now, it goes into the Ready status, otherwise it goes into the
+            // Scheduled status.
+            let scheduled = ready_at > now;
+
+            let status = if scheduled {
+                JobStatus::Scheduled
+            } else {
+                JobStatus::Ready
             };
 
-            let priority_key = job.priority_key();
-            let queue_priority_key = make_queue_priority_key(&job.queue, priority, &id);
-            let status_key = make_status_key(JobStatus::Ready, &id);
+            let job = Job {
+                id: id.clone(),
+                queue: opts.queue,
+                priority: opts.priority,
+                payload: opts.payload,
+                status: status.into(),
+                ready_at,
+            };
+
             let queue_key = make_queue_key(&job.queue, &id);
-            let queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
+            let status_key = make_status_key(status, &id);
+            let queue_status_key = make_queue_status_key(&job.queue, status, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            // Atomically push the job into the jobs keyspace and indexes.
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &job_bytes);
-            tx.insert(&ready_jobs_by_priority, &priority_key, b"");
-            tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
-            tx.insert(&jobs_by_status, &status_key, b"");
             tx.insert(&jobs_by_queue, &queue_key, b"");
+            tx.insert(&jobs_by_status, &status_key, b"");
             tx.insert(&jobs_by_queue_and_status, &queue_status_key, b"");
-            tx.commit()?;
 
+            // The `ready_jobs_by_priority*` and `scheduled_jobs_by_ready_at`
+            // indexes are partial. We have to insert into either one
+            // (exclusive) depending on whether or not the job is ready to run
+            // now.
+            if scheduled {
+                let scheduled_key = make_scheduled_key(ready_at, &id);
+                tx.insert(&scheduled_jobs_by_ready_at, &scheduled_key, b"");
+            } else {
+                let priority_key = make_priority_key(job.priority, &id);
+                let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &id);
+                tx.insert(&ready_jobs_by_priority, &priority_key, b"");
+                tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
+            }
+
+            tx.commit()?;
             Ok(job)
         })
         .await??;
 
-        let _ = self.event_tx.send(StoreEvent::JobEnqueued);
+        if !matches!(JobStatus::try_from(job.status), Ok(JobStatus::Scheduled)) {
+            let _ = self.event_tx.send(StoreEvent::JobEnqueued);
+        }
 
         Ok(job)
     }
@@ -547,10 +615,7 @@ impl Store {
     /// When empty, all ready jobs are candidates.
     ///
     /// Subscribers are not notified.
-    pub async fn take_next_job(
-        &self,
-        queues: &HashSet<String>,
-    ) -> Result<Option<Job>, StoreError> {
+    pub async fn take_next_job(&self, queues: &HashSet<String>) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
@@ -595,10 +660,8 @@ impl Store {
                     let end = Bound::Excluded(end_key);
 
                     sources.push(range_source!(
-                        snapshot.range::<Vec<u8>, _>(
-                            &ready_jobs_by_queue_and_priority,
-                            (start, end),
-                        ),
+                        snapshot
+                            .range::<Vec<u8>, _>(&ready_jobs_by_queue_and_priority, (start, end),),
                         prefix_len
                     ));
                 }
@@ -765,7 +828,11 @@ impl Store {
             let new_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-            tx.insert(&ready_jobs_by_priority, &job.priority_key(), b"");
+            tx.insert(
+                &ready_jobs_by_priority,
+                &make_priority_key(job.priority, &id),
+                b"",
+            );
             tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
@@ -1088,6 +1155,18 @@ fn make_priority_key(priority: u16, job_id: &str) -> String {
     format!("{}\0{}", prefix, job_id)
 }
 
+/// Build a scheduled index key: `{ready_at_be_u64}\0{job_id}`.
+///
+/// The 8-byte big-endian u64 gives chronological ordering so the background
+/// scheduler can scan from the front and stop at the first future timestamp.
+fn make_scheduled_key(ready_at: u64, job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 1 + job_id.len());
+    key.extend_from_slice(&ready_at.to_be_bytes());
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,7 +1183,10 @@ mod tests {
     async fn enqueue_returns_job_with_id() {
         let store = test_store();
         let job = store
-            .enqueue("default", 0, serde_json::json!({"task": "test"}))
+            .enqueue(EnqueueOptions::new(
+                "default",
+                serde_json::json!({"task": "test"}),
+            ))
             .await
             .unwrap();
 
@@ -1119,11 +1201,11 @@ mod tests {
     async fn enqueue_generates_unique_ids() {
         let store = test_store();
         let job1 = store
-            .enqueue("default", 0, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)))
             .await
             .unwrap();
         let job2 = store
-            .enqueue("default", 0, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)))
             .await
             .unwrap();
 
@@ -1134,31 +1216,33 @@ mod tests {
     async fn enqueue_priority_key_reflects_priority() {
         let store = test_store();
         let low = store
-            .enqueue("default", 10, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)).priority(10))
             .await
             .unwrap();
         let high = store
-            .enqueue("default", 1, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)).priority(1))
             .await
             .unwrap();
 
         // Higher priority (lower number) should sort first lexicographically.
-        assert!(high.priority_key() < low.priority_key());
+        assert!(
+            make_priority_key(high.priority, &high.id) < make_priority_key(low.priority, &low.id)
+        );
     }
 
     #[tokio::test]
     async fn enqueue_ids_are_fifo_ordered() {
         let store = test_store();
         let first = store
-            .enqueue("default", 0, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)))
             .await
             .unwrap();
         let second = store
-            .enqueue("default", 0, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)))
             .await
             .unwrap();
         let third = store
-            .enqueue("default", 0, serde_json::json!(null))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!(null)))
             .await
             .unwrap();
 
@@ -1178,15 +1262,15 @@ mod tests {
     async fn take_next_job_returns_highest_priority() {
         let store = test_store();
         store
-            .enqueue("default", 10, serde_json::json!("low"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("low")).priority(10))
             .await
             .unwrap();
         store
-            .enqueue("default", 1, serde_json::json!("high"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("high")).priority(1))
             .await
             .unwrap();
         store
-            .enqueue("default", 5, serde_json::json!("mid"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("mid")).priority(5))
             .await
             .unwrap();
 
@@ -1200,11 +1284,11 @@ mod tests {
     async fn take_next_job_fifo_within_same_priority() {
         let store = test_store();
         let first = store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         store
-            .enqueue("default", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -1216,11 +1300,11 @@ mod tests {
     async fn take_next_job_removes_from_queue() {
         let store = test_store();
         store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         store
-            .enqueue("default", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -1232,14 +1316,20 @@ mod tests {
         assert_eq!(second.payload, serde_json::json!("b"));
 
         // Queue should now be empty.
-        assert!(store.take_next_job(&HashSet::new()).await.unwrap().is_none());
+        assert!(
+            store
+                .take_next_job(&HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn mark_completed_removes_job() {
         let store = test_store();
         store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -1248,7 +1338,13 @@ mod tests {
 
         // Job should no longer be dequeue-able even if re-enqueue were attempted
         // via crash recovery — it's gone from the jobs keyspace entirely.
-        assert!(store.take_next_job(&HashSet::new()).await.unwrap().is_none());
+        assert!(
+            store
+                .take_next_job(&HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1261,7 +1357,7 @@ mod tests {
     async fn mark_completed_returns_false_on_double_ack() {
         let store = test_store();
         store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -1277,7 +1373,7 @@ mod tests {
 
         for i in 0..num_jobs {
             store
-                .enqueue("default", 0, serde_json::json!(i))
+                .enqueue(EnqueueOptions::new("default", serde_json::json!(i)))
                 .await
                 .unwrap();
         }
@@ -1312,9 +1408,18 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_filters_by_single_queue() {
         let store = test_store();
-        store.enqueue("emails", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("reports", 0, serde_json::json!("b")).await.unwrap();
-        store.enqueue("emails", 0, serde_json::json!("c")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let queues = HashSet::from(["reports".into()]);
         let job = store.take_next_job(&queues).await.unwrap().unwrap();
@@ -1328,9 +1433,18 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_filters_by_multiple_queues() {
         let store = test_store();
-        let a = store.enqueue("emails", 0, serde_json::json!("a")).await.unwrap();
-        store.enqueue("reports", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("webhooks", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let queues = HashSet::from(["emails".into(), "webhooks".into()]);
         let first = store.take_next_job(&queues).await.unwrap().unwrap();
@@ -1345,8 +1459,14 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_queue_filter_respects_priority() {
         let store = test_store();
-        store.enqueue("emails", 10, serde_json::json!("low")).await.unwrap();
-        let high = store.enqueue("emails", 1, serde_json::json!("high")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("low")).priority(10))
+            .await
+            .unwrap();
+        let high = store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("high")).priority(1))
+            .await
+            .unwrap();
 
         let queues = HashSet::from(["emails".into()]);
         let job = store.take_next_job(&queues).await.unwrap().unwrap();
@@ -1357,7 +1477,10 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_queue_filter_returns_none_for_empty_queue() {
         let store = test_store();
-        store.enqueue("emails", 0, serde_json::json!("a")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
+            .await
+            .unwrap();
 
         let queues = HashSet::from(["reports".into()]);
         assert!(store.take_next_job(&queues).await.unwrap().is_none());
@@ -1366,9 +1489,12 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_queue_filter_picks_best_across_queues() {
         let store = test_store();
-        store.enqueue("emails", 10, serde_json::json!("low")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("low")).priority(10))
+            .await
+            .unwrap();
         let high = store
-            .enqueue("webhooks", 1, serde_json::json!("high"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("high")).priority(1))
             .await
             .unwrap();
 
@@ -1383,7 +1509,7 @@ mod tests {
     async fn requeue_returns_job_to_queue() {
         let store = test_store();
         let job = store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
@@ -1399,11 +1525,11 @@ mod tests {
     async fn requeue_preserves_priority() {
         let store = test_store();
         let high = store
-            .enqueue("default", 1, serde_json::json!("high"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("high")).priority(1))
             .await
             .unwrap();
         store
-            .enqueue("default", 10, serde_json::json!("low"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("low")).priority(10))
             .await
             .unwrap();
 
@@ -1423,7 +1549,7 @@ mod tests {
     async fn requeue_skips_already_acked_job() {
         let store = test_store();
         store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
@@ -1432,7 +1558,13 @@ mod tests {
         assert!(!store.requeue(&taken.id).await.unwrap());
 
         // Queue should remain empty.
-        assert!(store.take_next_job(&HashSet::new()).await.unwrap().is_none());
+        assert!(
+            store
+                .take_next_job(&HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1441,7 +1573,7 @@ mod tests {
         let mut rx = store.subscribe();
 
         store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -1452,7 +1584,7 @@ mod tests {
     async fn mark_completed_broadcasts_job_completed() {
         let store = test_store();
         let job = store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
@@ -1470,7 +1602,7 @@ mod tests {
     async fn requeue_broadcasts_job_enqueued() {
         let store = test_store();
         store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
@@ -1485,7 +1617,7 @@ mod tests {
     async fn get_job_returns_enqueued_job() {
         let store = test_store();
         let enqueued = store
-            .enqueue("default", 0, serde_json::json!("hello"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("hello")))
             .await
             .unwrap();
 
@@ -1506,7 +1638,7 @@ mod tests {
     async fn get_job_returns_none_after_completion() {
         let store = test_store();
         let enqueued = store
-            .enqueue("default", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
             .await
             .unwrap();
         store.take_next_job(&HashSet::new()).await.unwrap();
@@ -1518,9 +1650,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_returns_all_in_asc_order() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert_eq!(page.jobs.len(), 3);
@@ -1532,9 +1673,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_returns_all_in_desc_order() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().direction(ScanDirection::Desc))
@@ -1549,9 +1699,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_respects_limit() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().limit(2))
@@ -1563,9 +1722,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_cursor_is_exclusive_asc() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().from(&a.id))
@@ -1579,9 +1747,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_cursor_is_exclusive_desc() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(
@@ -1608,7 +1785,10 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_cursor_past_end() {
         let store = test_store();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().from(&c.id))
@@ -1621,8 +1801,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_includes_working_jobs() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         store.take_next_job(&HashSet::new()).await.unwrap();
 
@@ -1636,8 +1822,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_excludes_completed_jobs() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
         store.mark_completed(&taken.id).await.unwrap();
@@ -1650,9 +1842,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_next_present_when_more_results() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().limit(2))
@@ -1669,8 +1870,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_next_absent_on_last_page() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().limit(2))
@@ -1683,7 +1890,10 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_prev_absent_on_first_page() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert!(page.prev.is_none());
@@ -1692,9 +1902,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_prev_present_when_cursor_provided() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().from(&a.id).limit(2))
@@ -1712,9 +1931,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_next_page_returns_remaining() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         // First page.
         let page1 = store
@@ -1735,8 +1963,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_filters_by_ready_status() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         // Take the first job so it becomes Working.
         store.take_next_job(&HashSet::new()).await.unwrap();
@@ -1753,8 +1987,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_filters_by_working_status() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         store.take_next_job(&HashSet::new()).await.unwrap();
 
@@ -1770,7 +2010,10 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_status_filter_empty_when_none_match() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
@@ -1782,9 +2025,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_status_filter_with_pagination() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(
@@ -1809,8 +2061,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_status_filter_desc_order() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(
@@ -1828,7 +2086,10 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_status_filter_reflects_requeue() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
 
         store.take_next_job(&HashSet::new()).await.unwrap();
 
@@ -1859,7 +2120,10 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_status_filter_reflects_completion() {
         let store = test_store();
-        store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
 
         let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
 
@@ -1884,15 +2148,15 @@ mod tests {
     async fn list_jobs_filters_by_single_queue() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         let c = store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -1909,15 +2173,15 @@ mod tests {
     async fn list_jobs_filters_by_multiple_queues() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         let c = store
-            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -1936,19 +2200,19 @@ mod tests {
     async fn list_jobs_queue_filter_merges_in_order() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("webhooks", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("b")))
             .await
             .unwrap();
         let c = store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
         let d = store
-            .enqueue("webhooks", 0, serde_json::json!("d"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("d")))
             .await
             .unwrap();
 
@@ -1985,7 +2249,7 @@ mod tests {
     async fn list_jobs_queue_filter_empty_when_none_match() {
         let store = test_store();
         store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -2000,15 +2264,15 @@ mod tests {
     async fn list_jobs_queue_filter_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         let c = store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2034,11 +2298,11 @@ mod tests {
     async fn list_jobs_queue_filter_reflects_completion() {
         let store = test_store();
         store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("emails", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -2058,9 +2322,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_filters_by_multiple_statuses() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         // Take a and b so they become Working.
         store.take_next_job(&HashSet::new()).await.unwrap();
@@ -2083,8 +2356,14 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_multi_status_desc_order() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
 
         store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
 
@@ -2107,15 +2386,15 @@ mod tests {
     async fn list_jobs_filters_by_queue_and_status() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         let _c = store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2163,19 +2442,19 @@ mod tests {
     async fn list_jobs_queue_and_status_multiple_queues_and_statuses() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("webhooks", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("b")))
             .await
             .unwrap();
         let c = store
-            .enqueue("reports", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("c")))
             .await
             .unwrap();
         let d = store
-            .enqueue("emails", 0, serde_json::json!("d"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("d")))
             .await
             .unwrap();
 
@@ -2205,11 +2484,11 @@ mod tests {
     async fn list_jobs_queue_and_status_desc_order() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("emails", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -2233,15 +2512,15 @@ mod tests {
     async fn list_jobs_queue_and_status_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("emails", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("b")))
             .await
             .unwrap();
         let c = store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2274,7 +2553,7 @@ mod tests {
     async fn list_jobs_queue_and_status_empty_when_none_match() {
         let store = test_store();
         store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -2293,7 +2572,7 @@ mod tests {
     async fn list_jobs_queue_and_status_reflects_requeue() {
         let store = test_store();
         let a = store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -2339,11 +2618,11 @@ mod tests {
     async fn list_jobs_queue_and_status_reflects_completion() {
         let store = test_store();
         store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         let b = store
-            .enqueue("emails", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -2376,9 +2655,18 @@ mod tests {
     #[tokio::test]
     async fn list_jobs_multi_status_with_pagination() {
         let store = test_store();
-        let a = store.enqueue("q", 0, serde_json::json!("a")).await.unwrap();
-        let b = store.enqueue("q", 0, serde_json::json!("b")).await.unwrap();
-        let c = store.enqueue("q", 0, serde_json::json!("c")).await.unwrap();
+        let a = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
+            .await
+            .unwrap();
 
         store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
 
@@ -2399,5 +2687,73 @@ mod tests {
         assert_eq!(page2.jobs.len(), 1);
         assert_eq!(page2.jobs[0].id, c.id);
         assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_future_ready_at_creates_scheduled_job() {
+        let store = test_store();
+        let future_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000; // 1 minute from now
+
+        let job = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(future_ms))
+            .await
+            .unwrap();
+
+        assert_eq!(job.status, u8::from(JobStatus::Scheduled));
+        assert_eq!(job.ready_at, future_ms);
+
+        // Scheduled jobs should not be dequeue-able.
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        assert!(taken.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_past_ready_at_creates_ready_job() {
+        let store = test_store();
+        let past_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 1000; // 1 second ago
+
+        let job = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(past_ms))
+            .await
+            .unwrap();
+
+        assert_eq!(job.status, u8::from(JobStatus::Ready));
+        assert_eq!(job.ready_at, past_ms);
+
+        // Should be dequeue-able immediately.
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().id, job.id);
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_ready_at_defaults_to_now() {
+        let before = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let store = test_store();
+        let job = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+
+        let after = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        assert_eq!(job.status, u8::from(JobStatus::Ready));
+        assert!(job.ready_at >= before);
+        assert!(job.ready_at <= after);
     }
 }

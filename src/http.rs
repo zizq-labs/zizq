@@ -772,7 +772,9 @@ async fn enqueue(
 
     match state
         .store
-        .enqueue(&enqueue_req.queue, priority, enqueue_req.payload)
+        .enqueue(
+            store::EnqueueOptions::new(enqueue_req.queue, enqueue_req.payload).priority(priority),
+        )
         .await
     {
         Ok(job) => respond(
@@ -1161,6 +1163,7 @@ async fn not_found(AcceptFormat(fmt): AcceptFormat) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::EnqueueOptions;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
@@ -1629,7 +1632,7 @@ mod tests {
 
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -1660,7 +1663,7 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
 
@@ -1679,17 +1682,17 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -1707,17 +1710,17 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -1743,12 +1746,12 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -1767,12 +1770,12 @@ mod tests {
         let (state, app) = test_state_and_app();
         let a = state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -1851,12 +1854,12 @@ mod tests {
 
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -1904,17 +1907,17 @@ mod tests {
 
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -1947,17 +1950,17 @@ mod tests {
 
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -1979,17 +1982,17 @@ mod tests {
 
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2020,17 +2023,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2051,17 +2054,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2082,17 +2085,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2121,17 +2124,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2155,17 +2158,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2194,17 +2197,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2290,12 +2293,12 @@ mod tests {
 
         state
             .store
-            .enqueue("q1", 0, serde_json::json!("first"))
+            .enqueue(EnqueueOptions::new("q1", serde_json::json!("first")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q2", 5, serde_json::json!("second"))
+            .enqueue(EnqueueOptions::new("q2", serde_json::json!("second")).priority(5))
             .await
             .unwrap();
 
@@ -2332,7 +2335,7 @@ mod tests {
         // Enqueue after take connection is open.
         let enqueued = state
             .store
-            .enqueue("default", 0, serde_json::json!("delayed"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("delayed")))
             .await
             .unwrap();
 
@@ -2350,7 +2353,7 @@ mod tests {
 
         state
             .store
-            .enqueue("default", 0, serde_json::json!("sse-test"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("sse-test")))
             .await
             .unwrap();
 
@@ -2383,7 +2386,7 @@ mod tests {
 
         state
             .store
-            .enqueue("default", 0, serde_json::json!("mp-test"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("mp-test")))
             .await
             .unwrap();
 
@@ -2428,7 +2431,7 @@ mod tests {
 
         state
             .store
-            .enqueue("default", 0, serde_json::json!("ct-test"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("ct-test")))
             .await
             .unwrap();
 
@@ -2447,7 +2450,7 @@ mod tests {
 
         let enqueued = state
             .store
-            .enqueue("default", 0, serde_json::json!("requeue-me"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("requeue-me")))
             .await
             .unwrap();
 
@@ -2487,12 +2490,12 @@ mod tests {
 
         let job_a = state
             .store
-            .enqueue("default", 0, serde_json::json!("acked"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("acked")))
             .await
             .unwrap();
         let job_b = state
             .store
-            .enqueue("default", 0, serde_json::json!("unacked"))
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("unacked")))
             .await
             .unwrap();
 
@@ -2547,17 +2550,17 @@ mod tests {
         // Enqueue 3 jobs.
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2594,12 +2597,12 @@ mod tests {
         // Enqueue 2 jobs.
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -2636,17 +2639,17 @@ mod tests {
         // Enqueue 3 jobs.
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2686,17 +2689,17 @@ mod tests {
         // Enqueue 3 jobs.
         state
             .store
-            .enqueue("q", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("q", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2728,7 +2731,7 @@ mod tests {
 
         state
             .store
-            .enqueue("q", 0, serde_json::json!("x"))
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("x")))
             .await
             .unwrap();
 
@@ -2754,12 +2757,12 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
 
@@ -2780,17 +2783,17 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("webhooks", 0, serde_json::json!("c"))
+            .enqueue(EnqueueOptions::new("webhooks", serde_json::json!("c")))
             .await
             .unwrap();
 
@@ -2815,12 +2818,12 @@ mod tests {
 
         state
             .store
-            .enqueue("emails", 0, serde_json::json!("a"))
+            .enqueue(EnqueueOptions::new("emails", serde_json::json!("a")))
             .await
             .unwrap();
         state
             .store
-            .enqueue("reports", 0, serde_json::json!("b"))
+            .enqueue(EnqueueOptions::new("reports", serde_json::json!("b")))
             .await
             .unwrap();
 
