@@ -757,6 +757,13 @@ async fn request_logging(req: Request, next: axum::middleware::Next) -> Response
     res
 }
 
+/// Generate a random u32 for use as a fallback worker ID.
+fn rand_id() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish() as u32
+}
+
 // --- Handlers ---
 
 /// Handle `GET /health`.
@@ -801,17 +808,27 @@ async fn enqueue(
     }
 
     match state.store.enqueue(opts).await.and_then(Job::try_from) {
-        Ok(job) => respond(
-            fmt,
-            StatusCode::CREATED,
-            &EnqueueResponse {
-                id: job.id,
-                queue: job.queue,
-                priority: job.priority,
-                status: job.status,
-                ready_at: job.ready_at,
-            },
-        ),
+        Ok(job) => {
+            tracing::debug!(
+                job_id = %job.id,
+                queue = %job.queue,
+                priority = job.priority,
+                status = %job.status,
+                ready_at = job.ready_at,
+                "job enqueued"
+            );
+            respond(
+                fmt,
+                StatusCode::CREATED,
+                &EnqueueResponse {
+                    id: job.id,
+                    queue: job.queue,
+                    priority: job.priority,
+                    status: job.status,
+                    ready_at: job.ready_at,
+                },
+            )
+        }
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
             respond(
@@ -832,7 +849,10 @@ async fn mark_completed(
     Path(id): Path<String>,
 ) -> Response {
     match state.store.mark_completed(&id).await {
-        Ok(true) => no_content(),
+        Ok(true) => {
+            tracing::debug!(job_id = %id, "job marked completed");
+            no_content()
+        }
         Ok(false) => respond(
             fmt,
             StatusCode::NOT_FOUND,
@@ -1062,9 +1082,21 @@ async fn take_jobs(
     TakeAccept(fmt): TakeAccept,
     State(state): State<Arc<AppState>>,
     Query(params): Query<TakeParams>,
+    headers: http::HeaderMap,
 ) -> Response {
     let prefetch = params.prefetch;
     let queues = params.queue.0;
+
+    // The client can provide a Worker-Id: header to specify its own ID that
+    // shows up in logs, but when one is not set we assign a new worker ID for
+    // each connection.
+    let worker_id = headers
+        .get("worker-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{:08x}", rand_id()));
+
     // Channel we'll use to emit events to the client. We reserve a slot
     // before dequeuing a job, so we never take work we can't deliver.
     let (tx, rx) = mpsc::channel::<TakeMessage>(1);
@@ -1078,103 +1110,47 @@ async fn take_jobs(
     let mut event_rx = state.store.subscribe();
     let mut shutdown = state.shutdown.clone();
 
-    tokio::spawn(async move {
-        // Maintain a set of in-flight job IDs. We need this because once we
-        // remove a job from the queue and return it to the client, the job
-        // will forever stay in the working queue until the client acknowledges
-        // or fails the job. If the client disconnects without doing this, we
-        // need to clean up any in-flight jobs by moving them back to the
-        // queue.
-        //
-        // In the extremely rare case of a crash or shutdown before the client
-        // finishes processing the job, recovery on server restart will move
-        // the job from the working set back into the queue.
-        let mut in_flight = HashSet::<String>::new();
+    // For visibility make sure empty queue list presents as "*" in logs.
+    let queues_display = if queues.is_empty() {
+        "*".to_string()
+    } else {
+        let mut sorted: Vec<_> = queues.iter().cloned().collect();
+        sorted.sort();
+        sorted.join(",")
+    };
 
-        // Pin the heartbeat timer outside the loop so it isn't reset
-        // when broadcast events wake the select. It is only reset
-        // after a heartbeat is actually sent.
-        let heartbeat_sleep = tokio::time::sleep(state.heartbeat_interval);
-        tokio::pin!(heartbeat_sleep);
+    // Open a span for the duration of the run loop (long-lived). All logs
+    // within the span are annotated with details of the span.
+    let span = tracing::debug_span!("take", worker_id = %worker_id, queues = %queues_display);
 
-        loop {
-            // Drain any pending events.
-            while let Ok(event) = event_rx.try_recv() {
-                if let StoreEvent::JobCompleted(id) = event {
-                    if in_flight.remove(&id) {
-                        let _ = state.global_in_flight.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some(v.saturating_sub(1)),
-                        );
-                    }
-                }
-            }
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            tracing::debug!(prefetch, "worker connected");
 
-            // Only attempt to take a job if the per-connection prefetch
-            // limit AND the global working limit haven't been reached.
-            let can_take = (prefetch == 0 || in_flight.len() < prefetch)
-                && (state.global_working_limit == 0
-                    || state.global_in_flight.load(Ordering::Relaxed) < state.global_working_limit);
+            // Maintain a set of in-flight job IDs. We need this because once we
+            // remove a job from the queue and return it to the client, the job
+            // will forever stay in the working queue until the client acknowledges
+            // or fails the job. If the client disconnects without doing this, we
+            // need to clean up any in-flight jobs by moving them back to the
+            // queue.
+            //
+            // In the extremely rare case of a crash or shutdown before the client
+            // finishes processing the job, recovery on server restart will move
+            // the job from the working set back into the queue.
+            let mut in_flight = HashSet::<String>::new();
 
-            if can_take {
-                // Wait until the client can accept a message before
-                // dequeuing. This ensures we never take a job we can't
-                // deliver.
-                let permit = tokio::select! {
-                    result = tx.reserve() => match result {
-                        Ok(permit) => permit,
-                        Err(_) => break, // client disconnected
-                    },
-                    _ = shutdown.changed() => break, // server shutting down
-                };
+            // Pin the heartbeat timer outside the loop so it isn't reset
+            // when broadcast events wake the select. It is only reset
+            // after a heartbeat is actually sent.
+            let heartbeat_sleep = tokio::time::sleep(state.heartbeat_interval);
+            tokio::pin!(heartbeat_sleep);
 
-                match state.store.take_next_job(&queues).await {
-                    Ok(Some(job)) => {
-                        in_flight.insert(job.id.clone());
-                        state.global_in_flight.fetch_add(1, Ordering::Relaxed);
-                        match Job::try_from(job) {
-                            Ok(job) => {
-                                permit.send(TakeMessage::Job(Arc::new(job)));
-                            }
-                            Err(e) => {
-                                tracing::error!(%e, "corrupt job data");
-                                break;
-                            }
-                        }
-                        // Reset the heartbeat timer since we just sent
-                        // data — the client knows we're alive.
-                        heartbeat_sleep
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + state.heartbeat_interval);
-                        continue;
-                    }
-                    Ok(None) => drop(permit),
-                    Err(e) => {
-                        tracing::error!(%e, "take_next_job failed");
-                        break;
-                    }
-                }
-            }
-
-            // No job available or at the working limit. Wait for a
-            // store event or heartbeat timeout. Any enqueue that
-            // happened between take_next_job() returning None and
-            // entering recv() is already buffered in the broadcast
-            // channel.
-            tokio::select! {
-                _ = &mut heartbeat_sleep => {
-                    if tx.send(TakeMessage::Heartbeat).await.is_err() {
-                        break;
-                    }
-                    // Reset for the next heartbeat.
-                    heartbeat_sleep
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + state.heartbeat_interval);
-                }
-                event = event_rx.recv() => {
-                    if let Ok(StoreEvent::JobCompleted(id)) = event {
+            loop {
+                // Drain any pending events.
+                while let Ok(event) = event_rx.try_recv() {
+                    if let StoreEvent::JobCompleted(id) = event {
                         if in_flight.remove(&id) {
+                            tracing::debug!(job_id = %id, "job completed");
                             let _ = state.global_in_flight.fetch_update(
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
@@ -1183,25 +1159,113 @@ async fn take_jobs(
                         }
                     }
                 }
-                _ = shutdown.changed() => break, // server shutting down
-            }
-        }
 
-        // The client disconnected. If there were any in-flight jobs re-queue
-        // them so other clients can pick them up.
-        for id in &in_flight {
-            if let Err(e) = state.store.requeue(id).await {
-                tracing::error!(job_id = %id, %e, "requeue failed");
-            }
-        }
+                // Only attempt to take a job if the per-connection prefetch
+                // limit AND the global working limit haven't been reached.
+                let can_take = (prefetch == 0 || in_flight.len() < prefetch)
+                    && (state.global_working_limit == 0
+                        || state.global_in_flight.load(Ordering::Relaxed)
+                            < state.global_working_limit);
 
-        // Bulk decrement the global in-flight count.
-        let _ = state
-            .global_in_flight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(in_flight.len() as u64))
-            });
-    });
+                if can_take {
+                    // Wait until the client can accept a message before
+                    // dequeuing. This ensures we never take a job we can't
+                    // deliver.
+                    let permit = tokio::select! {
+                        result = tx.reserve() => match result {
+                            Ok(permit) => permit,
+                            Err(_) => break, // client disconnected
+                        },
+                        _ = shutdown.changed() => break, // server shutting down
+                    };
+
+                    match state.store.take_next_job(&queues).await {
+                        Ok(Some(job)) => {
+                            in_flight.insert(job.id.clone());
+                            state.global_in_flight.fetch_add(1, Ordering::Relaxed);
+                            match Job::try_from(job) {
+                                Ok(job) => {
+                                    tracing::debug!(
+                                        job_id = %job.id,
+                                        queue = %job.queue,
+                                        priority = job.priority,
+                                        "job dispatched"
+                                    );
+                                    permit.send(TakeMessage::Job(Arc::new(job)));
+                                }
+                                Err(e) => {
+                                    tracing::error!(%e, "corrupt job data");
+                                    break;
+                                }
+                            }
+                            // Reset the heartbeat timer since we just sent
+                            // data — the client knows we're alive.
+                            heartbeat_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + state.heartbeat_interval);
+                            continue;
+                        }
+                        Ok(None) => drop(permit),
+                        Err(e) => {
+                            tracing::error!(%e, "take_next_job failed");
+                            break;
+                        }
+                    }
+                }
+
+                // No job available or at the working limit. Wait for a
+                // store event or heartbeat timeout. Any enqueue that
+                // happened between take_next_job() returning None and
+                // entering recv() is already buffered in the broadcast
+                // channel.
+                tokio::select! {
+                    _ = &mut heartbeat_sleep => {
+                        if tx.send(TakeMessage::Heartbeat).await.is_err() {
+                            break;
+                        }
+                        // Reset for the next heartbeat.
+                        heartbeat_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + state.heartbeat_interval);
+                    }
+                    event = event_rx.recv() => {
+                        if let Ok(StoreEvent::JobCompleted(id)) = event {
+                            if in_flight.remove(&id) {
+                                tracing::debug!(job_id = %id, "job completed");
+                                let _ = state.global_in_flight.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |v| Some(v.saturating_sub(1)),
+                                );
+                            }
+                        }
+                    }
+                    _ = shutdown.changed() => break, // server shutting down
+                }
+            }
+
+            // The client disconnected. If there were any in-flight jobs re-queue
+            // them so other clients can pick them up.
+            let in_flight_count = in_flight.len();
+            for id in &in_flight {
+                tracing::debug!(job_id = %id, "job requeued");
+                if let Err(e) = state.store.requeue(id).await {
+                    tracing::error!(job_id = %id, %e, "requeue failed");
+                }
+            }
+
+            tracing::debug!(in_flight = in_flight_count, "worker disconnected");
+
+            // Bulk decrement the global in-flight count.
+            let _ =
+                state
+                    .global_in_flight
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(in_flight.len() as u64))
+                    });
+        },
+        span,
+    ));
 
     // Build the response in the negotiated format.
     match fmt {
