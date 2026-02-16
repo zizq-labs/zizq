@@ -32,11 +32,7 @@
 
 use clap::{Parser, Subcommand};
 
-mod http;
-mod logging;
-mod scheduler;
-mod serve;
-mod store;
+use zanxio::{logging, serve};
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]

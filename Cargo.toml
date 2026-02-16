@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "BUSL-1.1"
 
+[lib]
+name = "zanxio"
+path = "src/lib.rs"
+
 [dependencies]
 fjall = "3.0.1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -22,3 +26,10 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 rmp = "0.8.15"
 tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+
+[[bench]]
+name = "throughput"
+harness = false
