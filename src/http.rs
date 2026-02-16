@@ -239,9 +239,7 @@ where
             if part.is_empty() {
                 continue;
             }
-            let value = part
-                .parse()
-                .map_err(serde::de::Error::custom)?;
+            let value = part.parse().map_err(serde::de::Error::custom)?;
             set.insert(value);
         }
         Ok(Self(set))
@@ -892,7 +890,11 @@ async fn list_jobs(
         opts = opts.from(from.clone());
     }
     if !params.status.is_empty() {
-        let statuses = params.status.iter().map(|s| store::JobStatus::from(*s)).collect();
+        let statuses = params
+            .status
+            .iter()
+            .map(|s| store::JobStatus::from(*s))
+            .collect();
         opts = opts.statuses(statuses);
     }
     if !params.queue.is_empty() {
@@ -2215,8 +2217,7 @@ mod tests {
         state.store.take_next_job(&HashSet::new()).await.unwrap();
 
         // Ready + working in emails + reports (excludes webhooks).
-        let req =
-            empty_request("GET", "/jobs?queue=emails;reports&status=ready;working");
+        let req = empty_request("GET", "/jobs?queue=emails;reports&status=ready;working");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -2353,7 +2354,10 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("default", serde_json::json!("sse-test")))
+            .enqueue(EnqueueOptions::new(
+                "default",
+                serde_json::json!("sse-test"),
+            ))
             .await
             .unwrap();
 
@@ -2450,7 +2454,10 @@ mod tests {
 
         let enqueued = state
             .store
-            .enqueue(EnqueueOptions::new("default", serde_json::json!("requeue-me")))
+            .enqueue(EnqueueOptions::new(
+                "default",
+                serde_json::json!("requeue-me"),
+            ))
             .await
             .unwrap();
 
