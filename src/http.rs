@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -29,8 +30,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-
-use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
 
 /// Default priority for jobs that don't specify one.
 ///
@@ -732,7 +731,30 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
         .fallback(not_found)
+        .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
+}
+
+// --- Middleware ---
+
+/// Log each request with method, path, status, and latency.
+async fn request_logging(req: Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let start = std::time::Instant::now();
+
+    let res = next.run(req).await;
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        method = %method,
+        path = %uri,
+        status = res.status().as_u16(),
+        latency_ms = elapsed.as_millis() as u64,
+        "request"
+    );
+
+    res
 }
 
 // --- Handlers ---
