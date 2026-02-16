@@ -272,31 +272,25 @@ pub struct Job {
     pub ready_at: u64,
 }
 
-impl From<store::Job> for Job {
-    fn from(job: store::Job) -> Self {
-        Self {
-            id: job.id,
-            queue: job.queue,
-            priority: job.priority,
-            status: store::JobStatus::try_from(job.status)
-                .unwrap_or(store::JobStatus::Ready)
-                .into(),
-            payload: job.payload,
-            ready_at: job.ready_at,
-        }
-    }
-}
+impl TryFrom<store::Job> for Job {
+    type Error = store::StoreError;
 
-impl From<Job> for store::Job {
-    fn from(job: Job) -> Self {
-        Self {
+    fn try_from(job: store::Job) -> Result<Self, Self::Error> {
+        let status = store::JobStatus::try_from(job.status).map_err(|v| {
+            store::StoreError::Corruption(format!(
+                "job {} has unrecognized status byte: {v}",
+                job.id
+            ))
+        })?;
+
+        Ok(Self {
             id: job.id,
             queue: job.queue,
             priority: job.priority,
+            status: status.into(),
             payload: job.payload,
-            status: store::JobStatus::from(job.status).into(),
             ready_at: job.ready_at,
-        }
+        })
     }
 }
 
@@ -341,6 +335,10 @@ struct EnqueueRequest {
 
     /// Arbitrary job payload provided to the client on dequeue.
     payload: serde_json::Value,
+
+    /// Optional timestamp (ms since epoch) when the job becomes eligible to
+    /// run. If omitted or in the past, the job is immediately ready.
+    ready_at: Option<u64>,
 }
 
 /// Query parameters for `GET /jobs`.
@@ -441,6 +439,12 @@ struct EnqueueResponse {
 
     /// The priority assigned to this job.
     priority: u16,
+
+    /// Current lifecycle status.
+    status: JobStatus,
+
+    /// When the job becomes eligible to run (milliseconds since Unix epoch).
+    ready_at: u64,
 }
 
 /// Shared server state, passed to all request handlers.
@@ -768,13 +772,13 @@ async fn enqueue(
 
     let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
 
-    match state
-        .store
-        .enqueue(
-            store::EnqueueOptions::new(enqueue_req.queue, enqueue_req.payload).priority(priority),
-        )
-        .await
-    {
+    let mut opts =
+        store::EnqueueOptions::new(enqueue_req.queue, enqueue_req.payload).priority(priority);
+    if let Some(ready_at) = enqueue_req.ready_at {
+        opts = opts.ready_at(ready_at);
+    }
+
+    match state.store.enqueue(opts).await.and_then(Job::try_from) {
         Ok(job) => respond(
             fmt,
             StatusCode::CREATED,
@@ -782,6 +786,8 @@ async fn enqueue(
                 id: job.id,
                 queue: job.queue,
                 priority: job.priority,
+                status: job.status,
+                ready_at: job.ready_at,
             },
         ),
         Err(e) => {
@@ -832,7 +838,19 @@ async fn get_job(
     Path(id): Path<String>,
 ) -> Response {
     match state.store.get_job(&id).await {
-        Ok(Some(job)) => respond(fmt, StatusCode::OK, &Job::from(job)),
+        Ok(Some(job)) => match Job::try_from(job) {
+            Ok(job) => respond(fmt, StatusCode::OK, &job),
+            Err(e) => {
+                tracing::error!(%e, "corrupt job data");
+                respond(
+                    fmt,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &ErrorResponse {
+                        error: "internal server error".into(),
+                    },
+                )
+            }
+        },
         Ok(None) => respond(
             fmt,
             StatusCode::NOT_FOUND,
@@ -929,20 +947,32 @@ async fn list_jobs(
                 )
             });
 
-            let jobs = page.jobs.into_iter().map(Job::from).collect();
+            let jobs: Result<Vec<Job>, _> = page.jobs.into_iter().map(Job::try_from).collect();
 
-            respond(
-                fmt,
-                StatusCode::OK,
-                &ListJobsResponse {
-                    jobs,
-                    pages: ListJobsPages {
-                        self_url,
-                        next,
-                        prev,
+            match jobs {
+                Ok(jobs) => respond(
+                    fmt,
+                    StatusCode::OK,
+                    &ListJobsResponse {
+                        jobs,
+                        pages: ListJobsPages {
+                            self_url,
+                            next,
+                            prev,
+                        },
                     },
-                },
-            )
+                ),
+                Err(e) => {
+                    tracing::error!(%e, "corrupt job data");
+                    respond(
+                        fmt,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse {
+                            error: "internal server error".into(),
+                        },
+                    )
+                }
+            }
         }
         Err(e) => {
             tracing::error!(%e, "list_jobs failed");
@@ -1081,7 +1111,15 @@ async fn take_jobs(
                     Ok(Some(job)) => {
                         in_flight.insert(job.id.clone());
                         state.global_in_flight.fetch_add(1, Ordering::Relaxed);
-                        permit.send(TakeMessage::Job(Arc::new(Job::from(job))));
+                        match Job::try_from(job) {
+                            Ok(job) => {
+                                permit.send(TakeMessage::Job(Arc::new(job)));
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "corrupt job data");
+                                break;
+                            }
+                        }
                         // Reset the heartbeat timer since we just sent
                         // data — the client knows we're alive.
                         heartbeat_sleep
@@ -1509,6 +1547,42 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert!(body["error"].as_str().unwrap().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_status_and_ready_at() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "q", "payload": "x"}),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["status"], "ready");
+        assert!(body["ready_at"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_future_ready_at_returns_scheduled() {
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"queue": "q", "payload": "x", "ready_at": future_ms}),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["status"], "scheduled");
+        assert_eq!(body["ready_at"], future_ms);
     }
 
     #[tokio::test]

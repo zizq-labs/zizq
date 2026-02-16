@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 set -e
 
-cargo fmt -- --check
+cargo fmt
+git diff --name-only --diff-filter=d -- '*.rs' | xargs -r git add
