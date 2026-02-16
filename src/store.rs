@@ -308,8 +308,8 @@ impl EnqueueOptions {
 /// Events broadcast by the store when job state changes.
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
-    /// A new job was enqueued (or requeued) and is available for processing.
-    JobEnqueued,
+    /// A job became ready for processing (newly enqueued or requeued).
+    JobReady,
 
     /// A job was successfully completed and removed.
     JobCompleted(String),
@@ -599,7 +599,7 @@ impl Store {
         .await??;
 
         if !matches!(JobStatus::try_from(job.status), Ok(JobStatus::Scheduled)) {
-            let _ = self.event_tx.send(StoreEvent::JobEnqueued);
+            let _ = self.event_tx.send(StoreEvent::JobReady);
         }
 
         Ok(job)
@@ -846,7 +846,7 @@ impl Store {
         .await??;
 
         if requeued {
-            let _ = self.event_tx.send(StoreEvent::JobEnqueued);
+            let _ = self.event_tx.send(StoreEvent::JobReady);
         }
 
         Ok(requeued)
@@ -1577,7 +1577,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobEnqueued));
+        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobReady));
     }
 
     #[tokio::test]
@@ -1610,7 +1610,7 @@ mod tests {
         let mut rx = store.subscribe();
         store.requeue(&taken.id).await.unwrap();
 
-        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobEnqueued));
+        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobReady));
     }
 
     #[tokio::test]
