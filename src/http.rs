@@ -27,7 +27,7 @@ use axum::response::Response;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -1077,6 +1077,36 @@ fn default_prefetch() -> usize {
     DEFAULT_PREFETCH
 }
 
+/// Re-check each in-flight job against the store and remove any that are no
+/// longer in the working state (e.g. completed while we were lagged).
+///
+/// This is the recovery path for broadcast channel overflow. It's not a hot
+/// path — it only runs when we've missed events, which requires 1024+
+/// events to buffer while this task is blocked.
+async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashSet<String>) {
+    let mut gone = Vec::new();
+    for id in in_flight.iter() {
+        match state.store.get_job(id).await {
+            Ok(Some(job)) if job.status == store::JobStatus::Working as u8 => {
+                // Still working — keep tracking it.
+            }
+            _ => {
+                // Missing (completed/deleted) or no longer working.
+                gone.push(id.clone());
+            }
+        }
+    }
+    for id in &gone {
+        in_flight.remove(id);
+        tracing::debug!(job_id = %id, "reconciled: job no longer in-flight");
+        let _ = state
+            .global_in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+}
+
 /// Handle `GET /jobs/take` — take jobs from the queue and deliver to workers.
 async fn take_jobs(
     TakeAccept(fmt): TakeAccept,
@@ -1146,17 +1176,34 @@ async fn take_jobs(
             tokio::pin!(heartbeat_sleep);
 
             loop {
-                // Drain any pending events.
-                while let Ok(event) = event_rx.try_recv() {
-                    if let StoreEvent::JobCompleted(id) = event {
-                        if in_flight.remove(&id) {
-                            tracing::debug!(job_id = %id, "job completed");
-                            let _ = state.global_in_flight.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |v| Some(v.saturating_sub(1)),
-                            );
+                // Drain any pending events. If the broadcast channel
+                // overflowed (Lagged), we may have missed some
+                // JobCompleted events, so reconcile our in-flight set
+                // against the store.
+                loop {
+                    match event_rx.try_recv() {
+                        Ok(StoreEvent::JobCompleted(id)) => {
+                            if in_flight.remove(&id) {
+                                tracing::debug!(job_id = %id, "job completed");
+                                let _ = state.global_in_flight.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |v| Some(v.saturating_sub(1)),
+                                );
+                            }
                         }
+                        Ok(_) => {}
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                missed = n,
+                                "broadcast lagged, reconciling in-flight set"
+                            );
+                            reconcile_in_flight(&state, &mut in_flight).await;
+                            // Keep draining — there may be more buffered
+                            // events after the lag point.
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Closed) => break,
                     }
                 }
 
@@ -1229,15 +1276,28 @@ async fn take_jobs(
                             .reset(tokio::time::Instant::now() + state.heartbeat_interval);
                     }
                     event = event_rx.recv() => {
-                        if let Ok(StoreEvent::JobCompleted(id)) = event {
-                            if in_flight.remove(&id) {
-                                tracing::debug!(job_id = %id, "job completed");
-                                let _ = state.global_in_flight.fetch_update(
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                    |v| Some(v.saturating_sub(1)),
-                                );
+                        match event {
+                            Ok(StoreEvent::JobCompleted(id)) => {
+                                if in_flight.remove(&id) {
+                                    tracing::debug!(job_id = %id, "job completed");
+                                    let _ = state.global_in_flight.fetch_update(
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                        |v| Some(v.saturating_sub(1)),
+                                    );
+                                }
                             }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(
+                                    missed = n,
+                                    "broadcast lagged, reconciling in-flight set"
+                                );
+                                reconcile_in_flight(
+                                    &state,
+                                    &mut in_flight,
+                                ).await;
+                            }
+                            _ => {}
                         }
                     }
                     _ = shutdown.changed() => break, // server shutting down
