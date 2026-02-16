@@ -66,6 +66,14 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         shutdown: shutdown_rx,
     });
 
+    // Start the background scheduler that promotes scheduled jobs to Ready
+    // once their ready_at timestamp arrives.
+    let scheduler_shutdown = state.shutdown.clone();
+    tokio::spawn(crate::scheduler::run(
+        state.store.clone(),
+        scheduler_shutdown,
+    ));
+
     // Set up the TCP socket for incoming connections.
     let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = TcpListener::bind(addr).await?;

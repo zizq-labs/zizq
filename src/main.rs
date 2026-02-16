@@ -20,18 +20,21 @@
 //!
 //! The following environment variables are also supported:
 //!
-//! ZANXIO_ROOT_DIR:      Same as --root-dir, specifies where Zanxio stores data
-//! ZANXIO_HOST:          Same as --host, specifies the address to bind to
-//! ZANXIO_PORT:          Same as --port, specifies the port to listen on
-//! ZANXIO_LOG_LEVEL:     Same as --log-level, specifies how verbose logs are
-//! ZANXIO_LOG_FILTER:    EnvFilter string for the tracing crate (overrides
-//!                       --log-level). This is useful when debugging
-//!                       dependencies.
+//! ZANXIO_ROOT_DIR:             Same as --root-dir, specifies where Zanxio stores data
+//! ZANXIO_HOST:                 Same as --host, specifies the address to bind to
+//! ZANXIO_PORT:                 Same as --port, specifies the port to listen on
+//! ZANXIO_LOG_LEVEL:            Same as --log-level, specifies how verbose logs are
+//! ZANXIO_LOG_FILTER:           EnvFilter string for the tracing crate (overrides
+//!                              --log-level). This is useful when debugging
+//!                              dependencies.
+//! ZANXIO_SCHEDULER_BATCH_SIZE: Max scheduled jobs to promote per iteration
+//!                              (default: 200).
 
 use clap::{Parser, Subcommand};
 
 mod http;
 mod logging;
+mod scheduler;
 mod serve;
 mod store;
 

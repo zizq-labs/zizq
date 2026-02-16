@@ -313,9 +313,16 @@ pub enum StoreEvent {
 
     /// A job was successfully completed and removed.
     JobCompleted(String),
+
+    /// A job was enqueued with a future `ready_at` timestamp.
+    ///
+    /// The scheduler listens for this to wake up early if the new job is
+    /// due sooner than whatever it was sleeping until.
+    JobScheduled,
 }
 
 /// Provides a handle to the persistent store.
+#[derive(Clone)]
 pub struct Store {
     /// Connection to the underlying database.
     db: SingleWriterTxDatabase,
@@ -598,8 +605,20 @@ impl Store {
         })
         .await??;
 
-        if !matches!(JobStatus::try_from(job.status), Ok(JobStatus::Scheduled)) {
-            let _ = self.event_tx.send(StoreEvent::JobReady);
+        match JobStatus::try_from(job.status) {
+            Ok(JobStatus::Ready) => {
+                let _ = self.event_tx.send(StoreEvent::JobReady);
+            }
+            Ok(JobStatus::Scheduled) => {
+                let _ = self.event_tx.send(StoreEvent::JobScheduled);
+            }
+            _ => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    status = job.status,
+                    "enqueue produced unexpected status"
+                );
+            }
         }
 
         Ok(job)
@@ -1090,6 +1109,135 @@ impl Store {
             })
         })
         .await?
+    }
+
+    /// Return up to `limit` due scheduled jobs, plus the next wake-up time.
+    ///
+    /// Scans `scheduled_jobs_by_ready_at` from the front (earliest first)
+    /// and collects jobs whose `ready_at <= now`. Stops as soon as it hits
+    /// a future job or exhausts the limit.
+    ///
+    /// Returns `(due_jobs, next_ready_at)` where `next_ready_at` is the
+    /// `ready_at` of the first future job (if any). The scheduler uses
+    /// this to know how long to sleep before the next scan.
+    pub async fn next_scheduled(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<(Vec<Job>, Option<u64>), StoreError> {
+        let db = self.db.clone();
+        let jobs = self.jobs.clone();
+        let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
+
+        task::spawn_blocking(move || -> Result<(Vec<Job>, Option<u64>), StoreError> {
+            let snapshot = db.read_tx();
+            let mut result = Vec::new();
+            for entry in snapshot.range::<&[u8], _>(&scheduled_jobs_by_ready_at, ..) {
+                let (key, _) = entry.into_inner()?;
+                // First 8 bytes are the BE u64 ready_at timestamp.
+                let ts_bytes: [u8; 8] = key[..8].try_into().map_err(|_| {
+                    StoreError::Corruption(format!(
+                        "scheduled index key too short ({} bytes, expected >= 9)",
+                        key.len(),
+                    ))
+                })?;
+                let ready_at = u64::from_be_bytes(ts_bytes);
+                if ready_at > now {
+                    // This job (and everything after) is in the future.
+                    return Ok((result, Some(ready_at)));
+                }
+                if result.len() >= limit {
+                    // Hit the batch cap but there are more due jobs. Return
+                    // without a next_ready_at so the caller loops immediately.
+                    return Ok((result, None));
+                }
+                // Job ID starts after the 8-byte timestamp + 1-byte separator.
+                let job_id = &key[9..];
+                let job_bytes = jobs.get(job_id)?.ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "job in scheduled_jobs_by_ready_at but missing from jobs keyspace: {:?}",
+                        String::from_utf8_lossy(job_id),
+                    ))
+                })?;
+                result.push(rmp_serde::from_slice(&job_bytes)?);
+            }
+            // Exhausted the index — no more scheduled jobs at all.
+            Ok((result, None))
+        })
+        .await?
+    }
+
+    /// Promote a single scheduled job to the Ready state.
+    ///
+    /// Atomically removes the job from the scheduled index, swaps its
+    /// status from Scheduled to Ready, and inserts it into the priority
+    /// indexes so it becomes takeable.
+    ///
+    /// Subscribers are notified with `StoreEvent::JobReady`.
+    pub async fn promote_scheduled(&self, job: &Job) -> Result<(), StoreError> {
+        let db = self.db.clone();
+        let jobs = self.jobs.clone();
+        let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
+        let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
+        let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
+
+        let id = job.id.clone();
+        let queue = job.queue.clone();
+        let priority = job.priority;
+        let ready_at = job.ready_at;
+
+        task::spawn_blocking(move || -> Result<(), StoreError> {
+            let mut tx = db.write_tx();
+
+            // Re-read the job inside the write lock to confirm it's still
+            // scheduled (a concurrent promote or deletion could have removed
+            // it).
+            let job_bytes = match jobs.get(&id)? {
+                Some(bytes) => bytes,
+                None => return Ok(()), // Already gone.
+            };
+            let current: Job = rmp_serde::from_slice(&job_bytes)?;
+            if current.status != JobStatus::Scheduled as u8 {
+                return Ok(()); // No longer scheduled.
+            }
+
+            // Remove from scheduled index.
+            let scheduled_key = make_scheduled_key(ready_at, &id);
+            tx.remove(&scheduled_jobs_by_ready_at, &scheduled_key);
+
+            // Swap status indexes: Scheduled -> Ready.
+            let old_status_key = make_status_key(JobStatus::Scheduled, &id);
+            let new_status_key = make_status_key(JobStatus::Ready, &id);
+            tx.remove(&jobs_by_status, &old_status_key);
+            tx.insert(&jobs_by_status, &new_status_key, b"");
+
+            let old_queue_status_key = make_queue_status_key(&queue, JobStatus::Scheduled, &id);
+            let new_queue_status_key = make_queue_status_key(&queue, JobStatus::Ready, &id);
+            tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
+            tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
+
+            // Insert into priority indexes so the job is takeable.
+            let priority_key = make_priority_key(priority, &id);
+            let queue_priority_key = make_queue_priority_key(&queue, priority, &id);
+            tx.insert(&ready_jobs_by_priority, &priority_key, b"");
+            tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
+
+            // Update the job record itself.
+            let mut updated = current;
+            updated.status = JobStatus::Ready.into();
+            let updated_bytes = rmp_serde::to_vec_named(&updated)?;
+            tx.insert(&jobs, &id, &updated_bytes);
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await??;
+
+        let _ = self.event_tx.send(StoreEvent::JobReady);
+
+        Ok(())
     }
 }
 
@@ -2755,5 +2903,238 @@ mod tests {
         assert_eq!(job.status, u8::from(JobStatus::Ready));
         assert!(job.ready_at >= before);
         assert!(job.ready_at <= after);
+    }
+
+    // --- next_scheduled / promote_scheduled tests ---
+
+    #[tokio::test]
+    async fn promote_scheduled_moves_due_job_to_ready() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Enqueue a job scheduled in the future so it enters Scheduled state.
+        let job = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(now + 60_000))
+            .await
+            .unwrap();
+        assert_eq!(job.status, u8::from(JobStatus::Scheduled));
+
+        // Pretend time has passed: ask for jobs due at ready_at.
+        let (batch, _) = store.next_scheduled(now + 60_000, 10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        store.promote_scheduled(&batch[0]).await.unwrap();
+
+        // It should now be takeable.
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().id, job.id);
+    }
+
+    #[tokio::test]
+    async fn next_scheduled_skips_future_jobs() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let future_ms = now + 3_600_000; // 1 hour from now
+
+        let job = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(future_ms))
+            .await
+            .unwrap();
+
+        // Asking with current time returns no due jobs, but reports the
+        // next ready_at so the caller knows when to wake up.
+        let (batch, next) = store.next_scheduled(now, 10).await.unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(next, Some(future_ms));
+
+        // Still not takeable.
+        assert!(
+            store
+                .take_next_job(&HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // But asking with future time returns it.
+        let (batch, _) = store.next_scheduled(future_ms, 10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, job.id);
+    }
+
+    #[tokio::test]
+    async fn next_scheduled_respects_limit() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let future = now + 60_000;
+
+        for i in 0..5u64 {
+            store
+                .enqueue(EnqueueOptions::new("q", serde_json::json!(i)).ready_at(future + i))
+                .await
+                .unwrap();
+        }
+
+        // All 5 are due at future+10, ask for only 2.
+        let (batch, next) = store.next_scheduled(future + 10, 2).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        // next_ready_at is None because we hit the limit, not because there
+        // are no more scheduled jobs.
+        assert_eq!(next, None);
+
+        // Ask for all of them.
+        let (batch, _) = store.next_scheduled(future + 10, 10).await.unwrap();
+        assert_eq!(batch.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn promote_scheduled_fires_job_ready_event() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let future = now + 60_000;
+
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(future))
+            .await
+            .unwrap();
+
+        let mut rx = store.subscribe();
+        let (batch, _) = store.next_scheduled(future, 10).await.unwrap();
+        store.promote_scheduled(&batch[0]).await.unwrap();
+
+        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobReady));
+    }
+
+    #[tokio::test]
+    async fn next_scheduled_returns_earliest_first() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let base = now + 60_000;
+
+        // Enqueue in reverse order to confirm sorting is by ready_at.
+        let later = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("later")).ready_at(base + 5000))
+            .await
+            .unwrap();
+        let earlier = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("earlier")).ready_at(base + 1000))
+            .await
+            .unwrap();
+
+        let (batch, _) = store.next_scheduled(base + 5000, 10).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].id, earlier.id);
+        assert_eq!(batch[1].id, later.id);
+    }
+
+    #[tokio::test]
+    async fn next_scheduled_returns_empty_when_no_scheduled_jobs() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Enqueue a ready job (no ready_at).
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")))
+            .await
+            .unwrap();
+
+        let (batch, next) = store.next_scheduled(now, 10).await.unwrap();
+        assert!(batch.is_empty());
+        // No scheduled jobs at all, so no next_ready_at either.
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn enqueue_scheduled_fires_job_scheduled_event() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+        let future = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(future))
+            .await
+            .unwrap();
+
+        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobScheduled));
+    }
+
+    #[tokio::test]
+    async fn promote_scheduled_is_idempotent() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("a")).ready_at(future))
+            .await
+            .unwrap();
+
+        let (batch, _) = store.next_scheduled(future, 10).await.unwrap();
+        store.promote_scheduled(&batch[0]).await.unwrap();
+
+        // Promoting again should be a no-op (job is already Ready).
+        store.promote_scheduled(&job).await.unwrap();
+
+        // Should still be takeable exactly once.
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().id, job.id);
+        assert!(
+            store
+                .take_next_job(&HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn next_scheduled_returns_next_ready_at_for_mixed_batch() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // One due job and one future job.
+        let due = store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("due")).ready_at(now + 100))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new("q", serde_json::json!("future")).ready_at(now + 60_000))
+            .await
+            .unwrap();
+
+        // Ask as of now + 200: only the first job is due.
+        let (batch, next) = store.next_scheduled(now + 200, 10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, due.id);
+        assert_eq!(next, Some(now + 60_000));
     }
 }
