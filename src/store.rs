@@ -1239,6 +1239,86 @@ impl Store {
 
         Ok(())
     }
+
+    /// Recover orphaned working jobs at startup.
+    ///
+    /// If the server crashes while jobs are in the `Working` state, those
+    /// jobs are stuck — no client is processing them. This method scans the
+    /// status index for all Working jobs and atomically moves them back to
+    /// Ready so they can be retaken.
+    ///
+    /// Must be called before any subscribers exist (no events are fired).
+    pub async fn recover_working_jobs(&self) -> Result<usize, StoreError> {
+        let db = self.db.clone();
+        let jobs = self.jobs.clone();
+        let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
+        let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
+
+        task::spawn_blocking(move || -> Result<usize, StoreError> {
+            // Scan the status index for all Working jobs.
+            // Working = 2, so the prefix range is [2, 0]..[3, 0].
+            let start: Vec<u8> = vec![JobStatus::Working as u8, 0];
+            let end: Vec<u8> = vec![JobStatus::Working as u8 + 1, 0];
+            let range = (Bound::Included(start), Bound::Excluded(end));
+
+            // Collect IDs first — we can't hold an iterator across the write tx.
+            let snapshot = db.read_tx();
+            let working_ids: Vec<String> = snapshot
+                .range::<Vec<u8>, _>(&jobs_by_status, range)
+                .map(|entry| {
+                    let (key, _) = entry.into_inner().expect("status index read failed");
+                    // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
+                    String::from_utf8(key[2..].to_vec()).expect("job ID is not valid UTF-8")
+                })
+                .collect();
+            drop(snapshot);
+
+            if working_ids.is_empty() {
+                return Ok(0);
+            }
+
+            let count = working_ids.len();
+            let mut tx = db.write_tx();
+
+            for id in &working_ids {
+                let job_bytes = jobs.get(id)?.ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "working job missing from jobs keyspace: {id:?}"
+                    ))
+                })?;
+                let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+
+                // Swap status indexes: Working -> Ready.
+                let old_status_key = make_status_key(JobStatus::Working, id);
+                let new_status_key = make_status_key(JobStatus::Ready, id);
+                tx.remove(&jobs_by_status, &old_status_key);
+                tx.insert(&jobs_by_status, &new_status_key, b"");
+
+                let old_queue_status_key =
+                    make_queue_status_key(&job.queue, JobStatus::Working, id);
+                let new_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, id);
+                tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
+                tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
+
+                // Insert into priority indexes so the jobs are takeable.
+                let priority_key = make_priority_key(job.priority, id);
+                let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, id);
+                tx.insert(&ready_jobs_by_priority, &priority_key, b"");
+                tx.insert(&ready_jobs_by_queue_and_priority, &queue_priority_key, b"");
+
+                // Update the job record itself.
+                job.status = JobStatus::Ready.into();
+                let updated_bytes = rmp_serde::to_vec_named(&job)?;
+                tx.insert(&jobs, id, &updated_bytes);
+            }
+
+            tx.commit()?;
+            Ok(count)
+        })
+        .await?
+    }
 }
 
 /// Base-36 alphabet (0-9, a-z) for compact, lexicographically sortable keys.
@@ -3136,5 +3216,114 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, due.id);
         assert_eq!(next, Some(now + 60_000));
+    }
+
+    #[tokio::test]
+    async fn recover_working_jobs_moves_working_to_ready() {
+        let store = test_store();
+        let job = store
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
+            .await
+            .unwrap();
+
+        // Take the job so it becomes Working.
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        assert_eq!(taken.id, job.id);
+
+        // Nothing left to take.
+        assert!(
+            store
+                .take_next_job(&HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Recover should move it back to Ready.
+        let recovered = store.recover_working_jobs().await.unwrap();
+        assert_eq!(recovered, 1);
+
+        // The job should be takeable again.
+        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        assert_eq!(retaken.id, job.id);
+    }
+
+    #[tokio::test]
+    async fn recover_working_jobs_returns_zero_when_none_working() {
+        let store = test_store();
+
+        // Enqueue a job but don't take it — it stays Ready.
+        store
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
+            .await
+            .unwrap();
+
+        let recovered = store.recover_working_jobs().await.unwrap();
+        assert_eq!(recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn recover_working_jobs_preserves_priority() {
+        let store = test_store();
+
+        // Enqueue two jobs at different priorities.
+        let low = store
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("low")).priority(10))
+            .await
+            .unwrap();
+        let high = store
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("high")).priority(1))
+            .await
+            .unwrap();
+
+        // Take both so they become Working.
+        store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+
+        // Recover both.
+        let recovered = store.recover_working_jobs().await.unwrap();
+        assert_eq!(recovered, 2);
+
+        // They should come back in priority order (high first, then low).
+        let first = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let second = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        assert_eq!(first.id, high.id);
+        assert_eq!(second.id, low.id);
+    }
+
+    #[tokio::test]
+    async fn recover_working_jobs_ignores_other_statuses() {
+        let store = test_store();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // A Ready job.
+        let ready = store
+            .enqueue(EnqueueOptions::new("default", serde_json::json!("ready")))
+            .await
+            .unwrap();
+
+        // A Scheduled job (far in the future).
+        let scheduled = store
+            .enqueue(
+                EnqueueOptions::new("default", serde_json::json!("scheduled"))
+                    .ready_at(now + 600_000),
+            )
+            .await
+            .unwrap();
+
+        // Recover should find nothing.
+        let recovered = store.recover_working_jobs().await.unwrap();
+        assert_eq!(recovered, 0);
+
+        // The ready job is still takeable.
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        assert_eq!(taken.id, ready.id);
+
+        // The scheduled job is still in the scheduled index.
+        let fetched = store.get_job(&scheduled.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, JobStatus::Scheduled as u8);
     }
 }
