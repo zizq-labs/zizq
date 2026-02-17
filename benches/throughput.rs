@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -50,6 +51,15 @@ enum Persistence {
 enum Format {
     Json,
     MsgPack,
+}
+
+/// How acks are dispatched relative to stream reads.
+#[derive(Clone, Copy)]
+enum AckStrategy {
+    /// Wait for ack response before reading the next job from the stream.
+    Sequential,
+    /// Fire ack without waiting; overlap with next job read via select!.
+    Overlapped,
 }
 
 /// Fully describes how a benchmark talks to the server.
@@ -110,6 +120,14 @@ impl BenchConfig {
     /// MIME type for the `Accept` header.
     fn accept(&self) -> &'static str {
         self.content_type()
+    }
+
+    /// Accept header value for streaming `GET /jobs/take`.
+    fn stream_accept(&self) -> &'static str {
+        match self.format {
+            Format::Json => "application/x-ndjson",
+            Format::MsgPack => "application/vnd.zanxio.msgpack-stream",
+        }
     }
 
     /// Serialize a value in the configured format.
@@ -293,6 +311,272 @@ async fn enqueue_concurrent(cfg: &BenchConfig, base_url: &str, n: usize) -> Dura
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: Dequeue (stream + ack)
+// ---------------------------------------------------------------------------
+
+/// Minimal deserialization target — we only need the job id for acking.
+#[derive(Deserialize)]
+struct TakeJob {
+    id: String,
+}
+
+/// Format-aware stream reader that wraps a `reqwest::Response` and yields
+/// deserialized job objects. Handles both NDJSON (line-buffered text) and
+/// length-prefixed msgpack (binary).
+enum JobStream {
+    Ndjson {
+        resp: reqwest::Response,
+        buf: String,
+    },
+    MsgPack {
+        resp: reqwest::Response,
+        buf: Vec<u8>,
+    },
+}
+
+impl JobStream {
+    fn new(format: Format, resp: reqwest::Response) -> Self {
+        match format {
+            Format::Json => JobStream::Ndjson {
+                resp,
+                buf: String::new(),
+            },
+            Format::MsgPack => JobStream::MsgPack {
+                resp,
+                buf: Vec::new(),
+            },
+        }
+    }
+
+    /// Read the next job from the stream, returning `None` when the stream
+    /// closes (server sent EOF).
+    async fn next_job(&mut self) -> Option<TakeJob> {
+        match self {
+            JobStream::Ndjson { resp, buf } => {
+                // Buffer chunks and split on newlines. Empty lines are
+                // heartbeats — skip them and keep reading.
+                loop {
+                    if let Some(pos) = buf.find('\n') {
+                        let line: String = buf.drain(..=pos).collect();
+                        let line = line.trim();
+                        if line.is_empty() {
+                            // Heartbeat — skip.
+                            continue;
+                        }
+                        return Some(serde_json::from_str(line).unwrap());
+                    }
+                    // Need more data from the network.
+                    let chunk = resp.chunk().await.ok()??;
+                    buf.push_str(std::str::from_utf8(&chunk).unwrap());
+                }
+            }
+            JobStream::MsgPack { resp, buf } => {
+                // Length-prefixed binary framing: 4-byte BE u32 length,
+                // then that many bytes of msgpack payload. Zero length
+                // means heartbeat.
+                loop {
+                    // Accumulate at least 4 bytes for the length prefix.
+                    while buf.len() < 4 {
+                        let chunk = resp.chunk().await.ok()??;
+                        buf.extend_from_slice(&chunk);
+                    }
+                    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    buf.drain(..4);
+
+                    if len == 0 {
+                        // Heartbeat — skip.
+                        continue;
+                    }
+
+                    // Accumulate the full msgpack payload.
+                    while buf.len() < len {
+                        let chunk = resp.chunk().await.ok()??;
+                        buf.extend_from_slice(&chunk);
+                    }
+                    let payload: Vec<u8> = buf.drain(..len).collect();
+                    return Some(rmp_serde::from_slice(&payload).unwrap());
+                }
+            }
+        }
+    }
+}
+
+/// Enqueue N jobs to a given queue as untimed setup for dequeue benchmarks.
+/// Always uses JSON for simplicity — the format being benchmarked is the
+/// stream/ack format, not the enqueue format.
+async fn pre_enqueue(base_url: &str, queue: &str, n: usize) {
+    let client = Client::builder().tcp_nodelay(true).build().unwrap();
+    let url = format!("{base_url}/jobs");
+
+    for i in 0..n {
+        let body = EnqueueBody {
+            queue,
+            payload: json!({"i": i}),
+        };
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "pre_enqueue failed: {}",
+            resp.status()
+        );
+        let _ = resp.bytes().await;
+    }
+}
+
+/// Take N jobs from a stream and ack each one. Runs as one of potentially
+/// many concurrent workers.
+async fn dequeue_worker(
+    cfg: &BenchConfig,
+    ack_strategy: AckStrategy,
+    base_url: &str,
+    queue: &str,
+    prefetch: u64,
+    acked: Arc<AtomicU64>,
+    target: u64,
+    done_tx: Arc<watch::Sender<bool>>,
+    mut done_rx: watch::Receiver<bool>,
+) {
+    let client = cfg.client();
+    let stream_url = format!("{base_url}/jobs/take?queue={queue}&prefetch={prefetch}");
+
+    let resp = client
+        .get(&stream_url)
+        .header("accept", cfg.stream_accept())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "stream open failed: {}",
+        resp.status()
+    );
+
+    let mut stream = JobStream::new(cfg.format, resp);
+
+    match ack_strategy {
+        AckStrategy::Sequential => loop {
+            tokio::select! {
+                job = stream.next_job() => {
+                    let Some(job) = job else { break };
+                    let ack_url = format!(
+                        "{base_url}/jobs/{}/success",
+                        job.id
+                    );
+                    let resp = client.post(&ack_url).send().await.unwrap();
+                    assert_eq!(resp.status(), 204, "ack failed: {}", resp.status());
+                    let prev = acked.fetch_add(1, Ordering::Relaxed);
+                    if prev + 1 >= target {
+                        let _ = done_tx.send(true);
+                    }
+                }
+                _ = done_rx.changed() => break,
+            }
+        },
+        AckStrategy::Overlapped => {
+            let mut in_flight = FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    // Prefer draining completed acks first so the in-flight
+                    // set doesn't grow unboundedly.
+                    biased;
+
+                    result = in_flight.next(), if !in_flight.is_empty() => {
+                        // Ack completed — unwrap the join result.
+                        result.unwrap();
+                        let prev = acked.fetch_add(1, Ordering::Relaxed);
+                        if prev + 1 >= target {
+                            let _ = done_tx.send(true);
+                        }
+                    }
+
+                    job = stream.next_job() => {
+                        let Some(job) = job else { break };
+                        let client = client.clone();
+                        let url = format!(
+                            "{base_url}/jobs/{}/success",
+                            job.id
+                        );
+                        in_flight.push(async move {
+                            let resp = client.post(&url).send().await.unwrap();
+                            assert_eq!(resp.status(), 204, "ack failed: {}", resp.status());
+                        });
+                    }
+
+                    _ = done_rx.changed() => break,
+                }
+            }
+            // Drain remaining in-flight acks.
+            while in_flight.next().await.is_some() {
+                let prev = acked.fetch_add(1, Ordering::Relaxed);
+                if prev + 1 >= target {
+                    let _ = done_tx.send(true);
+                }
+            }
+        }
+    }
+}
+
+/// Dequeue N jobs via streaming + ack and return the wall-clock time.
+/// Pre-enqueue happens before the timer starts.
+async fn dequeue(
+    cfg: &BenchConfig,
+    ack_strategy: AckStrategy,
+    base_url: &str,
+    n: usize,
+    workers: usize,
+    prefetch: u64,
+) -> Duration {
+    let queue = unique_queue();
+
+    // Untimed setup: seed the queue with jobs.
+    pre_enqueue(base_url, &queue, n).await;
+
+    let target = n as u64;
+    let acked = Arc::new(AtomicU64::new(0));
+    let (done_tx, done_rx) = watch::channel(false);
+    let done_tx = Arc::new(done_tx);
+
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..workers)
+        .map(|_| {
+            let cfg = cfg.clone();
+            let base_url = base_url.to_owned();
+            let queue = queue.clone();
+            let acked = Arc::clone(&acked);
+            let done_tx = Arc::clone(&done_tx);
+            let done_rx = done_rx.clone();
+            tokio::spawn(async move {
+                dequeue_worker(
+                    &cfg,
+                    ack_strategy,
+                    &base_url,
+                    &queue,
+                    prefetch,
+                    acked,
+                    target,
+                    done_tx,
+                    done_rx,
+                )
+                .await;
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    start.elapsed()
+}
+
+// ---------------------------------------------------------------------------
 // Criterion wiring
 // ---------------------------------------------------------------------------
 
@@ -312,7 +596,7 @@ fn bench_enqueue(c: &mut Criterion) {
         BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
     ];
 
-    let mut group = c.benchmark_group("enqueue");
+    let mut group = c.benchmark_group(format!("enqueue (n={n})"));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
 
@@ -351,7 +635,7 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
         BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
     ];
 
-    let mut group = c.benchmark_group("enqueue-concurrent");
+    let mut group = c.benchmark_group(format!("enqueue-concurrent (n={n})"));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
 
@@ -374,5 +658,94 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_enqueue, bench_enqueue_concurrent);
+fn bench_dequeue(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let url = rt.block_on(async { start_server().await.0 });
+    let n = env_or("BENCH_N", 100) as usize;
+    let workers = env_or("BENCH_WORKERS", 4) as usize;
+    let prefetch = env_or("BENCH_PREFETCH", 10);
+
+    // All dequeue configs use KeepAlive — the stream is inherently a
+    // persistent connection, and acks benefit from reuse too.
+    let configs: Vec<(BenchConfig, AckStrategy)> = vec![
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Overlapped,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Overlapped,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Overlapped,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Overlapped,
+        ),
+    ];
+
+    let mut group = c.benchmark_group(format!(
+        "dequeue (n={n} workers={workers} prefetch={prefetch})"
+    ));
+    group.throughput(Throughput::Elements(n as u64));
+    group.sample_size(10);
+
+    for (cfg, ack_strategy) in &configs {
+        let proto = match cfg.protocol {
+            Protocol::Http1 => "http1",
+            Protocol::H2c => "h2c",
+        };
+        let fmt = match cfg.format {
+            Format::Json => "json",
+            Format::MsgPack => "msgpack",
+        };
+        let ack = match ack_strategy {
+            AckStrategy::Sequential => "sequential",
+            AckStrategy::Overlapped => "overlapped",
+        };
+        let label = format!("{proto} {fmt} {ack}");
+
+        group.bench_function(&label, |b| {
+            b.to_async(&rt).iter_custom(|iters| {
+                let url = url.clone();
+                let cfg = cfg.clone();
+                let ack_strategy = *ack_strategy;
+                async move {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += dequeue(&cfg, ack_strategy, &url, n, workers, prefetch).await;
+                    }
+                    total
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_enqueue,
+    bench_enqueue_concurrent,
+    bench_dequeue
+);
 criterion_main!(benches);

@@ -2666,6 +2666,7 @@ dependencies = [
  "clap",
  "criterion",
  "fjall",
+ "futures-util",
  "http-body-util",
  "hyper-util",
  "reqwest",

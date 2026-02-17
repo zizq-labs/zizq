@@ -29,6 +29,7 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 reqwest = { version = "0.12", features = ["stream", "json"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+futures-util = "0.3"
 
 [[bench]]
 name = "throughput"
