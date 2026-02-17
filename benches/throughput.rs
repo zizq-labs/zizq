@@ -447,6 +447,7 @@ async fn pre_enqueue(base_url: &str, queue: &str, n: usize) {
 /// many concurrent workers.
 async fn dequeue_worker(
     cfg: &BenchConfig,
+    client: Client,
     ack_strategy: AckStrategy,
     base_url: &str,
     queue: &str,
@@ -456,7 +457,6 @@ async fn dequeue_worker(
     done_tx: Arc<watch::Sender<bool>>,
     mut done_rx: watch::Receiver<bool>,
 ) {
-    let client = cfg.client();
     let stream_url = format!("{base_url}/jobs/take?queue={queue}&prefetch={prefetch}");
 
     let resp = client
@@ -537,13 +537,16 @@ async fn dequeue_worker(
 }
 
 /// Dequeue N jobs via streaming + ack and return the wall-clock time.
-/// Pre-enqueue happens before the timer starts.
+/// Pre-enqueue happens before the timer starts. `clients` provides one
+/// pre-built reqwest client per worker — reusing them across iterations
+/// keeps connection pools alive and avoids ephemeral port exhaustion from
+/// TIME_WAIT accumulation.
 async fn dequeue(
     cfg: &BenchConfig,
+    clients: &[Client],
     ack_strategy: AckStrategy,
     base_url: &str,
     n: usize,
-    workers: usize,
     prefetch: u64,
 ) -> Duration {
     let queue = unique_queue();
@@ -558,9 +561,11 @@ async fn dequeue(
 
     let start = Instant::now();
 
-    let handles: Vec<_> = (0..workers)
-        .map(|_| {
+    let handles: Vec<_> = clients
+        .iter()
+        .map(|client| {
             let cfg = cfg.clone();
+            let client = client.clone();
             let base_url = base_url.to_owned();
             let queue = queue.clone();
             let acked = Arc::clone(&acked);
@@ -569,6 +574,7 @@ async fn dequeue(
             tokio::spawn(async move {
                 dequeue_worker(
                     &cfg,
+                    client,
                     ack_strategy,
                     &base_url,
                     &queue,
@@ -599,11 +605,12 @@ async fn dequeue(
 /// both the enqueue and dequeue sides; body encoding is pre-computed.
 async fn pipeline(
     cfg: &BenchConfig,
+    enqueue_client: &Client,
+    dequeue_clients: &[Client],
     ack_strategy: AckStrategy,
     base_url: &str,
     n: usize,
     enqueuers: usize,
-    dequeuers: usize,
     prefetch: u64,
 ) -> Duration {
     let queue = unique_queue();
@@ -629,9 +636,11 @@ async fn pipeline(
     let start = Instant::now();
 
     // Spawn dequeuers first so streams are opening while enqueuers start.
-    let dequeue_handles: Vec<_> = (0..dequeuers)
-        .map(|_| {
+    let dequeue_handles: Vec<_> = dequeue_clients
+        .iter()
+        .map(|client| {
             let cfg = cfg.clone();
+            let client = client.clone();
             let base_url = base_url.to_owned();
             let queue = queue.clone();
             let acked = Arc::clone(&acked);
@@ -640,6 +649,7 @@ async fn pipeline(
             tokio::spawn(async move {
                 dequeue_worker(
                     &cfg,
+                    client,
                     ack_strategy,
                     &base_url,
                     &queue,
@@ -655,14 +665,13 @@ async fn pipeline(
         .collect();
 
     // Spawn enqueuers that pull pre-encoded bodies from the channel.
-    let enqueue_client = cfg.client();
     let content_type = cfg.content_type();
     let accept = cfg.accept();
     let enqueue_url: Arc<str> = format!("{base_url}/jobs").into();
 
     let enqueue_handles: Vec<_> = (0..enqueuers)
         .map(|_| {
-            let client = enqueue_client.clone();
+            let client = Client::clone(enqueue_client);
             let url = Arc::clone(&enqueue_url);
             let rx = Arc::clone(&rx);
             tokio::spawn(async move {
@@ -845,14 +854,19 @@ fn bench_dequeue(c: &mut Criterion) {
         let label = format!("{proto} {fmt} {ack}");
 
         group.bench_function(&label, |b| {
+            // Create per-worker clients once, reused across all iterations
+            // so connection pools stay alive and we don't exhaust ephemeral
+            // ports with TIME_WAIT connections.
+            let clients: Vec<Client> = (0..dequeuers).map(|_| cfg.client()).collect();
             b.to_async(&rt).iter_custom(|iters| {
                 let url = url.clone();
                 let cfg = cfg.clone();
+                let clients = clients.clone();
                 let ack_strategy = *ack_strategy;
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += dequeue(&cfg, ack_strategy, &url, n, dequeuers, prefetch).await;
+                        total += dequeue(&cfg, &clients, ack_strategy, &url, n, prefetch).await;
                     }
                     total
                 }
@@ -928,16 +942,29 @@ fn bench_pipeline(c: &mut Criterion) {
         let label = format!("{proto} {fmt} {ack}");
 
         group.bench_function(&label, |b| {
+            // Create clients once, reused across all iterations.
+            let enqueue_client = cfg.client();
+            let dequeue_clients: Vec<Client> = (0..dequeuers).map(|_| cfg.client()).collect();
             b.to_async(&rt).iter_custom(|iters| {
                 let url = url.clone();
                 let cfg = cfg.clone();
+                let enqueue_client = enqueue_client.clone();
+                let dequeue_clients = dequeue_clients.clone();
                 let ack_strategy = *ack_strategy;
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total +=
-                            pipeline(&cfg, ack_strategy, &url, n, enqueuers, dequeuers, prefetch)
-                                .await;
+                        total += pipeline(
+                            &cfg,
+                            &enqueue_client,
+                            &dequeue_clients,
+                            ack_strategy,
+                            &url,
+                            n,
+                            enqueuers,
+                            prefetch,
+                        )
+                        .await;
                     }
                     total
                 }
