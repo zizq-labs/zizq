@@ -8,8 +8,10 @@
 //! iteration so accumulated data doesn't interfere between samples.
 //!
 //! Configure via environment variables:
-//!   BENCH_N        — jobs per iteration (default 100)
-//!   BENCH_WORKERS  — parallel workers for multi-worker scenarios (default 4)
+//!   BENCH_N          — jobs per iteration (default 100)
+//!   BENCH_ENQUEUERS  — parallel enqueue workers (default 4)
+//!   BENCH_DEQUEUERS  — parallel dequeue workers (default 4)
+//!   BENCH_PREFETCH   — per-stream prefetch limit for dequeue (default 10)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -255,11 +257,16 @@ async fn enqueue(cfg: &BenchConfig, base_url: &str, n: usize) -> Duration {
 // Scenario: Concurrent Enqueue
 // ---------------------------------------------------------------------------
 
-/// Enqueue N jobs concurrently (all requests in-flight at once) and return the
-/// wall-clock time. This exercises h2 multiplexing: many requests share one TCP
-/// connection simultaneously, like APNS-style workloads. For HTTP/1.1 each
-/// concurrent request needs its own connection, so h2 should have an advantage.
-async fn enqueue_concurrent(cfg: &BenchConfig, base_url: &str, n: usize) -> Duration {
+/// Enqueue N jobs across K workers and return the wall-clock time. Workers pull
+/// pre-encoded bodies from a shared channel, so the degree of parallelism is
+/// controlled independently from the job count. This exercises h2 multiplexing
+/// (many requests on one connection) vs HTTP/1.1 (one connection per worker).
+async fn enqueue_concurrent(
+    cfg: &BenchConfig,
+    base_url: &str,
+    n: usize,
+    workers: usize,
+) -> Duration {
     let client = cfg.client();
     let queue = unique_queue();
     let url: Arc<str> = format!("{base_url}/jobs").into();
@@ -268,37 +275,44 @@ async fn enqueue_concurrent(cfg: &BenchConfig, base_url: &str, n: usize) -> Dura
 
     // Pre-encode all request bodies so serialization doesn't count against
     // the concurrent send timing.
-    let bodies: Vec<Vec<u8>> = (0..n)
-        .map(|i| {
-            cfg.encode(&EnqueueBody {
-                queue: &queue,
-                payload: json!({"i": i}),
-            })
-        })
-        .collect();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(n);
+    for i in 0..n {
+        tx.send(cfg.encode(&EnqueueBody {
+            queue: &queue,
+            payload: json!({"i": i}),
+        }))
+        .await
+        .unwrap();
+    }
+    // Close the sender so workers drain to completion.
+    drop(tx);
+
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
     let start = Instant::now();
 
-    let handles: Vec<_> = bodies
-        .into_iter()
-        .map(|body| {
+    let handles: Vec<_> = (0..workers)
+        .map(|_| {
             let client = client.clone();
             let url = Arc::clone(&url);
+            let rx = Arc::clone(&rx);
             tokio::spawn(async move {
-                let resp = client
-                    .post(&*url)
-                    .header("content-type", content_type)
-                    .header("accept", accept)
-                    .body(body)
-                    .send()
-                    .await
-                    .unwrap();
-                assert!(
-                    resp.status().is_success(),
-                    "enqueue failed: {}",
-                    resp.status()
-                );
-                let _ = resp.bytes().await;
+                while let Some(body) = rx.lock().await.recv().await {
+                    let resp = client
+                        .post(&*url)
+                        .header("content-type", content_type)
+                        .header("accept", accept)
+                        .body(body)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(
+                        resp.status().is_success(),
+                        "enqueue failed: {}",
+                        resp.status()
+                    );
+                    let _ = resp.bytes().await;
+                }
             })
         })
         .collect();
@@ -623,6 +637,7 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let url = rt.block_on(async { start_server().await.0 });
     let n = env_or("BENCH_N", 100) as usize;
+    let enqueuers = env_or("BENCH_ENQUEUERS", 4) as usize;
 
     // Only keep-alive configs make sense for concurrent sends — the whole
     // point is many requests multiplexed on one connection (h2) vs many
@@ -635,7 +650,7 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
         BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
     ];
 
-    let mut group = c.benchmark_group(format!("enqueue-concurrent (n={n})"));
+    let mut group = c.benchmark_group(format!("enqueue-concurrent (n={n} enqueuers={enqueuers})"));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
 
@@ -647,7 +662,7 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += enqueue_concurrent(&cfg, &url, n).await;
+                        total += enqueue_concurrent(&cfg, &url, n, enqueuers).await;
                     }
                     total
                 }
@@ -662,7 +677,7 @@ fn bench_dequeue(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let url = rt.block_on(async { start_server().await.0 });
     let n = env_or("BENCH_N", 100) as usize;
-    let workers = env_or("BENCH_WORKERS", 4) as usize;
+    let dequeuers = env_or("BENCH_DEQUEUERS", 4) as usize;
     let prefetch = env_or("BENCH_PREFETCH", 10);
 
     // All dequeue configs use KeepAlive — the stream is inherently a
@@ -703,7 +718,7 @@ fn bench_dequeue(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group(format!(
-        "dequeue (n={n} workers={workers} prefetch={prefetch})"
+        "dequeue (n={n} dequeuers={dequeuers} prefetch={prefetch})"
     ));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
@@ -731,7 +746,7 @@ fn bench_dequeue(c: &mut Criterion) {
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += dequeue(&cfg, ack_strategy, &url, n, workers, prefetch).await;
+                        total += dequeue(&cfg, ack_strategy, &url, n, dequeuers, prefetch).await;
                     }
                     total
                 }
