@@ -591,6 +591,112 @@ async fn dequeue(
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: Pipeline (concurrent enqueue + dequeue)
+// ---------------------------------------------------------------------------
+
+/// Enqueue and dequeue N jobs simultaneously — enqueuers push while dequeuers
+/// stream and ack. Measures end-to-end pipeline throughput. The timer covers
+/// both the enqueue and dequeue sides; body encoding is pre-computed.
+async fn pipeline(
+    cfg: &BenchConfig,
+    ack_strategy: AckStrategy,
+    base_url: &str,
+    n: usize,
+    enqueuers: usize,
+    dequeuers: usize,
+    prefetch: u64,
+) -> Duration {
+    let queue = unique_queue();
+
+    // Pre-encode enqueue bodies outside the timer.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(n);
+    for i in 0..n {
+        tx.send(cfg.encode(&EnqueueBody {
+            queue: &queue,
+            payload: json!({"i": i}),
+        }))
+        .await
+        .unwrap();
+    }
+    drop(tx);
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+    let target = n as u64;
+    let acked = Arc::new(AtomicU64::new(0));
+    let (done_tx, done_rx) = watch::channel(false);
+    let done_tx = Arc::new(done_tx);
+
+    let start = Instant::now();
+
+    // Spawn dequeuers first so streams are opening while enqueuers start.
+    let dequeue_handles: Vec<_> = (0..dequeuers)
+        .map(|_| {
+            let cfg = cfg.clone();
+            let base_url = base_url.to_owned();
+            let queue = queue.clone();
+            let acked = Arc::clone(&acked);
+            let done_tx = Arc::clone(&done_tx);
+            let done_rx = done_rx.clone();
+            tokio::spawn(async move {
+                dequeue_worker(
+                    &cfg,
+                    ack_strategy,
+                    &base_url,
+                    &queue,
+                    prefetch,
+                    acked,
+                    target,
+                    done_tx,
+                    done_rx,
+                )
+                .await;
+            })
+        })
+        .collect();
+
+    // Spawn enqueuers that pull pre-encoded bodies from the channel.
+    let enqueue_client = cfg.client();
+    let content_type = cfg.content_type();
+    let accept = cfg.accept();
+    let enqueue_url: Arc<str> = format!("{base_url}/jobs").into();
+
+    let enqueue_handles: Vec<_> = (0..enqueuers)
+        .map(|_| {
+            let client = enqueue_client.clone();
+            let url = Arc::clone(&enqueue_url);
+            let rx = Arc::clone(&rx);
+            tokio::spawn(async move {
+                while let Some(body) = rx.lock().await.recv().await {
+                    let resp = client
+                        .post(&*url)
+                        .header("content-type", content_type)
+                        .header("accept", accept)
+                        .body(body)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(
+                        resp.status().is_success(),
+                        "enqueue failed: {}",
+                        resp.status()
+                    );
+                    let _ = resp.bytes().await;
+                }
+            })
+        })
+        .collect();
+
+    for handle in enqueue_handles {
+        handle.await.unwrap();
+    }
+    for handle in dequeue_handles {
+        handle.await.unwrap();
+    }
+
+    start.elapsed()
+}
+
+// ---------------------------------------------------------------------------
 // Criterion wiring
 // ---------------------------------------------------------------------------
 
@@ -757,10 +863,96 @@ fn bench_dequeue(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_pipeline(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let url = rt.block_on(async { start_server().await.0 });
+    let n = env_or("BENCH_N", 100) as usize;
+    let enqueuers = env_or("BENCH_ENQUEUERS", 4) as usize;
+    let dequeuers = env_or("BENCH_DEQUEUERS", 4) as usize;
+    let prefetch = env_or("BENCH_PREFETCH", 10);
+
+    let configs: Vec<(BenchConfig, AckStrategy)> = vec![
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Sequential,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Overlapped,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Overlapped,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Overlapped,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Overlapped,
+        ),
+    ];
+
+    let mut group = c.benchmark_group(format!(
+        "pipeline (n={n} enqueuers={enqueuers} dequeuers={dequeuers} prefetch={prefetch})"
+    ));
+    group.throughput(Throughput::Elements(n as u64));
+    group.sample_size(10);
+
+    for (cfg, ack_strategy) in &configs {
+        let proto = match cfg.protocol {
+            Protocol::Http1 => "http1",
+            Protocol::H2c => "h2c",
+        };
+        let fmt = match cfg.format {
+            Format::Json => "json",
+            Format::MsgPack => "msgpack",
+        };
+        let ack = match ack_strategy {
+            AckStrategy::Sequential => "sequential",
+            AckStrategy::Overlapped => "overlapped",
+        };
+        let label = format!("{proto} {fmt} {ack}");
+
+        group.bench_function(&label, |b| {
+            b.to_async(&rt).iter_custom(|iters| {
+                let url = url.clone();
+                let cfg = cfg.clone();
+                let ack_strategy = *ack_strategy;
+                async move {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total +=
+                            pipeline(&cfg, ack_strategy, &url, n, enqueuers, dequeuers, prefetch)
+                                .await;
+                    }
+                    total
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_enqueue,
     bench_enqueue_concurrent,
-    bench_dequeue
+    bench_dequeue,
+    bench_pipeline
 );
 criterion_main!(benches);
