@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
+use fjall::config::FilterPolicy;
 use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -532,27 +533,23 @@ impl Store {
     /// data.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let db = SingleWriterTxDatabase::builder(path).open()?;
+
+        // Index keyspaces are only ever range-scanned, never point-read,
+        // so bloom filters would waste memory and CPU during flushes.
+        // Point-read keyspaces (jobs, payloads) keep the default bloom
+        // filters for efficient ID lookups.
+        let index_opts: fn() -> fjall::KeyspaceCreateOptions =
+            || fjall::KeyspaceCreateOptions::default().filter_policy(FilterPolicy::disabled());
+
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
         let payloads = db.keyspace("payloads", fjall::KeyspaceCreateOptions::default)?;
-        let ready_jobs_by_priority = db.keyspace(
-            "ready_jobs_by_priority",
-            fjall::KeyspaceCreateOptions::default,
-        )?;
-        let ready_jobs_by_queue_and_priority = db.keyspace(
-            "ready_jobs_by_queue_and_priority",
-            fjall::KeyspaceCreateOptions::default,
-        )?;
-        let scheduled_jobs_by_ready_at = db.keyspace(
-            "scheduled_jobs_by_ready_at",
-            fjall::KeyspaceCreateOptions::default,
-        )?;
-        let jobs_by_status =
-            db.keyspace("jobs_by_status", fjall::KeyspaceCreateOptions::default)?;
-        let jobs_by_queue = db.keyspace("jobs_by_queue", fjall::KeyspaceCreateOptions::default)?;
-        let jobs_by_queue_and_status = db.keyspace(
-            "jobs_by_queue_and_status",
-            fjall::KeyspaceCreateOptions::default,
-        )?;
+        let ready_jobs_by_priority = db.keyspace("ready_jobs_by_priority", index_opts)?;
+        let ready_jobs_by_queue_and_priority =
+            db.keyspace("ready_jobs_by_queue_and_priority", index_opts)?;
+        let scheduled_jobs_by_ready_at = db.keyspace("scheduled_jobs_by_ready_at", index_opts)?;
+        let jobs_by_status = db.keyspace("jobs_by_status", index_opts)?;
+        let jobs_by_queue = db.keyspace("jobs_by_queue", index_opts)?;
+        let jobs_by_queue_and_status = db.keyspace("jobs_by_queue_and_status", index_opts)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
