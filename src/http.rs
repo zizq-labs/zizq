@@ -12,7 +12,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
@@ -1175,132 +1175,182 @@ async fn take_jobs(
             let heartbeat_sleep = tokio::time::sleep(state.heartbeat_interval);
             tokio::pin!(heartbeat_sleep);
 
-            loop {
-                // Drain any pending events. If the broadcast channel
-                // overflowed (Lagged), we may have missed some
-                // JobCompleted events, so reconcile our in-flight set
-                // against the store.
-                loop {
-                    match event_rx.try_recv() {
-                        Ok(StoreEvent::JobCompleted(id)) => {
-                            if in_flight.remove(&id) {
-                                tracing::debug!(job_id = %id, "job completed");
-                                let _ = state.global_in_flight.fetch_update(
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                    |v| Some(v.saturating_sub(1)),
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                missed = n,
-                                "broadcast lagged, reconciling in-flight set"
-                            );
-                            reconcile_in_flight(&state, &mut in_flight).await;
-                            // Keep draining — there may be more buffered
-                            // events after the lag point.
-                        }
-                        Err(broadcast::error::TryRecvError::Empty) => break,
-                        Err(broadcast::error::TryRecvError::Closed) => break,
-                    }
-                }
+            // The take loop uses a single select! driven by a claim
+            // token. The token starts unclaimed so we immediately try
+            // to drain pre-existing ready jobs on startup. After each
+            // successful take we mint a new local unclaimed token so
+            // the drain continues. When the queue is empty the CAS
+            // leaves the token claimed (true) and can_take becomes
+            // false — we sit idle until a JobCreated event overwrites
+            // the token with a fresh one.
+            //
+            // This keeps reserve(), the capacity check, and the token
+            // CAS in one place instead of splitting them across two
+            // phases.
+            let mut claim_token: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-                // Only attempt to take a job if the per-connection prefetch
-                // limit AND the global working limit haven't been reached.
-                let can_take = (prefetch == 0 || in_flight.len() < prefetch)
+            loop {
+                // We're not yet at our prefetch limit, and nobody else has
+                // taken the claim.
+                let can_take = !claim_token.load(Ordering::Relaxed)
+                    && (prefetch == 0 || in_flight.len() < prefetch)
                     && (state.global_working_limit == 0
                         || state.global_in_flight.load(Ordering::Relaxed)
                             < state.global_working_limit);
 
-                if can_take {
-                    // Wait until the client can accept a message before
-                    // dequeuing. This ensures we never take a job we can't
-                    // deliver.
-                    let permit = tokio::select! {
-                        result = tx.reserve() => match result {
-                            Ok(permit) => permit,
-                            Err(_) => break, // client disconnected
-                        },
-                        _ = shutdown.changed() => break, // server shutting down
-                    };
-
-                    match state.store.take_next_job(&queues).await {
-                        Ok(Some(job)) => {
-                            in_flight.insert(job.id.clone());
-                            state.global_in_flight.fetch_add(1, Ordering::Relaxed);
-                            match Job::try_from(job) {
-                                Ok(job) => {
-                                    tracing::debug!(
-                                        job_id = %job.id,
-                                        queue = %job.queue,
-                                        priority = job.priority,
-                                        "job dispatched"
-                                    );
-                                    permit.send(TakeMessage::Job(Arc::new(job)));
-                                }
-                                Err(e) => {
-                                    tracing::error!(%e, "corrupt job data");
-                                    break;
-                                }
-                            }
-                            // Reset the heartbeat timer since we just sent
-                            // data — the client knows we're alive.
-                            heartbeat_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + state.heartbeat_interval);
-                            continue;
-                        }
-                        Ok(None) => drop(permit),
-                        Err(e) => {
-                            tracing::error!(%e, "take_next_job failed");
-                            break;
-                        }
-                    }
-                }
-
-                // No job available or at the working limit. Wait for a
-                // store event or heartbeat timeout. Any enqueue that
-                // happened between take_next_job() returning None and
-                // entering recv() is already buffered in the broadcast
-                // channel.
                 tokio::select! {
+                    // Detect client disconnect without waiting for the
+                    // next heartbeat or reserve() call.
+                    _ = tx.closed() => break,
                     _ = &mut heartbeat_sleep => {
                         if tx.send(TakeMessage::Heartbeat).await.is_err() {
                             break;
                         }
-                        // Reset for the next heartbeat.
                         heartbeat_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + state.heartbeat_interval);
                     }
+                    // Drain phase.
+                    //
+                    // The reserve() is blocking, but we're inside select! so
+                    // won't block if there are other events on the event
+                    // channel, which is good because we can't afford to let
+                    // the event channel lag behind, even though we have a
+                    // costly fallback for Lagged handling.
+                    //
+                    // We're not even going to bother trying to take the claim
+                    // if we can't send data to the client, or if we've hit our
+                    // prefetch limit.
+                    result = tx.reserve(), if can_take => {
+                        // Client is able to receive more data, see if we can
+                        // get the claim.
+                        match result {
+                            Ok(permit) => {
+                                if claim_token
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::Acquire,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    // Won the claim — try to take a job. All
+                                    // other workers with the same claim token
+                                    // will skip and go back to waiting.
+                                    match state.store.take_next_job(&queues).await {
+                                        Ok(Some(job)) => {
+                                            in_flight.insert(job.id.clone());
+                                            state.global_in_flight.fetch_add(1, Ordering::Relaxed);
+                                            match Job::try_from(job) {
+                                                Ok(job) => {
+                                                    tracing::debug!(
+                                                        job_id = %job.id,
+                                                        queue = %job.queue,
+                                                        priority = job.priority,
+                                                        "job dispatched"
+                                                    );
+                                                    permit.send(TakeMessage::Job(Arc::new(job)));
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(%e, "corrupt job data");
+                                                    break;
+                                                }
+                                            }
+                                            // Mint a new local unclaimed
+                                            // token so the next iteration
+                                            // tries again — this drives
+                                            // the drain behavior.
+                                            claim_token =
+                                                Arc::new(AtomicBool::new(false));
+                                            // Reset the heartbeat timer
+                                            // since we just sent data.
+                                            heartbeat_sleep
+                                                .as_mut()
+                                                .reset(tokio::time::Instant::now() + state.heartbeat_interval);
+                                        }
+                                        Ok(None) => {
+                                            // Queue is empty. The CAS
+                                            // already set the token to
+                                            // true, so has_token will be
+                                            // false — we wait for events.
+                                            drop(permit);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(%e, "take_next_job failed");
+                                            break;
+                                        }
+                                    }
+                                }
+                                // CAS failed: another worker claimed it.
+                                // Token is now true so has_token will be
+                                // false next iteration — no spin.
+                            }
+                            Err(_) => break, // client disconnected
+                        }
+                    }
+                    // Wait phase.
+                    //
+                    // If we're not draining, we're waiting for events from the
+                    // store. We only go back to the drain phase if we got a
+                    // JobCreated event we care about. Other events are handled
+                    // without going back to the top of the loop.
                     event = event_rx.recv() => {
                         match event {
-                            Ok(StoreEvent::JobCompleted(id)) => {
-                                if in_flight.remove(&id) {
-                                    tracing::debug!(job_id = %id, "job completed");
-                                    let _ = state.global_in_flight.fetch_update(
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                        |v| Some(v.saturating_sub(1)),
-                                    );
+                            Ok(StoreEvent::JobCreated { queue, token }) => {
+                                // Store the latest matching token. We
+                                // don't CAS yet — we'll claim it when
+                                // reserve() tells us the client can
+                                // accept a message.
+                                if queues.is_empty()
+                                    || queues.contains(&queue)
+                                {
+                                    claim_token = token;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                            Ok(StoreEvent::JobCompleted(id)) => {
+                                if in_flight.remove(&id) {
+                                    tracing::debug!(
+                                        job_id = %id,
+                                        "job completed"
+                                    );
+                                    let _ = state
+                                        .global_in_flight
+                                        .fetch_update(
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                            |v| Some(v.saturating_sub(1)),
+                                        );
+                                    // Capacity freed. If an earlier
+                                    // JobCreated left an unclaimed token,
+                                    // can_take will be true on the next
+                                    // iteration and we'll try to claim it.
+                                }
+                            }
+                            Ok(StoreEvent::JobScheduled { .. }) => {}
+                            Err(broadcast::error::RecvError::Lagged(n))
+                            => {
                                 tracing::warn!(
                                     missed = n,
-                                    "broadcast lagged, reconciling in-flight set"
+                                    "broadcast lagged, \
+                                     reconciling in-flight set"
                                 );
                                 reconcile_in_flight(
                                     &state,
                                     &mut in_flight,
                                 ).await;
+                                // After reconciliation we may have missed
+                                // JobCreated events — mint an unclaimed
+                                // token to trigger a drain.
+                                claim_token =
+                                    Arc::new(AtomicBool::new(false));
                             }
-                            _ => {}
+                            Err(
+                                broadcast::error::RecvError::Closed,
+                            ) => break,
                         }
                     }
-                    _ = shutdown.changed() => break, // server shutting down
+                    _ = shutdown.changed() => break,
                 }
             }
 
@@ -3063,9 +3113,16 @@ mod tests {
         let line = std::str::from_utf8(&bytes).unwrap().trim();
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["queue"], "emails");
+
+        // Ack the emails job so it isn't requeued on disconnect.
+        state
+            .store
+            .mark_completed(job["id"].as_str().unwrap())
+            .await
+            .unwrap();
         drop(body);
 
-        // Give the spawned task time to detect disconnect and requeue.
+        // Give the spawned task time to detect disconnect.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // The reports job should still be available via unfiltered take.

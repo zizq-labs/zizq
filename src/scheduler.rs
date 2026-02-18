@@ -9,9 +9,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
-use crate::store::Store;
+use crate::store::{Store, StoreEvent};
 
 /// Default number of due jobs to fetch per iteration.
 ///
@@ -44,7 +44,9 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
         let now = now_millis();
 
         let (batch, next_ready_at) = match store.next_scheduled(now, batch_size).await {
+            // Got a batch of scheduled jobs to promote. Move to the next phase.
             Ok(result) => result,
+            // In the error case we just wait 1 second and try again.
             Err(e) => {
                 tracing::error!(%e, "next_scheduled failed");
                 tokio::select! {
@@ -58,6 +60,7 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
         // Promote all due jobs in this batch.
         let mut promoted_any = false;
         for job in &batch {
+            // If anything goes wrong we wait 1 second and try again.
             if let Err(e) = store.promote_scheduled(job).await {
                 tracing::error!(job_id = %job.id, %e, "promote_scheduled failed");
                 tokio::select! {
@@ -80,28 +83,63 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
             continue;
         }
 
-        // Sleep until the next scheduled job is due, or until a new
-        // scheduled job arrives that might be due sooner.
-        match next_ready_at {
-            Some(ready_at) => {
-                let delay = Duration::from_millis(ready_at.saturating_sub(now_millis()));
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = event_rx.recv() => {}
-                    _ = shutdown.changed() => break,
-                }
-            }
-            None if !promoted_any => {
-                // No scheduled jobs at all. Wait for one to be enqueued.
-                tokio::select! {
-                    _ = event_rx.recv() => {}
-                    _ = shutdown.changed() => break,
-                }
-            }
+        // Sleep until the next scheduled job is due. If a JobScheduled
+        // event arrives with an earlier ready_at, reset the timer — this
+        // avoids a database round-trip when the new job isn't due any
+        // sooner than what we're already waiting for. We ignore
+        // JobCreated and JobCompleted events since they're only relevant
+        // to workers.
+        //
+        // When there are no scheduled jobs at all (next_ready_at is
+        // None and we didn't promote anything), we use u64::MAX as the
+        // sleep target so that any JobScheduled event is "earlier" and
+        // resets the timer.
+        let sleep_until = match next_ready_at {
+            Some(ready_at) => ready_at,
+            None if !promoted_any => u64::MAX,
             None => {
                 // We promoted jobs and hit the batch limit — loop
                 // immediately (handled by the continue above, but this
                 // arm is here for exhaustiveness).
+                continue;
+            }
+        };
+
+        let delay = Duration::from_millis(sleep_until.saturating_sub(now_millis()));
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                event = event_rx.recv() => {
+                    match event {
+                        Ok(StoreEvent::JobScheduled { ready_at })
+                            if ready_at < sleep_until =>
+                        {
+                            // New job is due sooner — reset the timer.
+                            let delay = Duration::from_millis(
+                                ready_at.saturating_sub(now_millis()),
+                            );
+                            sleep.as_mut().reset(
+                                tokio::time::Instant::now() + delay,
+                            );
+                        }
+                        Ok(StoreEvent::JobScheduled { .. }) => {
+                            // New job is due later — keep sleeping.
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::debug!("scheduler stopped");
+                            return;
+                        }
+                        _ => {} // Ignore JobCreated, JobCompleted
+                    }
+                }
+                _ = shutdown.changed() => {
+                    tracing::debug!("scheduler stopped");
+                    return;
+                }
             }
         }
     }

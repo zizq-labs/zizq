@@ -18,6 +18,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
@@ -306,10 +308,30 @@ impl EnqueueOptions {
 }
 
 /// Events broadcast by the store when job state changes.
+///
+/// Workers use these events to decide when to check for new work:
+///
+/// - `JobCreated`: a job became ready. Workers check the queue name, then
+///   try to atomically claim the one-shot `token`. Only the winner calls
+///   `take_next_job`, avoiding thundering-herd DB contention.
+/// - `JobCompleted`: workers prune their in-flight set; no DB call needed.
+/// - `JobScheduled`: only the scheduler cares; workers ignore it.
+///
+/// On `Lagged`, workers fall back to a full reconciliation (re-check the
+/// DB and reconcile their in-flight set), since they may have missed both
+/// creation and completion events.
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
-    /// A job became ready for processing (newly enqueued or requeued).
-    JobReady,
+    /// A job became ready for processing (newly enqueued, requeued, or
+    /// promoted from the scheduled index).
+    ///
+    /// Contains the queue name so workers can cheaply filter irrelevant
+    /// events, and a single-use claim token (`Arc<AtomicBool>`) so that
+    /// only one worker per event hits the database.
+    JobCreated {
+        queue: String,
+        token: Arc<AtomicBool>,
+    },
 
     /// A job was successfully completed and removed.
     JobCompleted(String),
@@ -317,8 +339,8 @@ pub enum StoreEvent {
     /// A job was enqueued with a future `ready_at` timestamp.
     ///
     /// The scheduler listens for this to wake up early if the new job is
-    /// due sooner than whatever it was sleeping until.
-    JobScheduled,
+    /// due sooner than whatever it was sleeping until. Workers ignore it.
+    JobScheduled { ready_at: u64 },
 }
 
 /// Provides a handle to the persistent store.
@@ -607,10 +629,15 @@ impl Store {
 
         match JobStatus::try_from(job.status) {
             Ok(JobStatus::Ready) => {
-                let _ = self.event_tx.send(StoreEvent::JobReady);
+                let _ = self.event_tx.send(StoreEvent::JobCreated {
+                    queue: job.queue.clone(),
+                    token: Arc::new(AtomicBool::new(false)),
+                });
             }
             Ok(JobStatus::Scheduled) => {
-                let _ = self.event_tx.send(StoreEvent::JobScheduled);
+                let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                    ready_at: job.ready_at,
+                });
             }
             _ => {
                 tracing::warn!(
@@ -826,12 +853,13 @@ impl Store {
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let id = id.to_string();
 
-        let requeued = task::spawn_blocking(move || -> Result<bool, StoreError> {
+        // Returns Some(queue_name) if the job was requeued, None otherwise.
+        let requeued_queue = task::spawn_blocking(move || -> Result<Option<String>, StoreError> {
             let mut tx = db.write_tx();
 
             let old_status_key = make_status_key(JobStatus::Working, &id);
             if jobs_by_status.get(&old_status_key)?.is_none() {
-                return Ok(false);
+                return Ok(None);
             }
 
             // The job is still working, so it must still be in the jobs
@@ -840,6 +868,7 @@ impl Store {
                 StoreError::Corruption(format!("working job missing from jobs keyspace: {id:?}",))
             })?;
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let queue = job.queue.clone();
             let old_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Working, &id);
             let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &id);
             job.status = JobStatus::Ready.into();
@@ -860,15 +889,19 @@ impl Store {
             tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
             tx.commit()?;
 
-            Ok(true)
+            Ok(Some(queue))
         })
         .await??;
 
-        if requeued {
-            let _ = self.event_tx.send(StoreEvent::JobReady);
+        if let Some(queue) = requeued_queue {
+            let _ = self.event_tx.send(StoreEvent::JobCreated {
+                queue,
+                token: Arc::new(AtomicBool::new(false)),
+            });
+            return Ok(true);
         }
 
-        Ok(requeued)
+        Ok(false)
     }
 
     /// List jobs with cursor-based pagination.
@@ -1173,7 +1206,7 @@ impl Store {
     /// status from Scheduled to Ready, and inserts it into the priority
     /// indexes so it becomes takeable.
     ///
-    /// Subscribers are notified with `StoreEvent::JobReady`.
+    /// Subscribers are notified with `StoreEvent::JobCreated`.
     pub async fn promote_scheduled(&self, job: &Job) -> Result<(), StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
@@ -1184,6 +1217,7 @@ impl Store {
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         let id = job.id.clone();
+        let event_queue = job.queue.clone();
         let queue = job.queue.clone();
         let priority = job.priority;
         let ready_at = job.ready_at;
@@ -1235,7 +1269,10 @@ impl Store {
         })
         .await??;
 
-        let _ = self.event_tx.send(StoreEvent::JobReady);
+        let _ = self.event_tx.send(StoreEvent::JobCreated {
+            queue: event_queue,
+            token: Arc::new(AtomicBool::new(false)),
+        });
 
         Ok(())
     }
@@ -1796,7 +1833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_broadcasts_job_enqueued() {
+    async fn enqueue_broadcasts_job_created() {
         let store = test_store();
         let mut rx = store.subscribe();
 
@@ -1805,7 +1842,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobReady));
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
+            other => panic!("expected JobCreated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1827,7 +1867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_broadcasts_job_enqueued() {
+    async fn requeue_broadcasts_job_created() {
         let store = test_store();
         store
             .enqueue(EnqueueOptions::new("default", serde_json::json!("a")))
@@ -1838,7 +1878,10 @@ mod tests {
         let mut rx = store.subscribe();
         store.requeue(&taken.id).await.unwrap();
 
-        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobReady));
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
+            other => panic!("expected JobCreated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3077,7 +3120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_scheduled_fires_job_ready_event() {
+    async fn promote_scheduled_fires_job_created_event() {
         let store = test_store();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3094,7 +3137,10 @@ mod tests {
         let (batch, _) = store.next_scheduled(future, 10).await.unwrap();
         store.promote_scheduled(&batch[0]).await.unwrap();
 
-        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobReady));
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "q"),
+            other => panic!("expected JobCreated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3157,7 +3203,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(rx.recv().await.unwrap(), StoreEvent::JobScheduled));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            StoreEvent::JobScheduled { ready_at } if ready_at == future
+        ));
     }
 
     #[tokio::test]
