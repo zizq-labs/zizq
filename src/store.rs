@@ -4,9 +4,10 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! seven keyspaces:
+//! eight keyspaces:
 //!
-//! - `jobs`: source of truth, keyed by job ID, stores full job metadata.
+//! - `jobs`: source of truth, keyed by job ID, stores job metadata (no payload).
+//! - `payloads`: immutable job payloads, keyed by job ID.
 //! - `ready_jobs_by_priority`: partial priority index of ready jobs, keyed by `{priority_b36:4}\0{job_id}`.
 //! - `ready_jobs_by_queue_and_priority`: per-queue partial priority index of ready jobs, keyed by `{queue_name}\0{priority_b36:4}\0{job_id}`.
 //! - `scheduled_jobs_by_ready_at`: partial index of scheduled jobs, keyed by `{ready_at_be_u64}\0{job_id}`.
@@ -151,7 +152,13 @@ pub struct Job {
     pub priority: u16,
 
     /// Arbitrary payload provided by the client.
+    ///
+    /// Stored in a separate `payloads` keyspace so that status-change
+    /// operations (take, requeue, promote, recover) only re-write the small
+    /// metadata record. Defaults to `Null` when deserializing from the
+    /// `jobs` keyspace, which no longer contains the payload.
     #[serde(rename = "p")]
+    #[serde(default)]
     pub payload: serde_json::Value,
 
     /// Current lifecycle status, stored as a u8 which converts to `JobStatus`.
@@ -352,9 +359,17 @@ pub struct Store {
     /// Reference to the jobs keyspace.
     ///
     /// Jobs are keyed by their scru128 identifier which provides basic FIFO
-    /// semantics. This is the authoritative source of job data, but it is not
-    /// priority ordered.
+    /// semantics. This is the authoritative source of job metadata, but it
+    /// is not priority ordered. Payloads are stored separately.
     jobs: SingleWriterTxKeyspace,
+
+    /// Immutable job payloads, keyed by job ID.
+    ///
+    /// Separated from the `jobs` keyspace so that status-change operations
+    /// (take, requeue, promote, recover) only re-write the small metadata
+    /// record — less WAL data, less compaction, less time holding the
+    /// single-writer lock.
+    payloads: SingleWriterTxKeyspace,
 
     /// Partial index of ready jobs, ordered by priority then job ID.
     ///
@@ -482,9 +497,11 @@ fn kway_merge(
 }
 
 /// Look up full job records by ID, returning an error if any ID is missing
-/// from the `jobs` keyspace (data corruption).
+/// from the `jobs` keyspace (data corruption). Hydrates each job's payload
+/// from the separate `payloads` keyspace.
 fn load_jobs_by_ids(
     jobs_ks: &SingleWriterTxKeyspace,
+    payloads_ks: &SingleWriterTxKeyspace,
     ids: &[Vec<u8>],
     index_name: &str,
     rows: &mut Vec<Job>,
@@ -496,7 +513,14 @@ fn load_jobs_by_ids(
                 String::from_utf8_lossy(id),
             ))
         })?;
-        rows.push(rmp_serde::from_slice(&bytes)?);
+        let mut job: Job = rmp_serde::from_slice(&bytes)?;
+
+        // Hydrate the payload from the payloads keyspace.
+        if let Some(payload_bytes) = payloads_ks.get(id)? {
+            job.payload = rmp_serde::from_slice(&payload_bytes)?;
+        }
+
+        rows.push(job);
     }
     Ok(())
 }
@@ -509,6 +533,7 @@ impl Store {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let db = SingleWriterTxDatabase::builder(path).open()?;
         let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
+        let payloads = db.keyspace("payloads", fjall::KeyspaceCreateOptions::default)?;
         let ready_jobs_by_priority = db.keyspace(
             "ready_jobs_by_priority",
             fjall::KeyspaceCreateOptions::default,
@@ -534,6 +559,7 @@ impl Store {
         Ok(Self {
             db,
             jobs,
+            payloads,
             ready_jobs_by_priority,
             ready_jobs_by_queue_and_priority,
             scheduled_jobs_by_ready_at,
@@ -556,6 +582,7 @@ impl Store {
     pub async fn enqueue(&self, opts: EnqueueOptions) -> Result<Job, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
+        let payloads = self.payloads.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
@@ -588,6 +615,10 @@ impl Store {
                 JobStatus::Ready
             };
 
+            // Serialize the payload separately — it goes into its own keyspace
+            // so that status-change operations never re-write it.
+            let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
+
             let job = Job {
                 id: id.clone(),
                 queue: opts.queue,
@@ -597,13 +628,18 @@ impl Store {
                 ready_at,
             };
 
+            // Serialize metadata without the payload for the jobs keyspace.
+            let mut meta = job.clone();
+            meta.payload = serde_json::Value::Null;
+            let meta_bytes = rmp_serde::to_vec_named(&meta)?;
+
             let queue_key = make_queue_key(&job.queue, &id);
             let status_key = make_status_key(status, &id);
             let queue_status_key = make_queue_status_key(&job.queue, status, &id);
-            let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             let mut tx = db.write_tx();
-            tx.insert(&jobs, &id, &job_bytes);
+            tx.insert(&jobs, &id, &meta_bytes);
+            tx.insert(&payloads, &id, &payload_bytes);
             tx.insert(&jobs_by_queue, &queue_key, b"");
             tx.insert(&jobs_by_status, &status_key, b"");
             tx.insert(&jobs_by_queue_and_status, &queue_status_key, b"");
@@ -664,6 +700,7 @@ impl Store {
     pub async fn take_next_job(&self, queues: &HashSet<String>) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
+        let payloads = self.payloads.clone();
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
@@ -724,15 +761,16 @@ impl Store {
                 (priority_key, job_id)
             };
 
-            // Look up the full job data from the source of truth.
-            let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
+            // Look up job metadata from the jobs keyspace (payload is Null
+            // here — it lives in the payloads keyspace).
+            let meta_bytes = jobs.get(&job_id)?.ok_or_else(|| {
                 StoreError::Corruption(format!(
                     "job in ready_jobs_by_priority but missing from jobs keyspace: {:?}",
                     String::from_utf8_lossy(&job_id),
                 ))
             })?;
 
-            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let mut job: Job = rmp_serde::from_slice(&meta_bytes)?;
             let old_status_key = make_status_key(JobStatus::Ready, &job.id);
             let old_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &job.id);
             let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &job.id);
@@ -740,17 +778,25 @@ impl Store {
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
             let new_queue_status_key =
                 make_queue_status_key(&job.queue, JobStatus::Working, &job.id);
-            let job_bytes = rmp_serde::to_vec_named(&job)?;
+
+            // Only write metadata back — payload is immutable and stays in
+            // its own keyspace.
+            let meta_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Remove from priority indexes, update job record and status indexes.
             tx.remove(&ready_jobs_by_priority, &priority_key);
             tx.remove(&ready_jobs_by_queue_and_priority, &queue_priority_key);
-            tx.insert(&jobs, &job_id, &job_bytes);
+            tx.insert(&jobs, &job_id, &meta_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
             tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
             tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
             tx.commit()?;
+
+            // Hydrate the payload from the payloads keyspace for the caller.
+            if let Some(payload_bytes) = payloads.get(&job_id)? {
+                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+            }
 
             Ok(Some(job))
         })
@@ -767,6 +813,7 @@ impl Store {
     pub async fn mark_completed(&self, id: &str) -> Result<bool, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
+        let payloads = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
@@ -796,6 +843,7 @@ impl Store {
             let queue_status_key = make_queue_status_key(&job.queue, JobStatus::Working, &id);
 
             tx.remove(&jobs, &id);
+            tx.remove(&payloads, &id);
             tx.remove(&jobs_by_status, &status_key);
             tx.remove(&jobs_by_queue, &queue_key);
             tx.remove(&jobs_by_queue_and_status, &queue_status_key);
@@ -818,13 +866,20 @@ impl Store {
     /// Returns `None` if the job does not exist (or has been completed).
     pub async fn get_job(&self, id: &str) -> Result<Option<Job>, StoreError> {
         let jobs = self.jobs.clone();
+        let payloads = self.payloads.clone();
         let id = id.to_string();
 
         task::spawn_blocking(move || {
             let Some(bytes) = jobs.get(&id)? else {
                 return Ok(None);
             };
-            let job: Job = rmp_serde::from_slice(&bytes)?;
+            let mut job: Job = rmp_serde::from_slice(&bytes)?;
+
+            // Hydrate the payload from the payloads keyspace.
+            if let Some(payload_bytes) = payloads.get(&id)? {
+                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+            }
+
             Ok(Some(job))
         })
         .await?
@@ -947,6 +1002,7 @@ impl Store {
     pub async fn list_jobs(&self, opts: ListJobsOptions) -> Result<ListJobsPage, StoreError> {
         let db = self.db.clone();
         let jobs_ks = self.jobs.clone();
+        let payloads_ks = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
         let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
@@ -1001,7 +1057,13 @@ impl Store {
                 }
 
                 let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(&jobs_ks, &ids, "jobs_by_queue_and_status", &mut rows)?;
+                load_jobs_by_ids(
+                    &jobs_ks,
+                    &payloads_ks,
+                    &ids,
+                    "jobs_by_queue_and_status",
+                    &mut rows,
+                )?;
             } else if !opts.queues.is_empty() {
                 // Queue filter: k-way merge across per-queue ranges.
                 let sources: Vec<MergeSource<'_>> = opts
@@ -1034,7 +1096,7 @@ impl Store {
                     .collect();
 
                 let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(&jobs_ks, &ids, "jobs_by_queue", &mut rows)?;
+                load_jobs_by_ids(&jobs_ks, &payloads_ks, &ids, "jobs_by_queue", &mut rows)?;
             } else if !opts.statuses.is_empty() {
                 // Status filter: k-way merge across per-status ranges.
                 let sources: Vec<MergeSource<'_>> = opts
@@ -1064,7 +1126,7 @@ impl Store {
                     .collect();
 
                 let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(&jobs_ks, &ids, "jobs_by_status", &mut rows)?;
+                load_jobs_by_ids(&jobs_ks, &payloads_ks, &ids, "jobs_by_status", &mut rows)?;
             } else {
                 // No filter — scan the jobs keyspace directly.
                 match opts.direction {
@@ -1078,8 +1140,11 @@ impl Store {
                         };
 
                         for entry in range.take(fetch) {
-                            let (_, value) = entry.into_inner()?;
-                            let job: Job = rmp_serde::from_slice(&value)?;
+                            let (key, value) = entry.into_inner()?;
+                            let mut job: Job = rmp_serde::from_slice(&value)?;
+                            if let Some(payload_bytes) = payloads_ks.get(&*key)? {
+                                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+                            }
                             rows.push(job);
                         }
                     }
@@ -1093,8 +1158,11 @@ impl Store {
                         };
 
                         for entry in range.rev().take(fetch) {
-                            let (_, value) = entry.into_inner()?;
-                            let job: Job = rmp_serde::from_slice(&value)?;
+                            let (key, value) = entry.into_inner()?;
+                            let mut job: Job = rmp_serde::from_slice(&value)?;
+                            if let Some(payload_bytes) = payloads_ks.get(&*key)? {
+                                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+                            }
                             rows.push(job);
                         }
                     }
