@@ -218,6 +218,8 @@ async fn start_server() -> (String, JoinHandle<()>) {
 /// Request body for POST /jobs.
 #[derive(Serialize)]
 struct EnqueueBody<'a> {
+    #[serde(rename = "type")]
+    job_type: &'a str,
     queue: &'a str,
     payload: serde_json::Value,
 }
@@ -231,6 +233,7 @@ async fn enqueue(cfg: &BenchConfig, base_url: &str, n: usize) -> Duration {
     let start = Instant::now();
     for i in 0..n {
         let body = EnqueueBody {
+            job_type: "bench",
             queue: &queue,
             payload: json!({"i": i}),
         };
@@ -278,6 +281,7 @@ async fn enqueue_concurrent(
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(n);
     for i in 0..n {
         tx.send(cfg.encode(&EnqueueBody {
+            job_type: "bench",
             queue: &queue,
             payload: json!({"i": i}),
         }))
@@ -424,6 +428,7 @@ async fn pre_enqueue(base_url: &str, queue: &str, n: usize) {
 
     for i in 0..n {
         let body = EnqueueBody {
+            job_type: "bench",
             queue,
             payload: json!({"i": i}),
         };
@@ -619,6 +624,7 @@ async fn pipeline(
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(n);
     for i in 0..n {
         tx.send(cfg.encode(&EnqueueBody {
+            job_type: "bench",
             queue: &queue,
             payload: json!({"i": i}),
         }))
