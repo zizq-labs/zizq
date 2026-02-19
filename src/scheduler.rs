@@ -78,7 +78,7 @@ pub async fn run(
                 break;
             }
 
-            tracing::debug!(job_id = %job.id, queue = %job.queue, "job promoted");
+            tracing::debug!(job_id = %job.id, job_type = %job.job_type, queue = %job.queue, "job promoted");
             promoted_any = true;
         }
 

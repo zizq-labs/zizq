@@ -767,7 +767,7 @@ async fn request_logging(req: Request, next: axum::middleware::Next) -> Response
         method = %method,
         path = %uri,
         status = res.status().as_u16(),
-        latency_ms = elapsed.as_millis() as u64,
+        latency_ms = format_args!("{:.3}", elapsed.as_secs_f64() * 1000.0),
         "request"
     );
 
@@ -837,6 +837,7 @@ async fn enqueue(
         Ok(job) => {
             tracing::debug!(
                 job_id = %job.id,
+                job_type = %job.job_type,
                 queue = %job.queue,
                 priority = job.priority,
                 status = %job.status,
@@ -1283,6 +1284,7 @@ async fn take_jobs(
                                                 Ok(job) => {
                                                     tracing::debug!(
                                                         job_id = %job.id,
+                                                        job_type = %job.job_type,
                                                         queue = %job.queue,
                                                         priority = job.priority,
                                                         "job dispatched"
