@@ -4,7 +4,7 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! eight keyspaces:
+//! nine keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores job metadata (no payload).
 //! - `payloads`: immutable job payloads, keyed by job ID.
@@ -14,6 +14,7 @@
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 //! - `jobs_by_type`: type membership index, keyed by `{job_type}\0{job_id}`.
+//! - `errors`: error records per failure, keyed by `{job_id}\0{attempt_be_u32}`.
 //!
 //! Combined filters (e.g. queue + status) use sorted stream intersection
 //! across the individual indexes rather than a compound index.
@@ -177,6 +178,95 @@ pub struct Job {
     #[serde(rename = "r")]
     #[serde(default)]
     pub ready_at: u64,
+
+    /// Number of times this job has failed (incremented on each failure).
+    #[serde(rename = "a")]
+    #[serde(default)]
+    pub attempts: u32,
+
+    /// Per-job override for maximum retries on failure before the job is killed.
+    /// When `None`, the server default applies at failure time.
+    /// `retry_limit = Some(0)` means the first failure kills (1 total run).
+    /// `retry_limit = Some(3)` means kills after 4th failure (1 original + 3 retries).
+    #[serde(rename = "l")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u32>,
+
+    /// Per-job backoff configuration override. When `None`, server defaults
+    /// are used at backoff computation time. All three parameters form a
+    /// single curve — if you override one, you override all three.
+    #[serde(rename = "b")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<BackoffConfig>,
+
+    /// When the job was last dequeued (milliseconds since Unix epoch).
+    /// Overwritten on each dequeue.
+    #[serde(rename = "d")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dequeued_at: Option<u64>,
+
+    /// When the job last failed (milliseconds since Unix epoch).
+    /// Overwritten on each failure.
+    #[serde(rename = "f")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<u64>,
+}
+
+/// Backoff curve parameters for retry delay calculation.
+///
+/// The three parameters define a single curve:
+///   `delay_ms = attempts^exponent + base_ms + rand(0..jitter_ms) * (attempts + 1)`
+///
+/// These are grouped into a struct because overriding one in isolation
+/// doesn't make sense — the parameters work together  to shape the curve.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackoffConfig {
+    /// Power curve steepness (attempts ** exponent).
+    #[serde(rename = "x")]
+    pub exponent: f32,
+
+    /// Minimum delay in milliseconds.
+    #[serde(rename = "b")]
+    pub base_ms: f32,
+
+    /// Max random milliseconds per attempt multiplier (0..jitter_ms).
+    #[serde(rename = "j")]
+    pub jitter_ms: f32,
+}
+
+/// An error record stored in the `errors` keyspace.
+///
+/// One record is written per failure, append-only.
+/// Key: `{job_id}\0{attempt_be_u32}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorRecord {
+    /// Error message from the worker.
+    #[serde(rename = "m")]
+    pub message: String,
+
+    /// Error class, e.g. "TimeoutError".
+    #[serde(rename = "t")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+
+    /// Stack trace / backtrace.
+    #[serde(rename = "b")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backtrace: Option<String>,
+
+    /// Copied from the job's `dequeued_at`. Preserves dequeue -> fail latency.
+    #[serde(rename = "d")]
+    pub dequeued_at: u64,
+
+    /// Copied from the job's `failed_at` timestamp.
+    #[serde(rename = "f")]
+    pub failed_at: u64,
 }
 
 /// Direction for scanning the jobs keyspace when listing jobs.
@@ -311,11 +401,19 @@ pub struct EnqueueOptions {
     /// When the job becomes eligible to run (milliseconds since Unix epoch).
     /// `None` means immediately.
     pub ready_at: Option<u64>,
+
+    /// Per-job override for maximum retries. When `None`, the server
+    /// default applies at failure time.
+    pub retry_limit: Option<u32>,
+
+    /// Per-job backoff configuration override. When `None`, server defaults
+    /// apply at failure time.
+    pub backoff: Option<BackoffConfig>,
 }
 
 impl EnqueueOptions {
     /// Create options with required fields; priority defaults to 0, ready_at
-    /// to now.
+    /// to now, all retry/backoff fields to None (server defaults apply).
     pub fn new(
         job_type: impl Into<String>,
         queue: impl Into<String>,
@@ -327,6 +425,8 @@ impl EnqueueOptions {
             payload,
             priority: 0,
             ready_at: None,
+            retry_limit: None,
+            backoff: None,
         }
     }
 
@@ -341,6 +441,45 @@ impl EnqueueOptions {
         self.ready_at = Some(ready_at);
         self
     }
+
+    /// Set the retry limit and return `self`.
+    pub fn retry_limit(mut self, retry_limit: u32) -> Self {
+        self.retry_limit = Some(retry_limit);
+        self
+    }
+
+    /// Set the backoff configuration and return `self`.
+    pub fn backoff(mut self, backoff: BackoffConfig) -> Self {
+        self.backoff = Some(backoff);
+        self
+    }
+}
+
+/// Options for recording a job failure.
+pub struct FailureOptions {
+    /// Error message from the worker.
+    pub error: String,
+
+    /// Error class, e.g. "TimeoutError".
+    pub error_type: Option<String>,
+
+    /// Stack trace / backtrace.
+    pub backtrace: Option<String>,
+
+    /// Force retry at a specific time, even if max retries exceeded.
+    pub retry_at: Option<u64>,
+
+    /// Kill the job immediately, regardless of retry limit.
+    ///
+    /// A false value does not mean "prevent default killing". If the job
+    /// should be retried, pass a future dated retry_at value.
+    pub kill: bool,
+
+    /// Server default retry limit (used when job has no override).
+    pub default_retry_limit: u32,
+
+    /// Server default backoff config (used when job has no override).
+    pub default_backoff: BackoffConfig,
 }
 
 /// Events broadcast by the store when job state changes.
@@ -439,6 +578,13 @@ pub struct Store {
     /// only written at enqueue and removed at completion. No updates
     /// on status transitions.
     jobs_by_type: SingleWriterTxKeyspace,
+
+    /// Error records, keyed by `{job_id}\0{attempt_be_u32}`.
+    ///
+    /// One record per failure (append-only). Enables per-job error
+    /// history via prefix scan. Cleaned up when the job is completed
+    /// or killed (dead).
+    errors: SingleWriterTxKeyspace,
 
     /// Broadcast channel for store events.
     ///
@@ -708,6 +854,7 @@ impl Store {
         let jobs_by_status = db.keyspace("jobs_by_status", index_opts)?;
         let jobs_by_queue = db.keyspace("jobs_by_queue", index_opts)?;
         let jobs_by_type = db.keyspace("jobs_by_type", index_opts)?;
+        let errors = db.keyspace("errors", fjall::KeyspaceCreateOptions::default)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -721,6 +868,7 @@ impl Store {
             jobs_by_status,
             jobs_by_queue,
             jobs_by_type,
+            errors,
             event_tx,
         })
     }
@@ -782,6 +930,11 @@ impl Store {
                 payload: opts.payload,
                 status: status.into(),
                 ready_at,
+                attempts: 0,
+                retry_limit: opts.retry_limit,
+                backoff: opts.backoff,
+                dequeued_at: None,
+                failed_at: None,
             };
 
             // Serialize metadata without the payload for the jobs keyspace.
@@ -984,7 +1137,7 @@ impl Store {
 
             let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-            // Can't mark a job as completed if it's no currently working.
+            // Can't mark a job as completed if it's not currently working.
             if job.status != JobStatus::Working as u8 {
                 return Ok(false);
             }
