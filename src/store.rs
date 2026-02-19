@@ -4,7 +4,7 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! eight keyspaces:
+//! seven keyspaces:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores job metadata (no payload).
 //! - `payloads`: immutable job payloads, keyed by job ID.
@@ -13,7 +13,9 @@
 //! - `scheduled_jobs_by_ready_at`: partial index of scheduled jobs, keyed by `{ready_at_be_u64}\0{job_id}`.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
-//! - `jobs_by_queue_and_status`: compound index, keyed by `{queue_name}\0{status_u8}\0{job_id}`.
+//!
+//! Combined filters (e.g. queue + status) use sorted stream intersection
+//! across the individual indexes rather than a compound index.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -405,12 +407,6 @@ pub struct Store {
     /// efficient lookup of all jobs belonging to one or more queues.
     jobs_by_queue: SingleWriterTxKeyspace,
 
-    /// Compound queue + status index.
-    ///
-    /// Keyed by `{queue_name}\0{status_u8}\0{job_id}` with empty values.
-    /// Enables efficient combined filtering by queue and status.
-    jobs_by_queue_and_status: SingleWriterTxKeyspace,
-
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
@@ -445,85 +441,214 @@ macro_rules! range_source {
     }};
 }
 
-/// Merge multiple sorted sources of job IDs using a binary heap, collecting
-/// up to `limit` IDs in the requested order.
+/// A lazy, sorted stream of job IDs.
 ///
-/// For ascending, uses a min-heap (via `Reverse`). For descending, uses a
+/// Wraps a `MergeSource` closure and implements `Iterator` so we get
+/// standard combinators like `.take(n)` and `.collect()` for free.
+struct IdStream<'a>(MergeSource<'a>);
+
+impl<'a> Iterator for IdStream<'a> {
+    type Item = Result<Vec<u8>, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.0)()
+    }
+}
+
+/// Lazily merge multiple sorted `MergeSource`s into a single `IdStream`
+/// using a binary heap (k-way merge).
+///
+/// For ascending order, uses a min-heap (`Reverse`). For descending, a
 /// max-heap. Each source must already yield IDs in the matching order.
-fn kway_merge(
-    mut sources: Vec<MergeSource<'_>>,
-    direction: ScanDirection,
-    limit: usize,
-) -> Result<Vec<Vec<u8>>, StoreError> {
-    let mut result = Vec::with_capacity(limit);
+/// Errors encountered during seeding or iteration are deferred to the
+/// next call to `next()`.
+fn merge_sources<'a>(mut sources: Vec<MergeSource<'a>>, direction: ScanDirection) -> IdStream<'a> {
+    // Deferred error: if seeding the heap hits an error, we store it here
+    // and surface it on the first call to `next()`.
+    let mut deferred_err: Option<StoreError> = None;
 
     match direction {
         ScanDirection::Asc => {
             let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
             for (i, src) in sources.iter_mut().enumerate() {
-                if let Some(id) = src() {
-                    heap.push(Reverse((id?, i)));
+                if let Some(result) = src() {
+                    match result {
+                        Ok(id) => heap.push(Reverse((id, i))),
+                        Err(e) => {
+                            deferred_err = Some(e);
+                            break;
+                        }
+                    }
                 }
             }
-            while let Some(Reverse((id, i))) = heap.pop() {
-                result.push(id);
-                if result.len() >= limit {
-                    break;
+
+            IdStream(Box::new(move || {
+                if let Some(e) = deferred_err.take() {
+                    return Some(Err(e));
                 }
-                if let Some(next) = sources[i]() {
-                    heap.push(Reverse((next?, i)));
+                let Reverse((id, i)) = heap.pop()?;
+                if let Some(result) = sources[i]() {
+                    match result {
+                        Ok(next) => heap.push(Reverse((next, i))),
+                        Err(e) => deferred_err = Some(e),
+                    }
                 }
-            }
+                Some(Ok(id))
+            }))
         }
         ScanDirection::Desc => {
             let mut heap: BinaryHeap<(Vec<u8>, usize)> = BinaryHeap::new();
             for (i, src) in sources.iter_mut().enumerate() {
-                if let Some(id) = src() {
-                    heap.push((id?, i));
+                if let Some(result) = src() {
+                    match result {
+                        Ok(id) => heap.push((id, i)),
+                        Err(e) => {
+                            deferred_err = Some(e);
+                            break;
+                        }
+                    }
                 }
             }
-            while let Some((id, i)) = heap.pop() {
-                result.push(id);
-                if result.len() >= limit {
-                    break;
+
+            IdStream(Box::new(move || {
+                if let Some(e) = deferred_err.take() {
+                    return Some(Err(e));
                 }
-                if let Some(next) = sources[i]() {
-                    heap.push((next?, i));
+                let (id, i) = heap.pop()?;
+                if let Some(result) = sources[i]() {
+                    match result {
+                        Ok(next) => heap.push((next, i)),
+                        Err(e) => deferred_err = Some(e),
+                    }
+                }
+                Some(Ok(id))
+            }))
+        }
+    }
+}
+
+/// Lazily intersect two sorted `IdStream`s, yielding only IDs present in
+/// both.
+///
+/// Both streams must be sorted in the same `direction`. The intersection
+/// preserves that ordering. Internally buffers one item from each stream
+/// and advances whichever is "behind" (smaller in asc, larger in desc).
+fn intersect_streams<'a>(
+    mut a: IdStream<'a>,
+    mut b: IdStream<'a>,
+    direction: ScanDirection,
+) -> IdStream<'a> {
+    // Buffered next values from each stream.
+    let mut buf_a: Option<Vec<u8>> = None;
+    let mut buf_b: Option<Vec<u8>> = None;
+    // Whether we've primed the buffers yet.
+    let mut primed = false;
+
+    IdStream(Box::new(move || {
+        // Prime on first call so construction is cheap.
+        if !primed {
+            primed = true;
+            match a.next() {
+                Some(Ok(v)) => buf_a = Some(v),
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+            match b.next() {
+                Some(Ok(v)) => buf_b = Some(v),
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
+
+        loop {
+            let (va, vb) = match (buf_a.as_ref(), buf_b.as_ref()) {
+                (Some(va), Some(vb)) => (va, vb),
+                _ => return None, // One or both streams exhausted.
+            };
+
+            match va.cmp(vb) {
+                std::cmp::Ordering::Equal => {
+                    // Match! Yield this ID and advance both streams.
+                    let matched = buf_a.take().unwrap();
+                    buf_a = match a.next() {
+                        Some(Ok(v)) => Some(v),
+                        Some(Err(e)) => return Some(Err(e)),
+                        None => None,
+                    };
+                    buf_b = match b.next() {
+                        Some(Ok(v)) => Some(v),
+                        Some(Err(e)) => return Some(Err(e)),
+                        None => None,
+                    };
+                    return Some(Ok(matched));
+                }
+                std::cmp::Ordering::Less => {
+                    // a < b: in asc mode a is behind, advance a.
+                    //        in desc mode a is ahead, advance b.
+                    if direction == ScanDirection::Asc {
+                        buf_a = match a.next() {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => None,
+                        };
+                    } else {
+                        buf_b = match b.next() {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => None,
+                        };
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    // a > b: in asc mode b is behind, advance b.
+                    //        in desc mode b is ahead, advance a.
+                    if direction == ScanDirection::Asc {
+                        buf_b = match b.next() {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => None,
+                        };
+                    } else {
+                        buf_a = match a.next() {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => None,
+                        };
+                    }
                 }
             }
         }
-    }
-
-    Ok(result)
+    }))
 }
 
-/// Look up full job records by ID, returning an error if any ID is missing
-/// from the `jobs` keyspace (data corruption). Hydrates each job's payload
-/// from the separate `payloads` keyspace.
+/// Look up full job records from an iterator of raw IDs, returning an error
+/// if any ID is missing from the `jobs` keyspace (data corruption). Hydrates
+/// each job's payload from the separate `payloads` keyspace.
 fn load_jobs_by_ids(
     jobs_ks: &SingleWriterTxKeyspace,
     payloads_ks: &SingleWriterTxKeyspace,
-    ids: &[Vec<u8>],
-    index_name: &str,
-    rows: &mut Vec<Job>,
-) -> Result<(), StoreError> {
+    ids: impl Iterator<Item = Result<Vec<u8>, StoreError>>,
+    source: &str,
+) -> Result<Vec<Job>, StoreError> {
+    let mut rows = Vec::new();
     for id in ids {
-        let bytes = jobs_ks.get(id)?.ok_or_else(|| {
+        let id = id?;
+        let bytes = jobs_ks.get(&id)?.ok_or_else(|| {
             StoreError::Corruption(format!(
-                "job in {index_name} but missing from jobs keyspace: {:?}",
-                String::from_utf8_lossy(id),
+                "job in {source} but missing from jobs keyspace: {:?}",
+                String::from_utf8_lossy(&id),
             ))
         })?;
         let mut job: Job = rmp_serde::from_slice(&bytes)?;
 
         // Hydrate the payload from the payloads keyspace.
-        if let Some(payload_bytes) = payloads_ks.get(id)? {
+        if let Some(payload_bytes) = payloads_ks.get(&id)? {
             job.payload = rmp_serde::from_slice(&payload_bytes)?;
         }
 
         rows.push(job);
     }
-    Ok(())
+    Ok(rows)
 }
 
 impl Store {
@@ -549,7 +674,6 @@ impl Store {
         let scheduled_jobs_by_ready_at = db.keyspace("scheduled_jobs_by_ready_at", index_opts)?;
         let jobs_by_status = db.keyspace("jobs_by_status", index_opts)?;
         let jobs_by_queue = db.keyspace("jobs_by_queue", index_opts)?;
-        let jobs_by_queue_and_status = db.keyspace("jobs_by_queue_and_status", index_opts)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -562,7 +686,6 @@ impl Store {
             scheduled_jobs_by_ready_at,
             jobs_by_status,
             jobs_by_queue,
-            jobs_by_queue_and_status,
             event_tx,
         })
     }
@@ -585,7 +708,6 @@ impl Store {
         let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
             let id = scru128::new_string();
@@ -632,14 +754,12 @@ impl Store {
 
             let queue_key = make_queue_key(&job.queue, &id);
             let status_key = make_status_key(status, &id);
-            let queue_status_key = make_queue_status_key(&job.queue, status, &id);
 
             let mut tx = db.write_tx();
             tx.insert(&jobs, &id, &meta_bytes);
             tx.insert(&payloads, &id, &payload_bytes);
             tx.insert(&jobs_by_queue, &queue_key, b"");
             tx.insert(&jobs_by_status, &status_key, b"");
-            tx.insert(&jobs_by_queue_and_status, &queue_status_key, b"");
 
             // The `ready_jobs_by_priority*` and `scheduled_jobs_by_ready_at`
             // indexes are partial. We have to insert into either one
@@ -701,7 +821,6 @@ impl Store {
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let queues = queues.clone();
 
         task::spawn_blocking(move || {
@@ -746,7 +865,9 @@ impl Store {
                     ));
                 }
 
-                let mut ids = kway_merge(sources, ScanDirection::Asc, 1)?;
+                let mut ids: Vec<Vec<u8>> = merge_sources(sources, ScanDirection::Asc)
+                    .take(1)
+                    .collect::<Result<_, _>>()?;
                 if ids.is_empty() {
                     return Ok(None);
                 }
@@ -769,12 +890,9 @@ impl Store {
 
             let mut job: Job = rmp_serde::from_slice(&meta_bytes)?;
             let old_status_key = make_status_key(JobStatus::Ready, &job.id);
-            let old_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &job.id);
             let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &job.id);
             job.status = JobStatus::Working.into();
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
-            let new_queue_status_key =
-                make_queue_status_key(&job.queue, JobStatus::Working, &job.id);
 
             // Only write metadata back — payload is immutable and stays in
             // its own keyspace.
@@ -786,8 +904,6 @@ impl Store {
             tx.insert(&jobs, &job_id, &meta_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
-            tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
-            tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
             tx.commit()?;
 
             // Hydrate the payload from the payloads keyspace for the caller.
@@ -813,7 +929,6 @@ impl Store {
         let payloads = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
 
@@ -837,13 +952,11 @@ impl Store {
             // Clean up all indexes.
             let status_key = make_status_key(JobStatus::Working, &id);
             let queue_key = make_queue_key(&job.queue, &id);
-            let queue_status_key = make_queue_status_key(&job.queue, JobStatus::Working, &id);
 
             tx.remove(&jobs, &id);
             tx.remove(&payloads, &id);
             tx.remove(&jobs_by_status, &status_key);
             tx.remove(&jobs_by_queue, &queue_key);
-            tx.remove(&jobs_by_queue_and_status, &queue_status_key);
             tx.commit()?;
 
             Ok(true)
@@ -902,7 +1015,6 @@ impl Store {
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
         let id = id.to_string();
 
         // Returns Some(queue_name) if the job was requeued, None otherwise.
@@ -921,11 +1033,9 @@ impl Store {
             })?;
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
             let queue = job.queue.clone();
-            let old_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Working, &id);
             let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &id);
             job.status = JobStatus::Ready.into();
             let new_status_key = make_status_key(JobStatus::Ready, &id);
-            let new_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, &id);
             let job_bytes = rmp_serde::to_vec_named(&job)?;
 
             tx.insert(
@@ -937,8 +1047,6 @@ impl Store {
             tx.insert(&jobs, &id, &job_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
-            tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
-            tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
             tx.commit()?;
 
             Ok(Some(queue))
@@ -1002,7 +1110,6 @@ impl Store {
         let payloads_ks = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         task::spawn_blocking(move || {
             let snapshot = db.read_tx();
@@ -1011,64 +1118,16 @@ impl Store {
             let fetch = opts.limit + 1;
             let mut rows = Vec::with_capacity(fetch);
 
-            if !opts.queues.is_empty() && !opts.statuses.is_empty() {
-                // Combined queue + status filter: k-way merge across the
-                // Cartesian product of (queues × statuses).
-                let mut sources: Vec<MergeSource<'_>> = Vec::new();
-                for queue_name in &opts.queues {
-                    for status in &opts.statuses {
-                        let prefix_len = queue_name.len() + 3;
-                        let start = match &opts.from {
-                            Some(cursor) => {
-                                Bound::Excluded(make_queue_status_key(queue_name, *status, cursor))
-                            }
-                            None => {
-                                let mut key = Vec::with_capacity(queue_name.len() + 3);
-                                key.extend_from_slice(queue_name.as_bytes());
-                                key.push(0);
-                                key.push(*status as u8);
-                                key.push(0);
-                                Bound::Included(key)
-                            }
-                        };
-                        let mut end_key = Vec::with_capacity(queue_name.len() + 2);
-                        end_key.extend_from_slice(queue_name.as_bytes());
-                        end_key.push(0);
-                        end_key.push(*status as u8 + 1);
-                        let end = Bound::Excluded(end_key);
-
-                        sources.push(match opts.direction {
-                            ScanDirection::Asc => range_source!(
-                                snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_queue_and_status, (start, end),),
-                                prefix_len
-                            ),
-                            ScanDirection::Desc => range_source!(
-                                snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_queue_and_status, (start, end),)
-                                    .rev(),
-                                prefix_len
-                            ),
-                        });
-                    }
-                }
-
-                let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(
-                    &jobs_ks,
-                    &payloads_ks,
-                    &ids,
-                    "jobs_by_queue_and_status",
-                    &mut rows,
-                )?;
-            } else if !opts.queues.is_empty() {
-                // Queue filter: k-way merge across per-queue ranges.
-                let sources: Vec<MergeSource<'_>> = opts
-                    .queues
+            // Helper: build queue-index MergeSources for the given queues.
+            let queue_sources = |queues: &HashSet<String>,
+                                 from: &Option<String>,
+                                 direction: ScanDirection|
+             -> Vec<MergeSource<'_>> {
+                queues
                     .iter()
                     .map(|queue_name| {
                         let prefix_len = queue_name.len() + 1;
-                        let start = match &opts.from {
+                        let start = match from {
                             Some(cursor) => Bound::Excluded(make_queue_key(queue_name, cursor)),
                             None => Bound::Included(make_queue_key(queue_name, "")),
                         };
@@ -1077,53 +1136,96 @@ impl Store {
                         end_key.push(1);
                         let end = Bound::Excluded(end_key);
 
-                        match opts.direction {
+                        match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&jobs_by_queue, (start, end),),
+                                snapshot.range::<Vec<u8>, _>(&jobs_by_queue, (start, end)),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_queue, (start, end),)
+                                    .range::<Vec<u8>, _>(&jobs_by_queue, (start, end))
                                     .rev(),
                                 prefix_len
                             ),
                         }
                     })
-                    .collect();
+                    .collect()
+            };
 
-                let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(&jobs_ks, &payloads_ks, &ids, "jobs_by_queue", &mut rows)?;
-            } else if !opts.statuses.is_empty() {
-                // Status filter: k-way merge across per-status ranges.
-                let sources: Vec<MergeSource<'_>> = opts
-                    .statuses
+            // Helper: build status-index MergeSources for the given statuses.
+            let status_sources = |statuses: &HashSet<JobStatus>,
+                                  from: &Option<String>,
+                                  direction: ScanDirection|
+             -> Vec<MergeSource<'_>> {
+                statuses
                     .iter()
                     .map(|status| {
                         let prefix = *status as u8;
-                        let start = match &opts.from {
+                        let start = match from {
                             Some(cursor) => Bound::Excluded(make_status_key(*status, cursor)),
                             None => Bound::Included(vec![prefix, 0]),
                         };
                         let end = Bound::Excluded(vec![prefix + 1, 0]);
 
-                        match opts.direction {
+                        match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end),),
+                                snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end)),
                                 2
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_status, (start, end),)
+                                    .range::<Vec<u8>, _>(&jobs_by_status, (start, end))
                                     .rev(),
                                 2
                             ),
                         }
                     })
-                    .collect();
+                    .collect()
+            };
 
-                let ids = kway_merge(sources, opts.direction, fetch)?;
-                load_jobs_by_ids(&jobs_ks, &payloads_ks, &ids, "jobs_by_status", &mut rows)?;
+            // Collect an IdStream per active filter dimension. When
+            // multiple filters are active we intersect them; when only one
+            // is active we use it directly. This scales to new dimensions
+            // (e.g. job_type) without combinatorial branching.
+            let mut filters: Vec<(&str, IdStream<'_>)> = Vec::new();
+
+            if !opts.queues.is_empty() {
+                filters.push((
+                    "jobs_by_queue",
+                    merge_sources(
+                        queue_sources(&opts.queues, &opts.from, opts.direction),
+                        opts.direction,
+                    ),
+                ));
+            }
+            if !opts.statuses.is_empty() {
+                filters.push((
+                    "jobs_by_status",
+                    merge_sources(
+                        status_sources(&opts.statuses, &opts.from, opts.direction),
+                        opts.direction,
+                    ),
+                ));
+            }
+
+            if !filters.is_empty() {
+                // Build a human-readable source description for error
+                // messages, e.g. "jobs_by_queue" or
+                // "(jobs_by_queue & jobs_by_status)".
+                let source_desc = if filters.len() == 1 {
+                    filters[0].0.to_string()
+                } else {
+                    let names: Vec<&str> = filters.iter().map(|(n, _)| *n).collect();
+                    format!("({})", names.join(" & "))
+                };
+
+                let direction = opts.direction;
+                let mut iter = filters.into_iter().map(|(_, s)| s);
+                let first = iter.next().unwrap();
+                let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
+
+                rows =
+                    load_jobs_by_ids(&jobs_ks, &payloads_ks, combined.take(fetch), &source_desc)?;
             } else {
                 // No filter — scan the jobs keyspace directly.
                 match opts.direction {
@@ -1279,7 +1381,6 @@ impl Store {
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
         let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         let id = job.id.clone();
         let event_queue = job.queue.clone();
@@ -1311,11 +1412,6 @@ impl Store {
             let new_status_key = make_status_key(JobStatus::Ready, &id);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
-
-            let old_queue_status_key = make_queue_status_key(&queue, JobStatus::Scheduled, &id);
-            let new_queue_status_key = make_queue_status_key(&queue, JobStatus::Ready, &id);
-            tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
-            tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
 
             // Insert into priority indexes so the job is takeable.
             let priority_key = make_priority_key(priority, &id);
@@ -1356,7 +1452,6 @@ impl Store {
         let ready_jobs_by_priority = self.ready_jobs_by_priority.clone();
         let ready_jobs_by_queue_and_priority = self.ready_jobs_by_queue_and_priority.clone();
         let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue_and_status = self.jobs_by_queue_and_status.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Working jobs.
@@ -1398,12 +1493,6 @@ impl Store {
                 tx.remove(&jobs_by_status, &old_status_key);
                 tx.insert(&jobs_by_status, &new_status_key, b"");
 
-                let old_queue_status_key =
-                    make_queue_status_key(&job.queue, JobStatus::Working, id);
-                let new_queue_status_key = make_queue_status_key(&job.queue, JobStatus::Ready, id);
-                tx.remove(&jobs_by_queue_and_status, &old_queue_status_key);
-                tx.insert(&jobs_by_queue_and_status, &new_queue_status_key, b"");
-
                 // Insert into priority indexes so the jobs are takeable.
                 let priority_key = make_priority_key(job.priority, id);
                 let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, id);
@@ -1439,17 +1528,6 @@ fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
 fn make_queue_key(queue_name: &str, job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(queue_name.len() + 1 + job_id.len());
     key.extend_from_slice(queue_name.as_bytes());
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a compound queue + status index key: `{queue_name}\0{status_u8}\0{job_id}`.
-fn make_queue_status_key(queue_name: &str, status: JobStatus, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(queue_name.len() + 3 + job_id.len());
-    key.extend_from_slice(queue_name.as_bytes());
-    key.push(0);
-    key.push(status as u8);
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
