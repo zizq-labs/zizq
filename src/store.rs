@@ -219,6 +219,10 @@ pub struct ListJobsOptions {
     /// Optional queue filter. When non-empty, only jobs belonging to one of
     /// these queues are returned, using the queue index.
     pub queues: HashSet<String>,
+
+    /// Optional type filter. When non-empty, only jobs with one of these
+    /// types are returned, using the type index.
+    pub types: HashSet<String>,
 }
 
 impl ListJobsOptions {
@@ -230,6 +234,7 @@ impl ListJobsOptions {
             limit: 50,
             statuses: HashSet::new(),
             queues: HashSet::new(),
+            types: HashSet::new(),
         }
     }
 
@@ -264,6 +269,14 @@ impl ListJobsOptions {
     /// An empty set means "all queues".
     pub fn queues(mut self, queues: HashSet<String>) -> Self {
         self.queues = queues;
+        self
+    }
+
+    /// Filter by job type and return `self`.
+    ///
+    /// An empty set means "all types".
+    pub fn types(mut self, types: HashSet<String>) -> Self {
+        self.types = types;
         self
     }
 }
@@ -1103,7 +1116,7 @@ impl Store {
     ///
     /// Fetch the first page with default options:
     ///
-    /// ```ignore
+    /// ```rust
     /// let page = store.list_jobs(ListJobsOptions::new()).await?;
     /// for job in &page.jobs {
     ///     println!("{}: {}", job.id, job.queue);
@@ -1112,7 +1125,7 @@ impl Store {
     ///
     /// Paginate through all jobs:
     ///
-    /// ```ignore
+    /// ```rust
     /// let mut opts = ListJobsOptions::new().limit(100);
     /// loop {
     ///     let page = store.list_jobs(opts).await?;
@@ -1128,7 +1141,7 @@ impl Store {
     ///
     /// Fetch the most recent 10 jobs:
     ///
-    /// ```ignore
+    /// ```rust
     /// let page = store
     ///     .list_jobs(ListJobsOptions::new().direction(ScanDirection::Desc).limit(10))
     ///     .await?;
@@ -1139,6 +1152,7 @@ impl Store {
         let payloads_ks = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
+        let jobs_by_type = self.jobs_by_type.clone();
 
         task::spawn_blocking(move || {
             let snapshot = db.read_tx();
@@ -1212,10 +1226,44 @@ impl Store {
                     .collect()
             };
 
+            // Helper: build type-index MergeSources for the given types.
+            // Same key layout as queue: `{type}\0{job_id}`.
+            let type_sources = |types: &HashSet<String>,
+                                from: &Option<String>,
+                                direction: ScanDirection|
+             -> Vec<MergeSource<'_>> {
+                types
+                    .iter()
+                    .map(|type_name| {
+                        let prefix_len = type_name.len() + 1;
+                        let start = match from {
+                            Some(cursor) => Bound::Excluded(make_type_key(type_name, cursor)),
+                            None => Bound::Included(make_type_key(type_name, "")),
+                        };
+                        let mut end_key = Vec::with_capacity(type_name.len() + 1);
+                        end_key.extend_from_slice(type_name.as_bytes());
+                        end_key.push(1);
+                        let end = Bound::Excluded(end_key);
+
+                        match direction {
+                            ScanDirection::Asc => range_source!(
+                                snapshot.range::<Vec<u8>, _>(&jobs_by_type, (start, end)),
+                                prefix_len
+                            ),
+                            ScanDirection::Desc => range_source!(
+                                snapshot
+                                    .range::<Vec<u8>, _>(&jobs_by_type, (start, end))
+                                    .rev(),
+                                prefix_len
+                            ),
+                        }
+                    })
+                    .collect()
+            };
+
             // Collect an IdStream per active filter dimension. When
             // multiple filters are active we intersect them; when only one
-            // is active we use it directly. This scales to new dimensions
-            // (e.g. job_type) without combinatorial branching.
+            // is active we use it directly.
             let mut filters: Vec<(&str, IdStream<'_>)> = Vec::new();
 
             if !opts.queues.is_empty() {
@@ -1232,6 +1280,15 @@ impl Store {
                     "jobs_by_status",
                     merge_sources(
                         status_sources(&opts.statuses, &opts.from, opts.direction),
+                        opts.direction,
+                    ),
+                ));
+            }
+            if !opts.types.is_empty() {
+                filters.push((
+                    "jobs_by_type",
+                    merge_sources(
+                        type_sources(&opts.types, &opts.from, opts.direction),
                         opts.direction,
                     ),
                 ));
@@ -1312,6 +1369,7 @@ impl Store {
                     .limit(opts.limit)
                     .statuses(opts.statuses.clone())
                     .queues(opts.queues.clone())
+                    .types(opts.types.clone())
             };
 
             // Next page: exists if over-select found an extra row.
@@ -3368,6 +3426,351 @@ mod tests {
         assert_eq!(page2.jobs.len(), 1);
         assert_eq!(page2.jobs[0].id, c.id);
         assert!(page2.next.is_none());
+    }
+
+    // --- list_jobs type filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_single_type() {
+        let store = test_store();
+        let a = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().types(HashSet::from(["send_email".into()])))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_multiple_types() {
+        let store = test_store();
+        let a = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new("send_sms", "q", serde_json::json!("c")))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into(), "send_sms".into()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, c.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_type_filter_empty_when_none_match() {
+        let store = test_store();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().types(HashSet::from(["no_such_type".into()])))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_type_filter_reflects_completion() {
+        let store = test_store();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        store.mark_completed(&taken.id).await.unwrap();
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().types(HashSet::from(["send_email".into()])))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, b.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_type_filter_with_pagination() {
+        let store = test_store();
+        let a = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        let c = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into()]))
+                    .limit(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, a.id);
+        assert_eq!(page.jobs[1].id, b.id);
+        assert!(page.next.is_some());
+
+        let page2 = store.list_jobs(page.next.unwrap()).await.unwrap();
+        assert_eq!(page2.jobs.len(), 1);
+        assert_eq!(page2.jobs[0].id, c.id);
+        assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_type_filter_desc_order() {
+        let store = test_store();
+        let a = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        let b = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into()]))
+                    .direction(ScanDirection::Desc),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert_eq!(page.jobs[0].id, b.id);
+        assert_eq!(page.jobs[1].id, a.id);
+    }
+
+    // --- list_jobs combined type + queue + status filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_type_and_queue() {
+        let store = test_store();
+        let a = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "high",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "low",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "high",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into()]))
+                    .queues(HashSet::from(["high".into()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_type_and_status() {
+        let store = test_store();
+        let a = store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "q",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+
+        // Take a so it becomes working.
+        store.take_next_job(&HashSet::new()).await.unwrap();
+
+        // Working send_email jobs only.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into()]))
+                    .statuses(HashSet::from([JobStatus::Working])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_type_and_queue_and_status() {
+        let store = test_store();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "high",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "high",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "low",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+        store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "high",
+                serde_json::json!("d"),
+            ))
+            .await
+            .unwrap();
+
+        // Take a so it becomes working.
+        store.take_next_job(&HashSet::new()).await.unwrap();
+
+        // Ready send_email in high queue.
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into()]))
+                    .queues(HashSet::from(["high".into()]))
+                    .statuses(HashSet::from([JobStatus::Ready])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        // b is the only ready send_email in the high queue (a is working).
+        assert_eq!(page.jobs[0].payload, serde_json::json!("b"));
     }
 
     #[tokio::test]

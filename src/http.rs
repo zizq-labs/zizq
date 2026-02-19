@@ -369,6 +369,10 @@ struct ListJobsParams {
     /// Queue filter, semicolon-delimited (e.g. "emails;webhooks").
     #[serde(default)]
     queue: SemicolonSet<String>,
+
+    /// Type filter, semicolon-delimited (e.g. "send_email;generate_report").
+    #[serde(default, rename = "type")]
+    job_type: SemicolonSet<String>,
 }
 
 /// Sort order for job listings.
@@ -983,6 +987,9 @@ async fn list_jobs(
     if !params.queue.is_empty() {
         opts = opts.queues(params.queue.0.clone());
     }
+    if !params.job_type.is_empty() {
+        opts = opts.types(params.job_type.0.clone());
+    }
 
     match state.store.list_jobs(opts).await {
         Ok(page) => {
@@ -992,6 +999,7 @@ async fn list_jobs(
                 limit,
                 &params.status,
                 &params.queue,
+                &params.job_type,
             );
             let next = page.next.map(|o| {
                 build_page_url(
@@ -1000,6 +1008,7 @@ async fn list_jobs(
                     limit,
                     &params.status,
                     &params.queue,
+                    &params.job_type,
                 )
             });
             let prev = page.prev.map(|o| {
@@ -1009,6 +1018,7 @@ async fn list_jobs(
                     limit,
                     &params.status,
                     &params.queue,
+                    &params.job_type,
                 )
             });
 
@@ -1059,6 +1069,7 @@ fn build_page_url(
     limit: u16,
     statuses: &SemicolonSet<JobStatus>,
     queues: &SemicolonSet<String>,
+    types: &SemicolonSet<String>,
 ) -> String {
     let mut url = String::from("/jobs?");
     if let Some(cursor) = from {
@@ -1071,6 +1082,9 @@ fn build_page_url(
     }
     if !queues.is_empty() {
         url.push_str(&format!("&queue={queues}"));
+    }
+    if !types.is_empty() {
+        url.push_str(&format!("&type={types}"));
     }
     url
 }
@@ -2603,6 +2617,164 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0]["payload"], "a"); // emails, working
         assert_eq!(jobs[1]["payload"], "b"); // reports, ready
+    }
+
+    // --- list_jobs type filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_type() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?type=send_email");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["type"], "send_email");
+        assert_eq!(jobs[1]["type"], "send_email");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_multiple_types() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "q",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "q",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(EnqueueOptions::new("send_sms", "q", serde_json::json!("c")))
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?type=send_email;send_sms");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["payload"], "a");
+        assert_eq!(jobs[1]["payload"], "c");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_type_filter_preserves_in_pagination() {
+        let (state, app) = test_state_and_app();
+
+        for i in 0..3 {
+            state
+                .store
+                .enqueue(EnqueueOptions::new("send_email", "q", serde_json::json!(i)))
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs?type=send_email&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        assert!(next_url.contains("type=send_email"));
+
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_type_and_queue_and_status() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "high",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "send_email",
+                "high",
+                serde_json::json!("b"),
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(EnqueueOptions::new(
+                "generate_report",
+                "high",
+                serde_json::json!("c"),
+            ))
+            .await
+            .unwrap();
+
+        // Take a so it becomes working.
+        state.store.take_next_job(&HashSet::new()).await.unwrap();
+
+        // Ready send_email in high queue.
+        let req = empty_request("GET", "/jobs?type=send_email&queue=high&status=ready");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["payload"], "b");
     }
 
     // --- POST /jobs/{id}/success tests ---
