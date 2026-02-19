@@ -185,7 +185,12 @@ async fn start_server() -> (String, JoinHandle<()>) {
     });
 
     // Spawn the background scheduler.
-    tokio::spawn(zanxio::scheduler::run(store, shutdown_rx));
+    tokio::spawn(zanxio::scheduler::run(
+        store,
+        zanxio::scheduler::now_millis,
+        zanxio::scheduler::DEFAULT_BATCH_SIZE,
+        shutdown_rx,
+    ));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

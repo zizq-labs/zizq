@@ -16,10 +16,10 @@ use crate::store::{Store, StoreEvent};
 /// Default number of due jobs to fetch per iteration.
 ///
 /// Override with the `ZANXIO_SCHEDULER_BATCH_SIZE` environment variable.
-const DEFAULT_BATCH_SIZE: usize = 200;
+pub const DEFAULT_BATCH_SIZE: usize = 200;
 
 /// Returns the current time as milliseconds since the Unix epoch.
-fn now_millis() -> u64 {
+pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -32,16 +32,22 @@ fn now_millis() -> u64 {
 /// one at a time. If no jobs are due, the loop sleeps until the next
 /// scheduled `ready_at` timestamp, waking early if a new `JobScheduled`
 /// event arrives (which might be due sooner).
-pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
-    let batch_size = std::env::var("ZANXIO_SCHEDULER_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_BATCH_SIZE);
-
+///
+/// The `clock` parameter provides the current time in milliseconds since
+/// the Unix epoch. In production, pass `now_millis`; in tests, an
+/// injectable clock enables deterministic time control.
+///
+/// `batch_size` controls how many due jobs are fetched per iteration.
+pub async fn run(
+    store: Store,
+    clock: impl Fn() -> u64,
+    batch_size: usize,
+    mut shutdown: watch::Receiver<()>,
+) {
     let mut event_rx = store.subscribe();
 
     loop {
-        let now = now_millis();
+        let now = clock();
 
         let (batch, next_ready_at) = match store.next_scheduled(now, batch_size).await {
             // Got a batch of scheduled jobs to promote. Move to the next phase.
@@ -94,7 +100,7 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
         // None and we didn't promote anything), we use u64::MAX as the
         // sleep target so that any JobScheduled event is "earlier" and
         // resets the timer.
-        let sleep_until = match next_ready_at {
+        let mut sleep_until = match next_ready_at {
             Some(ready_at) => ready_at,
             None if !promoted_any => u64::MAX,
             None => {
@@ -105,7 +111,7 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
             }
         };
 
-        let delay = Duration::from_millis(sleep_until.saturating_sub(now_millis()));
+        let delay = Duration::from_millis(sleep_until.saturating_sub(clock()));
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
 
@@ -118,8 +124,9 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
                             if ready_at < sleep_until =>
                         {
                             // New job is due sooner — reset the timer.
+                            sleep_until = ready_at;
                             let delay = Duration::from_millis(
-                                ready_at.saturating_sub(now_millis()),
+                                ready_at.saturating_sub(clock()),
                             );
                             sleep.as_mut().reset(
                                 tokio::time::Instant::now() + delay,
@@ -145,4 +152,280 @@ pub async fn run(store: Store, mut shutdown: watch::Receiver<()>) {
     }
 
     tracing::debug!("scheduler stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{EnqueueOptions, JobStatus, Store};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_store() -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        std::mem::forget(dir);
+        store
+    }
+
+    /// Build a controllable clock backed by an `AtomicU64`.
+    ///
+    /// Returns the atomic (for advancing time) and a closure suitable for
+    /// passing to `run()`.
+    fn test_clock() -> (Arc<AtomicU64>, impl Fn() -> u64) {
+        let time = Arc::new(AtomicU64::new(now_millis()));
+        let t = Arc::clone(&time);
+        (time, move || t.load(Ordering::Relaxed))
+    }
+
+    /// Yield to let the scheduler process events. The scheduler uses
+    /// `spawn_blocking` for store operations, which run on real threads.
+    /// We alternate between brief real sleeps (so blocking tasks finish)
+    /// and async yields (so the scheduler task gets polled and processes
+    /// results). Multiple rounds handle the multi-step scheduler loop
+    /// (next_scheduled → promote → next_scheduled again).
+    async fn yield_scheduler() {
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn promotes_single_due_job() {
+        let store = test_store();
+        let (clock, clock_fn) = test_clock();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(run(
+            store.clone(),
+            clock_fn,
+            DEFAULT_BATCH_SIZE,
+            shutdown_rx,
+        ));
+
+        let t = clock.load(Ordering::Relaxed);
+
+        let job = store
+            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 1_000))
+            .await
+            .unwrap();
+
+        // Advance the clock past the job's ready_at and let the scheduler
+        // timer fire.
+        clock.store(t + 1_001, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        yield_scheduler().await;
+
+        let job = store.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Ready as u8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn promotes_batch_of_due_jobs() {
+        let store = test_store();
+        let (clock, clock_fn) = test_clock();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(run(
+            store.clone(),
+            clock_fn,
+            DEFAULT_BATCH_SIZE,
+            shutdown_rx,
+        ));
+
+        let t = clock.load(Ordering::Relaxed);
+
+        // Enqueue three jobs all due at the same time.
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let job = store
+                .enqueue(EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000))
+                .await
+                .unwrap();
+            ids.push(job.id);
+        }
+
+        clock.store(t + 1_001, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        yield_scheduler().await;
+
+        for id in &ids {
+            let job = store.get_job(id).await.unwrap().unwrap();
+            assert_eq!(job.status, JobStatus::Ready as u8);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn does_not_promote_future_jobs() {
+        let store = test_store();
+        let (clock, clock_fn) = test_clock();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(run(
+            store.clone(),
+            clock_fn,
+            DEFAULT_BATCH_SIZE,
+            shutdown_rx,
+        ));
+
+        let t = clock.load(Ordering::Relaxed);
+
+        let job = store
+            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 10_000))
+            .await
+            .unwrap();
+
+        // Advance partway — not past the job's ready_at.
+        clock.store(t + 5_000, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(5_000)).await;
+        yield_scheduler().await;
+
+        let job = store.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Scheduled as u8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wakes_early_when_earlier_job_arrives() {
+        let store = test_store();
+        let (clock, clock_fn) = test_clock();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(run(
+            store.clone(),
+            clock_fn,
+            DEFAULT_BATCH_SIZE,
+            shutdown_rx,
+        ));
+
+        let t = clock.load(Ordering::Relaxed);
+
+        // Enqueue a job due in 10s — scheduler starts sleeping until then.
+        let late = store
+            .enqueue(
+                EnqueueOptions::new("test", "q", serde_json::json!("late")).ready_at(t + 10_000),
+            )
+            .await
+            .unwrap();
+
+        // Now enqueue a job due in 2s — should reset the timer.
+        let early = store
+            .enqueue(
+                EnqueueOptions::new("test", "q", serde_json::json!("early")).ready_at(t + 2_000),
+            )
+            .await
+            .unwrap();
+
+        // Advance past the early job's ready_at but not the late one.
+        clock.store(t + 2_001, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(2_001)).await;
+        yield_scheduler().await;
+
+        let early_job = store.get_job(&early.id).await.unwrap().unwrap();
+        assert_eq!(early_job.status, JobStatus::Ready as u8);
+
+        let late_job = store.get_job(&late.id).await.unwrap().unwrap();
+        assert_eq!(late_job.status, JobStatus::Scheduled as u8);
+    }
+
+    /// Regression test for a bug where `sleep_until` was not updated when
+    /// the timer was reset by a `JobScheduled` event. Each successive event
+    /// passed the `ready_at < sleep_until` guard (because `sleep_until` was
+    /// still `u64::MAX`), pushing the timer forward to the latest job's
+    /// `ready_at` instead of keeping it pinned to the earliest.
+    #[tokio::test(start_paused = true)]
+    async fn does_not_reset_timer_when_later_job_arrives() {
+        let store = test_store();
+        let (clock, clock_fn) = test_clock();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        tokio::spawn(run(
+            store.clone(),
+            clock_fn,
+            DEFAULT_BATCH_SIZE,
+            shutdown_rx,
+        ));
+
+        let t = clock.load(Ordering::Relaxed);
+
+        // Enqueue a job due in 2s — scheduler resets timer from u64::MAX
+        // to t+2000.
+        let early = store
+            .enqueue(
+                EnqueueOptions::new("test", "q", serde_json::json!("early")).ready_at(t + 2_000),
+            )
+            .await
+            .unwrap();
+
+        // Enqueue a job due in 10s — must NOT push the timer forward.
+        let late = store
+            .enqueue(
+                EnqueueOptions::new("test", "q", serde_json::json!("late")).ready_at(t + 10_000),
+            )
+            .await
+            .unwrap();
+
+        // Advance past the early job only.
+        clock.store(t + 2_001, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(2_001)).await;
+        yield_scheduler().await;
+
+        let early_job = store.get_job(&early.id).await.unwrap().unwrap();
+        assert_eq!(
+            early_job.status,
+            JobStatus::Ready as u8,
+            "early job should be promoted — timer must not have been pushed to late job's ready_at"
+        );
+
+        let late_job = store.get_job(&late.id).await.unwrap().unwrap();
+        assert_eq!(late_job.status, JobStatus::Scheduled as u8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loops_immediately_when_batch_is_full() {
+        let store = test_store();
+        let (clock, clock_fn) = test_clock();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+
+        // Use batch size of 2 so we can trigger the "more due" path.
+        tokio::spawn(run(store.clone(), clock_fn, 2, shutdown_rx));
+
+        let t = clock.load(Ordering::Relaxed);
+
+        // Enqueue 3 jobs all due at the same time.
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let job = store
+                .enqueue(EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000))
+                .await
+                .unwrap();
+            ids.push(job.id);
+        }
+
+        clock.store(t + 1_001, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        yield_scheduler().await;
+
+        // All 3 should be promoted even though batch_size is 2 — the
+        // scheduler loops immediately when the batch was full.
+        for id in &ids {
+            let job = store.get_job(id).await.unwrap().unwrap();
+            assert_eq!(job.status, JobStatus::Ready as u8);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stops_on_shutdown_signal() {
+        let store = test_store();
+        let (_, clock_fn) = test_clock();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+
+        let handle = tokio::spawn(run(store, clock_fn, DEFAULT_BATCH_SIZE, shutdown_rx));
+
+        // Give the scheduler a moment to enter its loop.
+        yield_scheduler().await;
+
+        // Send shutdown.
+        drop(shutdown_tx);
+        yield_scheduler().await;
+
+        // The task should complete promptly.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        handle.await.unwrap();
+    }
 }

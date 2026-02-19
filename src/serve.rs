@@ -75,8 +75,14 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Start the background scheduler that promotes scheduled jobs to Ready
     // once their ready_at timestamp arrives.
     let scheduler_shutdown = state.shutdown.clone();
+    let scheduler_batch_size = std::env::var("ZANXIO_SCHEDULER_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(crate::scheduler::DEFAULT_BATCH_SIZE);
     tokio::spawn(crate::scheduler::run(
         state.store.clone(),
+        crate::scheduler::now_millis,
+        scheduler_batch_size,
         scheduler_shutdown,
     ));
 
