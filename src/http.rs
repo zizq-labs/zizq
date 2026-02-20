@@ -1414,11 +1414,17 @@ async fn take_jobs(
                                     claim_token = token;
                                 }
                             }
-                            Ok(StoreEvent::JobCompleted(id)) => {
-                                if in_flight.remove(&id) {
+                            Ok(StoreEvent::JobCompleted(ref id))
+                            | Ok(StoreEvent::JobKilled(ref id)) => {
+                                if in_flight.remove(id) {
+                                    let reason = match event {
+                                        Ok(StoreEvent::JobKilled(_)) => "killed",
+                                        _ => "completed",
+                                    };
                                     tracing::debug!(
                                         job_id = %id,
-                                        "job completed"
+                                        reason,
+                                        "job removed from working set"
                                     );
                                     let _ = state
                                         .global_in_flight

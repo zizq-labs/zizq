@@ -495,6 +495,7 @@ pub struct FailureOptions {
 /// On `Lagged`, workers fall back to a full reconciliation (re-check the
 /// DB and reconcile their in-flight set), since they may have missed both
 /// creation and completion events.
+
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
     /// A job became ready for processing (newly enqueued, requeued, or
@@ -510,6 +511,12 @@ pub enum StoreEvent {
 
     /// A job was successfully completed and removed.
     JobCompleted(String),
+
+    /// A job was killed (exhausted retries or force-killed) and removed.
+    ///
+    /// Workers handle this the same way as `JobCompleted` — prune the
+    /// in-flight set so capacity is freed.
+    JobKilled(String),
 
     /// A job was enqueued with a future `ready_at` timestamp.
     ///
@@ -1128,6 +1135,7 @@ impl Store {
         let jobs_by_status = self.jobs_by_status.clone();
         let jobs_by_queue = self.jobs_by_queue.clone();
         let jobs_by_type = self.jobs_by_type.clone();
+        let errors = self.errors.clone();
         let id = id.to_string();
         let id_for_event = id.clone();
 
@@ -1158,6 +1166,12 @@ impl Store {
             tx.remove(&jobs_by_status, &status_key);
             tx.remove(&jobs_by_queue, &queue_key);
             tx.remove(&jobs_by_type, &type_key);
+
+            // Clean up any error records from previous failures.
+            for key in error_keys(&errors, &id) {
+                tx.remove(&errors, &key);
+            }
+
             tx.commit()?;
 
             Ok(true)
@@ -1170,6 +1184,152 @@ impl Store {
         }
 
         completed
+    }
+
+    /// Record a job failure and either schedule a retry or kill the job
+    /// depending on the backoff policy.
+    ///
+    /// Returns `Some(job)` with metadata-only fields if the job was found in
+    /// the Working state. The returned job's status will be either `Scheduled`
+    /// in the retry scenario or `Dead` if the retry limit has been reached.
+    /// Returns `None` if the job wasn't found or wasn't in the Working state.
+    ///
+    /// For dead jobs, the job record and all associated data (payload,
+    /// indexes, error records) are deleted from the store.
+    pub async fn record_failure(
+        &self,
+        id: &str,
+        opts: FailureOptions,
+    ) -> Result<Option<Job>, StoreError> {
+        let db = self.db.clone();
+
+        let jobs = self.jobs.clone();
+        let payloads = self.payloads.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue = self.jobs_by_queue.clone();
+        let jobs_by_type = self.jobs_by_type.clone();
+        let scheduled_jobs_by_ready_at = self.scheduled_jobs_by_ready_at.clone();
+        let errors = self.errors.clone();
+
+        let id = id.to_string();
+        let id_for_event = id.clone();
+
+        let result: Result<Option<Job>, StoreError> = task::spawn_blocking(move || {
+            let mut tx = db.write_tx();
+
+            // Load the job to check its status and update it.
+            let job_bytes = match jobs.get(&id)? {
+                Some(bytes) => bytes,
+                None => return Ok(None),
+            };
+
+            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+
+            // Can only fail a job that is currently being worked on.
+            if job.status != JobStatus::Working as u8 {
+                return Ok(None);
+            }
+
+            // Record the failure time and increment the count.
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            job.attempts += 1;
+            job.failed_at = Some(now);
+
+            // Write the error record (append-only).
+            let error_key = make_error_key(&id, job.attempts);
+            let error_record = ErrorRecord {
+                message: opts.error,
+                error_type: opts.error_type,
+                backtrace: opts.backtrace,
+                dequeued_at: job.dequeued_at.unwrap_or(0),
+                failed_at: now,
+            };
+            let error_bytes = rmp_serde::to_vec_named(&error_record)?;
+            tx.insert(&errors, &error_key, &error_bytes);
+
+            // Client options may override the default backoff policy here so
+            // we always check those first and then apply the appropriate
+            // backoff policy.
+
+            let retry_limit = job.retry_limit.unwrap_or(opts.default_retry_limit);
+
+            if opts.kill {
+                // If the client requested to force kill this job, mark it dead.
+                job.status = JobStatus::Dead.into();
+            } else if let Some(retry_at) = opts.retry_at {
+                // If the client requested to reschedule this job, mark it
+                // scheduled and set the new ready_at.
+                job.status = JobStatus::Scheduled.into();
+                job.ready_at = retry_at;
+            } else if job.attempts > retry_limit {
+                // Client didn't specify what to do and retries have exhausted.
+                job.status = JobStatus::Dead.into();
+            } else {
+                // Client didn't specify what to do and we are able to retry.
+
+                // Calculate backoff delay.
+                let backoff = job.backoff.as_ref().unwrap_or(&opts.default_backoff);
+                let delay_ms = compute_backoff(job.attempts, backoff);
+                job.status = JobStatus::Scheduled.into();
+                job.ready_at = now + delay_ms;
+            };
+
+            let old_status_key = make_status_key(JobStatus::Working, &id);
+
+            if job.status == JobStatus::Scheduled as u8 {
+                // Move job back into the scheduled index.
+                let new_status_key = make_status_key(JobStatus::Scheduled, &id);
+                let scheduled_key = make_scheduled_key(job.ready_at, &id);
+
+                let meta_bytes = rmp_serde::to_vec_named(&job)?;
+                tx.insert(&jobs, &id, &meta_bytes);
+                tx.remove(&jobs_by_status, &old_status_key);
+                tx.insert(&jobs_by_status, &new_status_key, b"");
+                tx.insert(&scheduled_jobs_by_ready_at, &scheduled_key, b"");
+                tx.commit()?;
+            } else {
+                // Delete the job and all associated data.
+                let queue_key = make_queue_key(&job.queue, &id);
+                let type_key = make_type_key(&job.job_type, &id);
+
+                tx.remove(&jobs, &id);
+                tx.remove(&payloads, &id);
+                tx.remove(&jobs_by_status, &old_status_key);
+                tx.remove(&jobs_by_queue, &queue_key);
+                tx.remove(&jobs_by_type, &type_key);
+
+                // Clean up all previously committed error records.
+                for key in error_keys(&errors, &id) {
+                    tx.remove(&errors, &key);
+                }
+
+                // Also remove the error record we just inserted above.
+                // The prefix scan reads committed state, so it won't
+                // see the in-flight insert — we must remove it explicitly.
+                tx.remove(&errors, &error_key);
+
+                tx.commit()?;
+            }
+
+            Ok(Some(job))
+        })
+        .await?;
+
+        // Emit events outside spawn_blocking due to &self.event_tx.
+        if let Ok(Some(ref job)) = result {
+            if job.status == JobStatus::Scheduled as u8 {
+                let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                    ready_at: job.ready_at,
+                });
+            } else {
+                let _ = self.event_tx.send(StoreEvent::JobKilled(id_for_event));
+            }
+        }
+
+        result
     }
 
     /// Look up a job by ID.
@@ -1828,6 +1988,55 @@ fn make_scheduled_key(ready_at: u64, job_id: &str) -> Vec<u8> {
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
+}
+
+/// Build an error record key: `{job_id}\0{attempt_be_u32}`.
+///
+/// The null separator lets us prefix-scan all errors for a given job,
+/// and the big-endian attempt number gives chronological ordering.
+fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(job_id.len() + 1 + 4);
+    key.extend_from_slice(job_id.as_bytes());
+    key.push(0);
+    key.extend_from_slice(&attempt.to_be_bytes());
+    key
+}
+
+/// Iterate all error record keys for a job via prefix scan.
+///
+/// The returned iterator yields owned key bytes that the caller can pass
+/// to `tx.remove`. The fjall `Iter` is an owned value (no borrow on the
+/// keyspace), so it's safe to interleave iteration with mutable tx ops.
+fn error_keys(errors: &SingleWriterTxKeyspace, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
+    let mut prefix = Vec::with_capacity(job_id.len() + 1);
+    prefix.extend_from_slice(job_id.as_bytes());
+    prefix.push(0);
+
+    errors
+        .inner()
+        .prefix(&prefix)
+        .filter_map(|guard| guard.key().ok().map(|k| k.to_vec()))
+}
+
+/// Compute the backoff delay in milliseconds for a given attempt count.
+///
+/// Formula: `delay_ms = attempts^exponent + base_ms + rand(0..jitter_ms) * (attempts + 1)`
+///
+/// The jitter component scales linearly with the attempt count so that
+/// later retries spread further apart, reducing collision likelihood when
+/// many jobs fail at similar times.
+fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let base_delay = (attempts as f32).powf(backoff.exponent) + backoff.base_ms;
+
+    // Cheap random value using the same approach as rand_id() in http.rs.
+    let rand_frac = (RandomState::new().build_hasher().finish() as f64) / (u64::MAX as f64); // 0.0..1.0
+
+    let jitter = rand_frac * backoff.jitter_ms as f64 * (attempts as f64 + 1.0);
+
+    (base_delay as f64 + jitter) as u64
 }
 
 #[cfg(test)]
@@ -4418,5 +4627,412 @@ mod tests {
         // The scheduled job is still in the scheduled index.
         let fetched = store.get_job(&scheduled.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, JobStatus::Scheduled as u8);
+    }
+
+    // --- record_failure tests ---
+
+    /// Build a FailureOptions with sensible defaults for testing.
+    /// retry_limit=3, zero-jitter backoff so delays are deterministic.
+    fn test_failure_opts() -> FailureOptions {
+        FailureOptions {
+            error: "something broke".into(),
+            error_type: None,
+            backtrace: None,
+            retry_at: None,
+            kill: false,
+            default_retry_limit: 3,
+            default_backoff: BackoffConfig {
+                exponent: 2.0,
+                base_ms: 100.0,
+                jitter_ms: 0.0, // deterministic
+            },
+        }
+    }
+
+    /// Enqueue a job and take it so it's in the Working state.
+    async fn enqueue_and_take(store: &Store) -> Job {
+        store
+            .enqueue(EnqueueOptions::new(
+                "test",
+                "default",
+                serde_json::json!("payload"),
+            ))
+            .await
+            .unwrap();
+        store.take_next_job(&HashSet::new()).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn record_failure_retries_under_limit() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let result = store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+        assert_eq!(result.attempts, 1);
+        assert!(result.failed_at.is_some());
+        // ready_at should be in the future (base_ms=100, exponent=2, 1^2+100=101).
+        assert!(result.ready_at > 0);
+    }
+
+    #[tokio::test]
+    async fn record_failure_kills_when_retries_exhausted() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // retry_limit=0 means the first failure kills.
+        let mut opts = test_failure_opts();
+        opts.default_retry_limit = 0;
+
+        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        assert_eq!(result.status, JobStatus::Dead as u8);
+        assert_eq!(result.attempts, 1);
+
+        // Job should be gone from the store.
+        assert!(store.get_job(&job.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_failure_kills_when_kill_flag_set() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let mut opts = test_failure_opts();
+        opts.kill = true;
+
+        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        assert_eq!(result.status, JobStatus::Dead as u8);
+        assert!(store.get_job(&job.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_failure_kill_overrides_remaining_retries() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // retry_limit=100, but kill=true should still kill.
+        let mut opts = test_failure_opts();
+        opts.default_retry_limit = 100;
+        opts.kill = true;
+
+        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        assert_eq!(result.status, JobStatus::Dead as u8);
+    }
+
+    #[tokio::test]
+    async fn record_failure_retry_at_overrides_backoff() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let mut opts = test_failure_opts();
+        opts.retry_at = Some(999_999);
+
+        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+        assert_eq!(result.ready_at, 999_999);
+    }
+
+    #[tokio::test]
+    async fn record_failure_retry_at_overrides_exhausted_limit() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // retry_limit=0, but retry_at should force a retry anyway.
+        let mut opts = test_failure_opts();
+        opts.default_retry_limit = 0;
+        opts.retry_at = Some(123_456);
+
+        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+        assert_eq!(result.ready_at, 123_456);
+    }
+
+    #[tokio::test]
+    async fn record_failure_returns_none_for_unknown_id() {
+        let store = test_store();
+        let result = store
+            .record_failure("nonexistent", test_failure_opts())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_failure_returns_none_for_ready_job() {
+        let store = test_store();
+        store
+            .enqueue(EnqueueOptions::new(
+                "test",
+                "default",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+
+        // Don't take it — job is still Ready.
+        let job = store
+            .list_jobs(ListJobsOptions::new())
+            .await
+            .unwrap()
+            .jobs
+            .pop()
+            .unwrap();
+
+        let result = store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_failure_increments_attempts_across_retries() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // First failure: attempts goes from 0 -> 1.
+        store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The job is now Scheduled. Promote it and take it again.
+        let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
+        store.promote_scheduled(&scheduled).await.unwrap();
+        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+
+        // Second failure: attempts goes from 1 -> 2.
+        let result = store
+            .record_failure(&retaken.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn record_failure_writes_error_record() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let mut opts = test_failure_opts();
+        opts.error = "connection timeout".into();
+        opts.error_type = Some("TimeoutError".into());
+        opts.backtrace = Some("at line 42".into());
+
+        store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        // Read the error record from the errors keyspace.
+        let key = make_error_key(&job.id, 1);
+        let raw = store.errors.inner().get(&key).unwrap().unwrap();
+        let err: ErrorRecord = rmp_serde::from_slice(&raw).unwrap();
+
+        assert_eq!(err.message, "connection timeout");
+        assert_eq!(err.error_type.as_deref(), Some("TimeoutError"));
+        assert_eq!(err.backtrace.as_deref(), Some("at line 42"));
+        assert!(err.failed_at > 0);
+    }
+
+    #[tokio::test]
+    async fn record_failure_dead_cleans_up_error_records() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // Kill immediately — the error record written during this call
+        // should also be cleaned up since dead jobs are fully removed.
+        let mut opts = test_failure_opts();
+        opts.kill = true;
+
+        store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        // No error records should remain.
+        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_failure_dead_removes_payload() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // Verify payload exists before kill.
+        assert!(store.payloads.inner().get(&job.id).unwrap().is_some());
+
+        let mut opts = test_failure_opts();
+        opts.kill = true;
+
+        store.record_failure(&job.id, opts).await.unwrap().unwrap();
+
+        // Payload should be gone.
+        assert!(store.payloads.inner().get(&job.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_failure_retry_broadcasts_job_scheduled() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let mut rx = store.subscribe();
+        store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobScheduled { ready_at } => assert!(ready_at > 0),
+            other => panic!("expected JobScheduled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_failure_dead_broadcasts_job_killed() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let mut rx = store.subscribe();
+        let mut opts = test_failure_opts();
+        opts.kill = true;
+        store.record_failure(&job.id, opts).await.unwrap();
+
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobKilled(id) => assert_eq!(id, job.id),
+            other => panic!("expected JobKilled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_failure_does_not_hydrate_payload() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let result = store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Payload should be the default (Null), not the stored value.
+        assert_eq!(result.payload, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn record_failure_uses_job_retry_limit_over_default() {
+        let store = test_store();
+
+        // Enqueue with per-job retry_limit=1.
+        store
+            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("a")).retry_limit(1))
+            .await
+            .unwrap();
+        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+
+        // First failure (attempts 0->1): should retry (1 <= 1).
+        let result = store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+
+        // Promote and take again.
+        let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
+        store.promote_scheduled(&scheduled).await.unwrap();
+        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+
+        // Second failure (attempts 1->2): should die (2 > 1).
+        let result = store
+            .record_failure(&retaken.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, JobStatus::Dead as u8);
+    }
+
+    #[tokio::test]
+    async fn mark_completed_cleans_up_error_records() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // Fail once (retry), then promote, take, and complete.
+        store
+            .record_failure(&job.id, test_failure_opts())
+            .await
+            .unwrap();
+
+        let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
+        store.promote_scheduled(&scheduled).await.unwrap();
+        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        store.mark_completed(&retaken.id).await.unwrap();
+
+        // Error records from the earlier failure should be gone.
+        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        assert!(keys.is_empty());
+    }
+
+    // --- compute_backoff tests ---
+
+    #[test]
+    fn compute_backoff_zero_jitter_is_deterministic() {
+        let backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100.0,
+            jitter_ms: 0.0,
+        };
+
+        // attempts=1: 1^2 + 100 = 101
+        assert_eq!(compute_backoff(1, &backoff), 101);
+        // attempts=2: 2^2 + 100 = 104
+        assert_eq!(compute_backoff(2, &backoff), 104);
+        // attempts=3: 3^2 + 100 = 109
+        assert_eq!(compute_backoff(3, &backoff), 109);
+    }
+
+    #[test]
+    fn compute_backoff_with_jitter_stays_in_range() {
+        let backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100.0,
+            jitter_ms: 50.0,
+        };
+
+        // Run many times to exercise randomness.
+        for attempts in 1..=10 {
+            let delay = compute_backoff(attempts, &backoff);
+            let base = (attempts as f64).powf(2.0) + 100.0;
+            let max_jitter = 50.0 * (attempts as f64 + 1.0);
+            assert!(
+                delay >= base as u64,
+                "delay {delay} below base {base} for attempt {attempts}"
+            );
+            assert!(
+                delay <= (base + max_jitter) as u64,
+                "delay {delay} above max {} for attempt {attempts}",
+                base + max_jitter
+            );
+        }
+    }
+
+    #[test]
+    fn compute_backoff_zero_attempts() {
+        let backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100.0,
+            jitter_ms: 0.0,
+        };
+
+        // attempts=0: 0^2 + 100 = 100
+        assert_eq!(compute_backoff(0, &backoff), 100);
     }
 }
