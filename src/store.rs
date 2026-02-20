@@ -163,11 +163,11 @@ pub struct Job {
     ///
     /// Stored in a separate `payloads` keyspace so that status-change
     /// operations (take, requeue, promote, recover) only re-write the small
-    /// metadata record. Defaults to `Null` when deserializing from the
-    /// `jobs` keyspace, which no longer contains the payload.
+    /// metadata record. `None` when the payload has not been hydrated (i.e.
+    /// when reading metadata only from the `jobs` keyspace).
     #[serde(rename = "p")]
     #[serde(default)]
-    pub payload: serde_json::Value,
+    pub payload: Option<serde_json::Value>,
 
     /// Current lifecycle status, stored as a u8 which converts to `JobStatus`.
     #[serde(rename = "s")]
@@ -488,7 +488,8 @@ pub struct FailureOptions {
 /// - `JobCreated`: a job became ready. Workers check the queue name, then
 ///   try to atomically claim the one-shot `token`. Only the winner calls
 ///   `take_next_job`, avoiding thundering-herd DB contention.
-/// - `JobCompleted`: workers prune their in-flight set; no DB call needed.
+/// - `JobCompleted` / `JobFailed`: workers prune their in-flight set;
+///   no DB call needed.
 /// - `JobScheduled`: only the scheduler cares; workers ignore it.
 ///
 /// On `Lagged`, workers fall back to a full reconciliation (re-check the
@@ -511,11 +512,17 @@ pub enum StoreEvent {
     /// A job was successfully completed and removed.
     JobCompleted(String),
 
-    /// A job was killed (exhausted retries or force-killed) and removed.
+    /// A job failed (either rescheduled for retry or killed).
     ///
-    /// Workers handle this the same way as `JobCompleted` — prune the
-    /// in-flight set so capacity is freed.
-    JobKilled(String),
+    /// Workers use this to prune their in-flight set and free capacity.
+    /// The `attempts` count identifies which attempt failed — workers
+    /// compare it against the attempt they took so that stale events
+    /// from a previous retry cycle are safely ignored.
+    ///
+    /// For rescheduled jobs a `JobScheduled` event follows immediately
+    /// after, waking the scheduler at the new `ready_at`. For killed
+    /// jobs this is the only event.
+    JobFailed { id: String, attempts: u32 },
 
     /// A job was enqueued with a future `ready_at` timestamp.
     ///
@@ -828,7 +835,7 @@ fn load_jobs_by_ids(
 
         // Hydrate the payload from the payloads keyspace.
         if let Some(payload_bytes) = payloads_ks.get(&id)? {
-            job.payload = rmp_serde::from_slice(&payload_bytes)?;
+            job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
         }
 
         rows.push(job);
@@ -925,7 +932,7 @@ impl Store {
                 job_type: opts.job_type,
                 queue: opts.queue,
                 priority: opts.priority,
-                payload: opts.payload,
+                payload: Some(opts.payload),
                 status: status.into(),
                 ready_at,
                 attempts: 0,
@@ -937,7 +944,7 @@ impl Store {
 
             // Serialize metadata without the payload for the jobs keyspace.
             let mut meta = job.clone();
-            meta.payload = serde_json::Value::Null;
+            meta.payload = None;
             let meta_bytes = rmp_serde::to_vec_named(&meta)?;
 
             let queue_key = make_queue_key(&job.queue, &id);
@@ -1103,7 +1110,7 @@ impl Store {
 
             // Hydrate the payload from the payloads keyspace for the caller.
             if let Some(payload_bytes) = payloads.get(&job_id)? {
-                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
 
             Ok(Some(job))
@@ -1307,12 +1314,23 @@ impl Store {
 
         // Emit events outside spawn_blocking due to &self.event_tx.
         if let Ok(Some(ref job)) = result {
+            // Always emit JobFailed first so workers prune their
+            // in-flight set before any downstream events arrive.
+            //
+            // The attempts count must match what the worker stored when
+            // it took the job — that's the pre-increment value, since
+            // record_failure bumps attempts by 1 inside the closure.
+            let _ = self.event_tx.send(StoreEvent::JobFailed {
+                id: id_for_event,
+                attempts: job.attempts - 1,
+            });
+
             if job.status == JobStatus::Scheduled as u8 {
+                // Rescheduled for retry — tell the scheduler to wake up
+                // at the new ready_at.
                 let _ = self.event_tx.send(StoreEvent::JobScheduled {
                     ready_at: job.ready_at,
                 });
-            } else {
-                let _ = self.event_tx.send(StoreEvent::JobKilled(id_for_event));
             }
         }
 
@@ -1335,7 +1353,7 @@ impl Store {
 
             // Hydrate the payload from the payloads keyspace.
             if let Some(payload_bytes) = payloads.get(&id)? {
-                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
 
             Ok(Some(job))
@@ -1634,7 +1652,7 @@ impl Store {
                             let (key, value) = entry.into_inner()?;
                             let mut job: Job = rmp_serde::from_slice(&value)?;
                             if let Some(payload_bytes) = payloads_ks.get(&*key)? {
-                                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+                                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
                         }
@@ -1652,7 +1670,7 @@ impl Store {
                             let (key, value) = entry.into_inner()?;
                             let mut job: Job = rmp_serde::from_slice(&value)?;
                             if let Some(payload_bytes) = payloads_ks.get(&*key)? {
-                                job.payload = rmp_serde::from_slice(&payload_bytes)?;
+                                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
                         }
@@ -2056,7 +2074,7 @@ mod tests {
         assert_eq!(job.queue, "default");
         assert_eq!(job.priority, 0);
         assert_eq!(job.status, u8::from(JobStatus::Ready));
-        assert_eq!(job.payload, serde_json::json!({"task": "test"}));
+        assert_eq!(job.payload, Some(serde_json::json!({"task": "test"})));
     }
 
     #[tokio::test]
@@ -2176,7 +2194,7 @@ mod tests {
             .unwrap();
         assert_eq!(job.priority, 1);
         assert_eq!(job.status, u8::from(JobStatus::Working));
-        assert_eq!(job.payload, serde_json::json!("high"));
+        assert_eq!(job.payload, Some(serde_json::json!("high")));
     }
 
     #[tokio::test]
@@ -2235,8 +2253,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(first.id, second.id);
-        assert_eq!(first.payload, serde_json::json!("a"));
-        assert_eq!(second.payload, serde_json::json!("b"));
+        assert_eq!(first.payload, Some(serde_json::json!("a")));
+        assert_eq!(second.payload, Some(serde_json::json!("b")));
 
         // Queue should now be empty.
         assert!(
@@ -2752,7 +2770,7 @@ mod tests {
         assert_eq!(job.id, enqueued.id);
         assert_eq!(job.queue, "default");
         assert_eq!(job.status, u8::from(JobStatus::Ready));
-        assert_eq!(job.payload, serde_json::json!("hello"));
+        assert_eq!(job.payload, Some(serde_json::json!("hello")));
     }
 
     #[tokio::test]
@@ -4461,7 +4479,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
         // b is the only ready send_email in the high queue (a is working).
-        assert_eq!(page.jobs[0].payload, serde_json::json!("b"));
+        assert_eq!(page.jobs[0].payload, Some(serde_json::json!("b")));
     }
 
     #[tokio::test]
@@ -5269,7 +5287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_failure_retry_broadcasts_job_scheduled() {
+    async fn record_failure_retry_broadcasts_job_failed_then_scheduled() {
         let store = test_store();
         let job = enqueue_and_take(&store).await;
 
@@ -5279,6 +5297,18 @@ mod tests {
             .await
             .unwrap();
 
+        // First event: JobFailed so workers prune their in-flight set.
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobFailed { id, attempts } => {
+                assert_eq!(id, job.id);
+                // attempts=0: the pre-increment value that matches what
+                // the worker stored when it took the job.
+                assert_eq!(attempts, 0);
+            }
+            other => panic!("expected JobFailed, got {other:?}"),
+        }
+
+        // Second event: JobScheduled so the scheduler wakes up.
         match rx.recv().await.unwrap() {
             StoreEvent::JobScheduled { ready_at } => assert!(ready_at > 0),
             other => panic!("expected JobScheduled, got {other:?}"),
@@ -5286,7 +5316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_failure_dead_broadcasts_job_killed() {
+    async fn record_failure_dead_broadcasts_job_failed() {
         let store = test_store();
         let job = enqueue_and_take(&store).await;
 
@@ -5298,9 +5328,14 @@ mod tests {
             .await
             .unwrap();
 
+        // Even for killed jobs, the event is JobFailed — workers don't
+        // need to distinguish retry from kill; they just prune in-flight.
         match rx.recv().await.unwrap() {
-            StoreEvent::JobKilled(id) => assert_eq!(id, job.id),
-            other => panic!("expected JobKilled, got {other:?}"),
+            StoreEvent::JobFailed { id, attempts } => {
+                assert_eq!(id, job.id);
+                assert_eq!(attempts, 0);
+            }
+            other => panic!("expected JobFailed, got {other:?}"),
         }
     }
 
@@ -5315,8 +5350,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Payload should be the default (Null), not the stored value.
-        assert_eq!(result.payload, serde_json::Value::Null);
+        // Payload should be None (not hydrated), not the stored value.
+        assert_eq!(result.payload, None);
     }
 
     #[tokio::test]

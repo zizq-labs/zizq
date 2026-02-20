@@ -85,8 +85,8 @@ pub async fn run(
         // event arrives with an earlier ready_at, reset the timer — this
         // avoids a database round-trip when the new job isn't due any
         // sooner than what we're already waiting for. We ignore
-        // JobCreated and JobCompleted events since they're only relevant
-        // to workers.
+        // JobCreated, JobCompleted, and JobFailed events since they're
+        // only relevant to workers.
         //
         // When there are no scheduled jobs at all (next_ready_at is
         // None and we didn't promote anything), we use u64::MAX as the
@@ -132,7 +132,7 @@ pub async fn run(
                             tracing::debug!("scheduler stopped");
                             return;
                         }
-                        _ => {} // Ignore JobCreated, JobCompleted
+                        _ => {} // Ignore JobCreated, JobCompleted, JobFailed
                     }
                 }
                 _ = shutdown.changed() => {

@@ -6,7 +6,7 @@
 //! Defines the router, request handlers, content negotiation, take framing,
 //! and all request/response types.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
 use std::hash::Hash;
@@ -281,7 +281,11 @@ pub struct Job {
     pub status: JobStatus,
 
     /// Arbitrary payload provided by the client.
-    pub payload: serde_json::Value,
+    ///
+    /// Omitted from responses where the payload is not hydrated (e.g.
+    /// enqueue confirmations and failure reports, which return metadata only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 
     /// When the job becomes eligible to run (milliseconds since Unix epoch).
     pub ready_at: u64,
@@ -386,6 +390,32 @@ struct EnqueueRequest {
     ready_at: Option<u64>,
 }
 
+/// Request body for `POST /jobs/{id}/failure`.
+///
+/// Reports that a job has failed. The server decides whether to retry
+/// (with backoff) or kill the job based on the retry limit and any
+/// client-supplied overrides.
+#[derive(Deserialize)]
+struct FailureRequest {
+    /// Error message describing what went wrong.
+    error: String,
+
+    /// Optional error class, e.g. "TimeoutError" or "ConnectionRefused".
+    error_type: Option<String>,
+
+    /// Optional stack trace or backtrace from the worker.
+    backtrace: Option<String>,
+
+    /// Force retry at a specific time (ms since epoch), bypassing backoff
+    /// calculation. The job will be rescheduled even if max retries are
+    /// exceeded.
+    retry_at: Option<u64>,
+
+    /// Kill the job immediately, regardless of retry limit.
+    #[serde(default)]
+    kill: bool,
+}
+
 /// Query parameters for `GET /jobs`.
 #[derive(Deserialize)]
 struct ListJobsParams {
@@ -472,51 +502,6 @@ struct ListJobsPages {
 
     /// URL for the previous page, or null if this is the first page.
     prev: Option<String>,
-}
-
-/// Response shape for enqueue requests.
-#[derive(Serialize)]
-struct EnqueueResponse {
-    /// The unique identifier for this job.
-    ///
-    /// This identifier must be supplied when marking jobs as completed or
-    /// failed.
-    id: String,
-
-    /// The job type.
-    #[serde(rename = "type")]
-    job_type: String,
-
-    /// The queue onto which this job was pushed.
-    queue: String,
-
-    /// The priority assigned to this job.
-    priority: u16,
-
-    /// Current lifecycle status.
-    status: JobStatus,
-
-    /// When the job becomes eligible to run (milliseconds since Unix epoch).
-    ready_at: u64,
-
-    /// Number of times this job has failed.
-    attempts: u32,
-
-    /// Maximum retries before the job is killed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry_limit: Option<u32>,
-
-    /// Backoff configuration override.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backoff: Option<store::BackoffConfig>,
-
-    /// When the job was last dequeued.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dequeued_at: Option<u64>,
-
-    /// When the job last failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failed_at: Option<u64>,
 }
 
 /// Shared server state, passed to all request handlers.
@@ -815,6 +800,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/take", get(take_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
+        .route("/jobs/{id}/failure", post(report_failure))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
@@ -903,7 +889,7 @@ async fn enqueue(
 
     let now = (state.clock)();
     match state.store.enqueue(now, opts).await.and_then(Job::try_from) {
-        Ok(job) => {
+        Ok(mut job) => {
             tracing::debug!(
                 job_id = %job.id,
                 job_type = %job.job_type,
@@ -913,23 +899,10 @@ async fn enqueue(
                 ready_at = job.ready_at,
                 "job enqueued"
             );
-            respond(
-                fmt,
-                StatusCode::CREATED,
-                &EnqueueResponse {
-                    id: job.id,
-                    job_type: job.job_type,
-                    queue: job.queue,
-                    priority: job.priority,
-                    status: job.status,
-                    ready_at: job.ready_at,
-                    attempts: job.attempts,
-                    retry_limit: job.retry_limit,
-                    backoff: job.backoff,
-                    dequeued_at: job.dequeued_at,
-                    failed_at: job.failed_at,
-                },
-            )
+            // Drop the payload from the response — the enqueue confirmation
+            // returns metadata only.
+            job.payload = None;
+            respond(fmt, StatusCode::CREATED, &job)
         }
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
@@ -964,6 +937,67 @@ async fn mark_completed(
         ),
         Err(e) => {
             tracing::error!(%e, "mark_completed failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /jobs/{id}/failure` — report that a job has failed.
+///
+/// The server decides whether to retry (rescheduling with backoff) or kill
+/// the job based on the retry limit. The client can override the decision
+/// with `retry_at` (force reschedule) or `kill` (force kill).
+///
+/// Returns the updated job metadata (without payload) so the client can
+/// see the new status, next `ready_at`, and attempt count.
+async fn report_failure(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    NegotiatedBody(failure_req): NegotiatedBody<FailureRequest>,
+) -> Response {
+    let opts = store::FailureOptions {
+        error: failure_req.error,
+        error_type: failure_req.error_type,
+        backtrace: failure_req.backtrace,
+        retry_at: failure_req.retry_at,
+        kill: failure_req.kill,
+        default_retry_limit: state.default_retry_limit,
+        default_backoff: state.default_backoff.clone(),
+    };
+
+    let now = (state.clock)();
+    match state
+        .store
+        .record_failure(now, &id, opts)
+        .await
+        .and_then(|opt| opt.map(Job::try_from).transpose())
+    {
+        Ok(Some(job)) => {
+            tracing::debug!(
+                job_id = %job.id,
+                job_type = %job.job_type,
+                status = %job.status,
+                attempts = job.attempts,
+                "job failure recorded"
+            );
+            respond(fmt, StatusCode::OK, &job)
+        }
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: "job not found in working set".into(),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "record_failure failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1195,9 +1229,9 @@ fn default_prefetch() -> usize {
 /// This is the recovery path for broadcast channel overflow. It's not a hot
 /// path — it only runs when we've missed events, which requires 1024+
 /// events to buffer while this task is blocked.
-async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashSet<String>) {
+async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashMap<String, u32>) {
     let mut gone = Vec::new();
-    for id in in_flight.iter() {
+    for id in in_flight.keys() {
         match state.store.get_job(id).await {
             Ok(Some(job)) if job.status == store::JobStatus::Working as u8 => {
                 // Still working — keep tracking it.
@@ -1279,7 +1313,7 @@ async fn take_jobs(
             // In the extremely rare case of a crash or shutdown before the client
             // finishes processing the job, recovery on server restart will move
             // the job from the working set back into the queue.
-            let mut in_flight = HashSet::<String>::new();
+            let mut in_flight = HashMap::<String, u32>::new();
 
             // Pin the heartbeat timer outside the loop so it isn't reset
             // when broadcast events wake the select. It is only reset
@@ -1353,7 +1387,7 @@ async fn take_jobs(
                                     let now = (state.clock)();
                                     match state.store.take_next_job(now, &queues).await {
                                         Ok(Some(job)) => {
-                                            in_flight.insert(job.id.clone());
+                                            in_flight.insert(job.id.clone(), job.attempts);
                                             state.global_in_flight.fetch_add(1, Ordering::Relaxed);
                                             match Job::try_from(job) {
                                                 Ok(job) => {
@@ -1422,16 +1456,11 @@ async fn take_jobs(
                                     claim_token = token;
                                 }
                             }
-                            Ok(StoreEvent::JobCompleted(ref id))
-                            | Ok(StoreEvent::JobKilled(ref id)) => {
-                                if in_flight.remove(id) {
-                                    let reason = match event {
-                                        Ok(StoreEvent::JobKilled(_)) => "killed",
-                                        _ => "completed",
-                                    };
+                            Ok(StoreEvent::JobCompleted(ref id)) => {
+                                if in_flight.remove(id).is_some() {
                                     tracing::debug!(
                                         job_id = %id,
-                                        reason,
+                                        reason = "completed",
                                         "job removed from working set"
                                     );
                                     let _ = state
@@ -1441,10 +1470,32 @@ async fn take_jobs(
                                             Ordering::Relaxed,
                                             |v| Some(v.saturating_sub(1)),
                                         );
-                                    // Capacity freed. If an earlier
-                                    // JobCreated left an unclaimed token,
-                                    // can_take will be true on the next
-                                    // iteration and we'll try to claim it.
+                                }
+                            }
+                            Ok(StoreEvent::JobFailed {
+                                ref id, attempts, ..
+                            }) => {
+                                // Only prune if the attempt count matches
+                                // what we took. A stale JobFailed from a
+                                // previous retry cycle will have a lower
+                                // attempts count and is safely ignored.
+                                if in_flight
+                                    .get(id)
+                                    .is_some_and(|&a| a == attempts)
+                                {
+                                    in_flight.remove(id);
+                                    tracing::debug!(
+                                        job_id = %id,
+                                        reason = "failed",
+                                        "job removed from working set"
+                                    );
+                                    let _ = state
+                                        .global_in_flight
+                                        .fetch_update(
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                            |v| Some(v.saturating_sub(1)),
+                                        );
                                 }
                             }
                             Ok(StoreEvent::JobScheduled { .. }) => {}
@@ -1477,7 +1528,7 @@ async fn take_jobs(
             // The client disconnected. If there were any in-flight jobs re-queue
             // them so other clients can pick them up.
             let in_flight_count = in_flight.len();
-            for id in &in_flight {
+            for id in in_flight.keys() {
                 tracing::debug!(job_id = %id, "job requeued");
                 if let Err(e) = state.store.requeue(id).await {
                     tracing::error!(job_id = %id, %e, "requeue failed");
@@ -1522,18 +1573,33 @@ mod tests {
     use crate::store::EnqueueOptions;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicU64;
     use tower::util::ServiceExt;
 
-    /// Create a shared state and router for tests that need direct store access.
-    fn test_state_and_app() -> (Arc<AppState>, Router) {
+    /// Build a controllable clock backed by an `AtomicU64`.
+    ///
+    /// Returns the atomic (for advancing time) and an `Arc<dyn Fn>` suitable
+    /// for `AppState::clock`. The initial value is seeded from real time so
+    /// that timestamps look realistic.
+    fn mock_clock() -> (Arc<AtomicU64>, Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let time = Arc::new(AtomicU64::new(crate::time::now_millis()));
+        let t = Arc::clone(&time);
+        (time, Arc::new(move || t.load(Ordering::Relaxed)))
+    }
+
+    /// Create a bare `AppState` with a mock clock for tests.
+    ///
+    /// Returns `(clock_handle, state)` so tests can read `now` from the
+    /// clock and mutate the state (e.g. custom backoff, working limit)
+    /// before wrapping in `Arc` and building the router.
+    fn test_app_state() -> (Arc<AtomicU64>, AppState) {
+        let (clock, clock_fn) = mock_clock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
-        // Leak the TempDir so it isn't cleaned up while the store is open.
         std::mem::forget(dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        // Leak the sender so the shutdown signal is never triggered.
         std::mem::forget(shutdown_tx);
-        let state = Arc::new(AppState {
+        let state = AppState {
             store,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
             global_working_limit: 0,
@@ -1545,8 +1611,15 @@ mod tests {
                 base_ms: DEFAULT_BACKOFF_BASE_MS,
                 jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
             },
-            clock: Arc::new(crate::time::now_millis),
-        });
+            clock: clock_fn,
+        };
+        (clock, state)
+    }
+
+    /// Create a shared state and router for tests that need direct store access.
+    fn test_state_and_app() -> (Arc<AppState>, Router) {
+        let (_, state) = test_app_state();
+        let state = Arc::new(state);
         let router = app(state.clone());
         (state, router)
     }
@@ -3695,5 +3768,339 @@ mod tests {
         let line = std::str::from_utf8(&bytes).unwrap().trim();
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["queue"], "reports");
+    }
+
+    // --- POST /jobs/{id}/failure tests ---
+
+    #[tokio::test]
+    async fn failure_returns_200_with_scheduled_status() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        // Enqueue and take a job so it's in the working set.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "default", "payload": "hello"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap();
+
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // Report failure — should reschedule (default retry_limit > 0).
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "connection timeout"}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(job["status"], "scheduled");
+        assert_eq!(job["attempts"], 1);
+    }
+
+    #[tokio::test]
+    async fn failure_returns_200_with_dead_status_when_killed() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "default", "payload": "hello"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap();
+
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "fatal", "kill": true}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(job["status"], "dead");
+    }
+
+    #[tokio::test]
+    async fn failure_returns_404_for_unknown_job() {
+        let req = json_request(
+            "POST",
+            "/jobs/nonexistent/failure",
+            &serde_json::json!({"error": "oops"}),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn failure_returns_404_for_ready_job() {
+        let (_, app) = test_state_and_app();
+
+        // Enqueue but don't take — job is ready, not working.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "default", "payload": "hello"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap();
+
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "oops"}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn failure_does_not_return_payload() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "default", "payload": {"big": "data"}}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap();
+
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "oops"}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(
+            job.get("payload").is_none(),
+            "failure response should not include payload"
+        );
+    }
+
+    /// Integration test: a job is taken via /take, fails with retry, gets
+    /// promoted back to ready, and is re-delivered on the same /take stream.
+    ///
+    /// This exercises the full cycle: the take loop's in_flight tracking
+    /// must correctly prune the failed job (via the JobFailed event with
+    /// matching attempts), freeing capacity so the re-promoted job can be
+    /// taken again.
+    #[tokio::test]
+    async fn take_redelivers_failed_job_after_reschedule() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        // Enqueue one job.
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "q", serde_json::json!("work")),
+            )
+            .await
+            .unwrap();
+
+        // Connect a /take stream (prefetch=1).
+        let req = empty_request("GET", "/jobs/take?prefetch=1");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Read the first delivery.
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        let job_id = job["id"].as_str().unwrap();
+        assert_eq!(job["status"], "working");
+        assert_eq!(job["attempts"], 0);
+
+        // Report failure with retry_at in the past so we can promote
+        // immediately without relying on real-time scheduler delays.
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "boom", "retry_at": 1}),
+        );
+        let fail_res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(fail_res.status(), StatusCode::OK);
+
+        // Give the take loop a moment to process the JobFailed event
+        // and prune in_flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The in-flight counter should be back to 0.
+        assert_eq!(
+            state.global_in_flight.load(Ordering::Relaxed),
+            0,
+            "global_in_flight should be 0 after failure prunes in-flight"
+        );
+
+        // Manually promote the rescheduled job (ready_at=1 is in the
+        // past). This avoids depending on the background scheduler.
+        let (due, _) = state.store.next_scheduled(u64::MAX, 10).await.unwrap();
+        assert_eq!(due.len(), 1, "expected one scheduled job");
+        state.store.promote_scheduled(&due[0]).await.unwrap();
+
+        // The take stream should now re-deliver the job.
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job2: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job2["id"], job_id, "same job should be redelivered");
+        assert_eq!(job2["status"], "working");
+        assert_eq!(job2["attempts"], 1, "attempts should be incremented");
+    }
+
+    /// Verify that the server's default backoff config produces the correct
+    /// `ready_at` when no `retry_at` is provided by the client.
+    ///
+    /// Uses a mock clock so the assertion is exact — no timing margins.
+    #[tokio::test]
+    async fn failure_applies_default_backoff() {
+        let (clock, mut state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+
+        // Use a known backoff config with zero jitter so the result is
+        // deterministic: delay = attempts^exponent + base_ms = 1^2 + 500 = 501.
+        state.default_backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 500.0,
+            jitter_ms: 0.0,
+        };
+        let state = Arc::new(state);
+        let router = app(state.clone());
+
+        // Enqueue and take a job via the HTTP API.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "q", "payload": "x"}),
+        );
+        let res = router.clone().oneshot(req).await.unwrap();
+        let enq: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = enq["id"].as_str().unwrap().to_string();
+
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // Fail the job — the handler reads (state.clock)() which returns
+        // our fixed `now`, so ready_at = now + 501 exactly.
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "timeout"}),
+        );
+        let res = router.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(job["status"], "scheduled");
+
+        // With exponent=2, base_ms=500, jitter=0, attempts=1:
+        // delay = 1^2 + 500 = 501ms
+        let ready_at = job["ready_at"].as_u64().unwrap();
+        assert_eq!(
+            ready_at,
+            now + 501,
+            "ready_at should be exactly now + 501ms (backoff for attempt 1)",
+        );
+    }
+
+    /// Verify that failing a job frees global_in_flight capacity, allowing
+    /// a different pending job to be taken.
+    #[tokio::test]
+    async fn take_failure_frees_capacity_for_other_jobs() {
+        let (clock, mut state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        state.global_working_limit = 1;
+        let state = Arc::new(state);
+        let router = app(state.clone());
+
+        // Enqueue two jobs.
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
+            .await
+            .unwrap();
+
+        // Take with prefetch=2 but global_working_limit=1.
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
+        let res = router.clone().oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // First job delivered (hits global limit).
+        let bytes = next_body_bytes(&mut body).await;
+        let job_a: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        let job_a_id = job_a["id"].as_str().unwrap();
+        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 1);
+
+        // Fail the first job (kill it so it doesn't go back to the queue).
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_a_id}/failure"),
+            &serde_json::json!({"error": "fatal", "kill": true}),
+        );
+        let fail_res = router.oneshot(req).await.unwrap();
+        assert_eq!(fail_res.status(), StatusCode::OK);
+
+        // Second job should now be delivered since capacity was freed.
+        let bytes = next_body_bytes(&mut body).await;
+        let job_b: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(job_b["payload"], "b");
     }
 }
