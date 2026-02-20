@@ -285,6 +285,26 @@ pub struct Job {
 
     /// When the job becomes eligible to run (milliseconds since Unix epoch).
     pub ready_at: u64,
+
+    /// Number of times this job has failed.
+    pub attempts: u32,
+
+    /// Maximum retries before the job is killed. `None` means the server
+    /// default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u32>,
+
+    /// Backoff configuration override. `None` means the server default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<store::BackoffConfig>,
+
+    /// When the job was last dequeued (milliseconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dequeued_at: Option<u64>,
+
+    /// When the job last failed (milliseconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<u64>,
 }
 
 impl TryFrom<store::Job> for Job {
@@ -306,6 +326,11 @@ impl TryFrom<store::Job> for Job {
             status: status.into(),
             payload: job.payload,
             ready_at: job.ready_at,
+            attempts: job.attempts,
+            retry_limit: job.retry_limit,
+            backoff: job.backoff,
+            dequeued_at: job.dequeued_at,
+            failed_at: job.failed_at,
         })
     }
 }
@@ -473,6 +498,25 @@ struct EnqueueResponse {
 
     /// When the job becomes eligible to run (milliseconds since Unix epoch).
     ready_at: u64,
+
+    /// Number of times this job has failed.
+    attempts: u32,
+
+    /// Maximum retries before the job is killed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_limit: Option<u32>,
+
+    /// Backoff configuration override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backoff: Option<store::BackoffConfig>,
+
+    /// When the job was last dequeued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dequeued_at: Option<u64>,
+
+    /// When the job last failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_at: Option<u64>,
 }
 
 /// Shared server state, passed to all request handlers.
@@ -872,6 +916,11 @@ async fn enqueue(
                     priority: job.priority,
                     status: job.status,
                     ready_at: job.ready_at,
+                    attempts: job.attempts,
+                    retry_limit: job.retry_limit,
+                    backoff: job.backoff,
+                    dequeued_at: job.dequeued_at,
+                    failed_at: job.failed_at,
                 },
             )
         }
@@ -1927,6 +1976,10 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["id"], job_id);
         assert_eq!(body["status"], "working");
+        assert!(
+            body["dequeued_at"].is_u64(),
+            "working job should have dequeued_at set"
+        );
     }
 
     #[tokio::test]
@@ -2894,6 +2947,10 @@ mod tests {
         assert_eq!(job["payload"], "first");
         assert_eq!(job["status"], "working");
         assert!(job["id"].is_string());
+        assert!(
+            job["dequeued_at"].is_u64(),
+            "taken job should have dequeued_at set"
+        );
 
         // Second job (priority 5).
         let bytes = next_body_bytes(&mut body).await;
@@ -2902,6 +2959,10 @@ mod tests {
         assert_eq!(job["queue"], "q2");
         assert_eq!(job["payload"], "second");
         assert_eq!(job["status"], "working");
+        assert!(
+            job["dequeued_at"].is_u64(),
+            "taken job should have dequeued_at set"
+        );
     }
 
     #[tokio::test]

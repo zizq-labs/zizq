@@ -1084,6 +1084,12 @@ impl Store {
             let old_status_key = make_status_key(JobStatus::Ready, &job.id);
             let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &job.id);
             job.status = JobStatus::Working.into();
+            job.dequeued_at = Some(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
 
             // Only write metadata back — payload is immutable and stays in
@@ -2233,6 +2239,54 @@ mod tests {
         assert_eq!(job.id, high.id);
         assert_eq!(job.queue, "webhooks");
         assert_eq!(job.priority, 1);
+    }
+
+    #[tokio::test]
+    async fn take_next_job_sets_dequeued_at() {
+        let store = test_store();
+        let before = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        store
+            .enqueue(EnqueueOptions::new(
+                "test",
+                "default",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+
+        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+
+        let after = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let dequeued_at = job.dequeued_at.expect("dequeued_at should be set");
+        assert!(
+            dequeued_at >= before && dequeued_at <= after,
+            "dequeued_at ({dequeued_at}) should be between {before} and {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_next_job_dequeued_at_persists() {
+        let store = test_store();
+        store
+            .enqueue(EnqueueOptions::new(
+                "test",
+                "default",
+                serde_json::json!("a"),
+            ))
+            .await
+            .unwrap();
+
+        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let stored = store.get_job(&taken.id).await.unwrap().unwrap();
+        assert_eq!(stored.dequeued_at, taken.dequeued_at);
     }
 
     #[tokio::test]
