@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
+use crate::store::{self, BackoffConfig, ListJobsOptions, ScanDirection, Store, StoreEvent};
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -42,6 +42,18 @@ pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
 
 /// Default maximum number of jobs in the working set across all connections.
 pub const DEFAULT_GLOBAL_WORKING_LIMIT: u64 = 1024;
+
+/// Default maximum retries before a job is killed (25 retries = 26 total runs).
+pub const DEFAULT_RETRY_LIMIT: u32 = 25;
+
+/// Default backoff exponent (power curve steepness).
+pub const DEFAULT_BACKOFF_EXPONENT: f32 = 4.0;
+
+/// Default backoff base delay in milliseconds.
+pub const DEFAULT_BACKOFF_BASE_MS: f32 = 15_000.0;
+
+/// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
+pub const DEFAULT_BACKOFF_JITTER_MS: f32 = 30_000.0;
 
 // --- Take types ---
 
@@ -480,6 +492,12 @@ pub struct AppState {
 
     /// Cloneable receiver for graceful shutdown signaling.
     pub shutdown: watch::Receiver<()>,
+
+    /// Default retry limit applied to jobs that don't specify one.
+    pub default_retry_limit: u32,
+
+    /// Default backoff config applied to jobs that don't specify one.
+    pub default_backoff: BackoffConfig,
 }
 
 // --- Content negotiation ---
@@ -1458,6 +1476,12 @@ mod tests {
             global_working_limit: 0,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
+            default_retry_limit: DEFAULT_RETRY_LIMIT,
+            default_backoff: BackoffConfig {
+                exponent: DEFAULT_BACKOFF_EXPONENT,
+                base_ms: DEFAULT_BACKOFF_BASE_MS,
+                jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
+            },
         });
         let router = app(state.clone());
         (state, router)
@@ -3128,6 +3152,12 @@ mod tests {
             global_working_limit: 2,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
+            default_retry_limit: DEFAULT_RETRY_LIMIT,
+            default_backoff: BackoffConfig {
+                exponent: DEFAULT_BACKOFF_EXPONENT,
+                base_ms: DEFAULT_BACKOFF_BASE_MS,
+                jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
+            },
         });
         let router = app(state.clone());
 

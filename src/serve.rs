@@ -13,8 +13,11 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS};
-use crate::store::Store;
+use crate::http::{
+    self, AppState, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
+    DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_RETRY_LIMIT,
+};
+use crate::store::{BackoffConfig, Store};
 
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";
@@ -42,6 +45,23 @@ pub struct Args {
     /// 0 means no limit.
     #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, env = "ZANXIO_GLOBAL_WORKING_LIMIT")]
     global_working_limit: u64,
+
+    /// Default maximum retries before a failed job is killed.
+    /// Jobs can override this at enqueue time with a per-job retry_limit.
+    #[arg(long, default_value_t = DEFAULT_RETRY_LIMIT, env = "ZANXIO_DEFAULT_RETRY_LIMIT")]
+    default_retry_limit: u32,
+
+    /// Default backoff exponent (power curve steepness).
+    #[arg(long, default_value_t = DEFAULT_BACKOFF_EXPONENT, env = "ZANXIO_DEFAULT_BACKOFF_EXPONENT")]
+    default_backoff_exponent: f32,
+
+    /// Default backoff base delay in milliseconds.
+    #[arg(long, default_value_t = DEFAULT_BACKOFF_BASE_MS, env = "ZANXIO_DEFAULT_BACKOFF_BASE_MS")]
+    default_backoff_base_ms: f32,
+
+    /// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
+    #[arg(long, default_value_t = DEFAULT_BACKOFF_JITTER_MS, env = "ZANXIO_DEFAULT_BACKOFF_JITTER_MS")]
+    default_backoff_jitter_ms: f32,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -70,6 +90,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         global_working_limit: args.global_working_limit,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx,
+        default_retry_limit: args.default_retry_limit,
+        default_backoff: BackoffConfig {
+            exponent: args.default_backoff_exponent,
+            base_ms: args.default_backoff_base_ms,
+            jitter_ms: args.default_backoff_jitter_ms,
+        },
     });
 
     // Start the background scheduler that promotes scheduled jobs to Ready
