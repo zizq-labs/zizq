@@ -14,10 +14,11 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::http::{
-    self, AppState, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
-    DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_RETRY_LIMIT,
+    self, AppState, BackoffConfig, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT,
+    DEFAULT_BACKOFF_JITTER_MS, DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS,
+    DEFAULT_RETRY_LIMIT,
 };
-use crate::store::{BackoffConfig, Store};
+use crate::store::Store;
 
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";

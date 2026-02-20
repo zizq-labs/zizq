@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::store::{self, BackoffConfig, ListJobsOptions, ScanDirection, Store, StoreEvent};
+use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -300,7 +300,7 @@ pub struct Job {
 
     /// Backoff configuration override. `None` means the server default applies.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backoff: Option<store::BackoffConfig>,
+    pub backoff: Option<BackoffConfig>,
 
     /// When the job was last dequeued (milliseconds since Unix epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,7 +332,7 @@ impl TryFrom<store::Job> for Job {
             ready_at: job.ready_at,
             attempts: job.attempts,
             retry_limit: job.retry_limit,
-            backoff: job.backoff,
+            backoff: job.backoff.map(Into::into),
             dequeued_at: job.dequeued_at,
             failed_at: job.failed_at,
         })
@@ -388,6 +388,50 @@ struct EnqueueRequest {
     /// Optional timestamp (ms since epoch) when the job becomes eligible to
     /// run. If omitted or in the past, the job is immediately ready.
     ready_at: Option<u64>,
+
+    /// Per-job maximum retries before the job is killed on failure. When
+    /// omitted, the server default applies.
+    retry_limit: Option<u32>,
+
+    /// Per-job backoff configuration override. When omitted, the server
+    /// default applies.
+    backoff: Option<BackoffConfig>,
+}
+
+/// Client-facing backoff configuration with human-readable field names.
+///
+/// The store uses compact single-letter keys (`x`, `b`, `j`) for storage
+/// efficiency, but the HTTP API exposes descriptive names for clarity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackoffConfig {
+    /// Power curve steepness (attempts ** exponent).
+    pub exponent: f32,
+
+    /// Minimum delay in milliseconds.
+    pub base_ms: f32,
+
+    /// Max random milliseconds per attempt multiplier.
+    pub jitter_ms: f32,
+}
+
+impl From<BackoffConfig> for store::BackoffConfig {
+    fn from(b: BackoffConfig) -> Self {
+        Self {
+            exponent: b.exponent,
+            base_ms: b.base_ms,
+            jitter_ms: b.jitter_ms,
+        }
+    }
+}
+
+impl From<store::BackoffConfig> for BackoffConfig {
+    fn from(b: store::BackoffConfig) -> Self {
+        Self {
+            exponent: b.exponent,
+            base_ms: b.base_ms,
+            jitter_ms: b.jitter_ms,
+        }
+    }
 }
 
 /// Request body for `POST /jobs/{id}/failure`.
@@ -886,6 +930,12 @@ async fn enqueue(
     if let Some(ready_at) = enqueue_req.ready_at {
         opts = opts.ready_at(ready_at);
     }
+    if let Some(retry_limit) = enqueue_req.retry_limit {
+        opts = opts.retry_limit(retry_limit);
+    }
+    if let Some(backoff) = enqueue_req.backoff {
+        opts = opts.backoff(backoff.into());
+    }
 
     let now = (state.clock)();
     match state.store.enqueue(now, opts).await.and_then(Job::try_from) {
@@ -969,7 +1019,7 @@ async fn report_failure(
         retry_at: failure_req.retry_at,
         kill: failure_req.kill,
         default_retry_limit: state.default_retry_limit,
-        default_backoff: state.default_backoff.clone(),
+        default_backoff: state.default_backoff.clone().into(),
     };
 
     let now = (state.clock)();
@@ -1991,6 +2041,207 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["status"], "scheduled");
         assert_eq!(body["ready_at"], future_ms);
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_retry_limit_stores_value() {
+        let (_, app) = test_state_and_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "test",
+                "queue": "q",
+                "payload": "x",
+                "retry_limit": 5
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let id = body["id"].as_str().unwrap();
+
+        // Fetch the job back to confirm the value persisted.
+        let req = empty_request("GET", &format!("/jobs/{id}"));
+        let res = app.oneshot(req).await.unwrap();
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(job["retry_limit"], 5);
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_backoff_stores_value() {
+        let (_, app) = test_state_and_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "test",
+                "queue": "q",
+                "payload": "x",
+                "backoff": {
+                    "exponent": 3.0,
+                    "base_ms": 1000.0,
+                    "jitter_ms": 50.0
+                }
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let id = body["id"].as_str().unwrap();
+
+        // Fetch the job back to confirm the backoff config persisted with
+        // human-readable field names (not the compact store keys).
+        let req = empty_request("GET", &format!("/jobs/{id}"));
+        let res = app.oneshot(req).await.unwrap();
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let backoff = &job["backoff"];
+        assert_eq!(backoff["exponent"], 3.0);
+        assert_eq!(backoff["base_ms"], 1000.0);
+        assert_eq!(backoff["jitter_ms"], 50.0);
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_retry_limit_omits_field() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "q", "payload": "x"}),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+
+        // When no retry_limit is provided, the field should be absent (not
+        // null) thanks to skip_serializing_if.
+        assert!(body.get("retry_limit").is_none());
+        assert!(body.get("backoff").is_none());
+    }
+
+    /// Integration test: enqueue a job with a per-job retry_limit of 1,
+    /// then fail it once (rescheduled) and again (killed). Verifies the
+    /// per-job retry_limit overrides the server default.
+    #[tokio::test]
+    async fn enqueue_per_job_retry_limit_overrides_default() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let router = app(state.clone());
+
+        // Enqueue with retry_limit=1 — the job should survive one failure
+        // and be killed on the second.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "test",
+                "queue": "q",
+                "payload": "x",
+                "retry_limit": 1
+            }),
+        );
+        let res = router.clone().oneshot(req).await.unwrap();
+        let enq: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = enq["id"].as_str().unwrap().to_string();
+
+        // Take the job.
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // First failure — should reschedule (attempts=1 <= retry_limit=1).
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "oops"}),
+        );
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(
+            job["status"], "scheduled",
+            "first failure should reschedule"
+        );
+
+        // Promote the scheduled job back to ready and take it again.
+        let stored = state.store.get_job(&job_id).await.unwrap().unwrap();
+        state.store.promote_scheduled(&stored).await.unwrap();
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // Second failure — should kill (attempts=2 > retry_limit=1).
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "oops again"}),
+        );
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(job["status"], "dead", "second failure should kill");
+    }
+
+    /// Integration test: enqueue a job with a per-job backoff config and
+    /// verify that the failure uses it instead of the server default.
+    #[tokio::test]
+    async fn enqueue_per_job_backoff_overrides_default() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let router = app(state.clone());
+
+        // Enqueue with a custom backoff: exponent=1, base_ms=200, jitter=0.
+        // Backoff for attempt 1: 1^1 + 200 = 201ms.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "test",
+                "queue": "q",
+                "payload": "x",
+                "backoff": {
+                    "exponent": 1.0,
+                    "base_ms": 200.0,
+                    "jitter_ms": 0.0
+                }
+            }),
+        );
+        let res = router.clone().oneshot(req).await.unwrap();
+        let enq: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = enq["id"].as_str().unwrap().to_string();
+
+        // Take and fail the job.
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        let req = json_request(
+            "POST",
+            &format!("/jobs/{job_id}/failure"),
+            &serde_json::json!({"error": "timeout"}),
+        );
+        let res = router.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(job["status"], "scheduled");
+
+        let ready_at = job["ready_at"].as_u64().unwrap();
+        assert_eq!(
+            ready_at,
+            now + 201,
+            "ready_at should use per-job backoff (1^1 + 200 = 201ms), not server default",
+        );
     }
 
     #[tokio::test]
