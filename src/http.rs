@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::store::{self, ListJobsOptions, ScanDirection, Store, StoreEvent};
+use crate::store::{self, ListErrorsOptions, ListJobsOptions, ScanDirection, Store, StoreEvent};
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -548,6 +548,86 @@ struct ListJobsPages {
     prev: Option<String>,
 }
 
+// --- Error listing types ---
+
+/// HTTP-facing error record, converted from `store::ErrorRecord`.
+///
+/// Uses human-readable field names instead of the compact single-letter keys
+/// used in the store's MsgPack encoding.
+#[derive(Debug, Serialize)]
+struct ErrorRecord {
+    /// Which attempt this error corresponds to (1-based).
+    attempt: u32,
+
+    /// Error message from the worker.
+    message: String,
+
+    /// Error class, e.g. "TimeoutError".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
+
+    /// Stack trace / backtrace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backtrace: Option<String>,
+
+    /// When the job was dequeued for this attempt (ms since epoch).
+    dequeued_at: u64,
+
+    /// When the job failed (ms since epoch).
+    failed_at: u64,
+}
+
+impl From<store::ErrorRecord> for ErrorRecord {
+    fn from(r: store::ErrorRecord) -> Self {
+        Self {
+            attempt: r.attempt,
+            message: r.message,
+            error_type: r.error_type,
+            backtrace: r.backtrace,
+            dequeued_at: r.dequeued_at,
+            failed_at: r.failed_at,
+        }
+    }
+}
+
+/// Query parameters for `GET /jobs/{id}/errors`.
+#[derive(Deserialize)]
+struct ListErrorsParams {
+    /// Cursor: start after this attempt number (exclusive).
+    from: Option<u32>,
+
+    /// Sort order: "asc" (oldest first) or "desc" (newest first).
+    #[serde(default)]
+    order: Order,
+
+    /// Maximum number of error records to return (1–200, default 50).
+    limit: Option<u16>,
+}
+
+/// Response shape for paginated error listings.
+#[derive(Serialize)]
+struct ListErrorsResponse {
+    /// The error records on this page.
+    errors: Vec<ErrorRecord>,
+
+    /// Information about self, next, prev pages.
+    pages: ListErrorsPages,
+}
+
+/// Pagination links in an error listing response.
+#[derive(Serialize)]
+struct ListErrorsPages {
+    /// URL for the current page.
+    #[serde(rename = "self")]
+    self_url: String,
+
+    /// URL for the next page, or null if this is the last page.
+    next: Option<String>,
+
+    /// URL for the previous page, or null if this is the first page.
+    prev: Option<String>,
+}
+
 /// Shared server state, passed to all request handlers.
 pub struct AppState {
     /// Persistent store for job queue operations.
@@ -845,6 +925,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
         .route("/jobs/{id}/failure", post(report_failure))
+        .route("/jobs/{id}/errors", get(list_errors))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
@@ -1246,6 +1327,117 @@ fn build_page_url(
         url.push_str(&format!("&type={types}"));
     }
     url
+}
+
+/// Build a pagination URL for the errors listing endpoint.
+fn build_errors_page_url(job_id: &str, from: Option<u32>, order: Order, limit: u16) -> String {
+    let mut url = format!("/jobs/{job_id}/errors?");
+    if let Some(cursor) = from {
+        url.push_str(&format!("from={cursor}&"));
+    }
+    let order = serde_json::to_value(order).unwrap();
+    url.push_str(&format!("order={}&limit={limit}", order.as_str().unwrap()));
+    url
+}
+
+/// Handle `GET /jobs/{id}/errors` — list error records for a job.
+async fn list_errors(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    params: Result<Query<ListErrorsParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(e) => {
+            return respond(
+                Format::Json,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid query parameters: {e}"),
+                },
+            );
+        }
+    };
+
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if limit < 1 || limit > MAX_PAGE_LIMIT {
+        return respond(
+            fmt,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: format!("limit must be between 1 and {MAX_PAGE_LIMIT}"),
+            },
+        );
+    }
+
+    // Verify the job exists — 404 if not found, consistent with GET /jobs/{id}.
+    match state.store.get_job(&id).await {
+        Ok(None) => {
+            return respond(
+                fmt,
+                StatusCode::NOT_FOUND,
+                &ErrorResponse {
+                    error: "job not found".into(),
+                },
+            );
+        }
+        Err(e) => {
+            tracing::error!(%e, "list_errors: get_job failed");
+            return respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            );
+        }
+        Ok(Some(_)) => {}
+    }
+
+    let mut opts = ListErrorsOptions::new(&id)
+        .direction(params.order.into())
+        .limit(limit as usize);
+    if let Some(from) = params.from {
+        opts = opts.from(from);
+    }
+
+    match state.store.list_errors(opts).await {
+        Ok(page) => {
+            let self_url = build_errors_page_url(&id, params.from, params.order, limit);
+            let next = page
+                .next
+                .map(|o| build_errors_page_url(&id, o.from, o.direction.into(), limit));
+            let prev = page
+                .prev
+                .map(|o| build_errors_page_url(&id, o.from, o.direction.into(), limit));
+
+            let errors: Vec<ErrorRecord> = page.errors.into_iter().map(ErrorRecord::from).collect();
+
+            respond(
+                fmt,
+                StatusCode::OK,
+                &ListErrorsResponse {
+                    errors,
+                    pages: ListErrorsPages {
+                        self_url,
+                        next,
+                        prev,
+                    },
+                },
+            )
+        }
+        Err(e) => {
+            tracing::error!(%e, "list_errors failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
 }
 
 /// Default per-connection prefetch limit.
@@ -4353,5 +4545,174 @@ mod tests {
         let job_b: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
         assert_eq!(job_b["payload"], "b");
+    }
+
+    // --- list_errors tests ---
+
+    #[tokio::test]
+    async fn list_errors_returns_200_with_empty_list() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+
+        // Enqueue a job (no failures).
+        let job = state
+            .store
+            .enqueue(
+                now,
+                store::EnqueueOptions::new("test", "q", serde_json::json!("x")),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{}/errors", job.id));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["errors"].as_array().unwrap().len(), 0);
+        assert!(body["pages"]["next"].is_null());
+        assert!(body["pages"]["prev"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_errors_returns_errors_after_failures() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+
+        // Enqueue and take.
+        state
+            .store
+            .enqueue(
+                now,
+                store::EnqueueOptions::new("test", "q", serde_json::json!("x")),
+            )
+            .await
+            .unwrap();
+        let job = state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Fail the job.
+        let opts = store::FailureOptions {
+            error: "boom".into(),
+            error_type: Some("RuntimeError".into()),
+            backtrace: None,
+            retry_at: None,
+            kill: false,
+            default_retry_limit: 3,
+            default_backoff: store::BackoffConfig {
+                exponent: 2.0,
+                base_ms: 100.0,
+                jitter_ms: 0.0,
+            },
+        };
+        state
+            .store
+            .record_failure(now, &job.id, opts)
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{}/errors", job.id));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let errors = body["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["attempt"], 1);
+        assert_eq!(errors[0]["message"], "boom");
+        assert_eq!(errors[0]["error_type"], "RuntimeError");
+    }
+
+    #[tokio::test]
+    async fn list_errors_paginates_with_next_prev() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+
+        // Enqueue and take.
+        state
+            .store
+            .enqueue(
+                now,
+                store::EnqueueOptions::new("test", "q", serde_json::json!("x")),
+            )
+            .await
+            .unwrap();
+        let job = state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Fail, promote, retake, fail again to get 2 error records.
+        let fail_opts = || store::FailureOptions {
+            error: "err".into(),
+            error_type: None,
+            backtrace: None,
+            retry_at: None,
+            kill: false,
+            default_retry_limit: 10,
+            default_backoff: store::BackoffConfig {
+                exponent: 2.0,
+                base_ms: 100.0,
+                jitter_ms: 0.0,
+            },
+        };
+        state
+            .store
+            .record_failure(now, &job.id, fail_opts())
+            .await
+            .unwrap();
+
+        let scheduled = state.store.get_job(&job.id).await.unwrap().unwrap();
+        state.store.promote_scheduled(&scheduled).await.unwrap();
+        let retaken = state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .store
+            .record_failure(now, &retaken.id, fail_opts())
+            .await
+            .unwrap();
+
+        // Page 1: limit=1, should get one error and a next link.
+        let req = empty_request("GET", &format!("/jobs/{}/errors?limit=1", job.id));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        assert!(body["pages"]["next"].is_string());
+        assert!(body["pages"]["prev"].is_null());
+
+        // Page 2: follow the next link.
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+        assert!(body["pages"]["next"].is_null());
+        // prev should exist since we used a cursor.
+        assert!(body["pages"]["prev"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_errors_returns_404_for_unknown_job() {
+        let app = test_app();
+        let req = empty_request("GET", "/jobs/nonexistent/errors");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["error"], "job not found");
     }
 }

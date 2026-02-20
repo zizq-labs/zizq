@@ -266,6 +266,15 @@ pub struct ErrorRecord {
     /// Copied from the job's `failed_at` timestamp.
     #[serde(rename = "f")]
     pub failed_at: u64,
+
+    /// Which attempt this error corresponds to (1-based).
+    ///
+    /// Always overwritten from the key when reading via `list_errors`, so the
+    /// stored value is for forward-compat only. Old records without this field
+    /// deserialize as 0 thanks to `#[serde(default)]`.
+    #[serde(rename = "a")]
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 /// Direction for scanning the jobs keyspace when listing jobs.
@@ -381,6 +390,66 @@ pub struct ListJobsPage {
 
     /// Options to fetch the previous page, or `None` if this is the first page.
     pub prev: Option<ListJobsOptions>,
+}
+
+/// Options for listing error records with cursor-based pagination.
+#[derive(Debug, Clone)]
+pub struct ListErrorsOptions {
+    /// Job ID whose errors to list.
+    pub job_id: String,
+
+    /// Cursor: start after this attempt number (exclusive). `None` means start
+    /// from the beginning (asc) or end (desc).
+    pub from: Option<u32>,
+
+    /// Scan direction.
+    pub direction: ScanDirection,
+
+    /// Maximum number of error records to return.
+    pub limit: usize,
+}
+
+impl ListErrorsOptions {
+    /// Create default options for the given job (ascending, no cursor, limit 50).
+    pub fn new(job_id: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            from: None,
+            direction: ScanDirection::Asc,
+            limit: 50,
+        }
+    }
+
+    /// Set the cursor from which to paginate and return `self`.
+    pub fn from(mut self, cursor: u32) -> Self {
+        self.from = Some(cursor);
+        self
+    }
+
+    /// Set the direction in which to paginate and return `self`.
+    pub fn direction(mut self, direction: ScanDirection) -> Self {
+        self.direction = direction;
+        self
+    }
+
+    /// Set the maximum number of records to return and return `self`.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+/// A page of error records returned by `Store::list_errors`.
+#[derive(Debug)]
+pub struct ListErrorsPage {
+    /// The error records on this page.
+    pub errors: Vec<ErrorRecord>,
+
+    /// Options to fetch the next page, or `None` if this is the last page.
+    pub next: Option<ListErrorsOptions>,
+
+    /// Options to fetch the previous page, or `None` if this is the first page.
+    pub prev: Option<ListErrorsOptions>,
 }
 
 /// Options for enqueuing a new job.
@@ -1240,6 +1309,7 @@ impl Store {
                 backtrace: opts.backtrace,
                 dequeued_at: job.dequeued_at.unwrap_or(0),
                 failed_at: now,
+                attempt: job.attempts,
             };
             let error_bytes = rmp_serde::to_vec_named(&error_record)?;
             tx.insert(&errors, &error_key, &error_bytes);
@@ -1715,6 +1785,113 @@ impl Store {
 
             Ok(ListJobsPage {
                 jobs: rows,
+                next,
+                prev,
+            })
+        })
+        .await?
+    }
+
+    /// List error records for a job with cursor-based pagination.
+    ///
+    /// Returns a page of `ErrorRecord`s plus `next` / `prev` cursors for
+    /// follow-up requests. The cursor is the attempt number (u32), which is
+    /// the natural sort key within a job's error records.
+    pub async fn list_errors(&self, opts: ListErrorsOptions) -> Result<ListErrorsPage, StoreError> {
+        let errors_ks = self.errors.clone();
+
+        task::spawn_blocking(move || {
+            // We take 1 more record than requested so that we know if there's
+            // a next page or not.
+            let fetch = opts.limit + 1;
+
+            // Build the prefix for this job: `{job_id}\0`
+            let mut prefix = Vec::with_capacity(opts.job_id.len() + 1);
+            prefix.extend_from_slice(opts.job_id.as_bytes());
+            prefix.push(0);
+
+            // End sentinel: `{job_id}\x01` — one byte past the null separator,
+            // so the range covers all `{job_id}\0{...}` keys.
+            let mut end_sentinel = Vec::with_capacity(opts.job_id.len() + 1);
+            end_sentinel.extend_from_slice(opts.job_id.as_bytes());
+            end_sentinel.push(1);
+
+            let start = match opts.from {
+                Some(cursor) => Bound::Excluded(make_error_key(&opts.job_id, cursor)),
+                None => Bound::Included(prefix),
+            };
+            let end = Bound::Excluded(end_sentinel);
+
+            let mut rows = Vec::with_capacity(fetch);
+
+            match opts.direction {
+                ScanDirection::Asc => {
+                    for entry in errors_ks
+                        .inner()
+                        .range::<Vec<u8>, _>((start, end))
+                        .take(fetch)
+                    {
+                        let (key, value) = entry.into_inner()?;
+                        let mut record: ErrorRecord = rmp_serde::from_slice(&value)?;
+                        // Extract the attempt number from the last 4 bytes of the key.
+                        let attempt_bytes: [u8; 4] = key[key.len() - 4..]
+                            .try_into()
+                            .expect("error key must end with 4-byte attempt");
+                        record.attempt = u32::from_be_bytes(attempt_bytes);
+                        rows.push(record);
+                    }
+                }
+                ScanDirection::Desc => {
+                    for entry in errors_ks
+                        .inner()
+                        .range::<Vec<u8>, _>((start, end))
+                        .rev()
+                        .take(fetch)
+                    {
+                        let (key, value) = entry.into_inner()?;
+                        let mut record: ErrorRecord = rmp_serde::from_slice(&value)?;
+                        let attempt_bytes: [u8; 4] = key[key.len() - 4..]
+                            .try_into()
+                            .expect("error key must end with 4-byte attempt");
+                        record.attempt = u32::from_be_bytes(attempt_bytes);
+                        rows.push(record);
+                    }
+                }
+            }
+
+            // If we got more rows than the requested limit, there's a next page.
+            let has_more = rows.len() > opts.limit;
+            if has_more {
+                rows.truncate(opts.limit);
+            }
+
+            // Build next/prev options, preserving direction and limit.
+            let make_opts = |cursor: u32, direction: ScanDirection| {
+                ListErrorsOptions::new(&opts.job_id)
+                    .from(cursor)
+                    .direction(direction)
+                    .limit(opts.limit)
+            };
+
+            // Next page: exists if over-select found an extra row.
+            let next = if has_more {
+                let last_attempt = rows.last().unwrap().attempt;
+                Some(make_opts(last_attempt, opts.direction))
+            } else {
+                None
+            };
+
+            // Previous page: exists if a cursor was provided (we came from
+            // somewhere).
+            let prev = if opts.from.is_some() && !rows.is_empty() {
+                let first_attempt = rows.first().unwrap().attempt;
+                Some(make_opts(first_attempt, opts.direction.reverse()))
+            } else {
+                None
+            };
+
+            Ok(ListErrorsPage {
+                errors: rows,
                 next,
                 prev,
             })
@@ -5476,5 +5653,181 @@ mod tests {
 
         // attempts=0: 0^2 + 100 = 100
         assert_eq!(compute_backoff(0, &backoff), 100);
+    }
+
+    // --- list_errors tests ---
+
+    /// Helper: fail a working job, promote+retake it, and return the retaken job.
+    ///
+    /// This cycles one failure through the store so that `list_errors` has
+    /// something to read. The `error_msg` lets callers tag each failure for
+    /// assertion clarity.
+    async fn fail_and_retake(store: &Store, job_id: &str, error_msg: &str) -> Job {
+        let mut opts = test_failure_opts();
+        opts.error = error_msg.into();
+        store
+            .record_failure(now_millis(), job_id, opts)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Promote from Scheduled -> Ready and take again.
+        let scheduled = store.get_job(job_id).await.unwrap().unwrap();
+        store.promote_scheduled(&scheduled).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_errors_returns_empty_for_job_without_errors() {
+        let store = test_store();
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("payload")),
+            )
+            .await
+            .unwrap();
+
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id))
+            .await
+            .unwrap();
+
+        assert!(page.errors.is_empty());
+        assert!(page.next.is_none());
+        assert!(page.prev.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_errors_returns_errors_in_asc_order() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // Fail twice to produce two error records (attempts 1, 2).
+        let retaken = fail_and_retake(&store, &job.id, "error one").await;
+        let mut opts = test_failure_opts();
+        opts.error = "error two".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id))
+            .await
+            .unwrap();
+
+        assert_eq!(page.errors.len(), 2);
+        assert_eq!(page.errors[0].message, "error one");
+        assert_eq!(page.errors[1].message, "error two");
+    }
+
+    #[tokio::test]
+    async fn list_errors_returns_errors_in_desc_order() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let retaken = fail_and_retake(&store, &job.id, "error one").await;
+        let mut opts = test_failure_opts();
+        opts.error = "error two".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id).direction(ScanDirection::Desc))
+            .await
+            .unwrap();
+
+        assert_eq!(page.errors.len(), 2);
+        // Desc: newest first.
+        assert_eq!(page.errors[0].message, "error two");
+        assert_eq!(page.errors[1].message, "error one");
+    }
+
+    #[tokio::test]
+    async fn list_errors_paginates_with_limit() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        // Fail three times.
+        let retaken = fail_and_retake(&store, &job.id, "error one").await;
+        let retaken = fail_and_retake(&store, &retaken.id, "error two").await;
+        let mut opts = test_failure_opts();
+        opts.error = "error three".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        // Page 1: limit=2, should see errors 1 and 2 with a next cursor.
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id).limit(2))
+            .await
+            .unwrap();
+
+        assert_eq!(page.errors.len(), 2);
+        assert_eq!(page.errors[0].message, "error one");
+        assert_eq!(page.errors[1].message, "error two");
+        assert!(page.next.is_some());
+
+        // Page 2: follow the next cursor.
+        let page2 = store.list_errors(page.next.unwrap()).await.unwrap();
+
+        assert_eq!(page2.errors.len(), 1);
+        assert_eq!(page2.errors[0].message, "error three");
+        assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_errors_cursor_is_exclusive() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let retaken = fail_and_retake(&store, &job.id, "error one").await;
+        let mut opts = test_failure_opts();
+        opts.error = "error two".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        // Start after attempt 1 — should only see attempt 2.
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id).from(1))
+            .await
+            .unwrap();
+
+        assert_eq!(page.errors.len(), 1);
+        assert_eq!(page.errors[0].attempt, 2);
+        assert_eq!(page.errors[0].message, "error two");
+    }
+
+    #[tokio::test]
+    async fn list_errors_includes_attempt_number() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let retaken = fail_and_retake(&store, &job.id, "first").await;
+        let mut opts = test_failure_opts();
+        opts.error = "second".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id))
+            .await
+            .unwrap();
+
+        // Attempts are 1-based: first failure = 1, second = 2.
+        assert_eq!(page.errors[0].attempt, 1);
+        assert_eq!(page.errors[1].attempt, 2);
     }
 }
