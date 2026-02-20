@@ -191,12 +191,13 @@ async fn start_server() -> (String, JoinHandle<()>) {
             base_ms: DEFAULT_BACKOFF_BASE_MS,
             jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
         },
+        clock: Arc::new(zanxio::time::now_millis),
     });
 
     // Spawn the background scheduler.
     tokio::spawn(zanxio::scheduler::run(
         store,
-        zanxio::scheduler::now_millis,
+        zanxio::time::now_millis,
         zanxio::scheduler::DEFAULT_BATCH_SIZE,
         shutdown_rx,
     ));

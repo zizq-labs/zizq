@@ -7,7 +7,7 @@
 //! `scheduled_jobs_by_ready_at` index until their time arrives. This module
 //! provides the async loop that scans that index and promotes due jobs.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
@@ -18,14 +18,6 @@ use crate::store::{Store, StoreEvent};
 /// Override with the `ZANXIO_SCHEDULER_BATCH_SIZE` environment variable.
 pub const DEFAULT_BATCH_SIZE: usize = 200;
 
-/// Returns the current time as milliseconds since the Unix epoch.
-pub fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
 /// Run the scheduler loop until the shutdown signal is received.
 ///
 /// Each iteration fetches a batch of due scheduled jobs and promotes them
@@ -34,7 +26,7 @@ pub fn now_millis() -> u64 {
 /// event arrives (which might be due sooner).
 ///
 /// The `clock` parameter provides the current time in milliseconds since
-/// the Unix epoch. In production, pass `now_millis`; in tests, an
+/// the Unix epoch. In production, pass [`crate::time::now_millis`]; in tests, an
 /// injectable clock enables deterministic time control.
 ///
 /// `batch_size` controls how many due jobs are fetched per iteration.
@@ -158,6 +150,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::store::{EnqueueOptions, JobStatus, Store};
+    use crate::time::now_millis;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -206,7 +199,10 @@ mod tests {
         let t = clock.load(Ordering::Relaxed);
 
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 1_000))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 1_000),
+            )
             .await
             .unwrap();
 
@@ -238,7 +234,10 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..3 {
             let job = store
-                .enqueue(EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000))
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000),
+                )
                 .await
                 .unwrap();
             ids.push(job.id);
@@ -269,7 +268,10 @@ mod tests {
         let t = clock.load(Ordering::Relaxed);
 
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 10_000))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 10_000),
+            )
             .await
             .unwrap();
 
@@ -299,6 +301,7 @@ mod tests {
         // Enqueue a job due in 10s — scheduler starts sleeping until then.
         let late = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("late")).ready_at(t + 10_000),
             )
             .await
@@ -307,6 +310,7 @@ mod tests {
         // Now enqueue a job due in 2s — should reset the timer.
         let early = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("early")).ready_at(t + 2_000),
             )
             .await
@@ -347,6 +351,7 @@ mod tests {
         // to t+2000.
         let early = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("early")).ready_at(t + 2_000),
             )
             .await
@@ -355,6 +360,7 @@ mod tests {
         // Enqueue a job due in 10s — must NOT push the timer forward.
         let late = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("late")).ready_at(t + 10_000),
             )
             .await
@@ -391,7 +397,10 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..3 {
             let job = store
-                .enqueue(EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000))
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000),
+                )
                 .await
                 .unwrap();
             ids.push(job.id);

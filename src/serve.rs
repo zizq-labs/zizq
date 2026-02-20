@@ -96,6 +96,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             base_ms: args.default_backoff_base_ms,
             jitter_ms: args.default_backoff_jitter_ms,
         },
+        clock: Arc::new(crate::time::now_millis),
     });
 
     // Start the background scheduler that promotes scheduled jobs to Ready
@@ -107,7 +108,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(crate::scheduler::DEFAULT_BATCH_SIZE);
     tokio::spawn(crate::scheduler::run(
         state.store.clone(),
-        crate::scheduler::now_millis,
+        crate::time::now_millis,
         scheduler_batch_size,
         scheduler_shutdown,
     ));

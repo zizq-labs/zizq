@@ -542,6 +542,12 @@ pub struct AppState {
 
     /// Default backoff config applied to jobs that don't specify one.
     pub default_backoff: BackoffConfig,
+
+    /// Clock function for the current time in milliseconds since Unix epoch.
+    ///
+    /// In production, this is `time::now_millis`; tests can inject a
+    /// custom clock for deterministic timestamps.
+    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 // --- Content negotiation ---
@@ -895,7 +901,8 @@ async fn enqueue(
         opts = opts.ready_at(ready_at);
     }
 
-    match state.store.enqueue(opts).await.and_then(Job::try_from) {
+    let now = (state.clock)();
+    match state.store.enqueue(now, opts).await.and_then(Job::try_from) {
         Ok(job) => {
             tracing::debug!(
                 job_id = %job.id,
@@ -1343,7 +1350,8 @@ async fn take_jobs(
                                     // Won the claim — try to take a job. All
                                     // other workers with the same claim token
                                     // will skip and go back to waiting.
-                                    match state.store.take_next_job(&queues).await {
+                                    let now = (state.clock)();
+                                    match state.store.take_next_job(now, &queues).await {
                                         Ok(Some(job)) => {
                                             in_flight.insert(job.id.clone());
                                             state.global_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -1537,6 +1545,7 @@ mod tests {
                 base_ms: DEFAULT_BACKOFF_BASE_MS,
                 jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
             },
+            clock: Arc::new(crate::time::now_millis),
         });
         let router = app(state.clone());
         (state, router)
@@ -1973,7 +1982,11 @@ mod tests {
         let job_id = created["id"].as_str().unwrap();
 
         // Take the job so it moves to working.
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let req = empty_request("GET", &format!("/jobs/{job_id}"));
         let res = app.oneshot(req).await.unwrap();
@@ -2001,7 +2014,11 @@ mod tests {
         let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         state.store.mark_completed(job_id).await.unwrap();
 
         let req = empty_request("GET", &format!("/jobs/{job_id}"));
@@ -2038,7 +2055,10 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -2069,7 +2089,10 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -2088,17 +2111,26 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2116,17 +2148,26 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2152,12 +2193,18 @@ mod tests {
         let (state, app) = test_state_and_app();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -2176,12 +2223,18 @@ mod tests {
         let (state, app) = test_state_and_app();
         let a = state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -2260,17 +2313,27 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
         // Take the first job so it becomes working.
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let req = empty_request("GET", "/jobs?status=ready");
         let res = app.clone().oneshot(req).await.unwrap();
@@ -2313,17 +2376,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2356,22 +2428,35 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take the first job so it becomes working.
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let req = empty_request("GET", "/jobs?status=ready;working");
         let res = app.oneshot(req).await.unwrap();
@@ -2388,21 +2473,34 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let req = empty_request("GET", "/jobs?status=ready;working&limit=2");
         let res = app.clone().oneshot(req).await.unwrap();
@@ -2429,29 +2527,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2472,29 +2567,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2515,29 +2607,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2566,34 +2655,35 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take a so it becomes working.
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Only ready jobs in emails queue.
         let req = empty_request("GET", "/jobs?queue=emails&status=ready");
@@ -2612,29 +2702,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2663,34 +2750,35 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take a so it becomes working.
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Ready + working in emails + reports (excludes webhooks).
         let req = empty_request("GET", "/jobs?queue=emails;reports&status=ready;working");
@@ -2712,29 +2800,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("generate_report", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2755,25 +2840,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("generate_report", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("send_sms", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("send_sms", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2795,7 +2881,10 @@ mod tests {
         for i in 0..3 {
             state
                 .store
-                .enqueue(EnqueueOptions::new("send_email", "q", serde_json::json!(i)))
+                .enqueue(
+                    crate::time::now_millis(),
+                    EnqueueOptions::new("send_email", "q", serde_json::json!(i)),
+                )
                 .await
                 .unwrap();
         }
@@ -2822,34 +2911,35 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "high",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("send_email", "high", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "high",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("send_email", "high", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "high",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("generate_report", "high", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take a so it becomes working.
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Ready send_email in high queue.
         let req = empty_request("GET", "/jobs?type=send_email&queue=high&status=ready");
@@ -2878,7 +2968,11 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = body["id"].as_str().unwrap();
 
-        state.store.take_next_job(&HashSet::new()).await.unwrap();
+        state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Mark it as completed.
         let req = empty_request("POST", &format!("/jobs/{job_id}/success"));
@@ -2928,16 +3022,18 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "q1",
-                serde_json::json!("first"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q1", serde_json::json!("first")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q2", serde_json::json!("second")).priority(5))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q2", serde_json::json!("second")).priority(5),
+            )
             .await
             .unwrap();
 
@@ -2982,11 +3078,10 @@ mod tests {
         // Enqueue after take connection is open.
         let enqueued = state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("delayed"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("delayed")),
+            )
             .await
             .unwrap();
 
@@ -3004,11 +3099,10 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("sse-test"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("sse-test")),
+            )
             .await
             .unwrap();
 
@@ -3041,11 +3135,10 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("mp-test"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("mp-test")),
+            )
             .await
             .unwrap();
 
@@ -3090,11 +3183,10 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("ct-test"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("ct-test")),
+            )
             .await
             .unwrap();
 
@@ -3113,11 +3205,10 @@ mod tests {
 
         let enqueued = state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("requeue-me"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("requeue-me")),
+            )
             .await
             .unwrap();
 
@@ -3142,7 +3233,12 @@ mod tests {
 
         // Drain jobs from queue — our original job should be among them.
         let mut ids = Vec::new();
-        while let Some(job) = state.store.take_next_job(&HashSet::new()).await.unwrap() {
+        while let Some(job) = state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+        {
             ids.push(job.id);
         }
         assert!(
@@ -3157,20 +3253,18 @@ mod tests {
 
         let job_a = state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("acked"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("acked")),
+            )
             .await
             .unwrap();
         let job_b = state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("unacked"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("unacked")),
+            )
             .await
             .unwrap();
 
@@ -3193,7 +3287,12 @@ mod tests {
 
         // Only the unacked job should be requeued, not the acked one.
         let mut ids = Vec::new();
-        while let Some(job) = state.store.take_next_job(&HashSet::new()).await.unwrap() {
+        while let Some(job) = state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+        {
             ids.push(job.id);
         }
         assert!(
@@ -3225,23 +3324,33 @@ mod tests {
                 base_ms: DEFAULT_BACKOFF_BASE_MS,
                 jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
             },
+            clock: Arc::new(crate::time::now_millis),
         });
         let router = app(state.clone());
 
         // Enqueue 3 jobs.
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3278,12 +3387,18 @@ mod tests {
         // Enqueue 2 jobs.
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -3320,17 +3435,26 @@ mod tests {
         // Enqueue 3 jobs.
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3370,17 +3494,26 @@ mod tests {
         // Enqueue 3 jobs.
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3412,7 +3545,10 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("x")))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("x")),
+            )
             .await
             .unwrap();
 
@@ -3438,20 +3574,18 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -3472,29 +3606,26 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3519,20 +3650,18 @@ mod tests {
 
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         state
             .store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 

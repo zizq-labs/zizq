@@ -25,7 +25,6 @@ use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::SystemTime;
 
 use fjall::config::FilterPolicy;
 use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
@@ -889,7 +888,7 @@ impl Store {
     /// and into the priority indexes.
     ///
     /// Subscribers are notified when a job enters the ready state.
-    pub async fn enqueue(&self, opts: EnqueueOptions) -> Result<Job, StoreError> {
+    pub async fn enqueue(&self, now: u64, opts: EnqueueOptions) -> Result<Job, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let payloads = self.payloads.clone();
@@ -902,14 +901,6 @@ impl Store {
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
             let id = scru128::new_string();
-
-            // Get the current time which is both a default `ready_at` and a
-            // point of comparison to know if the job should be scheduled or
-            // should be queued immediately.
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
 
             // Read the `ready_at` timestamp, defaulting to now if not present.
             let ready_at = opts.ready_at.unwrap_or(now);
@@ -1013,7 +1004,11 @@ impl Store {
     /// When empty, all ready jobs are candidates.
     ///
     /// Subscribers are not notified.
-    pub async fn take_next_job(&self, queues: &HashSet<String>) -> Result<Option<Job>, StoreError> {
+    pub async fn take_next_job(
+        &self,
+        now: u64,
+        queues: &HashSet<String>,
+    ) -> Result<Option<Job>, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
         let payloads = self.payloads.clone();
@@ -1091,12 +1086,7 @@ impl Store {
             let old_status_key = make_status_key(JobStatus::Ready, &job.id);
             let queue_priority_key = make_queue_priority_key(&job.queue, job.priority, &job.id);
             job.status = JobStatus::Working.into();
-            job.dequeued_at = Some(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-            );
+            job.dequeued_at = Some(now);
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
 
             // Only write metadata back — payload is immutable and stays in
@@ -1198,6 +1188,7 @@ impl Store {
     /// indexes, error records) are deleted from the store.
     pub async fn record_failure(
         &self,
+        now: u64,
         id: &str,
         opts: FailureOptions,
     ) -> Result<Option<Job>, StoreError> {
@@ -1231,10 +1222,6 @@ impl Store {
             }
 
             // Record the failure time and increment the count.
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
             job.attempts += 1;
             job.failed_at = Some(now);
 
@@ -2043,6 +2030,9 @@ fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use crate::time::now_millis;
 
     fn test_store() -> Store {
         let dir = tempfile::tempdir().unwrap();
@@ -2055,11 +2045,10 @@ mod tests {
     async fn enqueue_returns_job_with_id() {
         let store = test_store();
         let job = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!({"task": "test"}),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({"task": "test"})),
+            )
             .await
             .unwrap();
 
@@ -2074,19 +2063,17 @@ mod tests {
     async fn enqueue_generates_unique_ids() {
         let store = test_store();
         let job1 = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!(null),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
             .await
             .unwrap();
         let job2 = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!(null),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
             .await
             .unwrap();
 
@@ -2097,11 +2084,17 @@ mod tests {
     async fn enqueue_priority_key_reflects_priority() {
         let store = test_store();
         let low = store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(10))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(10),
+            )
             .await
             .unwrap();
         let high = store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(1),
+            )
             .await
             .unwrap();
 
@@ -2115,27 +2108,24 @@ mod tests {
     async fn enqueue_ids_are_fifo_ordered() {
         let store = test_store();
         let first = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!(null),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
             .await
             .unwrap();
         let second = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!(null),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
             .await
             .unwrap();
         let third = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!(null),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
             .await
             .unwrap();
 
@@ -2147,7 +2137,10 @@ mod tests {
     #[tokio::test]
     async fn take_next_job_returns_none_when_empty() {
         let store = test_store();
-        let job = store.take_next_job(&HashSet::new()).await.unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         assert!(job.is_none());
     }
 
@@ -2155,19 +2148,32 @@ mod tests {
     async fn take_next_job_returns_highest_priority() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("mid")).priority(5))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("mid")).priority(5),
+            )
             .await
             .unwrap();
 
-        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.priority, 1);
         assert_eq!(job.status, u8::from(JobStatus::Working));
         assert_eq!(job.payload, serde_json::json!("high"));
@@ -2177,23 +2183,25 @@ mod tests {
     async fn take_next_job_fifo_within_same_priority() {
         let store = test_store();
         let first = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.id, first.id);
     }
 
@@ -2201,24 +2209,30 @@ mod tests {
     async fn take_next_job_removes_from_queue() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        let first = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
-        let second = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_ne!(first.id, second.id);
         assert_eq!(first.payload, serde_json::json!("a"));
@@ -2227,7 +2241,7 @@ mod tests {
         // Queue should now be empty.
         assert!(
             store
-                .take_next_job(&HashSet::new())
+                .take_next_job(now_millis(), &HashSet::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -2238,22 +2252,25 @@ mod tests {
     async fn mark_completed_removes_job() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(store.mark_completed(&job.id).await.unwrap());
 
         // Job should no longer be dequeue-able even if re-enqueue were attempted
         // via crash recovery — it's gone from the jobs keyspace entirely.
         assert!(
             store
-                .take_next_job(&HashSet::new())
+                .take_next_job(now_millis(), &HashSet::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -2270,15 +2287,18 @@ mod tests {
     async fn mark_completed_returns_false_on_double_ack() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(store.mark_completed(&job.id).await.unwrap());
         assert!(!store.mark_completed(&job.id).await.unwrap());
     }
@@ -2290,7 +2310,10 @@ mod tests {
 
         for i in 0..num_jobs {
             store
-                .enqueue(EnqueueOptions::new("test", "default", serde_json::json!(i)))
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", "default", serde_json::json!(i)),
+                )
                 .await
                 .unwrap();
         }
@@ -2301,7 +2324,11 @@ mod tests {
             let store = store.clone();
             handles.push(tokio::spawn(async move {
                 let mut taken = Vec::new();
-                while let Some(job) = store.take_next_job(&HashSet::new()).await.unwrap() {
+                while let Some(job) = store
+                    .take_next_job(now_millis(), &HashSet::new())
+                    .await
+                    .unwrap()
+                {
                     taken.push(job.id);
                 }
                 taken
@@ -2326,91 +2353,119 @@ mod tests {
     async fn take_next_job_filters_by_single_queue() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         let queues = HashSet::from(["reports".into()]);
-        let job = store.take_next_job(&queues).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &queues)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.id, b.id);
         assert_eq!(job.queue, "reports");
 
         // No more reports jobs.
-        assert!(store.take_next_job(&queues).await.unwrap().is_none());
+        assert!(
+            store
+                .take_next_job(now_millis(), &queues)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn take_next_job_filters_by_multiple_queues() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         let queues = HashSet::from(["emails".into(), "webhooks".into()]);
-        let first = store.take_next_job(&queues).await.unwrap().unwrap();
+        let first = store
+            .take_next_job(now_millis(), &queues)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.id, a.id);
 
-        let second = store.take_next_job(&queues).await.unwrap().unwrap();
+        let second = store
+            .take_next_job(now_millis(), &queues)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(second.id, c.id);
 
-        assert!(store.take_next_job(&queues).await.unwrap().is_none());
+        assert!(
+            store
+                .take_next_job(now_millis(), &queues)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn take_next_job_queue_filter_respects_priority() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "emails", serde_json::json!("low")).priority(10))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("low")).priority(10),
+            )
             .await
             .unwrap();
         let high = store
-            .enqueue(EnqueueOptions::new("test", "emails", serde_json::json!("high")).priority(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("high")).priority(1),
+            )
             .await
             .unwrap();
 
         let queues = HashSet::from(["emails".into()]);
-        let job = store.take_next_job(&queues).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &queues)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.id, high.id);
         assert_eq!(job.priority, 1);
     }
@@ -2419,32 +2474,47 @@ mod tests {
     async fn take_next_job_queue_filter_returns_none_for_empty_queue() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
         let queues = HashSet::from(["reports".into()]);
-        assert!(store.take_next_job(&queues).await.unwrap().is_none());
+        assert!(
+            store
+                .take_next_job(now_millis(), &queues)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn take_next_job_queue_filter_picks_best_across_queues() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "emails", serde_json::json!("low")).priority(10))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("low")).priority(10),
+            )
             .await
             .unwrap();
         let high = store
-            .enqueue(EnqueueOptions::new("test", "webhooks", serde_json::json!("high")).priority(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("high")).priority(1),
+            )
             .await
             .unwrap();
 
         let queues = HashSet::from(["emails".into(), "webhooks".into()]);
-        let job = store.take_next_job(&queues).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &queues)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.id, high.id);
         assert_eq!(job.queue, "webhooks");
         assert_eq!(job.priority, 1);
@@ -2459,15 +2529,18 @@ mod tests {
             .as_millis() as u64;
 
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         let after = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -2485,15 +2558,18 @@ mod tests {
     async fn take_next_job_dequeued_at_persists() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         let stored = store.get_job(&taken.id).await.unwrap().unwrap();
         assert_eq!(stored.dequeued_at, taken.dequeued_at);
     }
@@ -2502,19 +2578,26 @@ mod tests {
     async fn requeue_returns_job_to_queue() {
         let store = test_store();
         let job = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(taken.id, job.id);
 
         assert!(store.requeue(&taken.id).await.unwrap());
 
-        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retaken.id, job.id);
     }
 
@@ -2522,21 +2605,35 @@ mod tests {
     async fn requeue_preserves_priority() {
         let store = test_store();
         let high = store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(taken.id, high.id);
 
         assert!(store.requeue(&taken.id).await.unwrap());
 
         // Should get the high-priority job again, not the low-priority one.
-        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retaken.id, high.id);
         assert_eq!(retaken.priority, 1);
         assert_eq!(retaken.status, u8::from(JobStatus::Working));
@@ -2546,14 +2643,17 @@ mod tests {
     async fn requeue_skips_already_acked_job() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(store.mark_completed(&taken.id).await.unwrap());
 
         assert!(!store.requeue(&taken.id).await.unwrap());
@@ -2561,7 +2661,7 @@ mod tests {
         // Queue should remain empty.
         assert!(
             store
-                .take_next_job(&HashSet::new())
+                .take_next_job(now_millis(), &HashSet::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -2574,11 +2674,10 @@ mod tests {
         let mut rx = store.subscribe();
 
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -2592,14 +2691,17 @@ mod tests {
     async fn mark_completed_broadcasts_job_completed() {
         let store = test_store();
         let job = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut rx = store.subscribe();
         store.mark_completed(&taken.id).await.unwrap();
@@ -2614,14 +2716,17 @@ mod tests {
     async fn requeue_broadcasts_job_created() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut rx = store.subscribe();
         store.requeue(&taken.id).await.unwrap();
@@ -2636,11 +2741,10 @@ mod tests {
     async fn get_job_returns_enqueued_job() {
         let store = test_store();
         let enqueued = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("hello"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("hello")),
+            )
             .await
             .unwrap();
 
@@ -2661,14 +2765,16 @@ mod tests {
     async fn get_job_returns_none_after_completion() {
         let store = test_store();
         let enqueued = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         store.mark_completed(&enqueued.id).await.unwrap();
 
         assert!(store.get_job(&enqueued.id).await.unwrap().is_none());
@@ -2678,15 +2784,24 @@ mod tests {
     async fn list_jobs_returns_all_in_asc_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2701,15 +2816,24 @@ mod tests {
     async fn list_jobs_returns_all_in_desc_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2727,15 +2851,24 @@ mod tests {
     async fn list_jobs_respects_limit() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2750,15 +2883,24 @@ mod tests {
     async fn list_jobs_cursor_is_exclusive_asc() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2775,15 +2917,24 @@ mod tests {
     async fn list_jobs_cursor_is_exclusive_desc() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2813,7 +2964,10 @@ mod tests {
     async fn list_jobs_cursor_past_end() {
         let store = test_store();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2829,15 +2983,24 @@ mod tests {
     async fn list_jobs_includes_working_jobs() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert_eq!(page.jobs.len(), 2);
@@ -2850,15 +3013,25 @@ mod tests {
     async fn list_jobs_excludes_completed_jobs() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
@@ -2870,15 +3043,24 @@ mod tests {
     async fn list_jobs_next_present_when_more_results() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2898,11 +3080,17 @@ mod tests {
     async fn list_jobs_next_absent_on_last_page() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -2918,7 +3106,10 @@ mod tests {
     async fn list_jobs_prev_absent_on_first_page() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -2930,15 +3121,24 @@ mod tests {
     async fn list_jobs_prev_present_when_cursor_provided() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2959,15 +3159,24 @@ mod tests {
     async fn list_jobs_next_page_returns_remaining() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -2991,16 +3200,25 @@ mod tests {
     async fn list_jobs_filters_by_ready_status() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
         // Take the first job so it becomes Working.
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Ready])))
@@ -3015,15 +3233,24 @@ mod tests {
     async fn list_jobs_filters_by_working_status() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
@@ -3038,7 +3265,10 @@ mod tests {
     async fn list_jobs_status_filter_empty_when_none_match() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -3053,15 +3283,24 @@ mod tests {
     async fn list_jobs_status_filter_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3089,11 +3328,17 @@ mod tests {
     async fn list_jobs_status_filter_desc_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -3114,11 +3359,17 @@ mod tests {
     async fn list_jobs_status_filter_reflects_requeue() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Now working.
         let page = store
@@ -3148,11 +3399,18 @@ mod tests {
     async fn list_jobs_status_filter_reflects_completion() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
@@ -3175,27 +3433,24 @@ mod tests {
     async fn list_jobs_filters_by_single_queue() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3212,27 +3467,24 @@ mod tests {
     async fn list_jobs_filters_by_multiple_queues() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3251,35 +3503,31 @@ mod tests {
     async fn list_jobs_queue_filter_merges_in_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
         let d = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("d"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("d")),
+            )
             .await
             .unwrap();
 
@@ -3316,11 +3564,10 @@ mod tests {
     async fn list_jobs_queue_filter_empty_when_none_match() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -3335,27 +3582,24 @@ mod tests {
     async fn list_jobs_queue_filter_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3381,23 +3625,25 @@ mod tests {
     async fn list_jobs_queue_filter_reflects_completion() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store
@@ -3414,21 +3660,36 @@ mod tests {
     async fn list_jobs_filters_by_multiple_statuses() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take a and b so they become Working.
-        store.take_next_job(&HashSet::new()).await.unwrap();
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Filter by Ready + Working — should get all 3.
         let page = store
@@ -3448,15 +3709,24 @@ mod tests {
     async fn list_jobs_multi_status_desc_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap(); // a -> working
 
         let page = store
             .list_jobs(
@@ -3477,32 +3747,32 @@ mod tests {
     async fn list_jobs_filters_by_queue_and_status() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let _c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take a so it becomes Working.
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Only ready jobs in the emails queue.
         let page = store
@@ -3545,41 +3815,43 @@ mod tests {
     async fn list_jobs_queue_and_status_multiple_queues_and_statuses() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "webhooks",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "webhooks", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "reports",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "reports", serde_json::json!("c")),
+            )
             .await
             .unwrap();
         let d = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("d"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("d")),
+            )
             .await
             .unwrap();
 
         // Take a and b so they become Working.
-        store.take_next_job(&HashSet::new()).await.unwrap();
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Ready + Working in emails + webhooks (excludes reports).
         let page = store
@@ -3603,23 +3875,24 @@ mod tests {
     async fn list_jobs_queue_and_status_desc_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap(); // a -> working
 
         let page = store
             .list_jobs(
@@ -3639,27 +3912,24 @@ mod tests {
     async fn list_jobs_queue_and_status_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3692,11 +3962,10 @@ mod tests {
     async fn list_jobs_queue_and_status_empty_when_none_match() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -3715,15 +3984,17 @@ mod tests {
     async fn list_jobs_queue_and_status_reflects_requeue() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap(); // a -> working
 
         // Working in emails.
         let page = store
@@ -3765,23 +4036,25 @@ mod tests {
     async fn list_jobs_queue_and_status_reflects_completion() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "emails",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "emails", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store
@@ -3811,19 +4084,31 @@ mod tests {
     async fn list_jobs_multi_status_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("b")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
-        store.take_next_job(&HashSet::new()).await.unwrap(); // a -> working
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap(); // a -> working
 
         let page = store
             .list_jobs(
@@ -3850,27 +4135,24 @@ mod tests {
     async fn list_jobs_filters_by_single_type() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("generate_report", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3887,23 +4169,24 @@ mod tests {
     async fn list_jobs_filters_by_multiple_types() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("generate_report", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new("send_sms", "q", serde_json::json!("c")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_sms", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -3923,11 +4206,10 @@ mod tests {
     async fn list_jobs_type_filter_empty_when_none_match() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -3942,23 +4224,25 @@ mod tests {
     async fn list_jobs_type_filter_reflects_completion() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         store.mark_completed(&taken.id).await.unwrap();
 
         let page = store
@@ -3973,27 +4257,24 @@ mod tests {
     async fn list_jobs_type_filter_with_pagination() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         let c = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -4020,19 +4301,17 @@ mod tests {
     async fn list_jobs_type_filter_desc_order() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         let b = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
 
@@ -4055,27 +4334,24 @@ mod tests {
     async fn list_jobs_filters_by_type_and_queue() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "high",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "high", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "low",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "low", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "high",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("generate_report", "high", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
@@ -4095,32 +4371,32 @@ mod tests {
     async fn list_jobs_filters_by_type_and_status() {
         let store = test_store();
         let a = store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "q",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "q",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("generate_report", "q", serde_json::json!("c")),
+            )
             .await
             .unwrap();
 
         // Take a so it becomes working.
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Working send_email jobs only.
         let page = store
@@ -4139,40 +4415,39 @@ mod tests {
     async fn list_jobs_filters_by_type_and_queue_and_status() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "high",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "high", serde_json::json!("a")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "high",
-                serde_json::json!("b"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "high", serde_json::json!("b")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "send_email",
-                "low",
-                serde_json::json!("c"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("send_email", "low", serde_json::json!("c")),
+            )
             .await
             .unwrap();
         store
-            .enqueue(EnqueueOptions::new(
-                "generate_report",
-                "high",
-                serde_json::json!("d"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("generate_report", "high", serde_json::json!("d")),
+            )
             .await
             .unwrap();
 
         // Take a so it becomes working.
-        store.take_next_job(&HashSet::new()).await.unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
 
         // Ready send_email in high queue.
         let page = store
@@ -4199,7 +4474,10 @@ mod tests {
             + 60_000; // 1 minute from now
 
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future_ms))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future_ms),
+            )
             .await
             .unwrap();
 
@@ -4207,7 +4485,10 @@ mod tests {
         assert_eq!(job.ready_at, future_ms);
 
         // Scheduled jobs should not be dequeue-able.
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         assert!(taken.is_none());
     }
 
@@ -4221,7 +4502,10 @@ mod tests {
             - 1000; // 1 second ago
 
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(past_ms))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(past_ms),
+            )
             .await
             .unwrap();
 
@@ -4229,7 +4513,10 @@ mod tests {
         assert_eq!(job.ready_at, past_ms);
 
         // Should be dequeue-able immediately.
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().id, job.id);
     }
@@ -4243,7 +4530,10 @@ mod tests {
 
         let store = test_store();
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -4270,6 +4560,7 @@ mod tests {
         // Enqueue a job scheduled in the future so it enters Scheduled state.
         let job = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(now + 60_000),
             )
             .await
@@ -4282,7 +4573,10 @@ mod tests {
         store.promote_scheduled(&batch[0]).await.unwrap();
 
         // It should now be takeable.
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().id, job.id);
     }
@@ -4297,7 +4591,10 @@ mod tests {
         let future_ms = now + 3_600_000; // 1 hour from now
 
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future_ms))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future_ms),
+            )
             .await
             .unwrap();
 
@@ -4310,7 +4607,7 @@ mod tests {
         // Still not takeable.
         assert!(
             store
-                .take_next_job(&HashSet::new())
+                .take_next_job(now_millis(), &HashSet::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -4334,6 +4631,7 @@ mod tests {
         for i in 0..5u64 {
             store
                 .enqueue(
+                    now_millis(),
                     EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(future + i),
                 )
                 .await
@@ -4362,7 +4660,10 @@ mod tests {
         let future = now + 60_000;
 
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future),
+            )
             .await
             .unwrap();
 
@@ -4388,12 +4689,14 @@ mod tests {
         // Enqueue in reverse order to confirm sorting is by ready_at.
         let later = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("later")).ready_at(base + 5000),
             )
             .await
             .unwrap();
         let earlier = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("earlier"))
                     .ready_at(base + 1000),
             )
@@ -4416,7 +4719,10 @@ mod tests {
 
         // Enqueue a ready job (no ready_at).
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -4437,7 +4743,10 @@ mod tests {
             + 60_000;
 
         store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future),
+            )
             .await
             .unwrap();
 
@@ -4457,7 +4766,10 @@ mod tests {
         let future = now + 60_000;
 
         let job = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future),
+            )
             .await
             .unwrap();
 
@@ -4468,12 +4780,15 @@ mod tests {
         store.promote_scheduled(&job).await.unwrap();
 
         // Should still be takeable exactly once.
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().id, job.id);
         assert!(
             store
-                .take_next_job(&HashSet::new())
+                .take_next_job(now_millis(), &HashSet::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -4490,11 +4805,15 @@ mod tests {
 
         // One due job and one future job.
         let due = store
-            .enqueue(EnqueueOptions::new("test", "q", serde_json::json!("due")).ready_at(now + 100))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("due")).ready_at(now + 100),
+            )
             .await
             .unwrap();
         store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("future"))
                     .ready_at(now + 60_000),
             )
@@ -4512,22 +4831,25 @@ mod tests {
     async fn recover_working_jobs_moves_working_to_ready() {
         let store = test_store();
         let job = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
         // Take the job so it becomes Working.
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(taken.id, job.id);
 
         // Nothing left to take.
         assert!(
             store
-                .take_next_job(&HashSet::new())
+                .take_next_job(now_millis(), &HashSet::new())
                 .await
                 .unwrap()
                 .is_none()
@@ -4538,7 +4860,11 @@ mod tests {
         assert_eq!(recovered, 1);
 
         // The job should be takeable again.
-        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(retaken.id, job.id);
     }
 
@@ -4548,11 +4874,10 @@ mod tests {
 
         // Enqueue a job but don't take it — it stays Ready.
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -4566,25 +4891,47 @@ mod tests {
 
         // Enqueue two jobs at different priorities.
         let low = store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
+            )
             .await
             .unwrap();
         let high = store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
+            )
             .await
             .unwrap();
 
         // Take both so they become Working.
-        store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
-        store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Recover both.
         let recovered = store.recover_working_jobs().await.unwrap();
         assert_eq!(recovered, 2);
 
         // They should come back in priority order (high first, then low).
-        let first = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
-        let second = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.id, high.id);
         assert_eq!(second.id, low.id);
     }
@@ -4599,17 +4946,17 @@ mod tests {
 
         // A Ready job.
         let ready = store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("ready"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("ready")),
+            )
             .await
             .unwrap();
 
         // A Scheduled job (far in the future).
         let scheduled = store
             .enqueue(
+                now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("scheduled"))
                     .ready_at(now + 600_000),
             )
@@ -4621,7 +4968,11 @@ mod tests {
         assert_eq!(recovered, 0);
 
         // The ready job is still takeable.
-        let taken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(taken.id, ready.id);
 
         // The scheduled job is still in the scheduled index.
@@ -4652,14 +5003,17 @@ mod tests {
     /// Enqueue a job and take it so it's in the Working state.
     async fn enqueue_and_take(store: &Store) -> Job {
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("payload"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("payload")),
+            )
             .await
             .unwrap();
-        store.take_next_job(&HashSet::new()).await.unwrap().unwrap()
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -4668,7 +5022,7 @@ mod tests {
         let job = enqueue_and_take(&store).await;
 
         let result = store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap()
             .unwrap();
@@ -4689,7 +5043,11 @@ mod tests {
         let mut opts = test_failure_opts();
         opts.default_retry_limit = 0;
 
-        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        let result = store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, JobStatus::Dead as u8);
         assert_eq!(result.attempts, 1);
@@ -4706,7 +5064,11 @@ mod tests {
         let mut opts = test_failure_opts();
         opts.kill = true;
 
-        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        let result = store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, JobStatus::Dead as u8);
         assert!(store.get_job(&job.id).await.unwrap().is_none());
@@ -4722,7 +5084,11 @@ mod tests {
         opts.default_retry_limit = 100;
         opts.kill = true;
 
-        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        let result = store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, JobStatus::Dead as u8);
     }
@@ -4735,7 +5101,11 @@ mod tests {
         let mut opts = test_failure_opts();
         opts.retry_at = Some(999_999);
 
-        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        let result = store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, JobStatus::Scheduled as u8);
         assert_eq!(result.ready_at, 999_999);
@@ -4751,7 +5121,11 @@ mod tests {
         opts.default_retry_limit = 0;
         opts.retry_at = Some(123_456);
 
-        let result = store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        let result = store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, JobStatus::Scheduled as u8);
         assert_eq!(result.ready_at, 123_456);
@@ -4761,7 +5135,7 @@ mod tests {
     async fn record_failure_returns_none_for_unknown_id() {
         let store = test_store();
         let result = store
-            .record_failure("nonexistent", test_failure_opts())
+            .record_failure(now_millis(), "nonexistent", test_failure_opts())
             .await
             .unwrap();
         assert!(result.is_none());
@@ -4771,11 +5145,10 @@ mod tests {
     async fn record_failure_returns_none_for_ready_job() {
         let store = test_store();
         store
-            .enqueue(EnqueueOptions::new(
-                "test",
-                "default",
-                serde_json::json!("a"),
-            ))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
             .await
             .unwrap();
 
@@ -4789,7 +5162,7 @@ mod tests {
             .unwrap();
 
         let result = store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap();
         assert!(result.is_none());
@@ -4802,7 +5175,7 @@ mod tests {
 
         // First failure: attempts goes from 0 -> 1.
         store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap()
             .unwrap();
@@ -4810,11 +5183,15 @@ mod tests {
         // The job is now Scheduled. Promote it and take it again.
         let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
-        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Second failure: attempts goes from 1 -> 2.
         let result = store
-            .record_failure(&retaken.id, test_failure_opts())
+            .record_failure(now_millis(), &retaken.id, test_failure_opts())
             .await
             .unwrap()
             .unwrap();
@@ -4832,7 +5209,11 @@ mod tests {
         opts.error_type = Some("TimeoutError".into());
         opts.backtrace = Some("at line 42".into());
 
-        store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Read the error record from the errors keyspace.
         let key = make_error_key(&job.id, 1);
@@ -4855,7 +5236,11 @@ mod tests {
         let mut opts = test_failure_opts();
         opts.kill = true;
 
-        store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         // No error records should remain.
         let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
@@ -4873,7 +5258,11 @@ mod tests {
         let mut opts = test_failure_opts();
         opts.kill = true;
 
-        store.record_failure(&job.id, opts).await.unwrap().unwrap();
+        store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Payload should be gone.
         assert!(store.payloads.inner().get(&job.id).unwrap().is_none());
@@ -4886,7 +5275,7 @@ mod tests {
 
         let mut rx = store.subscribe();
         store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap();
 
@@ -4904,7 +5293,10 @@ mod tests {
         let mut rx = store.subscribe();
         let mut opts = test_failure_opts();
         opts.kill = true;
-        store.record_failure(&job.id, opts).await.unwrap();
+        store
+            .record_failure(now_millis(), &job.id, opts)
+            .await
+            .unwrap();
 
         match rx.recv().await.unwrap() {
             StoreEvent::JobKilled(id) => assert_eq!(id, job.id),
@@ -4918,7 +5310,7 @@ mod tests {
         let job = enqueue_and_take(&store).await;
 
         let result = store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap()
             .unwrap();
@@ -4933,14 +5325,21 @@ mod tests {
 
         // Enqueue with per-job retry_limit=1.
         store
-            .enqueue(EnqueueOptions::new("test", "default", serde_json::json!("a")).retry_limit(1))
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")).retry_limit(1),
+            )
             .await
             .unwrap();
-        let job = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let job = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         // First failure (attempts 0->1): should retry (1 <= 1).
         let result = store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap()
             .unwrap();
@@ -4949,11 +5348,15 @@ mod tests {
         // Promote and take again.
         let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
-        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
 
         // Second failure (attempts 1->2): should die (2 > 1).
         let result = store
-            .record_failure(&retaken.id, test_failure_opts())
+            .record_failure(now_millis(), &retaken.id, test_failure_opts())
             .await
             .unwrap()
             .unwrap();
@@ -4967,13 +5370,17 @@ mod tests {
 
         // Fail once (retry), then promote, take, and complete.
         store
-            .record_failure(&job.id, test_failure_opts())
+            .record_failure(now_millis(), &job.id, test_failure_opts())
             .await
             .unwrap();
 
         let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
-        let retaken = store.take_next_job(&HashSet::new()).await.unwrap().unwrap();
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
         store.mark_completed(&retaken.id).await.unwrap();
 
         // Error records from the earlier failure should be gone.
