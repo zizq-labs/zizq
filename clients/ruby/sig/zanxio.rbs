@@ -1,0 +1,34 @@
+# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Licensed under the MIT License. See LICENSE file for details.
+
+# Manual RBS declarations that rbs-inline can't generate.
+
+module Zanxio
+  # Serialization format for communication with the server.
+  type format = :json | :msgpack
+
+  # Sort direction for paginated list endpoints.
+  type sort_direction = :asc | :desc
+
+  # Backoff configuration expressed in fractional seconds.
+  type backoff = { exponent: Float, base: Float, jitter: Float }
+
+  # Structural type for a class that includes Zanxio::Job.
+  #
+  # When a class includes Zanxio::Job, the `included` callback extends
+  # ClassMethods onto the class. Steep can't infer this from the runtime
+  # `extend` call, so we describe the resulting shape as an interface.
+  #
+  # The `_` prefix is mandatory RBS syntax for interfaces. The `job_class`
+  # type alias below provides a cleaner name for use in source annotations.
+  interface _JobClass
+    def zanxio_queue: (?String?) -> String
+    def zanxio_retry_limit: (?Integer?) -> Integer?
+    def zanxio_backoff: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> backoff?
+    def name: () -> String?
+    def new: () -> Job
+  end
+
+  # Alias so source code can write `Zanxio::job_class` instead of `_JobClass`.
+  type job_class = _JobClass
+end

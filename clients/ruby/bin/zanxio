@@ -1,0 +1,138 @@
+#!/usr/bin/env ruby
+# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Licensed under the MIT License. See LICENSE file for details.
+
+# frozen_string_literal: true
+
+require "optparse"
+require "zanxio"
+
+# --- Defaults from env vars, falling back to hardcoded defaults ---
+
+thread_count = Integer(ENV.fetch("ZANXIO_THREADS", Zanxio::Worker::DEFAULT_THREADS))
+fiber_count = Integer(ENV.fetch("ZANXIO_FIBERS", Zanxio::Worker::DEFAULT_FIBERS))
+prefetch = ENV.key?("ZANXIO_PREFETCH") ? Integer(ENV["ZANXIO_PREFETCH"]) : nil
+shutdown_timeout = Float(ENV.fetch("ZANXIO_SHUTDOWN_TIMEOUT", Zanxio::Worker::DEFAULT_SHUTDOWN_TIMEOUT))
+reconnect_interval = Float(ENV.fetch("ZANXIO_RECONNECT_INTERVAL", Zanxio::Worker::DEFAULT_RECONNECT_INTERVAL))
+max_reconnect_interval = Float(ENV.fetch("ZANXIO_MAX_RECONNECT_INTERVAL", Zanxio::Worker::DEFAULT_MAX_RECONNECT_INTERVAL))
+reconnect_exponent = Float(ENV.fetch("ZANXIO_RECONNECT_EXPONENT", Zanxio::Worker::DEFAULT_RECONNECT_EXPONENT))
+
+queues = if ENV.key?("ZANXIO_QUEUES")
+  ENV["ZANXIO_QUEUES"].split(";").map(&:strip).reject(&:empty?)
+else
+  []
+end
+
+# --- CLI flag parsing (overrides env var defaults) ---
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: zanxio [OPTIONS] <ENTRYPOINT>"
+
+  opts.separator ""
+  opts.separator "Start a Zanxio worker process. The ENTRYPOINT is a Ruby file that loads your"
+  opts.separator "application (e.g. config/environment.rb for Rails)."
+  opts.separator ""
+  opts.separator "Client configuration (url, format, logger) should be set in the"
+  opts.separator "entrypoint via Zanxio.configure."
+  opts.separator ""
+  opts.separator "Options:"
+
+  opts.on("-t", "--threads N", Integer, "Number of worker threads (default: #{Zanxio::Worker::DEFAULT_THREADS}, env: ZANXIO_THREADS)") do |n|
+    thread_count = n
+  end
+
+  opts.on("-f", "--fibers N", Integer, "Number of fibers per thread (default: #{Zanxio::Worker::DEFAULT_FIBERS}, env: ZANXIO_FIBERS)") do |n|
+    fiber_count = n
+  end
+
+  opts.on("-p", "--prefetch N", Integer, "Prefetch count (default: threads*fibers, env: ZANXIO_PREFETCH)") do |n|
+    prefetch = n
+  end
+
+  queues_from_cli = false
+  opts.on("-q", "--queue QUEUE", "Queue to process (repeatable, env: ZANXIO_QUEUES semicolon-separated)") do |q|
+    # First -q flag replaces the env var default entirely
+    unless queues_from_cli
+      queues = []
+      queues_from_cli = true
+    end
+    queues << q
+  end
+
+  opts.on("--shutdown-timeout N", Float, "Shutdown timeout in seconds (default: #{Zanxio::Worker::DEFAULT_SHUTDOWN_TIMEOUT}, env: ZANXIO_SHUTDOWN_TIMEOUT)") do |n|
+    shutdown_timeout = n
+  end
+
+  opts.on("--reconnect-interval N", Float, "Initial reconnect interval in seconds (default: #{Zanxio::Worker::DEFAULT_RECONNECT_INTERVAL}, env: ZANXIO_RECONNECT_INTERVAL)") do |n|
+    reconnect_interval = n
+  end
+
+  opts.on("--max-reconnect-interval N", Float, "Max reconnect interval in seconds (default: #{Zanxio::Worker::DEFAULT_MAX_RECONNECT_INTERVAL}, env: ZANXIO_MAX_RECONNECT_INTERVAL)") do |n|
+    max_reconnect_interval = n
+  end
+
+  opts.on("--reconnect-exponent N", Float, "Reconnect backoff exponent (default: #{Zanxio::Worker::DEFAULT_RECONNECT_EXPONENT}, env: ZANXIO_RECONNECT_EXPONENT)") do |n|
+    reconnect_exponent = n
+  end
+
+  opts.on("-v", "--version", "Print version and exit") do
+    puts "zanxio #{Zanxio::VERSION}"
+    exit
+  end
+
+  opts.on("-h", "--help", "Show this help message") do
+    puts opts
+    exit
+  end
+end
+
+begin
+  parser.parse!
+rescue OptionParser::ParseError => e
+  warn e.message
+  warn "See 'zanxio --help' for usage information."
+  exit 1
+end
+
+# --- Validate options ---
+
+if thread_count < 1
+  warn "Error: --threads must be at least 1 (got #{thread_count})"
+  exit 1
+end
+
+if fiber_count < 1
+  warn "Error: --fibers must be at least 1 (got #{fiber_count})"
+  exit 1
+end
+
+# --- Validate and load entrypoint ---
+
+entrypoint = ARGV[0]
+
+if entrypoint.nil?
+  warn "Error: missing required ENTRYPOINT argument."
+  warn ""
+  warn parser.help
+  exit 1
+end
+
+unless File.file?(entrypoint)
+  warn "Error: entrypoint file not found: #{entrypoint}"
+  exit 1
+end
+
+require File.expand_path(entrypoint)
+
+# --- Start the worker ---
+
+Zanxio::Worker.run(
+  thread_count:,
+  fiber_count:,
+  prefetch:,
+  queues:,
+  shutdown_timeout:,
+  reconnect_interval:,
+  max_reconnect_interval:,
+  reconnect_exponent:,
+)

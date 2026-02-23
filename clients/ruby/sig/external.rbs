@@ -1,0 +1,79 @@
+# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Licensed under the MIT License. See LICENSE file for details.
+
+# RBS stubs for external gems that don't ship their own RBS declarations.
+#
+# The type coverage here is intentionally not exhaustive and is simply enough
+# for steep to do its static analysis of the Zanxio code.
+
+# HTTP/2 compatible HTTP client.
+module HTTPX
+  def self.plugin: (Symbol) -> Session
+
+  class Error < StandardError
+  end
+
+  # Raised by Response#raise_for_status on 4xx/5xx responses.
+  class HTTPError < Error
+    attr_reader response: Response
+    def status: () -> Integer
+  end
+
+  class Session
+    def plugin: (Symbol) -> Session
+    def with: (**untyped) -> Session
+    def get: (String, **untyped) -> (Response | StreamResponse | ErrorResponse)
+    def post: (String, **untyped) -> (Response | ErrorResponse)
+  end
+
+  class Response
+    def status: () -> Integer
+    def body: () -> Body
+    def is_a?: (untyped) -> bool
+
+    class Body
+      def to_s: () -> String
+    end
+  end
+
+  # Returned by get(..., stream: true). Yields raw byte chunks via `each`.
+  class StreamResponse
+    include Enumerable[String]
+    def each: () { (String) -> void } -> void
+    def each_line: () { (String) -> void } -> void
+    def status: () -> Integer
+  end
+
+  class ErrorResponse
+    def error: () -> StandardError
+    def is_a?: (untyped) -> bool
+  end
+end
+
+module MessagePack
+  def self.pack: (untyped) -> String
+  def self.unpack: (String) -> untyped
+end
+
+# Async gem — only loaded when fibers > 1.
+# Behavior is context-dependent: inside an existing event loop it spawns a
+# background Task; at top level (no reactor) it creates one and blocks.
+# The Zanxio worker calls it at the top of a thread, so it blocks there.
+module Async
+  # Async tasks are generic over some return type that is returned when the
+  # task is waited on.
+  class Task[out T]
+    # Spawns a new async task that eventually returns the result of the
+    # provided block when waited on.
+    def async: [U] () { () -> U } -> Task[U]
+
+    # Return the result of the block provided to `#async`
+    def wait: () -> T
+  end
+end
+
+module Kernel
+  # Top-level `Async { ... }` block, returns a task that eventually returns the
+  # result of the block once waited on.
+  def Async: [T] () { (Async::Task[T]) -> T } -> Async::Task[T]
+end
