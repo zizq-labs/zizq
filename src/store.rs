@@ -912,31 +912,87 @@ fn load_jobs_by_ids(
     Ok(rows)
 }
 
+/// Tuning parameters for the underlying LSM storage engine.
+///
+/// Job queue workloads are high-churn: jobs are enqueued, processed,
+/// and deleted rapidly, generating many tombstones across all keyspaces.
+/// The fjall defaults (64 MiB tables, 512 MiB journal) are tuned for
+/// larger, read-heavy workloads. These defaults are sized down for
+/// faster tombstone reclamation and tighter disk usage.
+pub struct StorageConfig {
+    /// Target size for SST files in data keyspaces (jobs, payloads, errors).
+    /// The memtable is sized to match so flushes produce appropriately-sized
+    /// L0 tables.
+    pub data_table_size: u64,
+
+    /// Target size for SST files in index keyspaces (status, queue, type,
+    /// priority indexes). These store tiny entries so smaller tables are
+    /// appropriate. The memtable is sized to match.
+    pub index_table_size: u64,
+
+    /// Maximum total size of the WAL (journal) on disk. The journal is
+    /// shared across all keyspaces and can only be reclaimed once every
+    /// keyspace referenced in it has flushed. The minimum is 64 MiB.
+    pub journal_size: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            data_table_size: 1024 * 1024,   // 1 MiB
+            index_table_size: 256 * 1024,   // 256 KiB
+            journal_size: 64 * 1024 * 1024, // 64 MiB (minimum)
+        }
+    }
+}
+
 impl Store {
     /// Open or create a store at the given path.
     ///
     /// The path refers to the directory in which fjall stores its keyspace
     /// data.
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
-        let db = SingleWriterTxDatabase::builder(path).open()?;
+    pub fn open(
+        path: impl AsRef<std::path::Path>,
+        config: StorageConfig,
+    ) -> Result<Self, StoreError> {
+        let db = SingleWriterTxDatabase::builder(path)
+            .max_journaling_size(config.journal_size)
+            .open()?;
 
-        // Index keyspaces are only ever range-scanned, never point-read,
-        // so bloom filters would waste memory and CPU during flushes.
-        // Point-read keyspaces (jobs, payloads) keep the default bloom
-        // filters for efficient ID lookups.
-        let index_opts: fn() -> fjall::KeyspaceCreateOptions =
-            || fjall::KeyspaceCreateOptions::default().filter_policy(FilterPolicy::disabled());
+        let data_compaction = Arc::new(
+            fjall::compaction::Leveled::default().with_table_target_size(config.data_table_size),
+        );
+        let index_compaction = Arc::new(
+            fjall::compaction::Leveled::default().with_table_target_size(config.index_table_size),
+        );
 
-        let jobs = db.keyspace("jobs", fjall::KeyspaceCreateOptions::default)?;
-        let payloads = db.keyspace("payloads", fjall::KeyspaceCreateOptions::default)?;
-        let ready_jobs_by_priority = db.keyspace("ready_jobs_by_priority", index_opts)?;
+        // Size the memtable (in-memory write buffer) to match each table
+        // target so that flushes produce appropriately-sized L0 tables.
+        //
+        // Index keyspaces also disable bloom filters since they are only
+        // ever range-scanned, never point-read.
+        let data_opts = || {
+            fjall::KeyspaceCreateOptions::default()
+                .compaction_strategy(data_compaction.clone())
+                .max_memtable_size(config.data_table_size)
+        };
+        let index_opts = || {
+            fjall::KeyspaceCreateOptions::default()
+                .compaction_strategy(index_compaction.clone())
+                .max_memtable_size(config.index_table_size)
+                .filter_policy(FilterPolicy::disabled())
+        };
+
+        let jobs = db.keyspace("jobs", &data_opts)?;
+        let payloads = db.keyspace("payloads", &data_opts)?;
+        let ready_jobs_by_priority = db.keyspace("ready_jobs_by_priority", &index_opts)?;
         let ready_jobs_by_queue_and_priority =
-            db.keyspace("ready_jobs_by_queue_and_priority", index_opts)?;
-        let scheduled_jobs_by_ready_at = db.keyspace("scheduled_jobs_by_ready_at", index_opts)?;
-        let jobs_by_status = db.keyspace("jobs_by_status", index_opts)?;
-        let jobs_by_queue = db.keyspace("jobs_by_queue", index_opts)?;
-        let jobs_by_type = db.keyspace("jobs_by_type", index_opts)?;
-        let errors = db.keyspace("errors", fjall::KeyspaceCreateOptions::default)?;
+            db.keyspace("ready_jobs_by_queue_and_priority", &index_opts)?;
+        let scheduled_jobs_by_ready_at = db.keyspace("scheduled_jobs_by_ready_at", &index_opts)?;
+        let jobs_by_status = db.keyspace("jobs_by_status", &index_opts)?;
+        let jobs_by_queue = db.keyspace("jobs_by_queue", &index_opts)?;
+        let jobs_by_type = db.keyspace("jobs_by_type", &index_opts)?;
+        let errors = db.keyspace("errors", &data_opts)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -2231,7 +2287,7 @@ mod tests {
 
     fn test_store() -> Store {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data")).unwrap();
+        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         store
     }

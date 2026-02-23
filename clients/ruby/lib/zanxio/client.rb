@@ -38,7 +38,13 @@ module Zanxio
     def initialize(url:, format: :msgpack) #: (url: String, ?format: Zanxio::format) -> void
       @url = url.chomp("/")
       @format = format
-      @http = HTTPX.plugin(:persistent).plugin(:stream)
+
+      # h2c upgrades the connection to HTTP/2 on the first GET request,
+      # enabling multiplexing for all subsequent requests (including POSTs
+      # for acks/nacks) on the same persistent connection.
+      @http = HTTPX.plugin(:persistent).plugin(:stream).plugin(:h2c)
+      @content_type = CONTENT_TYPES.fetch(format)
+      @stream_accept = STREAM_ACCEPT.fetch(format)
     end
 
     # Enqueue a new job.
@@ -215,10 +221,7 @@ module Zanxio
       params = { prefetch: } #: Hash[Symbol, untyped]
       params[:queue] = queues.join(";") unless queues.empty?
 
-      headers = {
-        "Accept" => STREAM_ACCEPT.fetch(@format)
-      }
-
+      headers = { "Accept" => @stream_accept }
       headers["Worker-Id"] = worker_id if worker_id
 
       uri = build_uri("/jobs/take", params:)
@@ -228,7 +231,7 @@ module Zanxio
       # the entire response body into memory. The StreamResponse also calls
       # `raise_for_status` internally after the stream ends (or on HTTP
       # errors), so we don't need a manual status check.
-      stream = @http.with(headers:).get(uri, stream: true)
+      stream = @http.get(uri, headers:, stream: true)
 
       case @format
       when :json then self.class.parse_ndjson(stream, &block)
@@ -327,10 +330,6 @@ module Zanxio
       params
     end
 
-    def content_type #: () -> String
-      CONTENT_TYPES.fetch(@format)
-    end
-
     def encode_body(body) #: (Hash[Symbol, untyped]) -> String
       case @format
       when :msgpack then MessagePack.pack(body)
@@ -347,27 +346,26 @@ module Zanxio
       end
     end
 
-    # GET with Accept header for content negotiation.
     def get(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> HTTPX::Response
-      uri = build_uri(path, params: params)
-      @http.with(headers: { "Accept" => content_type }).get(uri)
+      @http.get(
+        build_uri(path, params:),
+        headers: { "Accept" => @content_type }
+      )
     end
 
-    # POST with body and content negotiation headers.
     def post(path, body) #: (String, Hash[Symbol, untyped]) -> HTTPX::Response
-      uri = build_uri(path)
-      @http.with(
-        headers: {
-          "Content-Type" => content_type,
-          "Accept" => content_type
-        }
-      ).post(uri, body: encode_body(body))
+      @http.post(
+        build_uri(path),
+        headers: { "Content-Type" => @content_type, "Accept" => @content_type },
+        body: encode_body(body)
+      )
     end
 
-    # POST with no body (for success endpoint).
     def raw_post(path) #: (String) -> HTTPX::Response
-      uri = build_uri(path)
-      @http.with(headers: { "Accept" => content_type }).post(uri)
+      @http.post(
+        build_uri(path),
+        headers: { "Accept" => @content_type }
+      )
     end
 
     # Check response status and decode body, raising on errors.

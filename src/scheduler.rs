@@ -156,7 +156,7 @@ mod tests {
 
     fn test_store() -> Store {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data")).unwrap();
+        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         store
     }

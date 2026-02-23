@@ -1837,7 +1837,7 @@ mod tests {
     fn test_app_state() -> (Arc<AtomicU64>, AppState) {
         let (clock, clock_fn) = mock_clock();
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data")).unwrap();
+        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
@@ -3824,7 +3824,7 @@ mod tests {
     #[tokio::test]
     async fn take_respects_working_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data")).unwrap();
+        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
