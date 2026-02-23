@@ -203,6 +203,117 @@ class TestWorker < Minitest::Test
     assert_requested(nack_stub, at_least_times: 1)
   end
 
+  def test_dispatches_job_with_fibers
+    job1 = { "id" => "j1", "type" => "RecordingJob", "queue" => "test",
+             "priority" => 100, "attempts" => 1, "dequeued_at" => 1000,
+             "payload" => { "user_id" => 42 } }
+
+    stub_request(:get, "#{URL}/jobs/take?prefetch=2")
+      .to_return(
+        { status: 200, body: "#{JSON.generate(job1)}\n",
+          headers: { "Content-Type" => "application/x-ndjson" } },
+        { status: 200, body: "",
+          headers: { "Content-Type" => "application/x-ndjson" } }
+      )
+
+    ack_stub = stub_request(:post, "#{URL}/jobs/j1/success")
+      .to_return(status: 204)
+
+    # 1 thread with 2 fibers exercises the Async code path
+    worker = Zanxio::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
+                                 logger: Logger.new(File::NULL))
+
+    t = Thread.new { worker.run }
+
+    deadline = Time.now + 5
+    sleep 0.05 while RecordingJob.results.empty? && Time.now < deadline
+
+    worker.instance_variable_set(:@shutdown, true)
+    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    t.join(5)
+
+    assert_equal 1, RecordingJob.results.size
+    result = RecordingJob.results.first
+    assert_equal({ "user_id" => 42 }, result[:payload])
+    assert_equal "j1", result[:id]
+    assert_requested(ack_stub, at_least_times: 1)
+  end
+
+  def test_nacks_failing_job_with_fibers
+    job1 = { "id" => "j1", "type" => "FailingJob", "queue" => "default",
+             "priority" => 32_768, "attempts" => 1, "payload" => {} }
+
+    stub_request(:get, "#{URL}/jobs/take?prefetch=2")
+      .to_return(
+        { status: 200, body: "#{JSON.generate(job1)}\n",
+          headers: { "Content-Type" => "application/x-ndjson" } },
+        { status: 200, body: "",
+          headers: { "Content-Type" => "application/x-ndjson" } }
+      )
+
+    nack_stub = stub_request(:post, "#{URL}/jobs/j1/failure")
+      .with { |req|
+        body = JSON.parse(req.body)
+        body["error"].include?("RuntimeError") &&
+          body["error"].include?("boom")
+      }
+      .to_return(status: 200, body: JSON.generate({ "id" => "j1", "status" => "scheduled" }),
+                 headers: { "Content-Type" => "application/json" })
+
+    worker = Zanxio::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
+                                 logger: Logger.new(File::NULL))
+
+    t = Thread.new { worker.run }
+
+    deadline = Time.now + 5
+    sleep 0.05 while FailingJob.fail_count == 0 && Time.now < deadline
+
+    worker.instance_variable_set(:@shutdown, true)
+    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    t.join(5)
+
+    assert_equal 1, FailingJob.fail_count
+    assert_requested(nack_stub, at_least_times: 1)
+  end
+
+  def test_multiple_fibers_process_concurrently
+    job1 = { "id" => "j1", "type" => "RecordingJob", "queue" => "test",
+             "priority" => 100, "attempts" => 1, "dequeued_at" => 1000,
+             "payload" => { "n" => 1 } }
+    job2 = { "id" => "j2", "type" => "RecordingJob", "queue" => "test",
+             "priority" => 100, "attempts" => 1, "dequeued_at" => 1001,
+             "payload" => { "n" => 2 } }
+
+    stub_request(:get, "#{URL}/jobs/take?prefetch=2")
+      .to_return(
+        { status: 200,
+          body: "#{JSON.generate(job1)}\n#{JSON.generate(job2)}\n",
+          headers: { "Content-Type" => "application/x-ndjson" } },
+        { status: 200, body: "",
+          headers: { "Content-Type" => "application/x-ndjson" } }
+      )
+
+    stub_request(:post, %r{#{URL}/jobs/j[12]/success})
+      .to_return(status: 204)
+
+    worker = Zanxio::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
+                                 logger: Logger.new(File::NULL))
+
+    t = Thread.new { worker.run }
+
+    deadline = Time.now + 5
+    sleep 0.05 while RecordingJob.results.size < 2 && Time.now < deadline
+
+    worker.instance_variable_set(:@shutdown, true)
+    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    t.join(5)
+
+    # Both jobs were processed across the 2 fibers
+    assert_equal 2, RecordingJob.results.size
+    ids = RecordingJob.results.map { |r| r[:id] }.sort
+    assert_equal %w[j1 j2], ids
+  end
+
   def test_worker_id_proc
     worker = Zanxio::Worker.new(
       worker_id: ->(t, f) { "app-#{Process.pid}-t#{t}-f#{f}" }
