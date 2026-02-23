@@ -92,42 +92,34 @@ module Zanxio
 
     # --- Metadata helpers ---
     #
-    # These are set by the worker before calling #perform, giving the job
-    # access to its server-side metadata.
+    # These delegate to the Resources::Job instance set by the worker
+    # before calling #perform, giving the job access to its server-side
+    # metadata.
 
     # The unique job ID assigned by the server.
-    def zanxio_id #: () -> String?
-      @zanxio_metadata&.dig(:id)
-    end
+    def zanxio_id = @zanxio_job&.id         #: () -> String?
 
     # How many times this job has previously been attempted (0 on the first
     # run, 1 on the second, etc...).
-    def zanxio_attempts #: () -> Integer?
-      @zanxio_metadata&.dig(:attempts)
-    end
+    def zanxio_attempts = @zanxio_job&.attempts   #: () -> Integer?
 
     # The queue this job was dequeued from.
-    def zanxio_queue #: () -> String?
-      @zanxio_metadata&.dig(:queue)
-    end
+    def zanxio_queue = @zanxio_job&.queue      #: () -> String?
 
     # The priority this job was enqueued with.
-    def zanxio_priority #: () -> Integer?
-      @zanxio_metadata&.dig(:priority)
-    end
+    def zanxio_priority = @zanxio_job&.priority   #: () -> Integer?
 
     # Time at which this job was dequeued (fractional seconds since the Unix
-    # epoch). This can be converted to `Time` by using `Time.at(dequed_at)` but
-    # that is intentionally left to the caller due to time zone considerations.
-    def zanxio_dequeued_at #: () -> Float?
-      ms = @zanxio_metadata&.dig(:dequeued_at)
-      ms&./(1000.0)
-    end
+    # epoch). This can be converted to `Time` by using `Time.at(dequeued_at)`
+    # but that is intentionally left to the caller due to time zone
+    # considerations. Already in seconds (converted from ms by Resources::Job).
+    def zanxio_dequeued_at = @zanxio_job&.dequeued_at #: () -> Float?
 
     # @api private
-    # Set by the worker before calling #perform.
-    def _set_zanxio_metadata(metadata) #: (Hash[Symbol, untyped]) -> void
-      @zanxio_metadata = metadata
+    # Set by the worker before calling #perform. Receives the full
+    # Resources::Job object so all metadata is available through delegation.
+    def set_zanxio_job(job) #: (Resources::Job) -> void
+      @zanxio_job = job
     end
   end
 end

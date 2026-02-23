@@ -106,20 +106,23 @@ class TestJob < Minitest::Test
   # --- metadata helpers ---
 
   def test_metadata_helpers
+    client = Zanxio::Client.new(url: URL, format: :json)
+    resource_job = Zanxio::Resources::Job.new(client, {
+      "id" => "job-123",
+      "attempts" => 3,
+      "queue" => "emails",
+      "priority" => 100,
+      "dequeued_at" => 1_700_000_000_000
+    })
+
     job = SendEmailJob.new
-    job._set_zanxio_metadata(
-      id: "job-123",
-      attempts: 3,
-      queue: "emails",
-      priority: 100,
-      dequeued_at: 1_700_000_000_000
-    )
+    job.set_zanxio_job(resource_job)
 
     assert_equal "job-123", job.zanxio_id
     assert_equal 3, job.zanxio_attempts
     assert_equal "emails", job.zanxio_queue
     assert_equal 100, job.zanxio_priority
-    assert_equal 1_700_000_000.0, job.zanxio_dequeued_at
+    assert_in_delta 1_700_000_000.0, job.zanxio_dequeued_at, 0.001
   end
 
   def test_metadata_nil_before_set
@@ -142,7 +145,7 @@ class TestJob < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = Zanxio.enqueue(SendEmailJob, { user_id: 42 })
-    assert_equal "x", result["id"]
+    assert_equal "x", result.id
   end
 
   def test_enqueue_uses_class_queue_by_default

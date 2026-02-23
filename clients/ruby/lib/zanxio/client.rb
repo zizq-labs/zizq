@@ -53,7 +53,7 @@ module Zanxio
     # using the Zanxio API's expected inputs. Callers should generally use
     # [`Zanxio::enqueue`] instead.
     #
-    # Returns the job metadata hash (without payload).
+    # Returns a resource instance of the new job wrapping the API response.
     #
     # @rbs type: String
     # @rbs queue: String
@@ -62,7 +62,7 @@ module Zanxio
     # @rbs ready_at: Float?
     # @rbs retry_limit: Integer?
     # @rbs backoff: Hash[Symbol, untyped]?
-    # @rbs return: Hash[String, untyped]
+    # @rbs return: Resources::Job
     def enqueue(type:, queue:, payload:, priority: nil, ready_at: nil, retry_limit: nil, backoff: nil)
       body = { type:, queue:, payload: } #: Hash[Symbol, untyped]
       body[:priority] = priority if priority
@@ -72,13 +72,15 @@ module Zanxio
       body[:backoff] = backoff if backoff
 
       response = post("/jobs", body)
-      handle_response!(response, expected: 201)
+      data = handle_response!(response, expected: 201)
+      Resources::Job.new(self, data)
     end
 
     # Get a single job by ID.
-    def get_job(id) #: (String) -> Hash[String, untyped]
+    def get_job(id) #: (String) -> Resources::Job
       response = get("/jobs/#{id}")
-      handle_response!(response, expected: 200)
+      data = handle_response!(response, expected: 200)
+      Resources::Job.new(self, data)
     end
 
     # List jobs with optional filters.
@@ -92,12 +94,13 @@ module Zanxio
     # @rbs from: String?
     # @rbs order: Zanxio::sort_direction?
     # @rbs limit: Integer?
-    # @rbs return: Hash[String, untyped]
+    # @rbs return: Resources::JobPage
     def list_jobs(status: nil, queue: nil, type: nil, from: nil, order: nil, limit: nil)
       options = { status:, queue:, type:, from:, order:, limit: }.compact #: Hash[Symbol, untyped]
       params = build_list_params(options, multi_keys: %i[status queue type])
       response = get("/jobs", params:)
-      handle_response!(response, expected: 200)
+      data = handle_response!(response, expected: 200)
+      Resources::JobPage.new(self, data)
     end
 
     # List error records for a job.
@@ -106,11 +109,12 @@ module Zanxio
     # @rbs from: String?
     # @rbs order: Zanxio::sort_direction?
     # @rbs limit: Integer?
-    # @rbs return: Hash[String, untyped]
+    # @rbs return: Resources::ErrorPage
     def list_errors(id, from: nil, order: nil, limit: nil)
       params = { from:, order:, limit: }.compact #: Hash[Symbol, untyped]
       response = get("/jobs/#{id}/errors", params:)
-      handle_response!(response, expected: 200)
+      data = handle_response!(response, expected: 200)
+      Resources::ErrorPage.new(self, data)
     end
 
     # Health check.
@@ -166,7 +170,7 @@ module Zanxio
     # @rbs backtrace: String?
     # @rbs retry_at: Float?
     # @rbs kill: bool
-    # @rbs return: Hash[String, untyped]
+    # @rbs return: Resources::Job
     def report_failure(id, error:, error_type: nil, backtrace: nil, retry_at: nil, kill: false)
       body = { error: } #: Hash[Symbol, untyped]
       body[:error_type] = error_type if error_type
@@ -176,7 +180,8 @@ module Zanxio
       body[:kill] = kill if kill
 
       response = post("/jobs/#{id}/failure", body)
-      handle_response!(response, expected: 200)
+      data = handle_response!(response, expected: 200)
+      Resources::Job.new(self, data)
     end
 
     # Aliases for ack/nack vs report_success/report_failure.
@@ -213,7 +218,7 @@ module Zanxio
     # @rbs prefetch: Integer
     # @rbs queues: Array[String]
     # @rbs worker_id: String?
-    # @rbs &block: (Hash[String, untyped]) -> void
+    # @rbs &block: (Resources::Job) -> void
     # @rbs return: void
     def take_jobs(prefetch: 1, queues: [], worker_id: nil, &block)
       raise ArgumentError, "take_jobs requires a block" unless block
@@ -233,9 +238,12 @@ module Zanxio
       # errors), so we don't need a manual status check.
       stream = @http.get(uri, headers:, stream: true)
 
+      # Wrap each parsed hash in a Resources::Job before yielding.
+      wrapper = proc { |data| block.call(Resources::Job.new(self, data)) }
+
       case @format
-      when :json then self.class.parse_ndjson(stream, &block)
-      when :msgpack then self.class.parse_msgpack_stream(stream, &block)
+      when :json then self.class.parse_ndjson(stream, &wrapper)
+      when :msgpack then self.class.parse_msgpack_stream(stream, &wrapper)
       end
     rescue HTTPX::HTTPError => e
       raise StreamError, "take jobs stream returned HTTP #{e.status}"
@@ -304,6 +312,20 @@ module Zanxio
         remaining = io.read
         io = StringIO.new(remaining || "".b)
       end
+    end
+
+    # GET a path on the server and return the decoded response body.
+    #
+    # The path should include any query parameters already (e.g. pagination
+    # links from the server's `pages` object). This is intentionally public
+    # so that resource objects like Page can follow links without resorting
+    # to `.send`.
+    def get_path(path) #: (String) -> Hash[String, untyped]
+      response = @http.get(
+        "#{@url}#{path}",
+        headers: { "Accept" => @content_type }
+      )
+      handle_response!(response, expected: 200)
     end
 
     private

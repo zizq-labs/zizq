@@ -29,8 +29,9 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.enqueue(type: "SendEmail", queue: "emails", payload: { user_id: 42 })
-    assert_equal "abc123", result["id"]
-    assert_equal "SendEmail", result["type"]
+    assert_instance_of Zanxio::Resources::Job, result
+    assert_equal "abc123", result.id
+    assert_equal "SendEmail", result.type
   end
 
   def test_enqueue_msgpack
@@ -47,7 +48,8 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/msgpack" })
 
     result = @msgpack_client.enqueue(type: "SendEmail", queue: "emails", payload: { user_id: 42 })
-    assert_equal "abc123", result["id"]
+    assert_instance_of Zanxio::Resources::Job, result
+    assert_equal "abc123", result.id
   end
 
   def test_enqueue_with_priority
@@ -94,8 +96,9 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.get_job("job1")
-    assert_equal "job1", result["id"]
-    assert_equal({ "key" => "value" }, result["payload"])
+    assert_instance_of Zanxio::Resources::Job, result
+    assert_equal "job1", result.id
+    assert_equal({ "key" => "value" }, result.payload)
   end
 
   def test_get_job_not_found
@@ -117,7 +120,8 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.list_jobs
-    assert_equal [], result["jobs"]
+    assert_instance_of Zanxio::Resources::JobPage, result
+    assert_equal [], result.jobs
   end
 
   def test_list_jobs_with_filters
@@ -128,7 +132,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.list_jobs(status: %w[ready working], queue: "emails", limit: 10)
-    assert_equal 1, result["jobs"].size
+    assert_equal 1, result.jobs.size
   end
 
   # --- list_errors ---
@@ -143,8 +147,9 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.list_errors("j1")
-    assert_equal 1, result["errors"].size
-    assert_equal "boom", result["errors"][0]["message"]
+    assert_instance_of Zanxio::Resources::ErrorPage, result
+    assert_equal 1, result.errors.size
+    assert_equal "boom", result.errors[0].message
   end
 
   def test_list_errors_with_options
@@ -213,8 +218,9 @@ class TestClient < Minitest::Test
                                          error: "RuntimeError: boom",
                                          error_type: "RuntimeError",
                                          backtrace: "line1\nline2")
-    assert_equal "scheduled", result["status"]
-    assert_equal 1, result["attempts"]
+    assert_instance_of Zanxio::Resources::Job, result
+    assert_equal "scheduled", result.status
+    assert_equal 1, result.attempts
   end
 
   def test_report_failure_with_kill
@@ -224,7 +230,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.report_failure("job1", error: "fatal", kill: true)
-    assert_equal "dead", result["status"]
+    assert_equal "dead", result.status
   end
 
   def test_nack_alias
@@ -261,8 +267,9 @@ class TestClient < Minitest::Test
     jobs = []
     @json_client.take_jobs(prefetch: 5) { |job| jobs << job }
     assert_equal 2, jobs.size
-    assert_equal "j1", jobs[0]["id"]
-    assert_equal "j2", jobs[1]["id"]
+    assert_instance_of Zanxio::Resources::Job, jobs[0]
+    assert_equal "j1", jobs[0].id
+    assert_equal "j2", jobs[1].id
   end
 
   def test_take_ndjson_skips_heartbeats
@@ -322,8 +329,9 @@ class TestClient < Minitest::Test
     jobs = []
     @msgpack_client.take_jobs(prefetch: 2) { |job| jobs << job }
     assert_equal 2, jobs.size
-    assert_equal "j1", jobs[0]["id"]
-    assert_equal "j2", jobs[1]["id"]
+    assert_instance_of Zanxio::Resources::Job, jobs[0]
+    assert_equal "j1", jobs[0].id
+    assert_equal "j2", jobs[1].id
   end
 
   def test_take_msgpack_skips_heartbeats

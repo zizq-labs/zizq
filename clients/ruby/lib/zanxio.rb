@@ -13,9 +13,10 @@ autoload :HTTPX, "httpx"
 autoload :MessagePack, "msgpack"
 
 module Zanxio
-  autoload :Client, "zanxio/client"
-  autoload :Job,    "zanxio/job"
-  autoload :Worker, "zanxio/worker"
+  autoload :Client,    "zanxio/client"
+  autoload :Job,       "zanxio/job"
+  autoload :Resources, "zanxio/resources"
+  autoload :Worker,    "zanxio/worker"
 
   class << self
     # Returns the client configuration.

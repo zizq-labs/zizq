@@ -268,9 +268,9 @@ module Zanxio
     # including non-StandardError exceptions and errors from malformed job
     # hashes. This keeps the worker thread alive regardless of what happens
     # during dispatch.
-    def dispatch(client, job_hash, worker_id) #: (Client, Hash[String, untyped], String?) -> void
-      job_type = job_hash["type"]
-      job_id = job_hash["id"]
+    def dispatch(client, job, worker_id) #: (Client, Resources::Job, String?) -> void
+      job_type = job.type
+      job_id = job.id
 
       logger.debug { "Processing #{job_type} (#{job_id})" }
 
@@ -297,16 +297,10 @@ module Zanxio
       end
 
       job_instance = job_class.new
-      job_instance._set_zanxio_metadata(
-        id: job_id,
-        attempts: job_hash["attempts"],
-        queue: job_hash["queue"],
-        priority: job_hash["priority"],
-        dequeued_at: job_hash["dequeued_at"]
-      )
+      job_instance.set_zanxio_job(job)
 
       begin
-        job_instance.perform(job_hash["payload"] || {})
+        job_instance.perform(job.payload || {})
         safe_ack(client, job_id, worker_id: worker_id)
         logger.debug { "Completed #{job_type} (#{job_id})" }
       rescue Exception => e # Intentionally rescuing all Exceptions here
