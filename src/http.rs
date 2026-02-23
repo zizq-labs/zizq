@@ -348,6 +348,13 @@ struct HealthResponse {
     status: &'static str,
 }
 
+/// Response shape for the version endpoint.
+#[derive(Serialize)]
+struct VersionResponse {
+    /// Server version from Cargo.toml.
+    version: &'static str,
+}
+
 /// Response shape for all error responses.
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -920,6 +927,7 @@ fn build_msgpack_stream_response(rx: mpsc::Receiver<TakeMessage>) -> Response {
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/jobs", get(list_jobs).post(enqueue))
         .route("/jobs/take", get(take_jobs))
         .route("/jobs/{id}", get(get_job))
@@ -965,6 +973,17 @@ fn rand_id() -> u32 {
 /// Handle `GET /health`.
 async fn health(AcceptFormat(fmt): AcceptFormat) -> Response {
     respond(fmt, StatusCode::OK, &HealthResponse { status: "ok" })
+}
+
+/// Handle `GET /version`.
+async fn version(AcceptFormat(fmt): AcceptFormat) -> Response {
+    respond(
+        fmt,
+        StatusCode::OK,
+        &VersionResponse {
+            version: env!("CARGO_PKG_VERSION"),
+        },
+    )
 }
 
 /// Validate a queue name, returning an error message if invalid.
@@ -1922,6 +1941,16 @@ mod tests {
             res.headers().get("content-type").unwrap(),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn version_returns_200_with_version() {
+        let req = empty_request("GET", "/version");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

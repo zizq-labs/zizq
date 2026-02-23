@@ -123,6 +123,13 @@ module Zanxio
       handle_response!(response, expected: 200)
     end
 
+    # Server version string.
+    def server_version #: () -> String
+      response = get("/version")
+      data = handle_response!(response, expected: 200)
+      data["version"]
+    end
+
     # Mark a job as successfully completed (ack).
     #
     # If this method (or [`#report_failure`]) is not called upon job

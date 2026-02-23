@@ -173,6 +173,16 @@ class TestClient < Minitest::Test
     assert_equal "ok", result["status"]
   end
 
+  # --- server_version ---
+
+  def test_server_version
+    stub_request(:get, "#{URL}/version")
+      .to_return(status: 200, body: JSON.generate({ "version" => "0.1.0" }),
+                 headers: { "Content-Type" => "application/json" })
+
+    assert_equal "0.1.0", @json_client.server_version
+  end
+
   # --- report_success (ack) ---
 
   def test_report_success
