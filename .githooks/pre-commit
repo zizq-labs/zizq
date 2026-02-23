@@ -2,4 +2,4 @@
 set -e
 
 cargo fmt
-git diff --name-only --diff-filter=d -- '*.rs' | xargs -r git add
+git diff --cached --name-only --diff-filter=d -- '*.rs' | xargs -r git add
