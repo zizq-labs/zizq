@@ -92,11 +92,13 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
-    // Recover any jobs left in Working state from a previous crash.
-    let recovered = store.recover_working_jobs().await?;
+    // Recover orphaned working jobs and rebuild the in-memory ready index.
+    // Must complete before accepting requests.
+    let (recovered, indexed) = store.recover().await?;
     if recovered > 0 {
         tracing::info!(count = recovered, "recovered orphaned working jobs");
     }
+    tracing::info!(count = indexed, "ready index rebuilt");
 
     // Shutdown signal for long-lived take tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(());
