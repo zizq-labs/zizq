@@ -174,7 +174,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
     // Leak so the directory isn't cleaned up while the bench runs.
     std::mem::forget(dir);
 
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, Default::default()).unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     // Leak the sender so the shutdown signal is never triggered.

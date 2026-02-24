@@ -84,6 +84,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("ZANXIO_JOURNAL_SIZE") {
         storage_config.journal_size = v.parse()?;
     }
+    if let Ok(v) = std::env::var("ZANXIO_L0_THRESHOLD") {
+        storage_config.l0_threshold = v.parse()?;
+    }
 
     // Init/open the store (within the root dir).
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;

@@ -652,6 +652,12 @@ pub struct Store {
     ///
     /// Keyed by `{queue_name}\0{job_id}` with empty values. Enables
     /// efficient lookup of all jobs belonging to one or more queues.
+    ///
+    /// Currently write-once/remove-once (written at enqueue, removed at
+    /// completion/death), so removals use `remove_weak` to avoid
+    /// tombstone buildup. If we add queue-move support in the future,
+    /// the same key could be re-inserted and this must revert to
+    /// regular `remove`.
     jobs_by_queue: SingleWriterTxKeyspace,
 
     /// Type membership index.
@@ -919,6 +925,7 @@ fn load_jobs_by_ids(
 /// The fjall defaults (64 MiB tables, 512 MiB journal) are tuned for
 /// larger, read-heavy workloads. These defaults are sized down for
 /// faster tombstone reclamation and tighter disk usage.
+#[derive(Debug, Clone, Copy)]
 pub struct StorageConfig {
     /// Target size for SST files in data keyspaces (jobs, payloads, errors).
     /// The memtable is sized to match so flushes produce appropriately-sized
@@ -934,6 +941,11 @@ pub struct StorageConfig {
     /// shared across all keyspaces and can only be reclaimed once every
     /// keyspace referenced in it has flushed. The minimum is 64 MiB.
     pub journal_size: u64,
+
+    /// Number of L0 files that triggers compaction into L1. Lower values
+    /// mean more frequent compaction (less L0 buildup, faster reads after
+    /// recovery) but more write amplification during steady state.
+    pub l0_threshold: u8,
 }
 
 impl Default for StorageConfig {
@@ -942,6 +954,7 @@ impl Default for StorageConfig {
             data_table_size: 1024 * 1024,   // 1 MiB
             index_table_size: 256 * 1024,   // 256 KiB
             journal_size: 64 * 1024 * 1024, // 64 MiB (minimum)
+            l0_threshold: 4,
         }
     }
 }
@@ -960,10 +973,14 @@ impl Store {
             .open()?;
 
         let data_compaction = Arc::new(
-            fjall::compaction::Leveled::default().with_table_target_size(config.data_table_size),
+            fjall::compaction::Leveled::default()
+                .with_l0_threshold(config.l0_threshold)
+                .with_table_target_size(config.data_table_size),
         );
         let index_compaction = Arc::new(
-            fjall::compaction::Leveled::default().with_table_target_size(config.index_table_size),
+            fjall::compaction::Leveled::default()
+                .with_l0_threshold(config.l0_threshold)
+                .with_table_target_size(config.index_table_size),
         );
 
         // Size the memtable (in-memory write buffer) to match each table
@@ -1284,14 +1301,14 @@ impl Store {
             let type_key = make_type_key(&job.job_type, &id);
 
             tx.remove(&jobs, &id);
-            tx.remove(&payloads, &id);
+            tx.remove_weak(&payloads, &id);
             tx.remove(&jobs_by_status, &status_key);
-            tx.remove(&jobs_by_queue, &queue_key);
-            tx.remove(&jobs_by_type, &type_key);
+            tx.remove_weak(&jobs_by_queue, &queue_key);
+            tx.remove_weak(&jobs_by_type, &type_key);
 
             // Clean up any error records from previous failures.
             for key in error_keys(&errors, &id) {
-                tx.remove(&errors, &key);
+                tx.remove_weak(&errors, &key);
             }
 
             tx.commit()?;
@@ -1416,20 +1433,20 @@ impl Store {
                 let type_key = make_type_key(&job.job_type, &id);
 
                 tx.remove(&jobs, &id);
-                tx.remove(&payloads, &id);
+                tx.remove_weak(&payloads, &id);
                 tx.remove(&jobs_by_status, &old_status_key);
-                tx.remove(&jobs_by_queue, &queue_key);
-                tx.remove(&jobs_by_type, &type_key);
+                tx.remove_weak(&jobs_by_queue, &queue_key);
+                tx.remove_weak(&jobs_by_type, &type_key);
 
                 // Clean up all previously committed error records.
                 for key in error_keys(&errors, &id) {
-                    tx.remove(&errors, &key);
+                    tx.remove_weak(&errors, &key);
                 }
 
                 // Also remove the error record we just inserted above.
                 // The prefix scan reads committed state, so it won't
                 // see the in-flight insert — we must remove it explicitly.
-                tx.remove(&errors, &error_key);
+                tx.remove_weak(&errors, &error_key);
 
                 tx.commit()?;
             }

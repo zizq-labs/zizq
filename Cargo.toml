@@ -36,3 +36,7 @@ futures-util = "0.3"
 [[bench]]
 name = "throughput"
 harness = false
+
+[[bench]]
+name = "recovery"
+harness = false
