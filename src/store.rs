@@ -1018,9 +1018,9 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            data_table_size: 1024 * 1024,   // 1 MiB
-            index_table_size: 256 * 1024,   // 256 KiB
-            journal_size: 64 * 1024 * 1024, // 64 MiB (minimum)
+            data_table_size: 64 * 1024 * 1024, // 64 MiB
+            index_table_size: 8 * 1024 * 1024, // 8 MiB
+            journal_size: 64 * 1024 * 1024,    // 64 MiB (minimum)
             l0_threshold: 4,
         }
     }
