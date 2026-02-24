@@ -71,25 +71,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let root = std::path::Path::new(&args.root_dir);
     std::fs::create_dir_all(root)?;
 
-    // Storage engine tuning. These env vars are intentionally not exposed
-    // as CLI flags — they're advanced knobs for tuning LSM compaction
-    // behaviour and unlikely to need changing in normal operation.
-    let mut storage_config = crate::store::StorageConfig::default();
-    if let Ok(v) = std::env::var("ZANXIO_DATA_TABLE_SIZE") {
-        storage_config.data_table_size = v.parse()?;
-    }
-    if let Ok(v) = std::env::var("ZANXIO_INDEX_TABLE_SIZE") {
-        storage_config.index_table_size = v.parse()?;
-    }
-    if let Ok(v) = std::env::var("ZANXIO_JOURNAL_SIZE") {
-        storage_config.journal_size = v.parse()?;
-    }
-    if let Ok(v) = std::env::var("ZANXIO_L0_THRESHOLD") {
-        storage_config.l0_threshold = v.parse()?;
-    }
-
     // Init/open the store (within the root dir).
-    let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
+    let store = Store::open(
+        root.join(DATABASE_DIR),
+        crate::store::StorageConfig::from_env()?,
+    )?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
     // Recover orphaned working jobs and rebuild the in-memory ready index.

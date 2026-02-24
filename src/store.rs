@@ -1026,6 +1026,60 @@ impl Default for StorageConfig {
     }
 }
 
+impl StorageConfig {
+    /// Build a `StorageConfig` from environment variables, falling back to
+    /// defaults for any that are unset. Returns an error if a variable is
+    /// set but cannot be parsed.
+    ///
+    /// | Variable                    | Field              |
+    /// |-----------------------------|--------------------|
+    /// | `ZANXIO_DATA_TABLE_SIZE`    | `data_table_size`  |
+    /// | `ZANXIO_INDEX_TABLE_SIZE`   | `index_table_size` |
+    /// | `ZANXIO_JOURNAL_SIZE`       | `journal_size`     |
+    /// | `ZANXIO_L0_THRESHOLD`       | `l0_threshold`     |
+    pub fn from_env() -> Result<Self, EnvConfigError> {
+        let defaults = Self::default();
+        Ok(Self {
+            data_table_size: env_parse("ZANXIO_DATA_TABLE_SIZE")?
+                .unwrap_or(defaults.data_table_size),
+            index_table_size: env_parse("ZANXIO_INDEX_TABLE_SIZE")?
+                .unwrap_or(defaults.index_table_size),
+            journal_size: env_parse("ZANXIO_JOURNAL_SIZE")?.unwrap_or(defaults.journal_size),
+            l0_threshold: env_parse("ZANXIO_L0_THRESHOLD")?.unwrap_or(defaults.l0_threshold),
+        })
+    }
+}
+
+/// Error returned when an environment variable is set but cannot be parsed.
+#[derive(Debug)]
+pub struct EnvConfigError {
+    /// The environment variable name.
+    pub name: String,
+    /// The raw value that failed to parse.
+    pub value: String,
+}
+
+impl fmt::Display for EnvConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid value for {}: {:?}", self.name, self.value,)
+    }
+}
+
+impl std::error::Error for EnvConfigError {}
+
+/// Parse an environment variable as a numeric type. Returns `Ok(None)` if
+/// unset, `Ok(Some(value))` on success, or `Err` if set but unparseable.
+fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>, EnvConfigError> {
+    let val = match std::env::var(name) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    val.parse().map(Some).map_err(|_| EnvConfigError {
+        name: name.to_string(),
+        value: val,
+    })
+}
+
 impl Store {
     /// Open or create a store at the given path.
     ///
