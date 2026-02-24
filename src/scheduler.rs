@@ -3,9 +3,9 @@
 
 //! Background scheduler that promotes scheduled jobs to the Ready state.
 //!
-//! Jobs enqueued with a future `ready_at` timestamp sit in the
-//! `scheduled_jobs_by_ready_at` index until their time arrives. This module
-//! provides the async loop that scans that index and promotes due jobs.
+//! Jobs enqueued with a future `ready_at` timestamp sit in the in-memory
+//! scheduled index until their time arrives. This module provides the async
+//! loop that scans that index and promotes due jobs.
 
 use std::time::Duration;
 
