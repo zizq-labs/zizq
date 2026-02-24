@@ -1646,8 +1646,14 @@ async fn take_jobs(
                                     // other workers with the same claim token
                                     // will skip and go back to waiting.
                                     let now = (state.clock)();
+                                    let take_start = std::time::Instant::now();
                                     match state.store.take_next_job(now, &queues).await {
                                         Ok(Some(job)) => {
+                                            tracing::trace!(
+                                                take_us = take_start.elapsed().as_micros(),
+                                                job_id = %job.id,
+                                                "take loop: got job"
+                                            );
                                             in_flight.insert(job.id.clone(), job.attempts);
                                             state.global_in_flight.fetch_add(1, Ordering::Relaxed);
                                             match Job::try_from(job) {
@@ -1679,6 +1685,10 @@ async fn take_jobs(
                                                 .reset(tokio::time::Instant::now() + state.heartbeat_interval);
                                         }
                                         Ok(None) => {
+                                            tracing::trace!(
+                                                take_us = take_start.elapsed().as_micros(),
+                                                "take loop: queue empty"
+                                            );
                                             // Queue is empty. The CAS
                                             // already set the token to
                                             // true, so has_token will be

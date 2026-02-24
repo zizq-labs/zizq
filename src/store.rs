@@ -1166,18 +1166,31 @@ impl Store {
         let jobs_by_status = self.jobs_by_status.clone();
         let queues = queues.clone();
 
+        let spawn_start = std::time::Instant::now();
         task::spawn_blocking(move || {
+            let blocking_start = std::time::Instant::now();
+            let spawn_wait = blocking_start.duration_since(spawn_start);
+
             // Acquire the write lock before reading, so no other writer
             // can take the same job between our read and the remove.
             let mut tx = db.write_tx();
+            let write_tx_elapsed = blocking_start.elapsed();
 
             // Find the highest-priority, oldest ready job, returning
             // (priority_key, job_id) as raw bytes for index manipulation.
+            let scan_start = std::time::Instant::now();
             let (priority_key, job_id): (Vec<u8>, Vec<u8>) = if queues.is_empty() {
                 // Unfiltered: the first key in the global priority index.
                 let entry = match ready_jobs_by_priority.first_key_value() {
                     Some(entry) => entry,
-                    None => return Ok(None),
+                    None => {
+                        tracing::trace!(
+                            spawn_wait_us = spawn_wait.as_micros(),
+                            write_tx_us = write_tx_elapsed.as_micros(),
+                            "take_next_job: empty (unfiltered)"
+                        );
+                        return Ok(None);
+                    }
                 };
                 let (k, _) = entry.into_inner()?;
                 let priority_key = k.to_vec();
@@ -1212,6 +1225,11 @@ impl Store {
                     .take(1)
                     .collect::<Result<_, _>>()?;
                 if ids.is_empty() {
+                    tracing::trace!(
+                        spawn_wait_us = spawn_wait.as_micros(),
+                        write_tx_us = write_tx_elapsed.as_micros(),
+                        "take_next_job: empty (filtered)"
+                    );
                     return Ok(None);
                 }
 
@@ -1221,6 +1239,7 @@ impl Store {
                 let job_id = priority_key[5..].to_vec();
                 (priority_key, job_id)
             };
+            let scan_elapsed = scan_start.elapsed();
 
             // Look up job metadata from the jobs keyspace (payload is Null
             // here — it lives in the payloads keyspace).
@@ -1243,17 +1262,32 @@ impl Store {
             let meta_bytes = rmp_serde::to_vec_named(&job)?;
 
             // Remove from priority indexes, update job record and status indexes.
+            let commit_start = std::time::Instant::now();
             tx.remove(&ready_jobs_by_priority, &priority_key);
             tx.remove(&ready_jobs_by_queue_and_priority, &queue_priority_key);
             tx.insert(&jobs, &job_id, &meta_bytes);
             tx.remove(&jobs_by_status, &old_status_key);
             tx.insert(&jobs_by_status, &new_status_key, b"");
             tx.commit()?;
+            let commit_elapsed = commit_start.elapsed();
 
             // Hydrate the payload from the payloads keyspace for the caller.
+            let hydrate_start = std::time::Instant::now();
             if let Some(payload_bytes) = payloads.get(&job_id)? {
                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
+            let hydrate_elapsed = hydrate_start.elapsed();
+
+            tracing::trace!(
+                spawn_wait_us = spawn_wait.as_micros(),
+                write_tx_us = write_tx_elapsed.as_micros(),
+                scan_us = scan_elapsed.as_micros(),
+                commit_us = commit_elapsed.as_micros(),
+                hydrate_us = hydrate_elapsed.as_micros(),
+                total_us = blocking_start.elapsed().as_micros(),
+                job_id = %job.id,
+                "take_next_job"
+            );
 
             Ok(Some(job))
         })
