@@ -27,7 +27,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.1"
 
   spec.files = Dir["lib/**/*.rb", "bin/**/*", "LICENSE"]
-  spec.executables = ["zanxio"]
+  spec.executables = ["zanxio-worker"]
   spec.require_paths = ["lib"]
 
   spec.add_dependency "httpx", "~> 1.4"

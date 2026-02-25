@@ -26,7 +26,7 @@ end
 # --- CLI flag parsing (overrides env var defaults) ---
 
 parser = OptionParser.new do |opts|
-  opts.banner = "Usage: zanxio [OPTIONS] <ENTRYPOINT>"
+  opts.banner = "Usage: zanxio-worker [OPTIONS] <ENTRYPOINT>"
 
   opts.separator ""
   opts.separator "Start a Zanxio worker process. The ENTRYPOINT is a Ruby file that loads your"
@@ -76,7 +76,7 @@ parser = OptionParser.new do |opts|
   end
 
   opts.on("-v", "--version", "Print version and exit") do
-    puts "zanxio #{Zanxio::VERSION}"
+    puts "zanxio-worker #{Zanxio::VERSION}"
     exit
   end
 
@@ -90,7 +90,7 @@ begin
   parser.parse!
 rescue OptionParser::ParseError => e
   warn e.message
-  warn "See 'zanxio --help' for usage information."
+  warn "See 'zanxio-worker --help' for usage information."
   exit 1
 end
 
