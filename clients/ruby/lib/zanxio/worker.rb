@@ -178,10 +178,16 @@ module Zanxio
         until @shutdown
           begin
             client = Zanxio.client
-            logger.info { "Connected to #{client.url}, streaming jobs..." }
-            current_interval = reconnect_interval # reset on successful connect
+            logger.info { "Connecting to #{client.url}..." }
 
-            client.take_jobs(prefetch:, queues:) do |job_hash|
+            client.take_jobs(
+              prefetch:,
+              queues:,
+              on_connect: -> {
+                logger.info { "Connected to #{client.url}, streaming jobs..." }
+                current_interval = reconnect_interval
+              }
+            ) do |job_hash|
               begin
                 @dispatch_queue.push(job_hash)
               rescue ClosedQueueError
@@ -191,6 +197,9 @@ module Zanxio
                 break
               end
             end
+
+            # Stream ended normally — reset backoff for next reconnect.
+            current_interval = reconnect_interval
           rescue Zanxio::ConnectionError, Zanxio::StreamError => e
             break if @shutdown
 

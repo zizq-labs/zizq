@@ -227,7 +227,7 @@ module Zanxio
     # @rbs worker_id: String?
     # @rbs &block: (Resources::Job) -> void
     # @rbs return: void
-    def take_jobs(prefetch: 1, queues: [], worker_id: nil, &block)
+    def take_jobs(prefetch: 1, queues: [], worker_id: nil, on_connect: nil, &block)
       raise ArgumentError, "take_jobs requires a block" unless block
 
       params = { prefetch: } #: Hash[Symbol, untyped]
@@ -244,6 +244,13 @@ module Zanxio
       # `raise_for_status` internally after the stream ends (or on HTTP
       # errors), so we don't need a manual status check.
       stream = @http.get(uri, headers:, stream: true)
+      begin
+        stream.status # force the connection; raises on failure
+        on_connect&.call
+      rescue StopIteration
+        # Empty stream — connection closed before any data arrived.
+        return
+      end
 
       # Wrap each parsed hash in a Resources::Job before yielding.
       wrapper = proc { |data| block.call(Resources::Job.new(self, data)) }
@@ -254,6 +261,8 @@ module Zanxio
       end
     rescue HTTPX::HTTPError => e
       raise StreamError, "take jobs stream returned HTTP #{e.status}"
+    rescue HTTPX::ConnectionError => e
+      raise ConnectionError, e.message
     rescue IOError, Errno::ECONNRESET, Errno::EPIPE => e
       raise StreamError, e.message
     end

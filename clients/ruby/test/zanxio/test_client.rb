@@ -317,6 +317,28 @@ class TestClient < Minitest::Test
     assert_raises(ArgumentError) { @json_client.take_jobs(prefetch: 1) }
   end
 
+  def test_take_on_connect_called_when_stream_opens
+    body = "#{JSON.generate({ "id" => "j1" })}\n"
+
+    stub_request(:get, "#{URL}/jobs/take?prefetch=1")
+      .to_return(status: 200, body: body,
+                 headers: { "Content-Type" => "application/x-ndjson" })
+
+    connected = false
+    @json_client.take_jobs(prefetch: 1, on_connect: -> { connected = true }) { |_| }
+    assert connected, "on_connect should have been called"
+  end
+
+  def test_take_on_connect_not_called_for_empty_stream
+    stub_request(:get, "#{URL}/jobs/take?prefetch=1")
+      .to_return(status: 200, body: "",
+                 headers: { "Content-Type" => "application/x-ndjson" })
+
+    connected = false
+    @json_client.take_jobs(prefetch: 1, on_connect: -> { connected = true }) { |_| }
+    refute connected, "on_connect should not fire when the stream is immediately empty"
+  end
+
   # --- take (MsgPack streaming) ---
 
   def test_take_msgpack_yields_jobs
