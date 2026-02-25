@@ -141,7 +141,7 @@ module Zanxio
       # The latch is closed by the signal handler or the producer's ensure
       # block — pop returns nil in either case, waking the main thread.
       @shutdown_latch.pop
-      logger.info { "Shutting down, waiting up to #{shutdown_timeout}s for workers to finish..." }
+      logger.info { "Shutting down; waiting up to #{shutdown_timeout}s for workers to finish..." }
 
       # The producer has no work to drain — kill it immediately. It may
       # be blocked in a streaming HTTP read that neither Thread#raise nor
@@ -184,7 +184,7 @@ module Zanxio
               prefetch:,
               queues:,
               on_connect: -> {
-                logger.info { "Connected to #{client.url}, streaming jobs..." }
+                logger.info { "Connected; listening for jobs." }
                 current_interval = reconnect_interval
               }
             ) do |job_hash|
@@ -203,13 +203,13 @@ module Zanxio
           rescue Zanxio::ConnectionError, Zanxio::StreamError => e
             break if @shutdown
 
-            logger.warn { "Stream disconnected: #{e.message}. Reconnecting in #{current_interval}s..." }
+            logger.warn { "#{e.message}; reconnecting in #{current_interval}s..." }
             sleep current_interval
             current_interval = [current_interval * reconnect_exponent, max_reconnect_interval].min
           rescue => e
             break if @shutdown
 
-            logger.error { "Producer error: #{e.class}: #{e.message}" }
+            logger.error { "Error: #{e.class}: #{e.message}" }
             logger.debug { e.backtrace&.join("\n") }
             sleep current_interval
             current_interval = [current_interval * reconnect_exponent, max_reconnect_interval].min
@@ -218,7 +218,7 @@ module Zanxio
 
         # Ensure queue is closed so workers can drain and exit
         @dispatch_queue.close rescue nil
-        logger.info { "Producer stopped" }
+        logger.info { "Stopped" }
       ensure
         # Wake the main thread whether we exited due to shutdown or a crash.
         @shutdown_latch.close rescue nil
@@ -358,7 +358,7 @@ module Zanxio
           next # Thread finished cleanly
         end
 
-        logger.warn { "Shutdown timeout reached, killing thread #{t.name}" }
+        logger.warn { "Shutdown timeout reached; killing thread #{t.name}" }
         t.kill
       end
     end
