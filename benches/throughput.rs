@@ -438,8 +438,7 @@ impl JobStream {
 /// Enqueue N jobs to a given queue as untimed setup for dequeue benchmarks.
 /// Always uses JSON for simplicity — the format being benchmarked is the
 /// stream/ack format, not the enqueue format.
-async fn pre_enqueue(base_url: &str, queue: &str, n: usize) {
-    let client = Client::builder().tcp_nodelay(true).build().unwrap();
+async fn pre_enqueue(client: &Client, base_url: &str, queue: &str, n: usize) {
     let url = format!("{base_url}/jobs");
 
     for i in 0..n {
@@ -573,7 +572,7 @@ async fn dequeue(
     let queue = unique_queue();
 
     // Untimed setup: seed the queue with jobs.
-    pre_enqueue(base_url, &queue, n).await;
+    pre_enqueue(&clients[0], base_url, &queue, n).await;
 
     let target = n as u64;
     let acked = Arc::new(AtomicU64::new(0));
