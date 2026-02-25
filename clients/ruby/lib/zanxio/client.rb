@@ -86,7 +86,7 @@ module Zanxio
     # List jobs with optional filters.
     #
     # Multi-value filters (`status`, `queue`, `type`) accept arrays — they
-    # are joined with semicolons as the server expects.
+    # are joined with commas as the server expects.
     #
     # @rbs status: (String | Array[String])?
     # @rbs queue: (String | Array[String])?
@@ -231,7 +231,7 @@ module Zanxio
       raise ArgumentError, "take_jobs requires a block" unless block
 
       params = { prefetch: } #: Hash[Symbol, untyped]
-      params[:queue] = queues.join(";") unless queues.empty?
+      params[:queue] = queues.join(",") unless queues.empty?
 
       headers = { "Accept" => @stream_accept }
       headers["Worker-Id"] = worker_id if worker_id
@@ -355,12 +355,12 @@ module Zanxio
       uri
     end
 
-    # Build query params for list endpoints, joining multi-value keys with ";".
+    # Build query params for list endpoints, joining multi-value keys with ",".
     def build_list_params(options, multi_keys: []) #: (Hash[Symbol, untyped], ?multi_keys: Array[Symbol]) -> Hash[Symbol, untyped]
       params = {} #: Hash[Symbol, untyped]
       options.each do |key, value|
         if multi_keys.include?(key) && value.is_a?(Array)
-          params[key] = value.join(";")
+          params[key] = value.join(",")
         else
           params[key] = value
         end

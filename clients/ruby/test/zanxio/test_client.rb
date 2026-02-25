@@ -127,7 +127,7 @@ class TestClient < Minitest::Test
   def test_list_jobs_with_filters
     response = { "jobs" => [{ "id" => "j1" }], "pages" => { "self" => "/jobs" } }
 
-    stub_request(:get, "#{URL}/jobs?status=ready;working&queue=emails&limit=10")
+    stub_request(:get, "#{URL}/jobs?status=ready,working&queue=emails&limit=10")
       .to_return(status: 200, body: JSON.generate(response),
                  headers: { "Content-Type" => "application/json" })
 
@@ -297,7 +297,7 @@ class TestClient < Minitest::Test
   end
 
   def test_take_with_queues
-    stub_request(:get, "#{URL}/jobs/take?prefetch=1&queue=emails;webhooks")
+    stub_request(:get, "#{URL}/jobs/take?prefetch=1&queue=emails,webhooks")
       .to_return(status: 200, body: "",
                  headers: { "Content-Type" => "application/x-ndjson" })
 

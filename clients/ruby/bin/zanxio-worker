@@ -18,7 +18,7 @@ max_reconnect_interval = Float(ENV.fetch("ZANXIO_MAX_RECONNECT_INTERVAL", Zanxio
 reconnect_exponent = Float(ENV.fetch("ZANXIO_RECONNECT_EXPONENT", Zanxio::Worker::DEFAULT_RECONNECT_EXPONENT))
 
 queues = if ENV.key?("ZANXIO_QUEUES")
-  ENV["ZANXIO_QUEUES"].split(";").map(&:strip).reject(&:empty?)
+  ENV["ZANXIO_QUEUES"].split(",").map(&:strip).reject(&:empty?)
 else
   []
 end
@@ -50,13 +50,13 @@ parser = OptionParser.new do |opts|
   end
 
   queues_from_cli = false
-  opts.on("-q", "--queue QUEUE", "Queue to process (repeatable, env: ZANXIO_QUEUES semicolon-separated)") do |q|
+  opts.on("-q", "--queue QUEUE", "Queue to process (repeatable or comma-separated, env: ZANXIO_QUEUES)") do |q|
     # First -q flag replaces the env var default entirely
     unless queues_from_cli
       queues = []
       queues_from_cli = true
     end
-    queues << q
+    queues.concat(q.split(",").map(&:strip).reject(&:empty?))
   end
 
   opts.on("--shutdown-timeout N", Float, "Shutdown timeout in seconds (default: #{Zanxio::Worker::DEFAULT_SHUTDOWN_TIMEOUT}, env: ZANXIO_SHUTDOWN_TIMEOUT)") do |n|

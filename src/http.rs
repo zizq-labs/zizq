@@ -194,37 +194,37 @@ impl FromStr for JobStatus {
     }
 }
 
-// --- SemicolonSet ---
+// --- CommaSet ---
 
-/// A set of values deserialized from a semicolon-delimited query parameter.
+/// A set of values deserialized from a comma-delimited query parameter.
 ///
-/// For example, `?status=ready;working` deserializes into a
-/// `SemicolonSet<JobStatus>` containing `{Ready, Working}`.
+/// For example, `?status=ready,working` deserializes into a
+/// `CommaSet<JobStatus>` containing `{Ready, Working}`.
 ///
 /// An absent or empty parameter deserializes as an empty set.
 #[derive(Debug, Clone)]
-struct SemicolonSet<T: Eq + Hash>(HashSet<T>);
+struct CommaSet<T: Eq + Hash>(HashSet<T>);
 
-impl<T: Eq + Hash> Default for SemicolonSet<T> {
+impl<T: Eq + Hash> Default for CommaSet<T> {
     fn default() -> Self {
         Self(HashSet::new())
     }
 }
 
-impl<T: Eq + Hash> std::ops::Deref for SemicolonSet<T> {
+impl<T: Eq + Hash> std::ops::Deref for CommaSet<T> {
     type Target = HashSet<T>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl<T: Eq + Hash + fmt::Display + Ord> fmt::Display for SemicolonSet<T> {
+impl<T: Eq + Hash + fmt::Display + Ord> fmt::Display for CommaSet<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts: Vec<_> = self.0.iter().collect();
         parts.sort();
         for (i, part) in parts.iter().enumerate() {
             if i > 0 {
-                f.write_str(";")?;
+                f.write_str(",")?;
             }
             write!(f, "{part}")?;
         }
@@ -232,7 +232,7 @@ impl<T: Eq + Hash + fmt::Display + Ord> fmt::Display for SemicolonSet<T> {
     }
 }
 
-impl<'de, T> Deserialize<'de> for SemicolonSet<T>
+impl<'de, T> Deserialize<'de> for CommaSet<T>
 where
     T: Eq + Hash + FromStr,
     T::Err: fmt::Display,
@@ -246,7 +246,7 @@ where
             return Ok(Self(HashSet::new()));
         }
         let mut set = HashSet::new();
-        for part in s.split(';') {
+        for part in s.split(',') {
             if part.is_empty() {
                 continue;
             }
@@ -480,17 +480,17 @@ struct ListJobsParams {
     /// Maximum number of jobs to return (1–200, default 50).
     limit: Option<u16>,
 
-    /// Status filter, semicolon-delimited (e.g. "ready;working").
+    /// Status filter, comma-delimited (e.g. "ready,working").
     #[serde(default)]
-    status: SemicolonSet<JobStatus>,
+    status: CommaSet<JobStatus>,
 
-    /// Queue filter, semicolon-delimited (e.g. "emails;webhooks").
+    /// Queue filter, comma-delimited (e.g. "emails,webhooks").
     #[serde(default)]
-    queue: SemicolonSet<String>,
+    queue: CommaSet<String>,
 
-    /// Type filter, semicolon-delimited (e.g. "send_email;generate_report").
+    /// Type filter, comma-delimited (e.g. "send_email,generate_report").
     #[serde(default, rename = "type")]
-    job_type: SemicolonSet<String>,
+    job_type: CommaSet<String>,
 }
 
 /// Sort order for job listings.
@@ -988,19 +988,19 @@ async fn version(AcceptFormat(fmt): AcceptFormat) -> Response {
 
 /// Validate a queue name, returning an error message if invalid.
 ///
-/// Queue names must be non-empty and must not contain `;` (used as a
+/// Queue names must be non-empty and must not contain `,` (used as a
 /// delimiter in query parameters) or null bytes (used as key separators
 /// in internal indexes).
 /// Validate a string field used as an index key (queue name, job type, etc.).
 ///
-/// Rejects empty strings, semicolons (used as a set delimiter in query
+/// Rejects empty strings, commas (used as a set delimiter in query
 /// parameters), and null bytes (used as a separator in index keys).
 fn validate_name(field: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{field} must not be empty"));
     }
-    if value.contains(';') {
-        return Err(format!("{field} must not contain ';'"));
+    if value.contains(',') {
+        return Err(format!("{field} must not contain ','"));
     }
     if value.contains('\0') {
         return Err(format!("{field} must not contain null bytes"));
@@ -1326,9 +1326,9 @@ fn build_page_url(
     from: Option<&str>,
     order: Order,
     limit: u16,
-    statuses: &SemicolonSet<JobStatus>,
-    queues: &SemicolonSet<String>,
-    types: &SemicolonSet<String>,
+    statuses: &CommaSet<JobStatus>,
+    queues: &CommaSet<String>,
+    types: &CommaSet<String>,
 ) -> String {
     let mut url = String::from("/jobs?");
     if let Some(cursor) = from {
@@ -1474,10 +1474,10 @@ struct TakeParams {
     #[serde(default = "default_prefetch")]
     prefetch: usize,
 
-    /// Queue filter, semicolon-delimited (e.g. "emails;webhooks").
+    /// Queue filter, comma-delimited (e.g. "emails,webhooks").
     /// Empty means all queues.
     #[serde(default)]
-    queue: SemicolonSet<String>,
+    queue: CommaSet<String>,
 }
 
 fn default_prefetch() -> usize {
@@ -2211,17 +2211,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_rejects_queue_name_with_semicolon() {
+    async fn enqueue_rejects_queue_name_with_comma() {
         let req = json_request(
             "POST",
             "/jobs",
-            &serde_json::json!({"type": "test", "queue": "a;b", "payload": "x"}),
+            &serde_json::json!({"type": "test", "queue": "a,b", "payload": "x"}),
         );
         let res = test_app().oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
-        assert!(body["error"].as_str().unwrap().contains(";"));
+        assert!(body["error"].as_str().unwrap().contains(","));
     }
 
     #[tokio::test]
@@ -2476,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semicolon_set_ignores_trailing_semicolons() {
+    async fn comma_set_ignores_trailing_commas() {
         let (_, app) = test_state_and_app();
 
         // Enqueue jobs in two queues.
@@ -2489,8 +2489,8 @@ mod tests {
             app.clone().oneshot(req).await.unwrap();
         }
 
-        // Trailing semicolon should be ignored — same as ?queue=emails;webhooks
-        let req = empty_request("GET", "/jobs?queue=emails;webhooks;");
+        // Trailing comma should be ignored — same as ?queue=emails,webhooks
+        let req = empty_request("GET", "/jobs?queue=emails,webhooks,");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -2975,7 +2975,7 @@ mod tests {
         assert_eq!(jobs[0]["status"], "ready");
     }
 
-    // --- GET /jobs semicolon-delimited filter tests ---
+    // --- GET /jobs comma-delimited filter tests ---
 
     #[tokio::test]
     async fn list_jobs_filters_by_multiple_statuses() {
@@ -3013,7 +3013,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs?status=ready;working");
+        let req = empty_request("GET", "/jobs?status=ready,working");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -3057,7 +3057,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs?status=ready;working&limit=2");
+        let req = empty_request("GET", "/jobs?status=ready,working&limit=2");
         let res = app.clone().oneshot(req).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
@@ -3145,7 +3145,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs?queue=emails;webhooks");
+        let req = empty_request("GET", "/jobs?queue=emails,webhooks");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -3336,7 +3336,7 @@ mod tests {
             .unwrap();
 
         // Ready + working in emails + reports (excludes webhooks).
-        let req = empty_request("GET", "/jobs?queue=emails;reports&status=ready;working");
+        let req = empty_request("GET", "/jobs?queue=emails,reports&status=ready,working");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -3418,7 +3418,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs?type=send_email;send_sms");
+        let req = empty_request("GET", "/jobs?type=send_email,send_sms");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -4184,7 +4184,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs/take?queue=emails;webhooks&prefetch=2");
+        let req = empty_request("GET", "/jobs/take?queue=emails,webhooks&prefetch=2");
         let res = app.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
