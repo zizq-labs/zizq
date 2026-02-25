@@ -38,7 +38,7 @@ use tokio_stream::wrappers::ReceiverStream;
 const DEFAULT_PRIORITY: u16 = 32_768;
 
 /// Default interval between heartbeat frames on idle take connections.
-pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
+pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 3;
 
 /// Default maximum number of jobs in the working set across all connections.
 pub const DEFAULT_GLOBAL_WORKING_LIMIT: u64 = 1024;

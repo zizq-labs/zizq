@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use zanxio::http::BackoffConfig;
 use zanxio::http::{
     self, AppState, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
-    DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS, DEFAULT_RETRY_LIMIT,
+    DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_RETRY_LIMIT,
 };
 use zanxio::store::Store;
 
@@ -182,7 +182,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
 
     let state = Arc::new(AppState {
         store: store.clone(),
-        heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
+        heartbeat_interval: Duration::from_millis(200),
         global_working_limit: DEFAULT_GLOBAL_WORKING_LIMIT,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx.clone(),
@@ -613,7 +613,15 @@ async fn dequeue(
         handle.await.unwrap();
     }
 
-    start.elapsed()
+    let elapsed = start.elapsed();
+
+    // Allow server-side streaming handlers to detect the disconnect (via
+    // heartbeat write failure) and close their connections before the next
+    // iteration opens new ones. Without this, FDs accumulate across
+    // iterations and eventually hit the OS limit.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    elapsed
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +731,12 @@ async fn pipeline(
         handle.await.unwrap();
     }
 
-    start.elapsed()
+    let elapsed = start.elapsed();
+
+    // Same drain delay as dequeue() — see comment there.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    elapsed
 }
 
 // ---------------------------------------------------------------------------
