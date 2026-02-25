@@ -12,8 +12,8 @@
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 //! - `jobs_by_type`: type membership index, keyed by `{job_type}\0{job_id}`.
 //! - `errors`: error records per failure, keyed by `{job_id}\0{attempt_be_u32}`.
-//! - In-memory `ReadyIndex`: BTreeSet-based priority index of ready jobs,
-//!   rebuilt from the `jobs` keyspace on startup.
+//! - In-memory `ReadyIndex`: lock-free crossbeam skip-list priority index of
+//!   ready jobs, rebuilt from the `jobs` keyspace on startup.
 //! - In-memory `ScheduledIndex`: BTreeSet-based chronological index of
 //!   scheduled jobs, rebuilt from the `jobs` keyspace on startup.
 //!
@@ -21,12 +21,15 @@
 //! across the individual indexes rather than a compound index.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+
+use crossbeam_skiplist::{SkipMap, SkipSet};
+use dashmap::DashMap;
 
 use fjall::config::FilterPolicy;
 use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
@@ -602,75 +605,130 @@ pub enum StoreEvent {
     JobScheduled { ready_at: u64 },
 }
 
-/// In-memory priority index for ready jobs.
+/// In-memory priority index for ready jobs (lock-free).
 ///
 /// The ready index is inherently ephemeral — jobs live in it for milliseconds
-/// under normal throughput— which is worst-case for LSM trees (high tombstone
-/// churn causes scan latency spikes tied to compaction cycles). BTreeSets give
-/// O(log n) lookups with zero LSM overhead, so we keep the Priority + FIFO
-/// ordered queue in memory, but we keep the authoritative source of data in
-/// the database, synchronised with the BTreeSet memory structures here. This
-/// may seem memory-intensive, but queue systems are transient, and we're only
-/// storing identifiers here, not entire jobs (those remain in the database).
+/// under normal throughput — which is worst-case for LSM trees (high tombstone
+/// churn causes scan latency spikes tied to compaction cycles). Skip lists give
+/// O(log n) lookups without a global mutex, so enqueue (insert) and take
+/// (remove) can operate on the index concurrently. The authoritative source of
+/// data remains in the database; this index is rebuilt on startup via
+/// `Store::rebuild_ready_index` and then kept in sync at runtime.
 ///
-/// The `jobs` keyspace (LSM-backed) remains the source of truth; this index is
-/// rebuilt from it on startup via `Store::rebuild_ready_index`, and then
-/// kept in sync at runtime.
-///
-/// Tuples are `(priority, job_id)`. `Ord` on `(u16, String)` gives priority
-/// ASC, then job_id ASC — exactly the ordering needed (FIFO within same
-/// priority, since scru128 IDs are lexicographically time-ordered).
+/// Keys are `(priority, job_id)`. `Ord` on `(u16, String)` gives priority ASC,
+/// then job_id ASC — exactly the ordering needed (FIFO within same priority,
+/// since scru128 IDs are lexicographically time-ordered).
 struct ReadyIndex {
-    /// Global priority index across all queues.
-    global: BTreeSet<(u16, String)>,
+    /// Global prioritised job index.
+    ///
+    /// All claims to take a job use this index as the authoritative source of
+    /// truth. If removal from this set fails (CAS operation under the hood)
+    /// then a new candidate must be selected.
+    ///
+    /// Key: `(priority, job_id)`, Value: `queue_name`.
+    /// The value stores the queue name so that after `remove()` we know which
+    /// per-queue set to clean up.
+    global: SkipMap<(u16, String), String>,
 
-    /// Per-queue priority indexes.
-    by_queue: HashMap<String, BTreeSet<(u16, String)>>,
+    /// Per-queue indexes — for queue-filtered candidate selection.
+    ///
+    /// `DashMap` provides concurrent access to the `queue -> SkipSet` mapping
+    /// without a global lock.
+    ///
+    /// Entries are only removed from this set if they were successfully
+    /// claimed in the global set. No entries should exist in the global set
+    /// that do not exist in the per-queue set (insert order is per-queue first
+    /// then global).
+    by_queue: DashMap<String, SkipSet<(u16, String)>>,
 }
 
 impl ReadyIndex {
     fn new() -> Self {
         Self {
-            global: BTreeSet::new(),
-            by_queue: HashMap::new(),
+            global: SkipMap::new(),
+            by_queue: DashMap::new(),
         }
     }
 
-    /// Insert a job into both the global and per-queue indexes.
-    fn insert(&mut self, queue: &str, priority: u16, job_id: String) {
+    /// Insert a job into both the per-queue and global indexes.
+    ///
+    /// Inserts into `by_queue` first, then `global`. This ordering
+    /// guarantees that any entry visible in `global` is already in
+    /// `by_queue`, so the unfiltered `remove()` path's by_queue cleanup always
+    /// finds the entry. The filtered path may briefly peek a by_queue entry
+    /// whose global counterpart isn't inserted yet — `global.get()` returns
+    /// `None` and it retries harmlessly.
+    fn insert(&self, queue: &str, priority: u16, job_id: String) {
         let entry = (priority, job_id);
-        self.global.insert(entry.clone());
         self.by_queue
             .entry(queue.to_string())
-            .or_default()
-            .insert(entry);
+            .or_insert_with(SkipSet::new)
+            .insert(entry.clone());
+        self.global.insert(entry, queue.to_string());
     }
 
-    /// Remove a job from both the global and per-queue indexes.
-    fn remove(&mut self, queue: &str, priority: u16, job_id: &str) {
-        let entry = (priority, job_id.to_string());
-        self.global.remove(&entry);
-        if let Some(set) = self.by_queue.get_mut(queue) {
-            set.remove(&entry);
-            if set.is_empty() {
-                self.by_queue.remove(queue);
-            }
-        }
-    }
-
-    /// Peek at the highest-priority (lowest number), oldest ready job.
+    /// Atomically claim the highest-priority (lowest number), oldest ready job.
     ///
-    /// If `queues` is empty, returns the global minimum. Otherwise finds the
-    /// minimum across the requested queues' BTreeSets.
-    fn peek(&self, queues: &HashSet<String>) -> Option<(u16, String)> {
-        if queues.is_empty() {
-            self.global.iter().next().cloned()
-        } else {
-            queues
-                .iter()
-                .filter_map(|q| self.by_queue.get(q)?.iter().next())
-                .min()
-                .cloned()
+    /// Returns `(priority, job_id, queue)` if a job was claimed, or `None` if
+    /// the index is empty (or empty for the requested queues).
+    ///
+    /// Both paths use the same CAS pattern: find a candidate entry, call
+    /// `Entry::remove()` (only one thread wins the CAS), and retry on failure.
+    ///
+    /// - Unfiltered (queues is empty): peeks `global.front()` directly.
+    /// - Queue-filtered: peeks each target queue's SkipSet front, picks
+    ///   the minimum, then looks up the global entry via `get()`.
+    ///
+    /// Important: `SkipMap::remove(&key)` is *not* safe as a claim
+    /// mechanism — it returns `Some(entry)` to ALL concurrent callers that
+    /// find the node, regardless of who actually marked it. Only
+    /// `Entry::remove()` (which returns `bool` from the CAS) is safe.
+    fn claim(&self, queues: &HashSet<String>) -> Option<(u16, String, String)> {
+        loop {
+            // Find the best candidate. Unfiltered peeks global directly;
+            // filtered peeks per-queue sets and resolves via global.get().
+            // front() and get() both skip marked (already-claimed) nodes.
+            let candidate = if queues.is_empty() {
+                // If we're just taking a job from any queue, it's just
+                // whatever is at the front of the global queue.
+                let entry = self.global.front()?; // ?: or return None
+                let key = entry.key().clone();
+                let queue = entry.value().clone();
+                Some((entry, key, queue))
+            } else {
+                // If we're taking a job from a specific set of queues, we need
+                // to find the first job on each of those queues and then
+                // select the highest priority/earliest job ID.
+                let (priority, job_id, queue) = queues
+                    .iter()
+                    .filter_map(|q| {
+                        let set = self.by_queue.get(q)?;
+                        let front = set.front()?;
+                        let (priority, job_id) = front.value().clone();
+                        Some((priority, job_id, q.clone()))
+                    })
+                    .min()?; // ?: or return None
+
+                // Look up the global entry for the CAS. Returns None if:
+                // (a) not yet in global (insert race — by_queue is populated
+                //     first, global second), or
+                // (b) already claimed and marked by another thread.
+                // In either case, don't touch by_queue — the insert will
+                // complete shortly (a), or the winner will clean up (b).
+                let key = (priority, job_id);
+                self.global.get(&key).map(|entry| (entry, key, queue))
+            };
+
+            // Claim via Entry::remove() — CAS, only one thread wins.
+            if let Some((entry, (priority, job_id), queue)) = candidate {
+                if entry.remove() {
+                    // Won the claim — clean up the per-queue set.
+                    if let Some(set) = self.by_queue.get(&queue) {
+                        set.remove(&(priority, job_id.clone()));
+                    }
+                    return Some((priority, job_id, queue));
+                }
+            } // else loop again
         }
     }
 }
@@ -682,8 +740,8 @@ impl ReadyIndex {
 /// then FIFO within the same timestamp (scru128 IDs are lexicographically
 /// time-ordered).
 ///
-/// Protected by `std::sync::Mutex` (not tokio) — same rationale as
-/// `ReadyIndex`: critical sections are nanoseconds (BTreeSet insert/remove).
+/// Protected by `std::sync::Mutex` (not tokio) — critical sections are
+/// nanoseconds (BTreeSet insert/remove).
 struct ScheduledIndex {
     entries: BTreeSet<(u64, String)>,
 }
@@ -750,11 +808,11 @@ pub struct Store {
     /// single-writer lock.
     payloads: SingleWriterTxKeyspace,
 
-    /// In-memory priority index for ready jobs.
+    /// In-memory priority index for ready jobs (lock-free).
     ///
-    /// Protected by `std::sync::Mutex` (not tokio) because critical sections
-    /// are nanoseconds (BTreeSet insert/remove).
-    ready_index: Arc<Mutex<ReadyIndex>>,
+    /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
+    /// no external mutex needed.
+    ready_index: Arc<ReadyIndex>,
 
     /// In-memory chronological index of scheduled jobs.
     ///
@@ -1189,7 +1247,7 @@ impl Store {
             db,
             jobs,
             payloads,
-            ready_index: Arc::new(Mutex::new(ReadyIndex::new())),
+            ready_index: Arc::new(ReadyIndex::new()),
             scheduled_index: Arc::new(Mutex::new(ScheduledIndex::new())),
             jobs_by_status,
             jobs_by_queue,
@@ -1278,10 +1336,7 @@ impl Store {
             if scheduled {
                 scheduled_index.lock().unwrap().insert(ready_at, id.clone());
             } else {
-                ready_index
-                    .lock()
-                    .unwrap()
-                    .insert(&job.queue, job.priority, job.id.clone());
+                ready_index.insert(&job.queue, job.priority, job.id.clone());
             }
 
             Ok(job)
@@ -1314,12 +1369,17 @@ impl Store {
 
     /// Take the next job from the priority index.
     ///
-    /// Atomically removes the highest-priority (lowest number), oldest job
-    /// and marks it as working. Returns `None` if no ready jobs match.
+    /// Atomically claims the highest-priority (lowest number), oldest job
+    /// from the lock-free ready index and marks it as working. Returns `None`
+    /// if no ready jobs match.
     ///
     /// When `queues` is non-empty, only jobs in the specified queues are
-    /// considered, using a k-way merge across per-queue priority ranges.
-    /// When empty, all ready jobs are candidates.
+    /// considered. When empty, all ready jobs are candidates.
+    ///
+    /// The `claim()` call removes the entry from the skip-list index before
+    /// we even start the fjall transaction — this prevents duplicates without
+    /// needing a mutex around peek+remove. If the fjall commit fails, we
+    /// re-insert into the index to restore consistency.
     ///
     /// Subscribers are not notified.
     pub async fn take_next_job(
@@ -1339,26 +1399,27 @@ impl Store {
             let blocking_start = std::time::Instant::now();
             let spawn_wait = blocking_start.duration_since(spawn_start);
 
-            // Acquire the write lock before reading, so no other writer
-            // can take the same job between our read and the remove.
-            let mut tx = db.write_tx();
-            let write_tx_elapsed = blocking_start.elapsed();
-
-            // Peek at the in-memory ready index to find the best candidate.
-            // The Mutex critical section is nanoseconds (BTreeSet iteration).
+            // Claim the best candidate from the lock-free ready index.
+            // This atomically removes the entry — two concurrent callers
+            // each get a different job (no mutex needed).
             let scan_start = std::time::Instant::now();
-            let (priority, job_id) = match ready_index.lock().unwrap().peek(&queues) {
+            let (_priority, job_id, queue) = match ready_index.claim(&queues) {
                 Some(entry) => entry,
                 None => {
                     tracing::trace!(
                         spawn_wait_us = spawn_wait.as_micros(),
-                        write_tx_us = write_tx_elapsed.as_micros(),
                         "take_next_job: empty"
                     );
                     return Ok(None);
                 }
             };
             let scan_elapsed = scan_start.elapsed();
+
+            // Acquire the fjall write lock *after* claiming from the index.
+            // The index claim already prevents duplicates, so we just need
+            // the write lock for the LSM transaction.
+            let mut tx = db.write_tx();
+            let write_tx_elapsed = blocking_start.elapsed();
 
             // Look up job metadata from the jobs keyspace.
             let meta_bytes = jobs.get(&job_id)?.ok_or_else(|| {
@@ -1372,15 +1433,6 @@ impl Store {
             job.status = JobStatus::Working.into();
             job.dequeued_at = Some(now);
             let new_status_key = make_status_key(JobStatus::Working, &job.id);
-
-            // Remove from the in-memory ready index before committing to
-            // prevent a data race: if we removed after the commit, another
-            // writer could acquire the write lock between our commit and
-            // remove, peek the same entry, and take it twice.
-            ready_index
-                .lock()
-                .unwrap()
-                .remove(&job.queue, priority, &job_id);
 
             // Only write metadata back — payload is immutable and stays in
             // its own keyspace.
@@ -1401,11 +1453,7 @@ impl Store {
                 if let Ok(Some(bytes)) = jobs.get(&job_id) {
                     if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
                         if current.status == JobStatus::Ready as u8 {
-                            ready_index.lock().unwrap().insert(
-                                &current.queue,
-                                current.priority,
-                                current.id,
-                            );
+                            ready_index.insert(&current.queue, current.priority, current.id);
                         }
                     }
                 }
@@ -1428,6 +1476,7 @@ impl Store {
                 hydrate_us = hydrate_elapsed.as_micros(),
                 total_us = blocking_start.elapsed().as_micros(),
                 job_id = %job.id,
+                queue = %queue,
                 "take_next_job"
             );
 
@@ -1735,10 +1784,7 @@ impl Store {
                 tx.commit()?;
 
                 // Insert into the in-memory ready index after commit succeeds.
-                ready_index
-                    .lock()
-                    .unwrap()
-                    .insert(&queue, priority, id.clone());
+                ready_index.insert(&queue, priority, id.clone());
 
                 Ok(Some((queue, priority, id)))
             },
@@ -2090,9 +2136,12 @@ impl Store {
                         let (key, value) = entry.into_inner()?;
                         let mut record: ErrorRecord = rmp_serde::from_slice(&value)?;
                         // Extract the attempt number from the last 4 bytes of the key.
-                        let attempt_bytes: [u8; 4] = key[key.len() - 4..]
-                            .try_into()
-                            .expect("error key must end with 4-byte attempt");
+                        let attempt_bytes: [u8; 4] =
+                            key[key.len() - 4..].try_into().map_err(|_| {
+                                StoreError::Corruption(
+                                    "error key must end with 4-byte attempt".into(),
+                                )
+                            })?;
                         record.attempt = u32::from_be_bytes(attempt_bytes);
                         rows.push(record);
                     }
@@ -2106,9 +2155,12 @@ impl Store {
                     {
                         let (key, value) = entry.into_inner()?;
                         let mut record: ErrorRecord = rmp_serde::from_slice(&value)?;
-                        let attempt_bytes: [u8; 4] = key[key.len() - 4..]
-                            .try_into()
-                            .expect("error key must end with 4-byte attempt");
+                        let attempt_bytes: [u8; 4] =
+                            key[key.len() - 4..].try_into().map_err(|_| {
+                                StoreError::Corruption(
+                                    "error key must end with 4-byte attempt".into(),
+                                )
+                            })?;
                         record.attempt = u32::from_be_bytes(attempt_bytes);
                         rows.push(record);
                     }
@@ -2260,7 +2312,7 @@ impl Store {
             }
 
             // Insert into the in-memory ready index after commit succeeds.
-            ready_index.lock().unwrap().insert(&queue, priority, id);
+            ready_index.insert(&queue, priority, id);
 
             Ok(())
         })
@@ -2283,7 +2335,7 @@ impl Store {
     ///    client handling them. This phase scans the status index and
     ///    atomically moves them back to `Ready`.
     ///
-    /// 2. Rebuild ready index: The in-memory BTreeSet is empty after
+    /// 2. Rebuild ready index: The in-memory skip list is empty after
     ///    opening the database. This phase scans the status index for all
     ///    `Ready` jobs (including any just recovered above) and populates
     ///    the index so `take_next_job` can find them.
@@ -2328,11 +2380,13 @@ impl Store {
             let working_ids: Vec<String> = snapshot
                 .range::<Vec<u8>, _>(&jobs_by_status, range)
                 .map(|entry| {
-                    let (key, _) = entry.into_inner().expect("status index read failed");
+                    let (key, _) = entry.into_inner()?;
                     // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
-                    String::from_utf8(key[2..].to_vec()).expect("job ID is not valid UTF-8")
+                    String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                        StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
+                    })
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             drop(snapshot);
 
             if working_ids.is_empty() {
@@ -2371,7 +2425,8 @@ impl Store {
     /// Populate the in-memory ready index from the `jobs_by_status` index.
     ///
     /// Scans for all Ready jobs, reads their metadata to get queue and
-    /// priority, and inserts each entry into the BTreeSet.
+    /// priority, and inserts each entry into the skip list. No mutex needed —
+    /// each `insert()` is lock-free, and recovery runs before any consumers.
     async fn rebuild_ready_index(&self) -> Result<usize, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
@@ -2386,23 +2441,23 @@ impl Store {
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             let snapshot = db.read_tx();
-            let mut idx = ready_index.lock().unwrap();
             let mut count = 0;
 
             for entry in snapshot.range::<Vec<u8>, _>(&jobs_by_status, range) {
-                let (key, _) = entry.into_inner().expect("status index read failed");
+                let (key, _) = entry.into_inner()?;
                 // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
-                let job_id =
-                    String::from_utf8(key[2..].to_vec()).expect("job ID is not valid UTF-8");
+                let job_id = String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                    StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
+                })?;
 
-                let job_bytes = jobs
-                    .get(&job_id)
-                    .expect("jobs keyspace read failed")
-                    .unwrap_or_else(|| panic!("ready job missing from jobs keyspace: {job_id:?}"));
-                let job: Job =
-                    rmp_serde::from_slice(&job_bytes).expect("job deserialization failed");
+                let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "ready job missing from jobs keyspace: {job_id:?}"
+                    ))
+                })?;
+                let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                idx.insert(&job.queue, job.priority, job_id);
+                ready_index.insert(&job.queue, job.priority, job_id);
                 count += 1;
             }
 
@@ -2433,19 +2488,18 @@ impl Store {
             let mut count = 0;
 
             for entry in snapshot.range::<Vec<u8>, _>(&jobs_by_status, range) {
-                let (key, _) = entry.into_inner().expect("status index read failed");
+                let (key, _) = entry.into_inner()?;
                 // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
-                let job_id =
-                    String::from_utf8(key[2..].to_vec()).expect("job ID is not valid UTF-8");
+                let job_id = String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                    StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
+                })?;
 
-                let job_bytes = jobs
-                    .get(&job_id)
-                    .expect("jobs keyspace read failed")
-                    .unwrap_or_else(|| {
-                        panic!("scheduled job missing from jobs keyspace: {job_id:?}")
-                    });
-                let job: Job =
-                    rmp_serde::from_slice(&job_bytes).expect("job deserialization failed");
+                let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "scheduled job missing from jobs keyspace: {job_id:?}"
+                    ))
+                })?;
+                let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
                 idx.insert(job.ready_at, job_id);
                 count += 1;
@@ -2824,6 +2878,57 @@ mod tests {
         }
 
         // Every job should have been taken exactly once.
+        assert_eq!(all_ids.len(), num_jobs);
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), num_jobs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn take_next_job_filtered_never_returns_duplicates_under_contention() {
+        let store = Arc::new(test_store());
+        let num_jobs = 50;
+        let queue = "contention";
+
+        for i in 0..num_jobs {
+            store
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", queue, serde_json::json!(i)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let queues: HashSet<String> = [queue.to_string()].into_iter().collect();
+
+        // Spawn many concurrent workers all racing to take jobs
+        // using the queue-filtered path.
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            let queues = queues.clone();
+            handles.push(tokio::spawn(async move {
+                let mut taken = Vec::new();
+                while let Some(job) = store.take_next_job(now_millis(), &queues).await.unwrap() {
+                    taken.push(job.id.clone());
+                    // Also verify the ack works (job is in Working status).
+                    assert!(
+                        store.mark_completed(&job.id).await.unwrap(),
+                        "mark_completed returned false for job {}",
+                        job.id,
+                    );
+                }
+                taken
+            }));
+        }
+
+        let mut all_ids = Vec::new();
+        for handle in handles {
+            all_ids.extend(handle.await.unwrap());
+        }
+
+        // Every job should have been taken and acked exactly once.
         assert_eq!(all_ids.len(), num_jobs);
         all_ids.sort();
         all_ids.dedup();

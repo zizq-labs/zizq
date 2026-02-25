@@ -2665,6 +2665,8 @@ dependencies = [
  "axum",
  "clap",
  "criterion",
+ "crossbeam-skiplist",
+ "dashmap",
  "fjall",
  "futures-util",
  "http-body-util",
