@@ -10,7 +10,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-fjall = "3.0.1"
+fjall = "3.0.2"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
