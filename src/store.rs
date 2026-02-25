@@ -14,18 +14,17 @@
 //! - `errors`: error records per failure, keyed by `{job_id}\0{attempt_be_u32}`.
 //! - In-memory `ReadyIndex`: lock-free crossbeam skip-list priority index of
 //!   ready jobs, rebuilt from the `jobs` keyspace on startup.
-//! - In-memory `ScheduledIndex`: BTreeSet-based chronological index of
-//!   scheduled jobs, rebuilt from the `jobs` keyspace on startup.
+//! - In-memory `ScheduledIndex`: lock-free crossbeam skip-set chronological
+//!   index of scheduled jobs, rebuilt from the `jobs` keyspace on startup.
 //!
 //! Combined filters (e.g. queue + status) use sorted stream intersection
 //! across the individual indexes rather than a compound index.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use crossbeam_skiplist::{SkipMap, SkipSet};
@@ -735,29 +734,30 @@ impl ReadyIndex {
 
 /// In-memory chronological index of scheduled jobs.
 ///
-/// Keeps a `BTreeSet<(u64, String)>` ordered by `(ready_at, job_id)`.
+/// Keeps a `SkipSet<(u64, String)>` ordered by `(ready_at, job_id)`.
 /// The tuple's derived `Ord` gives chronological ordering (ready_at ASC),
 /// then FIFO within the same timestamp (scru128 IDs are lexicographically
 /// time-ordered).
 ///
-/// Protected by `std::sync::Mutex` (not tokio) — critical sections are
-/// nanoseconds (BTreeSet insert/remove).
+/// Lock-free — uses `crossbeam-skiplist` internally. The scheduler is the
+/// sole consumer of `next_due`/`remove`, so there's no concurrent claim
+/// contention; producers (`enqueue`, `record_failure`) only call `insert`.
 struct ScheduledIndex {
-    entries: BTreeSet<(u64, String)>,
+    entries: SkipSet<(u64, String)>,
 }
 
 impl ScheduledIndex {
     fn new() -> Self {
         Self {
-            entries: BTreeSet::new(),
+            entries: SkipSet::new(),
         }
     }
 
-    fn insert(&mut self, ready_at: u64, job_id: String) {
+    fn insert(&self, ready_at: u64, job_id: String) {
         self.entries.insert((ready_at, job_id));
     }
 
-    fn remove(&mut self, ready_at: u64, job_id: &str) {
+    fn remove(&self, ready_at: u64, job_id: &str) {
         self.entries.remove(&(ready_at, job_id.to_string()));
     }
 
@@ -770,7 +770,8 @@ impl ScheduledIndex {
     ///   or if there are no more scheduled jobs at all.
     fn next_due(&self, now: u64, limit: usize) -> (Vec<(u64, String)>, Option<u64>) {
         let mut due = Vec::new();
-        for (ready_at, job_id) in &self.entries {
+        for entry in self.entries.iter() {
+            let (ready_at, job_id) = entry.value();
             if *ready_at > now {
                 // This entry (and everything after) is in the future.
                 return (due, Some(*ready_at));
@@ -819,7 +820,7 @@ pub struct Store {
     /// Ordered by `(ready_at, job_id)`. Only jobs in the `Scheduled` state
     /// appear here. A background task scans this index to promote jobs to
     /// `Ready` once their time arrives.
-    scheduled_index: Arc<Mutex<ScheduledIndex>>,
+    scheduled_index: Arc<ScheduledIndex>,
 
     /// Reference to the status index keyspace.
     ///
@@ -1248,7 +1249,7 @@ impl Store {
             jobs,
             payloads,
             ready_index: Arc::new(ReadyIndex::new()),
-            scheduled_index: Arc::new(Mutex::new(ScheduledIndex::new())),
+            scheduled_index: Arc::new(ScheduledIndex::new()),
             jobs_by_status,
             jobs_by_queue,
             jobs_by_type,
@@ -1334,7 +1335,7 @@ impl Store {
             // Ready jobs go into the ready index; scheduled jobs go into the
             // scheduled index (promoted later by the scheduler).
             if scheduled {
-                scheduled_index.lock().unwrap().insert(ready_at, id.clone());
+                scheduled_index.insert(ready_at, id.clone());
             } else {
                 ready_index.insert(&job.queue, job.priority, job.id.clone());
             }
@@ -1652,10 +1653,7 @@ impl Store {
                 tx.commit()?;
 
                 // Insert into the in-memory scheduled index after commit succeeds.
-                scheduled_index
-                    .lock()
-                    .unwrap()
-                    .insert(job.ready_at, id.clone());
+                scheduled_index.insert(job.ready_at, id.clone());
             } else {
                 // Delete the job and all associated data.
                 let queue_key = make_queue_key(&job.queue, &id);
@@ -2225,9 +2223,7 @@ impl Store {
         let scheduled_index = self.scheduled_index.clone();
 
         task::spawn_blocking(move || -> Result<(Vec<Job>, Option<u64>), StoreError> {
-            // Lock the BTreeSet, collect due entries, unlock. The mutex is
-            // held only for the in-memory scan — fjall reads happen outside.
-            let (due_entries, next_ready_at) = scheduled_index.lock().unwrap().next_due(now, limit);
+            let (due_entries, next_ready_at) = scheduled_index.next_due(now, limit);
 
             let mut result = Vec::with_capacity(due_entries.len());
             for (_ready_at, job_id) in &due_entries {
@@ -2267,7 +2263,7 @@ impl Store {
         task::spawn_blocking(move || -> Result<(), StoreError> {
             // Remove from the in-memory scheduled index *before* commit to
             // prevent data races (same as take_next_job).
-            scheduled_index.lock().unwrap().remove(ready_at, &id);
+            scheduled_index.remove(ready_at, &id);
 
             let mut tx = db.write_tx();
 
@@ -2304,7 +2300,7 @@ impl Store {
                 if let Ok(Some(bytes)) = jobs.get(&id) {
                     if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
                         if current.status == JobStatus::Scheduled as u8 {
-                            scheduled_index.lock().unwrap().insert(ready_at, id);
+                            scheduled_index.insert(ready_at, id);
                         }
                     }
                 }
@@ -2340,7 +2336,7 @@ impl Store {
     ///    `Ready` jobs (including any just recovered above) and populates
     ///    the index so `take_next_job` can find them.
     ///
-    /// 3. Rebuild scheduled index: The in-memory BTreeSet is empty after
+    /// 3. Rebuild scheduled index: The in-memory SkipSet is empty after
     ///    opening the database. This phase scans the status index for all
     ///    `Scheduled` jobs and populates the chronological index so the
     ///    scheduler can find them.
@@ -2469,7 +2465,7 @@ impl Store {
     /// Populate the in-memory scheduled index from the `jobs_by_status` index.
     ///
     /// Scans for all Scheduled jobs, reads their metadata to get `ready_at`,
-    /// and inserts each entry into the BTreeSet.
+    /// and inserts each entry into the SkipSet.
     async fn rebuild_scheduled_index(&self) -> Result<usize, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
@@ -2484,7 +2480,6 @@ impl Store {
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             let snapshot = db.read_tx();
-            let mut idx = scheduled_index.lock().unwrap();
             let mut count = 0;
 
             for entry in snapshot.range::<Vec<u8>, _>(&jobs_by_status, range) {
@@ -2501,7 +2496,7 @@ impl Store {
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                idx.insert(job.ready_at, job_id);
+                scheduled_index.insert(job.ready_at, job_id);
                 count += 1;
             }
 

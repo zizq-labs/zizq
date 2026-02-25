@@ -388,8 +388,9 @@ mod tests {
         let (clock, clock_fn) = test_clock();
         let (_shutdown_tx, shutdown_rx) = watch::channel(());
 
-        // Use batch size of 2 so we can trigger the "more due" path.
-        tokio::spawn(run(store.clone(), clock_fn, 2, shutdown_rx));
+        // Use a small batch size so we can trigger the "more due" path.
+        let batch_size = 2;
+        tokio::spawn(run(store.clone(), clock_fn, batch_size, shutdown_rx));
 
         let t = clock.load(Ordering::Relaxed);
 
@@ -408,7 +409,14 @@ mod tests {
 
         clock.store(t + 1_001, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(1_001)).await;
-        yield_scheduler().await;
+        // One yield per scan-promote cycle. The small batch_size forces
+        // multiple cycles (each involving multiple spawn_blocking calls),
+        // and each cycle needs its own yield_scheduler budget of real
+        // wall-clock time for the blocking tasks to complete.
+        let cycles = (ids.len() + batch_size - 1) / batch_size;
+        for _ in 0..cycles {
+            yield_scheduler().await;
+        }
 
         // All 3 should be promoted even though batch_size is 2 — the
         // scheduler loops immediately when the batch was full.
