@@ -82,6 +82,30 @@ module Zanxio
           @zanxio_backoff
         end
       end
+
+      # Declare the default retention configuration for this job class.
+      #
+      # Times are specified in seconds (optionally fractional).
+      # `ActiveSupport::Duration` works here.
+      #
+      # Both parameters are optional — only the ones provided will be sent
+      # to the server. Omitted values use the server's defaults.
+      #
+      # Example:
+      #
+      #   zanxio_retention completed: 0, dead: 7 * 86_400
+      #
+      # If not called, the server's default is used.
+      def zanxio_retention(completed: nil, dead: nil) #: (?completed: Numeric?, ?dead: Numeric?) -> Zanxio::retention?
+        if completed || dead
+          result = {} #: Hash[Symbol, Float]
+          result[:completed] = completed.to_f if completed
+          result[:dead] = dead.to_f if dead
+          @zanxio_retention = result
+        else
+          @zanxio_retention
+        end
+      end
     end
 
     # Override this method in your job class to define the work to perform.

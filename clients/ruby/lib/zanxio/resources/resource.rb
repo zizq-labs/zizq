@@ -25,6 +25,15 @@ module Zanxio
         @data
       end
 
+      # Omit the client from inspect output to reduce noise.
+      def inspect #: () -> String
+        ivars = instance_variables
+          .reject { |v| v == :@client }
+          .map { |v| " #{v}=#{instance_variable_get(v).inspect}" }
+          .join
+        "#<#{self.class}#{ivars}>"
+      end
+
       protected
 
       # Convert a millisecond timestamp to fractional seconds, nil-safe.

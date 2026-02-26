@@ -13,6 +13,9 @@ module Zanxio
   # Backoff configuration expressed in fractional seconds.
   type backoff = { exponent: Float, base: Float, jitter: Float }
 
+  # Retention configuration expressed in fractional seconds.
+  type retention = { ?completed: Float, ?dead: Float }
+
   # Structural type for a class that includes Zanxio::Job.
   #
   # When a class includes Zanxio::Job, the `included` callback extends
@@ -25,6 +28,7 @@ module Zanxio
     def zanxio_queue: (?String?) -> String
     def zanxio_retry_limit: (?Integer?) -> Integer?
     def zanxio_backoff: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> backoff?
+    def zanxio_retention: (?completed: Numeric?, ?dead: Numeric?) -> retention?
     def name: () -> String?
     def new: () -> Job
   end

@@ -21,8 +21,9 @@ module Zanxio
       def attempts    = @data["attempts"]    #: () -> Integer
       def payload     = @data["payload"]     #: () -> Hash[String, untyped]?
       def dequeued_at = ms_to_seconds(@data["dequeued_at"]) #: () -> Float?
-      def failed_at   = ms_to_seconds(@data["failed_at"])   #: () -> Float?
-      def retry_limit = @data["retry_limit"] #: () -> Integer?
+      def failed_at     = ms_to_seconds(@data["failed_at"])     #: () -> Float?
+      def completed_at  = ms_to_seconds(@data["completed_at"])  #: () -> Float?
+      def retry_limit   = @data["retry_limit"] #: () -> Integer?
 
       # Backoff configuration converted from the wire format (ms) to the
       # Ruby-idiomatic format (seconds), matching the Zanxio::backoff type.
@@ -35,6 +36,18 @@ module Zanxio
           base: raw["base_ms"] / 1000.0,
           jitter: raw["jitter_ms"] / 1000.0
         }
+      end
+
+      # Retention configuration converted from the wire format (ms) to the
+      # Ruby-idiomatic format (seconds), matching the Zanxio::retention type.
+      def retention #: () -> Zanxio::retention?
+        raw = @data["retention"]
+        return nil unless raw
+
+        result = {} #: Hash[Symbol, Float]
+        result[:completed] = raw["completed_ms"] / 1000.0 if raw["completed_ms"]
+        result[:dead] = raw["dead_ms"] / 1000.0 if raw["dead_ms"]
+        result
       end
 
       # Fetch the error history for this job.

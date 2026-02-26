@@ -78,6 +78,7 @@ module Zanxio
     # @rbs ready_at: Float?
     # @rbs retry_limit: Integer?
     # @rbs backoff: Zanxio::backoff?
+    # @rbs retention: Zanxio::retention?
     # @rbs return: Hash[String, untyped]
     def enqueue(
       job_class,
@@ -87,7 +88,8 @@ module Zanxio
       delay: nil,
       ready_at: nil,
       retry_limit: nil,
-      backoff: nil
+      backoff: nil,
+      retention: nil
     )
       unless job_class.is_a?(Class) && job_class < Zanxio::Job
         raise ArgumentError, "#{job_class.inspect} must include Zanxio::Job"
@@ -103,6 +105,7 @@ module Zanxio
       queue ||= zanxio_job_class.zanxio_queue
       retry_limit ||= zanxio_job_class.zanxio_retry_limit
       backoff ||= zanxio_job_class.zanxio_backoff
+      retention ||= zanxio_job_class.zanxio_retention
 
       params = { type:, queue:, payload: } #: Hash[Symbol, untyped]
       params[:priority] = priority if priority
@@ -117,6 +120,15 @@ module Zanxio
           base_ms: (backoff[:base].to_f * 1000).to_f,
           jitter_ms: (backoff[:jitter].to_f * 1000).to_f
         }
+      end
+
+      # Retention times are specified in seconds in Ruby but the server
+      # expects milliseconds. Convert here at the boundary.
+      if retention
+        wire = {} #: Hash[Symbol, Integer]
+        wire[:completed_ms] = (retention[:completed].to_f * 1000).to_i if retention[:completed]
+        wire[:dead_ms] = (retention[:dead].to_f * 1000).to_i if retention[:dead]
+        params[:retention] = wire
       end
 
       # Support ActiveSupport::Duration and Numeric alike.

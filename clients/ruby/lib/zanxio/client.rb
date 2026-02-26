@@ -62,14 +62,16 @@ module Zanxio
     # @rbs ready_at: Float?
     # @rbs retry_limit: Integer?
     # @rbs backoff: Hash[Symbol, untyped]?
+    # @rbs retention: Hash[Symbol, untyped]?
     # @rbs return: Resources::Job
-    def enqueue(type:, queue:, payload:, priority: nil, ready_at: nil, retry_limit: nil, backoff: nil)
+    def enqueue(type:, queue:, payload:, priority: nil, ready_at: nil, retry_limit: nil, backoff: nil, retention: nil)
       body = { type:, queue:, payload: } #: Hash[Symbol, untyped]
       body[:priority] = priority if priority
       # ready_at is fractional seconds in Ruby; the server expects ms.
       body[:ready_at] = (ready_at * 1000).to_i if ready_at
       body[:retry_limit] = retry_limit if retry_limit
       body[:backoff] = backoff if backoff
+      body[:retention] = retention if retention
 
       response = post("/jobs", body)
       data = handle_response!(response, expected: 201)
