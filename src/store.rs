@@ -275,11 +275,11 @@ pub struct BackoffConfig {
 
     /// Minimum delay in milliseconds.
     #[serde(rename = "b")]
-    pub base_ms: f32,
+    pub base_ms: u32,
 
     /// Max random milliseconds per attempt multiplier (0..jitter_ms).
     #[serde(rename = "j")]
-    pub jitter_ms: f32,
+    pub jitter_ms: u32,
 }
 
 /// An error record stored in the `errors` keyspace.
@@ -1235,6 +1235,18 @@ pub struct StorageConfig {
     pub default_backoff: BackoffConfig,
 }
 
+/// Default target size for data SST files (64 MiB).
+pub const DEFAULT_DATA_TABLE_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Default target size for index SST files (8 MiB).
+pub const DEFAULT_INDEX_TABLE_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Default maximum journal (WAL) size on disk (64 MiB minimum).
+pub const DEFAULT_JOURNAL_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Default L0 compaction threshold.
+pub const DEFAULT_L0_THRESHOLD: u8 = 4;
+
 /// Default maximum retries before a failed job is killed.
 pub const DEFAULT_RETRY_LIMIT: u32 = 25;
 
@@ -1242,10 +1254,10 @@ pub const DEFAULT_RETRY_LIMIT: u32 = 25;
 pub const DEFAULT_BACKOFF_EXPONENT: f32 = 4.0;
 
 /// Default backoff base delay in milliseconds.
-pub const DEFAULT_BACKOFF_BASE_MS: f32 = 15_000.0;
+pub const DEFAULT_BACKOFF_BASE_MS: u32 = 15_000;
 
 /// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
-pub const DEFAULT_BACKOFF_JITTER_MS: f32 = 30_000.0;
+pub const DEFAULT_BACKOFF_JITTER_MS: u32 = 30_000;
 
 /// Default retention period for completed jobs (milliseconds).
 /// 0 means completed jobs are logically invisible immediately.
@@ -1257,10 +1269,10 @@ pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            data_table_size: 64 * 1024 * 1024, // 64 MiB
-            index_table_size: 8 * 1024 * 1024, // 8 MiB
-            journal_size: 64 * 1024 * 1024,    // 64 MiB (minimum)
-            l0_threshold: 4,
+            data_table_size: DEFAULT_DATA_TABLE_SIZE,
+            index_table_size: DEFAULT_INDEX_TABLE_SIZE,
+            journal_size: DEFAULT_JOURNAL_SIZE,
+            l0_threshold: DEFAULT_L0_THRESHOLD,
             default_completed_retention_ms: DEFAULT_COMPLETED_RETENTION_MS,
             default_dead_retention_ms: DEFAULT_DEAD_RETENTION_MS,
             default_retry_limit: DEFAULT_RETRY_LIMIT,
@@ -2855,7 +2867,7 @@ fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
 
-    let base_delay = (attempts as f32).powf(backoff.exponent) + backoff.base_ms;
+    let base_delay = (attempts as f32).powf(backoff.exponent) + backoff.base_ms as f32;
 
     // Cheap random value using the same approach as rand_id() in http.rs.
     let rand_frac = (RandomState::new().build_hasher().finish() as f64) / (u64::MAX as f64); // 0.0..1.0
@@ -5914,8 +5926,8 @@ mod tests {
         config.default_retry_limit = retry_limit;
         config.default_backoff = BackoffConfig {
             exponent: 2.0,
-            base_ms: 100.0,
-            jitter_ms: 0.0, // deterministic
+            base_ms: 100,
+            jitter_ms: 0, // deterministic
         };
         let store = Store::open(dir.path().join("data"), config).unwrap();
         std::mem::forget(dir);
@@ -6351,8 +6363,8 @@ mod tests {
     fn compute_backoff_zero_jitter_is_deterministic() {
         let backoff = BackoffConfig {
             exponent: 2.0,
-            base_ms: 100.0,
-            jitter_ms: 0.0,
+            base_ms: 100,
+            jitter_ms: 0,
         };
 
         // attempts=1: 1^2 + 100 = 101
@@ -6367,8 +6379,8 @@ mod tests {
     fn compute_backoff_with_jitter_stays_in_range() {
         let backoff = BackoffConfig {
             exponent: 2.0,
-            base_ms: 100.0,
-            jitter_ms: 50.0,
+            base_ms: 100,
+            jitter_ms: 50,
         };
 
         // Run many times to exercise randomness.
@@ -6392,8 +6404,8 @@ mod tests {
     fn compute_backoff_zero_attempts() {
         let backoff = BackoffConfig {
             exponent: 2.0,
-            base_ms: 100.0,
-            jitter_ms: 0.0,
+            base_ms: 100,
+            jitter_ms: 0,
         };
 
         // attempts=0: 0^2 + 100 = 100

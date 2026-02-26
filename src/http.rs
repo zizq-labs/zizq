@@ -422,10 +422,10 @@ pub struct BackoffConfig {
     pub exponent: f32,
 
     /// Minimum delay in milliseconds.
-    pub base_ms: f32,
+    pub base_ms: u32,
 
     /// Max random milliseconds per attempt multiplier.
-    pub jitter_ms: f32,
+    pub jitter_ms: u32,
 }
 
 impl From<BackoffConfig> for store::BackoffConfig {
@@ -2350,8 +2350,8 @@ mod tests {
                 "payload": "x",
                 "backoff": {
                     "exponent": 3.0,
-                    "base_ms": 1000.0,
-                    "jitter_ms": 50.0
+                    "base_ms": 1000,
+                    "jitter_ms": 50
                 }
             }),
         );
@@ -2368,8 +2368,8 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let backoff = &job["backoff"];
         assert_eq!(backoff["exponent"], 3.0);
-        assert_eq!(backoff["base_ms"], 1000.0);
-        assert_eq!(backoff["jitter_ms"], 50.0);
+        assert_eq!(backoff["base_ms"], 1000);
+        assert_eq!(backoff["jitter_ms"], 50);
     }
 
     #[tokio::test]
@@ -2476,8 +2476,8 @@ mod tests {
                 "payload": "x",
                 "backoff": {
                     "exponent": 1.0,
-                    "base_ms": 200.0,
-                    "jitter_ms": 0.0
+                    "base_ms": 200,
+                    "jitter_ms": 0
                 }
             }),
         );
@@ -4520,8 +4520,8 @@ mod tests {
         let mut config = store::StorageConfig::default();
         config.default_backoff = store::BackoffConfig {
             exponent: 2.0,
-            base_ms: 500.0,
-            jitter_ms: 0.0,
+            base_ms: 500,
+            jitter_ms: 0,
         };
         let (clock, state) = test_app_state_with_config(config);
         let now = clock.load(Ordering::Relaxed);

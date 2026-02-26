@@ -13,18 +13,35 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_INTERVAL_MS};
-use crate::reaper::DEFAULT_CHECK_INTERVAL_MS;
+use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
 use crate::store::{self, Store};
 
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";
 
+/// Parse a duration string into milliseconds.
+///
+/// Accepts either a bare number (interpreted as milliseconds) or a
+/// human-readable duration string via `humantime` (e.g. "5s", "1.5s", "7d").
+fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    if let Ok(n) = s.parse::<u64>() {
+        return Ok(n);
+    }
+    humantime::parse_duration(s)
+        .map(|d| d.as_millis() as u64)
+        .map_err(|e| e.to_string())
+}
+
 /// Arguments for the `serve` subcommand.
 #[derive(Parser)]
 pub struct Args {
     /// Root directory for all server data and configuration.
-    #[arg(long, default_value = "./zanxio-root", env = "ZANXIO_ROOT_DIR")]
+    #[arg(
+        long,
+        default_value = "./zanxio-root",
+        value_name = "PATH",
+        env = "ZANXIO_ROOT_DIR"
+    )]
     root_dir: String,
 
     /// Address to bind the HTTP server to.
@@ -35,45 +52,45 @@ pub struct Args {
     #[arg(long, default_value_t = 7890, env = "ZANXIO_PORT")]
     port: u16,
 
-    /// Milliseconds between heartbeat frames on idle take connections.
-    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_INTERVAL_MS, env = "ZANXIO_HEARTBEAT_INTERVAL_MS")]
+    /// Interval between heartbeat frames on idle take connections (e.g. 3s, 500ms).
+    #[arg(long = "heartbeat-interval", default_value = "3s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_HEARTBEAT_INTERVAL")]
     heartbeat_interval_ms: u64,
 
     /// Maximum number of jobs in the working set across all connections.
     /// 0 means no limit.
-    #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, env = "ZANXIO_GLOBAL_WORKING_LIMIT")]
+    #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, value_name = "NUMBER", env = "ZANXIO_GLOBAL_WORKING_LIMIT")]
     global_working_limit: u64,
 
     /// Default maximum retries before a failed job is killed.
     /// Jobs can override this at enqueue time with a per-job retry_limit.
-    #[arg(long, default_value_t = store::DEFAULT_RETRY_LIMIT, env = "ZANXIO_DEFAULT_RETRY_LIMIT")]
+    #[arg(long, default_value_t = store::DEFAULT_RETRY_LIMIT, value_name = "NUMBER", env = "ZANXIO_DEFAULT_RETRY_LIMIT")]
     default_retry_limit: u32,
 
     /// Default backoff exponent (power curve steepness).
-    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_EXPONENT, env = "ZANXIO_DEFAULT_BACKOFF_EXPONENT")]
+    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_EXPONENT, value_name = "NUMBER", env = "ZANXIO_DEFAULT_BACKOFF_EXPONENT")]
     default_backoff_exponent: f32,
 
-    /// Default backoff base delay in milliseconds.
-    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_BASE_MS, env = "ZANXIO_DEFAULT_BACKOFF_BASE_MS")]
-    default_backoff_base_ms: f32,
+    /// Default backoff base delay (e.g. 15s, 500ms).
+    #[arg(long = "default-backoff-base", default_value = "15s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_BACKOFF_BASE")]
+    default_backoff_base_ms: u64,
 
-    /// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
-    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_JITTER_MS, env = "ZANXIO_DEFAULT_BACKOFF_JITTER_MS")]
-    default_backoff_jitter_ms: f32,
+    /// Default backoff jitter — max random delay per attempt multiplier (e.g. 30s, 500ms).
+    #[arg(long = "default-backoff-jitter", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_BACKOFF_JITTER")]
+    default_backoff_jitter_ms: u64,
 
-    /// Default retention period for completed jobs (milliseconds).
+    /// Default retention period for completed jobs (e.g. 0, 1h, 7d).
     /// 0 means completed jobs are purged immediately.
-    #[arg(long, default_value_t = store::DEFAULT_COMPLETED_RETENTION_MS, env = "ZANXIO_DEFAULT_COMPLETED_JOB_RETENTION")]
-    default_completed_job_retention: u64,
+    #[arg(long = "default-completed-job-retention", default_value = "0", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_COMPLETED_JOB_RETENTION")]
+    default_completed_job_retention_ms: u64,
 
-    /// Default retention period for dead jobs (milliseconds).
+    /// Default retention period for dead jobs (e.g. 7d, 24h).
     /// 0 means dead jobs are purged immediately.
-    #[arg(long, default_value_t = store::DEFAULT_DEAD_RETENTION_MS, env = "ZANXIO_DEFAULT_DEAD_JOB_RETENTION")]
-    default_dead_job_retention: u64,
+    #[arg(long = "default-dead-job-retention", default_value = "7d", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_DEAD_JOB_RETENTION")]
+    default_dead_job_retention_ms: u64,
 
-    /// Interval between reaper scans (milliseconds).
-    #[arg(long, default_value_t = DEFAULT_CHECK_INTERVAL_MS, env = "ZANXIO_REAPER_CHECK_INTERVAL")]
-    reaper_check_interval: u64,
+    /// Interval between reaper scans (e.g. 30s, 1m).
+    #[arg(long = "reaper-check-interval", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_REAPER_CHECK_INTERVAL")]
+    reaper_check_interval_ms: u64,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -84,13 +101,13 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Init/open the store (within the root dir).
     let mut storage_config = crate::store::StorageConfig::from_env()?;
-    storage_config.default_completed_retention_ms = args.default_completed_job_retention;
-    storage_config.default_dead_retention_ms = args.default_dead_job_retention;
+    storage_config.default_completed_retention_ms = args.default_completed_job_retention_ms;
+    storage_config.default_dead_retention_ms = args.default_dead_job_retention_ms;
     storage_config.default_retry_limit = args.default_retry_limit;
     storage_config.default_backoff = store::BackoffConfig {
         exponent: args.default_backoff_exponent,
-        base_ms: args.default_backoff_base_ms,
-        jitter_ms: args.default_backoff_jitter_ms,
+        base_ms: args.default_backoff_base_ms as u32,
+        jitter_ms: args.default_backoff_jitter_ms as u32,
     };
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
@@ -137,7 +154,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         state.store.clone(),
         crate::time::now_millis,
         crate::reaper::DEFAULT_BATCH_SIZE,
-        Duration::from_millis(args.reaper_check_interval),
+        Duration::from_millis(args.reaper_check_interval_ms),
         reaper_shutdown,
     ));
 

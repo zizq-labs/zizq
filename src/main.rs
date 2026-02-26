@@ -39,11 +39,17 @@ use zanxio::{logging, serve};
 #[command(name = "zanxio", version, about = "A self-contained job queue server")]
 struct Cli {
     /// Log output format.
-    #[arg(long, default_value = "pretty", global = true)]
+    #[arg(long, default_value = "pretty", value_name = "FORMAT", global = true)]
     log_format: logging::LogFormat,
 
     /// Log level for zanxio.
-    #[arg(long, default_value = "info", env = "ZANXIO_LOG_LEVEL", global = true)]
+    #[arg(
+        long,
+        default_value = "info",
+        value_name = "LEVEL",
+        env = "ZANXIO_LOG_LEVEL",
+        global = true
+    )]
     log_level: logging::LogLevel,
 
     /// The subcommand that is to be arg parsed and executed.
