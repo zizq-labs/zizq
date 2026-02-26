@@ -148,19 +148,19 @@ impl TryFrom<u8> for JobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     /// Unique job identifier (scru128).
-    #[serde(rename = "i")]
+    #[serde(rename = "I")]
     pub id: String,
 
     /// Job type, e.g. "send_email" or "generate_report".
-    #[serde(rename = "t")]
+    #[serde(rename = "T")]
     pub job_type: String,
 
     /// Queue this job belongs to.
-    #[serde(rename = "q")]
+    #[serde(rename = "Q")]
     pub queue: String,
 
     /// Priority (lower number = higher priority).
-    #[serde(rename = "n")]
+    #[serde(rename = "N")]
     pub priority: u16,
 
     /// Arbitrary payload provided by the client.
@@ -169,12 +169,12 @@ pub struct Job {
     /// operations (take, requeue, promote, recover) only re-write the small
     /// metadata record. `None` when the payload has not been hydrated (i.e.
     /// when reading metadata only from the `jobs` keyspace).
-    #[serde(rename = "p")]
+    #[serde(rename = "P")]
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
 
     /// Current lifecycle status, stored as a u8 which converts to `JobStatus`.
-    #[serde(rename = "s")]
+    #[serde(rename = "S")]
     pub status: u8,
 
     /// When the job becomes eligible to run (milliseconds since Unix epoch).
