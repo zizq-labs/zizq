@@ -212,7 +212,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1_001)).await;
         yield_scheduler().await;
 
-        let job = store.get_job(&job.id).await.unwrap().unwrap();
+        let job = store.get_job(t, &job.id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Ready as u8);
     }
 
@@ -248,7 +248,7 @@ mod tests {
         yield_scheduler().await;
 
         for id in &ids {
-            let job = store.get_job(id).await.unwrap().unwrap();
+            let job = store.get_job(t, id).await.unwrap().unwrap();
             assert_eq!(job.status, JobStatus::Ready as u8);
         }
     }
@@ -280,7 +280,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(5_000)).await;
         yield_scheduler().await;
 
-        let job = store.get_job(&job.id).await.unwrap().unwrap();
+        let job = store.get_job(t, &job.id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Scheduled as u8);
     }
 
@@ -321,10 +321,10 @@ mod tests {
         tokio::time::advance(Duration::from_millis(2_001)).await;
         yield_scheduler().await;
 
-        let early_job = store.get_job(&early.id).await.unwrap().unwrap();
+        let early_job = store.get_job(t, &early.id).await.unwrap().unwrap();
         assert_eq!(early_job.status, JobStatus::Ready as u8);
 
-        let late_job = store.get_job(&late.id).await.unwrap().unwrap();
+        let late_job = store.get_job(t, &late.id).await.unwrap().unwrap();
         assert_eq!(late_job.status, JobStatus::Scheduled as u8);
     }
 
@@ -371,14 +371,14 @@ mod tests {
         tokio::time::advance(Duration::from_millis(2_001)).await;
         yield_scheduler().await;
 
-        let early_job = store.get_job(&early.id).await.unwrap().unwrap();
+        let early_job = store.get_job(t, &early.id).await.unwrap().unwrap();
         assert_eq!(
             early_job.status,
             JobStatus::Ready as u8,
             "early job should be promoted — timer must not have been pushed to late job's ready_at"
         );
 
-        let late_job = store.get_job(&late.id).await.unwrap().unwrap();
+        let late_job = store.get_job(t, &late.id).await.unwrap().unwrap();
         assert_eq!(late_job.status, JobStatus::Scheduled as u8);
     }
 
@@ -421,7 +421,7 @@ mod tests {
         // All 3 should be promoted even though batch_size is 2 — the
         // scheduler loops immediately when the batch was full.
         for id in &ids {
-            let job = store.get_job(id).await.unwrap().unwrap();
+            let job = store.get_job(t, id).await.unwrap().unwrap();
             assert_eq!(job.status, JobStatus::Ready as u8);
         }
     }

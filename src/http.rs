@@ -37,23 +37,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// and lower priority work.
 const DEFAULT_PRIORITY: u16 = 32_768;
 
-/// Default interval between heartbeat frames on idle take connections.
-pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 3;
+/// Default interval between heartbeat frames on idle take connections (milliseconds).
+pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 3_000;
 
 /// Default maximum number of jobs in the working set across all connections.
 pub const DEFAULT_GLOBAL_WORKING_LIMIT: u64 = 1024;
-
-/// Default maximum retries before a job is killed (25 retries = 26 total runs).
-pub const DEFAULT_RETRY_LIMIT: u32 = 25;
-
-/// Default backoff exponent (power curve steepness).
-pub const DEFAULT_BACKOFF_EXPONENT: f32 = 4.0;
-
-/// Default backoff base delay in milliseconds.
-pub const DEFAULT_BACKOFF_BASE_MS: f32 = 15_000.0;
-
-/// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
-pub const DEFAULT_BACKOFF_JITTER_MS: f32 = 30_000.0;
 
 // --- Take types ---
 
@@ -309,6 +297,18 @@ pub struct Job {
     /// When the job last failed (milliseconds since Unix epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<u64>,
+
+    /// Per-job retention configuration override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionConfig>,
+
+    /// When the reaper will hard-delete this job (milliseconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purge_at: Option<u64>,
+
+    /// When the job was completed (milliseconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
 }
 
 impl TryFrom<store::Job> for Job {
@@ -335,6 +335,9 @@ impl TryFrom<store::Job> for Job {
             backoff: job.backoff.map(Into::into),
             dequeued_at: job.dequeued_at,
             failed_at: job.failed_at,
+            retention: job.retention.map(Into::into),
+            purge_at: job.purge_at,
+            completed_at: job.completed_at,
         })
     }
 }
@@ -403,6 +406,10 @@ struct EnqueueRequest {
     /// Per-job backoff configuration override. When omitted, the server
     /// default applies.
     backoff: Option<BackoffConfig>,
+
+    /// Per-job retention configuration override. When omitted, the server
+    /// default applies.
+    retention: Option<RetentionConfig>,
 }
 
 /// Client-facing backoff configuration with human-readable field names.
@@ -437,6 +444,36 @@ impl From<store::BackoffConfig> for BackoffConfig {
             exponent: b.exponent,
             base_ms: b.base_ms,
             jitter_ms: b.jitter_ms,
+        }
+    }
+}
+
+/// Client-facing retention configuration with human-readable field names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Retention period for completed jobs (milliseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_ms: Option<u64>,
+
+    /// Retention period for dead jobs (milliseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_ms: Option<u64>,
+}
+
+impl From<RetentionConfig> for store::RetentionConfig {
+    fn from(r: RetentionConfig) -> Self {
+        Self {
+            completed_ms: r.completed_ms,
+            dead_ms: r.dead_ms,
+        }
+    }
+}
+
+impl From<store::RetentionConfig> for RetentionConfig {
+    fn from(r: store::RetentionConfig) -> Self {
+        Self {
+            completed_ms: r.completed_ms,
+            dead_ms: r.dead_ms,
         }
     }
 }
@@ -641,7 +678,7 @@ pub struct AppState {
     pub store: Store,
 
     /// Interval between heartbeat frames on idle take connections.
-    pub heartbeat_interval: Duration,
+    pub heartbeat_interval_ms: Duration,
 
     /// Maximum number of jobs in the working set across all connections.
     /// 0 means no limit.
@@ -652,12 +689,6 @@ pub struct AppState {
 
     /// Cloneable receiver for graceful shutdown signaling.
     pub shutdown: watch::Receiver<()>,
-
-    /// Default retry limit applied to jobs that don't specify one.
-    pub default_retry_limit: u32,
-
-    /// Default backoff config applied to jobs that don't specify one.
-    pub default_backoff: BackoffConfig,
 
     /// Clock function for the current time in milliseconds since Unix epoch.
     ///
@@ -1036,6 +1067,9 @@ async fn enqueue(
     if let Some(backoff) = enqueue_req.backoff {
         opts = opts.backoff(backoff.into());
     }
+    if let Some(retention) = enqueue_req.retention {
+        opts = opts.retention(retention.into());
+    }
 
     let now = (state.clock)();
     match state.store.enqueue(now, opts).await.and_then(Job::try_from) {
@@ -1073,7 +1107,8 @@ async fn mark_completed(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.store.mark_completed(&id).await {
+    let now = (state.clock)();
+    match state.store.mark_completed(now, &id).await {
         Ok(true) => {
             tracing::debug!(job_id = %id, "job marked completed");
             no_content()
@@ -1118,8 +1153,6 @@ async fn report_failure(
         backtrace: failure_req.backtrace,
         retry_at: failure_req.retry_at,
         kill: failure_req.kill,
-        default_retry_limit: state.default_retry_limit,
-        default_backoff: state.default_backoff.clone().into(),
     };
 
     let now = (state.clock)();
@@ -1165,7 +1198,8 @@ async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.store.get_job(&id).await {
+    let now = (state.clock)();
+    match state.store.get_job(now, &id).await {
         Ok(Some(job)) => match Job::try_from(job) {
             Ok(job) => respond(fmt, StatusCode::OK, &job),
             Err(e) => {
@@ -1229,9 +1263,11 @@ async fn list_jobs(
         );
     }
 
+    let now = (state.clock)();
     let mut opts = ListJobsOptions::new()
         .direction(params.order.into())
-        .limit(limit as usize);
+        .limit(limit as usize)
+        .now(now);
     if let Some(from) = &params.from {
         opts = opts.from(from.clone());
     }
@@ -1391,7 +1427,8 @@ async fn list_errors(
     }
 
     // Verify the job exists — 404 if not found, consistent with GET /jobs/{id}.
-    match state.store.get_job(&id).await {
+    let now = (state.clock)();
+    match state.store.get_job(now, &id).await {
         Ok(None) => {
             return respond(
                 fmt,
@@ -1492,8 +1529,9 @@ fn default_prefetch() -> usize {
 /// events to buffer while this task is blocked.
 async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashMap<String, u32>) {
     let mut gone = Vec::new();
+    let now = (state.clock)();
     for id in in_flight.keys() {
-        match state.store.get_job(id).await {
+        match state.store.get_job(now, id).await {
             Ok(Some(job)) if job.status == store::JobStatus::Working as u8 => {
                 // Still working — keep tracking it.
             }
@@ -1579,7 +1617,7 @@ async fn take_jobs(
             // Pin the heartbeat timer outside the loop so it isn't reset
             // when broadcast events wake the select. It is only reset
             // after a heartbeat is actually sent.
-            let heartbeat_sleep = tokio::time::sleep(state.heartbeat_interval);
+            let heartbeat_sleep = tokio::time::sleep(state.heartbeat_interval_ms);
             tokio::pin!(heartbeat_sleep);
 
             // The take loop uses a single select! driven by a claim
@@ -1615,7 +1653,7 @@ async fn take_jobs(
                         }
                         heartbeat_sleep
                             .as_mut()
-                            .reset(tokio::time::Instant::now() + state.heartbeat_interval);
+                            .reset(tokio::time::Instant::now() + state.heartbeat_interval_ms);
                     }
                     // Drain phase.
                     //
@@ -1682,7 +1720,7 @@ async fn take_jobs(
                                             // since we just sent data.
                                             heartbeat_sleep
                                                 .as_mut()
-                                                .reset(tokio::time::Instant::now() + state.heartbeat_interval);
+                                                .reset(tokio::time::Instant::now() + state.heartbeat_interval_ms);
                                         }
                                         Ok(None) => {
                                             tracing::trace!(
@@ -1864,24 +1902,22 @@ mod tests {
     /// clock and mutate the state (e.g. custom backoff, working limit)
     /// before wrapping in `Arc` and building the router.
     fn test_app_state() -> (Arc<AtomicU64>, AppState) {
+        test_app_state_with_config(Default::default())
+    }
+
+    fn test_app_state_with_config(config: store::StorageConfig) -> (Arc<AtomicU64>, AppState) {
         let (clock, clock_fn) = mock_clock();
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
+        let store = Store::open(dir.path().join("data"), config).unwrap();
         std::mem::forget(dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
         let state = AppState {
             store,
-            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
+            heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_working_limit: 0,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
-            default_retry_limit: DEFAULT_RETRY_LIMIT,
-            default_backoff: BackoffConfig {
-                exponent: DEFAULT_BACKOFF_EXPONENT,
-                base_ms: DEFAULT_BACKOFF_BASE_MS,
-                jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
-            },
             clock: clock_fn,
         };
         (clock, state)
@@ -2400,7 +2436,7 @@ mod tests {
         );
 
         // Promote the scheduled job back to ready and take it again.
-        let stored = state.store.get_job(&job_id).await.unwrap().unwrap();
+        let stored = state.store.get_job(now, &job_id).await.unwrap().unwrap();
         state.store.promote_scheduled(&stored).await.unwrap();
         state
             .store
@@ -2569,12 +2605,13 @@ mod tests {
         let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
+        let now = (state.clock)();
         state
             .store
-            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .take_next_job(now, &HashSet::new())
             .await
             .unwrap();
-        state.store.mark_completed(job_id).await.unwrap();
+        state.store.mark_completed(now, job_id).await.unwrap();
 
         let req = empty_request("GET", &format!("/jobs/{job_id}"));
         let res = app.oneshot(req).await.unwrap();
@@ -3832,7 +3869,13 @@ mod tests {
         let _ = next_body_bytes(&mut body).await;
 
         // Ack the first job while the connection is still open.
-        assert!(state.store.mark_completed(&job_a.id).await.unwrap());
+        assert!(
+            state
+                .store
+                .mark_completed(crate::time::now_millis(), &job_a.id)
+                .await
+                .unwrap()
+        );
 
         // Drop the body to simulate client disconnect.
         drop(body);
@@ -3869,16 +3912,10 @@ mod tests {
         std::mem::forget(shutdown_tx);
         let state = Arc::new(AppState {
             store,
-            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS),
+            heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_working_limit: 2,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
-            default_retry_limit: DEFAULT_RETRY_LIMIT,
-            default_backoff: BackoffConfig {
-                exponent: DEFAULT_BACKOFF_EXPONENT,
-                base_ms: DEFAULT_BACKOFF_BASE_MS,
-                jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
-            },
             clock: Arc::new(crate::time::now_millis),
         });
         let router = app(state.clone());
@@ -3924,7 +3961,7 @@ mod tests {
         // Ack the first job to free a slot.
         state
             .store
-            .mark_completed(job_a["id"].as_str().unwrap())
+            .mark_completed(crate::time::now_millis(), job_a["id"].as_str().unwrap())
             .await
             .unwrap();
 
@@ -3972,7 +4009,7 @@ mod tests {
         // Ack the first job.
         state
             .store
-            .mark_completed(job_a["id"].as_str().unwrap())
+            .mark_completed(crate::time::now_millis(), job_a["id"].as_str().unwrap())
             .await
             .unwrap();
 
@@ -4032,7 +4069,7 @@ mod tests {
         // Third job should be held back. Ack one to free a slot.
         state
             .store
-            .mark_completed(job_a["id"].as_str().unwrap())
+            .mark_completed(crate::time::now_millis(), job_a["id"].as_str().unwrap())
             .await
             .unwrap();
 
@@ -4233,7 +4270,7 @@ mod tests {
         // Ack the emails job so it isn't requeued on disconnect.
         state
             .store
-            .mark_completed(job["id"].as_str().unwrap())
+            .mark_completed(crate::time::now_millis(), job["id"].as_str().unwrap())
             .await
             .unwrap();
         drop(body);
@@ -4478,16 +4515,16 @@ mod tests {
     /// Uses a mock clock so the assertion is exact — no timing margins.
     #[tokio::test]
     async fn failure_applies_default_backoff() {
-        let (clock, mut state) = test_app_state();
-        let now = clock.load(Ordering::Relaxed);
-
         // Use a known backoff config with zero jitter so the result is
         // deterministic: delay = attempts^exponent + base_ms = 1^2 + 500 = 501.
-        state.default_backoff = BackoffConfig {
+        let mut config = store::StorageConfig::default();
+        config.default_backoff = store::BackoffConfig {
             exponent: 2.0,
             base_ms: 500.0,
             jitter_ms: 0.0,
         };
+        let (clock, state) = test_app_state_with_config(config);
+        let now = clock.load(Ordering::Relaxed);
         let state = Arc::new(state);
         let router = app(state.clone());
 
@@ -4641,12 +4678,6 @@ mod tests {
             backtrace: None,
             retry_at: None,
             kill: false,
-            default_retry_limit: 3,
-            default_backoff: store::BackoffConfig {
-                exponent: 2.0,
-                base_ms: 100.0,
-                jitter_ms: 0.0,
-            },
         };
         state
             .store
@@ -4694,12 +4725,6 @@ mod tests {
             backtrace: None,
             retry_at: None,
             kill: false,
-            default_retry_limit: 10,
-            default_backoff: store::BackoffConfig {
-                exponent: 2.0,
-                base_ms: 100.0,
-                jitter_ms: 0.0,
-            },
         };
         state
             .store
@@ -4707,7 +4732,7 @@ mod tests {
             .await
             .unwrap();
 
-        let scheduled = state.store.get_job(&job.id).await.unwrap().unwrap();
+        let scheduled = state.store.get_job(now, &job.id).await.unwrap().unwrap();
         state.store.promote_scheduled(&scheduled).await.unwrap();
         let retaken = state
             .store

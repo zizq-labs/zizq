@@ -25,11 +25,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use zanxio::http::BackoffConfig;
-use zanxio::http::{
-    self, AppState, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
-    DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_RETRY_LIMIT,
-};
+use zanxio::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
 use zanxio::store::Store;
 
 // ---------------------------------------------------------------------------
@@ -182,16 +178,10 @@ async fn start_server() -> (String, JoinHandle<()>) {
 
     let state = Arc::new(AppState {
         store: store.clone(),
-        heartbeat_interval: Duration::from_millis(200),
+        heartbeat_interval_ms: Duration::from_millis(200),
         global_working_limit: DEFAULT_GLOBAL_WORKING_LIMIT,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx.clone(),
-        default_retry_limit: DEFAULT_RETRY_LIMIT,
-        default_backoff: BackoffConfig {
-            exponent: DEFAULT_BACKOFF_EXPONENT,
-            base_ms: DEFAULT_BACKOFF_BASE_MS,
-            jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
-        },
         clock: Arc::new(zanxio::time::now_millis),
     });
 

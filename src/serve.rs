@@ -13,12 +13,9 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http::{
-    self, AppState, BackoffConfig, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT,
-    DEFAULT_BACKOFF_JITTER_MS, DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_SECONDS,
-    DEFAULT_RETRY_LIMIT,
-};
-use crate::store::Store;
+use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT, DEFAULT_HEARTBEAT_INTERVAL_MS};
+use crate::reaper::DEFAULT_CHECK_INTERVAL_MS;
+use crate::store::{self, Store};
 
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";
@@ -38,9 +35,9 @@ pub struct Args {
     #[arg(long, default_value_t = 7890, env = "ZANXIO_PORT")]
     port: u16,
 
-    /// Seconds between heartbeat frames on idle take connections.
-    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_SECONDS, env = "ZANXIO_HEARTBEAT_INTERVAL")]
-    heartbeat_interval: u64,
+    /// Milliseconds between heartbeat frames on idle take connections.
+    #[arg(long, default_value_t = DEFAULT_HEARTBEAT_INTERVAL_MS, env = "ZANXIO_HEARTBEAT_INTERVAL_MS")]
+    heartbeat_interval_ms: u64,
 
     /// Maximum number of jobs in the working set across all connections.
     /// 0 means no limit.
@@ -49,20 +46,34 @@ pub struct Args {
 
     /// Default maximum retries before a failed job is killed.
     /// Jobs can override this at enqueue time with a per-job retry_limit.
-    #[arg(long, default_value_t = DEFAULT_RETRY_LIMIT, env = "ZANXIO_DEFAULT_RETRY_LIMIT")]
+    #[arg(long, default_value_t = store::DEFAULT_RETRY_LIMIT, env = "ZANXIO_DEFAULT_RETRY_LIMIT")]
     default_retry_limit: u32,
 
     /// Default backoff exponent (power curve steepness).
-    #[arg(long, default_value_t = DEFAULT_BACKOFF_EXPONENT, env = "ZANXIO_DEFAULT_BACKOFF_EXPONENT")]
+    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_EXPONENT, env = "ZANXIO_DEFAULT_BACKOFF_EXPONENT")]
     default_backoff_exponent: f32,
 
     /// Default backoff base delay in milliseconds.
-    #[arg(long, default_value_t = DEFAULT_BACKOFF_BASE_MS, env = "ZANXIO_DEFAULT_BACKOFF_BASE_MS")]
+    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_BASE_MS, env = "ZANXIO_DEFAULT_BACKOFF_BASE_MS")]
     default_backoff_base_ms: f32,
 
     /// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
-    #[arg(long, default_value_t = DEFAULT_BACKOFF_JITTER_MS, env = "ZANXIO_DEFAULT_BACKOFF_JITTER_MS")]
+    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_JITTER_MS, env = "ZANXIO_DEFAULT_BACKOFF_JITTER_MS")]
     default_backoff_jitter_ms: f32,
+
+    /// Default retention period for completed jobs (milliseconds).
+    /// 0 means completed jobs are purged immediately.
+    #[arg(long, default_value_t = store::DEFAULT_COMPLETED_RETENTION_MS, env = "ZANXIO_DEFAULT_COMPLETED_JOB_RETENTION")]
+    default_completed_job_retention: u64,
+
+    /// Default retention period for dead jobs (milliseconds).
+    /// 0 means dead jobs are purged immediately.
+    #[arg(long, default_value_t = store::DEFAULT_DEAD_RETENTION_MS, env = "ZANXIO_DEFAULT_DEAD_JOB_RETENTION")]
+    default_dead_job_retention: u64,
+
+    /// Interval between reaper scans (milliseconds).
+    #[arg(long, default_value_t = DEFAULT_CHECK_INTERVAL_MS, env = "ZANXIO_REAPER_CHECK_INTERVAL")]
+    reaper_check_interval: u64,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -72,10 +83,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(root)?;
 
     // Init/open the store (within the root dir).
-    let store = Store::open(
-        root.join(DATABASE_DIR),
-        crate::store::StorageConfig::from_env()?,
-    )?;
+    let mut storage_config = crate::store::StorageConfig::from_env()?;
+    storage_config.default_completed_retention_ms = args.default_completed_job_retention;
+    storage_config.default_dead_retention_ms = args.default_dead_job_retention;
+    storage_config.default_retry_limit = args.default_retry_limit;
+    storage_config.default_backoff = store::BackoffConfig {
+        exponent: args.default_backoff_exponent,
+        base_ms: args.default_backoff_base_ms,
+        jitter_ms: args.default_backoff_jitter_ms,
+    };
+    let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
     // Recover orphaned working jobs and rebuild the in-memory indexes.
@@ -93,16 +110,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize shared state accessible to all request handlers.
     let state = Arc::new(AppState {
         store,
-        heartbeat_interval: Duration::from_secs(args.heartbeat_interval),
+        heartbeat_interval_ms: Duration::from_millis(args.heartbeat_interval_ms),
         global_working_limit: args.global_working_limit,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx,
-        default_retry_limit: args.default_retry_limit,
-        default_backoff: BackoffConfig {
-            exponent: args.default_backoff_exponent,
-            base_ms: args.default_backoff_base_ms,
-            jitter_ms: args.default_backoff_jitter_ms,
-        },
         clock: Arc::new(crate::time::now_millis),
     });
 
@@ -118,6 +129,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         crate::time::now_millis,
         scheduler_batch_size,
         scheduler_shutdown,
+    ));
+
+    // Start the background reaper that purges expired completed/dead jobs.
+    let reaper_shutdown = state.shutdown.clone();
+    tokio::spawn(crate::reaper::run(
+        state.store.clone(),
+        crate::time::now_millis,
+        crate::reaper::DEFAULT_BATCH_SIZE,
+        Duration::from_millis(args.reaper_check_interval),
+        reaper_shutdown,
     ));
 
     // Set up the TCP socket for incoming connections.

@@ -4,13 +4,14 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! six keyspaces plus two in-memory indexes:
+//! seven keyspaces plus two in-memory indexes:
 //!
 //! - `jobs`: source of truth, keyed by job ID, stores job metadata (no payload).
 //! - `payloads`: immutable job payloads, keyed by job ID.
 //! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
 //! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
 //! - `jobs_by_type`: type membership index, keyed by `{job_type}\0{job_id}`.
+//! - `jobs_by_purge_at`: expiry index for the reaper, keyed by `{purge_at_be_u64}\0{job_id}`.
 //! - `errors`: error records per failure, keyed by `{job_id}\0{attempt_be_u32}`.
 //! - In-memory `ReadyIndex`: lock-free crossbeam skip-list priority index of
 //!   ready jobs, rebuilt from the `jobs` keyspace on startup.
@@ -217,6 +218,46 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<u64>,
+
+    /// Per-job retention configuration override. When `None`, server
+    /// defaults are used at completion/death time.
+    #[serde(rename = "e")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionConfig>,
+
+    /// When the reaper should hard-delete this job (milliseconds since
+    /// Unix epoch). Set when a job transitions to Completed or Dead.
+    #[serde(rename = "p")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purge_at: Option<u64>,
+
+    /// When the job was completed (milliseconds since Unix epoch).
+    #[serde(rename = "c")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+}
+
+/// Retention configuration for completed and dead jobs.
+///
+/// Controls how long completed and dead jobs remain visible in the API
+/// before the reaper purges them. When `None` on a job, server defaults
+/// apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Retention period for completed jobs (milliseconds). When `None`, server default applies.
+    #[serde(rename = "c")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_ms: Option<u64>,
+
+    /// Retention period for dead jobs (milliseconds). When `None`, server default applies.
+    #[serde(rename = "d")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_ms: Option<u64>,
 }
 
 /// Backoff curve parameters for retry delay calculation.
@@ -325,6 +366,10 @@ pub struct ListJobsOptions {
     /// Optional type filter. When non-empty, only jobs with one of these
     /// types are returned, using the type index.
     pub types: HashSet<String>,
+
+    /// Current time for filtering out expired jobs (purge_at <= now).
+    /// When `Some`, jobs past their purge_at are skipped.
+    pub now: Option<u64>,
 }
 
 impl ListJobsOptions {
@@ -337,6 +382,7 @@ impl ListJobsOptions {
             statuses: HashSet::new(),
             queues: HashSet::new(),
             types: HashSet::new(),
+            now: None,
         }
     }
 
@@ -379,6 +425,12 @@ impl ListJobsOptions {
     /// An empty set means "all types".
     pub fn types(mut self, types: HashSet<String>) -> Self {
         self.types = types;
+        self
+    }
+
+    /// Set the current time for filtering expired jobs and return `self`.
+    pub fn now(mut self, now: u64) -> Self {
+        self.now = Some(now);
         self
     }
 }
@@ -481,6 +533,10 @@ pub struct EnqueueOptions {
     /// Per-job backoff configuration override. When `None`, server defaults
     /// apply at failure time.
     pub backoff: Option<BackoffConfig>,
+
+    /// Per-job retention configuration override. When `None`, server
+    /// defaults are used at completion/death time.
+    pub retention: Option<RetentionConfig>,
 }
 
 impl EnqueueOptions {
@@ -499,6 +555,7 @@ impl EnqueueOptions {
             ready_at: None,
             retry_limit: None,
             backoff: None,
+            retention: None,
         }
     }
 
@@ -525,6 +582,12 @@ impl EnqueueOptions {
         self.backoff = Some(backoff);
         self
     }
+
+    /// Set the retention configuration and return `self`.
+    pub fn retention(mut self, retention: RetentionConfig) -> Self {
+        self.retention = Some(retention);
+        self
+    }
 }
 
 /// Options for recording a job failure.
@@ -546,12 +609,6 @@ pub struct FailureOptions {
     /// A false value does not mean "prevent default killing". If the job
     /// should be retried, pass a future dated retry_at value.
     pub kill: bool,
-
-    /// Server default retry limit (used when job has no override).
-    pub default_retry_limit: u32,
-
-    /// Server default backoff config (used when job has no override).
-    pub default_backoff: BackoffConfig,
 }
 
 /// Events broadcast by the store when job state changes.
@@ -855,6 +912,25 @@ pub struct Store {
     /// or killed (dead).
     errors: SingleWriterTxKeyspace,
 
+    /// Purge-at index for deferred deletion by the reaper.
+    ///
+    /// Keyed by `{purge_at_be_u64}\0{job_id}` with empty values. The
+    /// reaper scans this index to find jobs whose retention period has
+    /// expired and need hard-deletion.
+    jobs_by_purge_at: SingleWriterTxKeyspace,
+
+    /// Default retention period for completed jobs (milliseconds).
+    default_completed_retention_ms: u64,
+
+    /// Default retention period for dead jobs (milliseconds).
+    default_dead_retention_ms: u64,
+
+    /// Default maximum retries before a failed job is killed.
+    default_retry_limit: u32,
+
+    /// Default backoff config applied to jobs that don't specify one.
+    default_backoff: BackoffConfig,
+
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
@@ -1072,11 +1148,18 @@ fn intersect_streams<'a>(
 /// Look up full job records from an iterator of raw IDs, returning an error
 /// if any ID is missing from the `jobs` keyspace (data corruption). Hydrates
 /// each job's payload from the separate `payloads` keyspace.
+///
+/// When `now` is `Some`, jobs with `purge_at <= now` are skipped (logically
+/// invisible before the reaper physically deletes them). The iterator
+/// continues scanning past expired jobs until `limit` entries are collected
+/// or the stream is exhausted.
 fn load_jobs_by_ids(
     jobs_ks: &SingleWriterTxKeyspace,
     payloads_ks: &SingleWriterTxKeyspace,
     ids: impl Iterator<Item = Result<Vec<u8>, StoreError>>,
     source: &str,
+    now: Option<u64>,
+    limit: usize,
 ) -> Result<Vec<Job>, StoreError> {
     let mut rows = Vec::new();
     for id in ids {
@@ -1089,12 +1172,22 @@ fn load_jobs_by_ids(
         })?;
         let mut job: Job = rmp_serde::from_slice(&bytes)?;
 
+        // Skip expired jobs (logically invisible).
+        if let Some(now) = now {
+            if job.purge_at.is_some_and(|p| p <= now) {
+                continue;
+            }
+        }
+
         // Hydrate the payload from the payloads keyspace.
         if let Some(payload_bytes) = payloads_ks.get(&id)? {
             job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
         }
 
         rows.push(job);
+        if rows.len() >= limit {
+            break;
+        }
     }
     Ok(rows)
 }
@@ -1106,7 +1199,7 @@ fn load_jobs_by_ids(
 /// The fjall defaults (64 MiB tables, 512 MiB journal) are tuned for
 /// larger, read-heavy workloads. These defaults are sized down for
 /// faster tombstone reclamation and tighter disk usage.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// Target size for SST files in data keyspaces (jobs, payloads, errors).
     /// The memtable is sized to match so flushes produce appropriately-sized
@@ -1127,7 +1220,39 @@ pub struct StorageConfig {
     /// mean more frequent compaction (less L0 buildup, faster reads after
     /// recovery) but more write amplification during steady state.
     pub l0_threshold: u8,
+
+    /// Default retention period for completed jobs (milliseconds).
+    /// 0 means completed jobs are logically invisible immediately.
+    pub default_completed_retention_ms: u64,
+
+    /// Default retention period for dead jobs (milliseconds).
+    pub default_dead_retention_ms: u64,
+
+    /// Default maximum retries before a failed job is killed.
+    pub default_retry_limit: u32,
+
+    /// Default backoff config applied to jobs that don't specify one.
+    pub default_backoff: BackoffConfig,
 }
+
+/// Default maximum retries before a failed job is killed.
+pub const DEFAULT_RETRY_LIMIT: u32 = 25;
+
+/// Default backoff exponent (power curve steepness).
+pub const DEFAULT_BACKOFF_EXPONENT: f32 = 4.0;
+
+/// Default backoff base delay in milliseconds.
+pub const DEFAULT_BACKOFF_BASE_MS: f32 = 15_000.0;
+
+/// Default backoff jitter in milliseconds (max random ms per attempt multiplier).
+pub const DEFAULT_BACKOFF_JITTER_MS: f32 = 30_000.0;
+
+/// Default retention period for completed jobs (milliseconds).
+/// 0 means completed jobs are logically invisible immediately.
+pub const DEFAULT_COMPLETED_RETENTION_MS: u64 = 0;
+
+/// Default retention period for dead jobs (milliseconds). 7 days.
+pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -1136,6 +1261,14 @@ impl Default for StorageConfig {
             index_table_size: 8 * 1024 * 1024, // 8 MiB
             journal_size: 64 * 1024 * 1024,    // 64 MiB (minimum)
             l0_threshold: 4,
+            default_completed_retention_ms: DEFAULT_COMPLETED_RETENTION_MS,
+            default_dead_retention_ms: DEFAULT_DEAD_RETENTION_MS,
+            default_retry_limit: DEFAULT_RETRY_LIMIT,
+            default_backoff: BackoffConfig {
+                exponent: DEFAULT_BACKOFF_EXPONENT,
+                base_ms: DEFAULT_BACKOFF_BASE_MS,
+                jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
+            },
         }
     }
 }
@@ -1160,6 +1293,10 @@ impl StorageConfig {
                 .unwrap_or(defaults.index_table_size),
             journal_size: env_parse("ZANXIO_JOURNAL_SIZE")?.unwrap_or(defaults.journal_size),
             l0_threshold: env_parse("ZANXIO_L0_THRESHOLD")?.unwrap_or(defaults.l0_threshold),
+            default_completed_retention_ms: defaults.default_completed_retention_ms,
+            default_dead_retention_ms: defaults.default_dead_retention_ms,
+            default_retry_limit: defaults.default_retry_limit,
+            default_backoff: defaults.default_backoff,
         })
     }
 }
@@ -1198,7 +1335,8 @@ impl Store {
     /// Open or create a store at the given path.
     ///
     /// The path refers to the directory in which fjall stores its keyspace
-    /// data.
+    /// data. `default_completed_retention_ms` and `default_dead_retention_ms`
+    /// control how long completed/dead jobs remain visible before purging.
     pub fn open(
         path: impl AsRef<std::path::Path>,
         config: StorageConfig,
@@ -1241,6 +1379,7 @@ impl Store {
         let jobs_by_queue = db.keyspace("jobs_by_queue", &index_opts)?;
         let jobs_by_type = db.keyspace("jobs_by_type", &index_opts)?;
         let errors = db.keyspace("errors", &data_opts)?;
+        let jobs_by_purge_at = db.keyspace("jobs_by_purge_at", &index_opts)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -1254,6 +1393,11 @@ impl Store {
             jobs_by_queue,
             jobs_by_type,
             errors,
+            jobs_by_purge_at,
+            default_completed_retention_ms: config.default_completed_retention_ms,
+            default_dead_retention_ms: config.default_dead_retention_ms,
+            default_retry_limit: config.default_retry_limit,
+            default_backoff: config.default_backoff,
             event_tx,
         })
     }
@@ -1311,6 +1455,9 @@ impl Store {
                 backoff: opts.backoff,
                 dequeued_at: None,
                 failed_at: None,
+                retention: opts.retention,
+                purge_at: None,
+                completed_at: None,
             };
 
             // Serialize metadata without the payload for the jobs keyspace.
@@ -1488,54 +1635,54 @@ impl Store {
 
     /// Mark a job as successfully completed.
     ///
-    /// Removes the job from the `jobs` keyspace and removes associated index
-    /// entries. Returns `true` if the job was found in the working state,
-    /// `false` if it was not (e.g. already acked or never existed).
+    /// Transitions the job to Completed status and sets `purge_at` so the
+    /// reaper will hard-delete it after the retention period. Returns `true`
+    /// if the job was found in the working state, `false` if it was not.
     ///
     /// Subscribers are notified on success.
-    pub async fn mark_completed(&self, id: &str) -> Result<bool, StoreError> {
+    pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
         let db = self.db.clone();
         let jobs = self.jobs.clone();
-        let payloads = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_type = self.jobs_by_type.clone();
-        let errors = self.errors.clone();
+        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
+        let default_completed_retention_ms = self.default_completed_retention_ms;
         let id = id.to_string();
         let id_for_event = id.clone();
 
         let completed = task::spawn_blocking(move || {
-            // Acquire the write lock before checking, so no other writer
-            // can remove the job between our check and the remove.
             let mut tx = db.write_tx();
 
             let job_bytes = match jobs.get(&id)? {
                 Some(bytes) => bytes,
-                None => return Ok(false), // No such job. Already completed?
+                None => return Ok(false),
             };
 
-            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-            // Can't mark a job as completed if it's not currently working.
             if job.status != JobStatus::Working as u8 {
                 return Ok(false);
             }
 
-            // Clean up all indexes.
-            let status_key = make_status_key(JobStatus::Working, &id);
-            let queue_key = make_queue_key(&job.queue, &id);
-            let type_key = make_type_key(&job.job_type, &id);
+            let retention_ms = job
+                .retention
+                .as_ref()
+                .and_then(|r| r.completed_ms)
+                .unwrap_or(default_completed_retention_ms);
+            let purge_at = now + retention_ms;
 
-            tx.remove(&jobs, &id);
-            tx.remove_weak(&payloads, &id);
-            tx.remove(&jobs_by_status, &status_key);
-            tx.remove_weak(&jobs_by_queue, &queue_key);
-            tx.remove_weak(&jobs_by_type, &type_key);
+            let old_status_key = make_status_key(JobStatus::Working, &id);
+            let new_status_key = make_status_key(JobStatus::Completed, &id);
+            let purge_key = make_purge_key(purge_at, &id);
 
-            // Clean up any error records from previous failures.
-            for key in error_keys(&errors, &id) {
-                tx.remove_weak(&errors, &key);
-            }
+            job.status = JobStatus::Completed.into();
+            job.purge_at = Some(purge_at);
+            job.completed_at = Some(now);
+            let meta_bytes = rmp_serde::to_vec_named(&job)?;
+
+            tx.insert(&jobs, &id, &meta_bytes);
+            tx.remove(&jobs_by_status, &old_status_key);
+            tx.insert(&jobs_by_status, &new_status_key, b"");
+            tx.insert(&jobs_by_purge_at, &purge_key, b"");
 
             tx.commit()?;
 
@@ -1544,7 +1691,6 @@ impl Store {
         .await?;
 
         if let Ok(true) = &completed {
-            // Best-effort: if no subscribers, the send error is harmless.
             let _ = self.event_tx.send(StoreEvent::JobCompleted(id_for_event));
         }
 
@@ -1559,8 +1705,8 @@ impl Store {
     /// in the retry scenario or `Dead` if the retry limit has been reached.
     /// Returns `None` if the job wasn't found or wasn't in the Working state.
     ///
-    /// For dead jobs, the job record and all associated data (payload,
-    /// indexes, error records) are deleted from the store.
+    /// Dead jobs are transitioned to Dead status with a `purge_at` timestamp
+    /// so the reaper can hard-delete them after the retention period.
     pub async fn record_failure(
         &self,
         now: u64,
@@ -1570,12 +1716,13 @@ impl Store {
         let db = self.db.clone();
 
         let jobs = self.jobs.clone();
-        let payloads = self.payloads.clone();
         let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_type = self.jobs_by_type.clone();
+        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
         let scheduled_index = self.scheduled_index.clone();
         let errors = self.errors.clone();
+        let default_dead_retention_ms = self.default_dead_retention_ms;
+        let default_retry_limit = self.default_retry_limit;
+        let default_backoff = self.default_backoff.clone();
 
         let id = id.to_string();
         let id_for_event = id.clone();
@@ -1617,24 +1764,17 @@ impl Store {
             // we always check those first and then apply the appropriate
             // backoff policy.
 
-            let retry_limit = job.retry_limit.unwrap_or(opts.default_retry_limit);
+            let retry_limit = job.retry_limit.unwrap_or(default_retry_limit);
 
             if opts.kill {
-                // If the client requested to force kill this job, mark it dead.
                 job.status = JobStatus::Dead.into();
             } else if let Some(retry_at) = opts.retry_at {
-                // If the client requested to reschedule this job, mark it
-                // scheduled and set the new ready_at.
                 job.status = JobStatus::Scheduled.into();
                 job.ready_at = retry_at;
             } else if job.attempts > retry_limit {
-                // Client didn't specify what to do and retries have exhausted.
                 job.status = JobStatus::Dead.into();
             } else {
-                // Client didn't specify what to do and we are able to retry.
-
-                // Calculate backoff delay.
-                let backoff = job.backoff.as_ref().unwrap_or(&opts.default_backoff);
+                let backoff = job.backoff.as_ref().unwrap_or(&default_backoff);
                 let delay_ms = compute_backoff(job.attempts, backoff);
                 job.status = JobStatus::Scheduled.into();
                 job.ready_at = now + delay_ms;
@@ -1655,26 +1795,24 @@ impl Store {
                 // Insert into the in-memory scheduled index after commit succeeds.
                 scheduled_index.insert(job.ready_at, id.clone());
             } else {
-                // Delete the job and all associated data.
-                let queue_key = make_queue_key(&job.queue, &id);
-                let type_key = make_type_key(&job.job_type, &id);
+                // Dead: transition to Dead status with purge_at for deferred deletion.
+                let retention_ms = job
+                    .retention
+                    .as_ref()
+                    .and_then(|r| r.dead_ms)
+                    .unwrap_or(default_dead_retention_ms);
+                let purge_at = now + retention_ms;
 
-                tx.remove(&jobs, &id);
-                tx.remove_weak(&payloads, &id);
+                let new_status_key = make_status_key(JobStatus::Dead, &id);
+                let purge_key = make_purge_key(purge_at, &id);
+
+                job.purge_at = Some(purge_at);
+                let meta_bytes = rmp_serde::to_vec_named(&job)?;
+
+                tx.insert(&jobs, &id, &meta_bytes);
                 tx.remove(&jobs_by_status, &old_status_key);
-                tx.remove_weak(&jobs_by_queue, &queue_key);
-                tx.remove_weak(&jobs_by_type, &type_key);
-
-                // Clean up all previously committed error records.
-                for key in error_keys(&errors, &id) {
-                    tx.remove_weak(&errors, &key);
-                }
-
-                // Also remove the error record we just inserted above.
-                // The prefix scan reads committed state, so it won't
-                // see the in-flight insert — we must remove it explicitly.
-                tx.remove_weak(&errors, &error_key);
-
+                tx.insert(&jobs_by_status, &new_status_key, b"");
+                tx.insert(&jobs_by_purge_at, &purge_key, b"");
                 tx.commit()?;
             }
 
@@ -1709,8 +1847,10 @@ impl Store {
 
     /// Look up a job by ID.
     ///
-    /// Returns `None` if the job does not exist (or has been completed).
-    pub async fn get_job(&self, id: &str) -> Result<Option<Job>, StoreError> {
+    /// Returns `None` if the job does not exist, or if its `purge_at`
+    /// timestamp has passed (logically invisible before the reaper
+    /// physically deletes it).
+    pub async fn get_job(&self, now: u64, id: &str) -> Result<Option<Job>, StoreError> {
         let jobs = self.jobs.clone();
         let payloads = self.payloads.clone();
         let id = id.to_string();
@@ -1720,6 +1860,11 @@ impl Store {
                 return Ok(None);
             };
             let mut job: Job = rmp_serde::from_slice(&bytes)?;
+
+            // Filter out expired jobs (logically invisible).
+            if job.purge_at.is_some_and(|p| p <= now) {
+                return Ok(None);
+            }
 
             // Hydrate the payload from the payloads keyspace.
             if let Some(payload_bytes) = payloads.get(&id)? {
@@ -2004,8 +2149,14 @@ impl Store {
                 let first = iter.next().unwrap();
                 let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
 
-                rows =
-                    load_jobs_by_ids(&jobs_ks, &payloads_ks, combined.take(fetch), &source_desc)?;
+                rows = load_jobs_by_ids(
+                    &jobs_ks,
+                    &payloads_ks,
+                    combined,
+                    &source_desc,
+                    opts.now,
+                    fetch,
+                )?;
             } else {
                 // No filter — scan the jobs keyspace directly.
                 match opts.direction {
@@ -2018,13 +2169,21 @@ impl Store {
                             None => snapshot.range::<&str, _>(&jobs_ks, ..),
                         };
 
-                        for entry in range.take(fetch) {
+                        for entry in range {
                             let (key, value) = entry.into_inner()?;
                             let mut job: Job = rmp_serde::from_slice(&value)?;
+                            if let Some(now) = opts.now {
+                                if job.purge_at.is_some_and(|p| p <= now) {
+                                    continue;
+                                }
+                            }
                             if let Some(payload_bytes) = payloads_ks.get(&*key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
+                            if rows.len() >= fetch {
+                                break;
+                            }
                         }
                     }
                     ScanDirection::Desc => {
@@ -2036,13 +2195,21 @@ impl Store {
                             None => snapshot.range::<&str, _>(&jobs_ks, ..),
                         };
 
-                        for entry in range.rev().take(fetch) {
+                        for entry in range.rev() {
                             let (key, value) = entry.into_inner()?;
                             let mut job: Job = rmp_serde::from_slice(&value)?;
+                            if let Some(now) = opts.now {
+                                if job.purge_at.is_some_and(|p| p <= now) {
+                                    continue;
+                                }
+                            }
                             if let Some(payload_bytes) = payloads_ks.get(&*key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
+                            if rows.len() >= fetch {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2057,13 +2224,17 @@ impl Store {
 
             // Build next/prev options, preserving all filters.
             let make_opts = |cursor: &str, direction: ScanDirection| {
-                ListJobsOptions::new()
+                let mut o = ListJobsOptions::new()
                     .from(cursor.to_string())
                     .direction(direction)
                     .limit(opts.limit)
                     .statuses(opts.statuses.clone())
                     .queues(opts.queues.clone())
-                    .types(opts.types.clone())
+                    .types(opts.types.clone());
+                if let Some(now) = opts.now {
+                    o = o.now(now);
+                }
+                o
             };
 
             // Next page: exists if over-select found an extra row.
@@ -2504,6 +2675,106 @@ impl Store {
         })
         .await?
     }
+
+    /// Fetch a batch of jobs whose purge_at has passed.
+    ///
+    /// Returns `(batch_of_job_ids, has_more)`. The reaper calls this
+    /// repeatedly to drain expired jobs.
+    pub async fn next_expired(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool), StoreError> {
+        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
+
+        task::spawn_blocking(move || -> Result<(Vec<String>, bool), StoreError> {
+            // Scan from the start of the index up to `now` (inclusive).
+            // Key layout: {purge_at_be_u64}\0{job_id}
+            let end_key = make_purge_key(now + 1, "");
+            let range = (Bound::<Vec<u8>>::Unbounded, Bound::Excluded(end_key));
+
+            let mut ids = Vec::new();
+            for entry in jobs_by_purge_at.inner().range::<Vec<u8>, _>(range) {
+                let (key, _) = entry.into_inner()?;
+                // Extract job_id: skip 8 bytes (purge_at) + 1 byte (null separator).
+                let job_id = String::from_utf8(key[9..].to_vec()).map_err(|e| {
+                    StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
+                })?;
+                ids.push(job_id);
+                if ids.len() > limit {
+                    break;
+                }
+            }
+
+            let has_more = ids.len() > limit;
+            if has_more {
+                ids.truncate(limit);
+            }
+            Ok((ids, has_more))
+        })
+        .await?
+    }
+
+    /// Hard-delete a job and all associated data.
+    ///
+    /// Called by the reaper for each expired job. Returns `true` if the
+    /// job was found and deleted, `false` if already purged.
+    pub async fn purge_job(&self, id: &str) -> Result<bool, StoreError> {
+        let db = self.db.clone();
+        let jobs = self.jobs.clone();
+        let payloads = self.payloads.clone();
+        let jobs_by_status = self.jobs_by_status.clone();
+        let jobs_by_queue = self.jobs_by_queue.clone();
+        let jobs_by_type = self.jobs_by_type.clone();
+        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
+        let errors = self.errors.clone();
+        let ready_index = self.ready_index.clone();
+        let id = id.to_string();
+
+        task::spawn_blocking(move || -> Result<bool, StoreError> {
+            let mut tx = db.write_tx();
+
+            let job_bytes = match jobs.get(&id)? {
+                Some(bytes) => bytes,
+                None => return Ok(false), // Already purged.
+            };
+
+            let job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let status = JobStatus::try_from(job.status).map_err(|v| {
+                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+            })?;
+
+            // Remove from all indexes.
+            let status_key = make_status_key(status, &id);
+            let queue_key = make_queue_key(&job.queue, &id);
+            let type_key = make_type_key(&job.job_type, &id);
+
+            tx.remove(&jobs, &id);
+            tx.remove_weak(&payloads, &id);
+            tx.remove(&jobs_by_status, &status_key);
+            tx.remove_weak(&jobs_by_queue, &queue_key);
+            tx.remove_weak(&jobs_by_type, &type_key);
+
+            // Remove from purge_at index.
+            if let Some(purge_at) = job.purge_at {
+                let purge_key = make_purge_key(purge_at, &id);
+                tx.remove(&jobs_by_purge_at, &purge_key);
+            }
+
+            // Clean up all error records.
+            for key in error_keys(&errors, &id) {
+                tx.remove_weak(&errors, &key);
+            }
+
+            tx.commit()?;
+
+            // Defensive: remove from ready_index in case of inconsistency.
+            ready_index.global.remove(&(job.priority, id));
+
+            Ok(true)
+        })
+        .await?
+    }
 }
 
 /// Build a status index key: `{status_byte}\0{job_id}`.
@@ -2528,6 +2799,18 @@ fn make_queue_key(queue_name: &str, job_id: &str) -> Vec<u8> {
 fn make_type_key(job_type: &str, job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(job_type.len() + 1 + job_id.len());
     key.extend_from_slice(job_type.as_bytes());
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
+/// Build a purge-at index key: `{purge_at_be_u64}\0{job_id}`.
+///
+/// Big-endian encoding gives chronological ordering so the reaper can
+/// range-scan from the start to find expired entries.
+fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + 1 + job_id.len());
+    key.extend_from_slice(&purge_at.to_be_bytes());
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
@@ -2796,7 +3079,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store.mark_completed(&job.id).await.unwrap());
+        assert!(store.mark_completed(now_millis(), &job.id).await.unwrap());
 
         // Job should no longer be dequeue-able even if re-enqueue were attempted
         // via crash recovery — it's gone from the jobs keyspace entirely.
@@ -2812,7 +3095,12 @@ mod tests {
     #[tokio::test]
     async fn mark_completed_returns_false_for_unknown_id() {
         let store = test_store();
-        assert!(!store.mark_completed("nonexistent").await.unwrap());
+        assert!(
+            !store
+                .mark_completed(now_millis(), "nonexistent")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2831,8 +3119,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store.mark_completed(&job.id).await.unwrap());
-        assert!(!store.mark_completed(&job.id).await.unwrap());
+        assert!(store.mark_completed(now_millis(), &job.id).await.unwrap());
+        assert!(!store.mark_completed(now_millis(), &job.id).await.unwrap());
     }
 
     #[tokio::test]
@@ -2909,7 +3197,7 @@ mod tests {
                     taken.push(job.id.clone());
                     // Also verify the ack works (job is in Working status).
                     assert!(
-                        store.mark_completed(&job.id).await.unwrap(),
+                        store.mark_completed(now_millis(), &job.id).await.unwrap(),
                         "mark_completed returned false for job {}",
                         job.id,
                     );
@@ -3153,7 +3441,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let stored = store.get_job(&taken.id).await.unwrap().unwrap();
+        let stored = store
+            .get_job(now_millis(), &taken.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.dequeued_at, taken.dequeued_at);
     }
 
@@ -3237,7 +3529,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(store.mark_completed(&taken.id).await.unwrap());
+        assert!(store.mark_completed(now_millis(), &taken.id).await.unwrap());
 
         assert!(!store.requeue(&taken.id).await.unwrap());
 
@@ -3287,7 +3579,7 @@ mod tests {
             .unwrap();
 
         let mut rx = store.subscribe();
-        store.mark_completed(&taken.id).await.unwrap();
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         match rx.recv().await.unwrap() {
             StoreEvent::JobCompleted(id) => assert_eq!(id, job.id),
@@ -3331,7 +3623,11 @@ mod tests {
             .await
             .unwrap();
 
-        let job = store.get_job(&enqueued.id).await.unwrap().unwrap();
+        let job = store
+            .get_job(now_millis(), &enqueued.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.id, enqueued.id);
         assert_eq!(job.queue, "default");
         assert_eq!(job.status, u8::from(JobStatus::Ready));
@@ -3341,7 +3637,13 @@ mod tests {
     #[tokio::test]
     async fn get_job_returns_none_for_unknown_id() {
         let store = test_store();
-        assert!(store.get_job("nonexistent").await.unwrap().is_none());
+        assert!(
+            store
+                .get_job(now_millis(), "nonexistent")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3358,9 +3660,18 @@ mod tests {
             .take_next_job(now_millis(), &HashSet::new())
             .await
             .unwrap();
-        store.mark_completed(&enqueued.id).await.unwrap();
+        store
+            .mark_completed(now_millis(), &enqueued.id)
+            .await
+            .unwrap();
 
-        assert!(store.get_job(&enqueued.id).await.unwrap().is_none());
+        assert!(
+            store
+                .get_job(now_millis(), &enqueued.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3615,9 +3926,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        store.mark_completed(&taken.id).await.unwrap();
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
-        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now_millis()))
+            .await
+            .unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, b.id);
     }
@@ -4001,7 +4315,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
 
-        store.mark_completed(&taken.id).await.unwrap();
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
@@ -4227,10 +4541,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        store.mark_completed(&taken.id).await.unwrap();
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().queues(HashSet::from(["emails".into()])))
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(HashSet::from(["emails".into()]))
+                    .now(now_millis()),
+            )
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -4638,7 +4956,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        store.mark_completed(&taken.id).await.unwrap();
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         let page = store
             .list_jobs(
@@ -4826,10 +5144,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        store.mark_completed(&taken.id).await.unwrap();
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().types(HashSet::from(["send_email".into()])))
+            .list_jobs(
+                ListJobsOptions::new()
+                    .types(HashSet::from(["send_email".into()]))
+                    .now(now_millis()),
+            )
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -5564,14 +5886,17 @@ mod tests {
         assert_eq!(taken.id, ready.id);
 
         // The scheduled job is still in the scheduled index.
-        let fetched = store.get_job(&scheduled.id).await.unwrap().unwrap();
+        let fetched = store
+            .get_job(now_millis(), &scheduled.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.status, JobStatus::Scheduled as u8);
     }
 
     // --- record_failure tests ---
 
     /// Build a FailureOptions with sensible defaults for testing.
-    /// retry_limit=3, zero-jitter backoff so delays are deterministic.
     fn test_failure_opts() -> FailureOptions {
         FailureOptions {
             error: "something broke".into(),
@@ -5579,13 +5904,22 @@ mod tests {
             backtrace: None,
             retry_at: None,
             kill: false,
-            default_retry_limit: 3,
-            default_backoff: BackoffConfig {
-                exponent: 2.0,
-                base_ms: 100.0,
-                jitter_ms: 0.0, // deterministic
-            },
         }
+    }
+
+    /// Create a test store with a specific retry limit and zero-jitter backoff.
+    fn test_store_with_retry_limit(retry_limit: u32) -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageConfig::default();
+        config.default_retry_limit = retry_limit;
+        config.default_backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100.0,
+            jitter_ms: 0.0, // deterministic
+        };
+        let store = Store::open(dir.path().join("data"), config).unwrap();
+        std::mem::forget(dir);
+        store
     }
 
     /// Enqueue a job and take it so it's in the Working state.
@@ -5618,18 +5952,17 @@ mod tests {
         assert_eq!(result.status, JobStatus::Scheduled as u8);
         assert_eq!(result.attempts, 1);
         assert!(result.failed_at.is_some());
-        // ready_at should be in the future (base_ms=100, exponent=2, 1^2+100=101).
+        // ready_at should be in the future (backoff from the store's default config).
         assert!(result.ready_at > 0);
     }
 
     #[tokio::test]
     async fn record_failure_kills_when_retries_exhausted() {
-        let store = test_store();
+        // retry_limit=0 means the first failure kills.
+        let store = test_store_with_retry_limit(0);
         let job = enqueue_and_take(&store).await;
 
-        // retry_limit=0 means the first failure kills.
-        let mut opts = test_failure_opts();
-        opts.default_retry_limit = 0;
+        let opts = test_failure_opts();
 
         let result = store
             .record_failure(now_millis(), &job.id, opts)
@@ -5640,8 +5973,9 @@ mod tests {
         assert_eq!(result.status, JobStatus::Dead as u8);
         assert_eq!(result.attempts, 1);
 
-        // Job should be gone from the store.
-        assert!(store.get_job(&job.id).await.unwrap().is_none());
+        // Dead job is still visible during its retention period.
+        let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, JobStatus::Dead as u8);
     }
 
     #[tokio::test]
@@ -5659,17 +5993,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, JobStatus::Dead as u8);
-        assert!(store.get_job(&job.id).await.unwrap().is_none());
+
+        // Dead job is still visible during its retention period.
+        let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, JobStatus::Dead as u8);
     }
 
     #[tokio::test]
     async fn record_failure_kill_overrides_remaining_retries() {
-        let store = test_store();
+        // retry_limit=100, but kill=true should still kill.
+        let store = test_store_with_retry_limit(100);
         let job = enqueue_and_take(&store).await;
 
-        // retry_limit=100, but kill=true should still kill.
         let mut opts = test_failure_opts();
-        opts.default_retry_limit = 100;
         opts.kill = true;
 
         let result = store
@@ -5701,12 +6037,11 @@ mod tests {
 
     #[tokio::test]
     async fn record_failure_retry_at_overrides_exhausted_limit() {
-        let store = test_store();
+        // retry_limit=0, but retry_at should force a retry anyway.
+        let store = test_store_with_retry_limit(0);
         let job = enqueue_and_take(&store).await;
 
-        // retry_limit=0, but retry_at should force a retry anyway.
         let mut opts = test_failure_opts();
-        opts.default_retry_limit = 0;
         opts.retry_at = Some(123_456);
 
         let result = store
@@ -5769,7 +6104,7 @@ mod tests {
             .unwrap();
 
         // The job is now Scheduled. Promote it and take it again.
-        let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
+        let scheduled = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
         let retaken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5815,12 +6150,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_failure_dead_cleans_up_error_records() {
+    async fn record_failure_dead_retains_error_records_for_reaper() {
         let store = test_store();
         let job = enqueue_and_take(&store).await;
 
-        // Kill immediately — the error record written during this call
-        // should also be cleaned up since dead jobs are fully removed.
+        // Kill immediately — error records are now retained until the
+        // reaper purges the job.
         let mut opts = test_failure_opts();
         opts.kill = true;
 
@@ -5830,13 +6165,18 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // No error records should remain.
+        // Error records should still exist (cleanup deferred to reaper).
+        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        assert!(!keys.is_empty());
+
+        // purge_job should clean them up.
+        store.purge_job(&job.id).await.unwrap();
         let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
         assert!(keys.is_empty());
     }
 
     #[tokio::test]
-    async fn record_failure_dead_removes_payload() {
+    async fn record_failure_dead_retains_payload_for_reaper() {
         let store = test_store();
         let job = enqueue_and_take(&store).await;
 
@@ -5852,7 +6192,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Payload should be gone.
+        // Payload should still exist (cleanup deferred to reaper).
+        assert!(store.payloads.inner().get(&job.id).unwrap().is_some());
+
+        // purge_job should clean it up.
+        store.purge_job(&job.id).await.unwrap();
         assert!(store.payloads.inner().get(&job.id).unwrap().is_none());
     }
 
@@ -5951,7 +6295,7 @@ mod tests {
         assert_eq!(result.status, JobStatus::Scheduled as u8);
 
         // Promote and take again.
-        let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
+        let scheduled = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
         let retaken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5969,7 +6313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_completed_cleans_up_error_records() {
+    async fn mark_completed_retains_error_records_for_reaper() {
         let store = test_store();
         let job = enqueue_and_take(&store).await;
 
@@ -5979,16 +6323,24 @@ mod tests {
             .await
             .unwrap();
 
-        let scheduled = store.get_job(&job.id).await.unwrap().unwrap();
+        let scheduled = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
         let retaken = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
             .unwrap()
             .unwrap();
-        store.mark_completed(&retaken.id).await.unwrap();
+        store
+            .mark_completed(now_millis(), &retaken.id)
+            .await
+            .unwrap();
 
-        // Error records from the earlier failure should be gone.
+        // Error records are now retained until the reaper purges the job.
+        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        assert!(!keys.is_empty());
+
+        // purge_job should clean them up.
+        store.purge_job(&job.id).await.unwrap();
         let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
         assert!(keys.is_empty());
     }
@@ -6065,7 +6417,7 @@ mod tests {
             .unwrap();
 
         // Promote from Scheduled -> Ready and take again.
-        let scheduled = store.get_job(job_id).await.unwrap().unwrap();
+        let scheduled = store.get_job(now_millis(), job_id).await.unwrap().unwrap();
         store.promote_scheduled(&scheduled).await.unwrap();
         store
             .take_next_job(now_millis(), &HashSet::new())

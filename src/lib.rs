@@ -8,6 +8,7 @@
 
 pub mod http;
 pub mod logging;
+pub mod reaper;
 pub mod scheduler;
 pub mod serve;
 pub mod store;

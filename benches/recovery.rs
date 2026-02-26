@@ -140,7 +140,7 @@ async fn drain_jobs(store: &Store, queues: &HashSet<String>, n: usize) {
         let taken = store.take_next_job(now, queues).await.unwrap();
         assert!(taken.is_some(), "expected a job to be available");
         let job = taken.unwrap();
-        store.mark_completed(&job.id).await.unwrap();
+        store.mark_completed(now, &job.id).await.unwrap();
     }
 }
 
@@ -178,7 +178,7 @@ fn main() {
     // half its jobs in ready state and builds up L0 file history across
     // restarts. The backlog grows with each cycle.
     for cycle in 0..cycles {
-        let store = Store::open(&path, config).unwrap();
+        let store = Store::open(&path, config.clone()).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         println!(
@@ -229,7 +229,7 @@ fn main() {
             take_times.push(t.elapsed());
 
             let t = Instant::now();
-            store.mark_completed(&job.id).await.unwrap();
+            store.mark_completed(now, &job.id).await.unwrap();
             complete_times.push(t.elapsed());
         }
     });
