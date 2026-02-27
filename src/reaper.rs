@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::store::Store;
 
 /// Default number of expired jobs to fetch per iteration.
-pub const DEFAULT_BATCH_SIZE: usize = 200;
+pub const DEFAULT_BATCH_SIZE: usize = 1_000;
 
 /// Default interval between reaper scans (milliseconds).
 pub const DEFAULT_CHECK_INTERVAL_MS: u64 = 30_000;
@@ -42,12 +42,15 @@ pub async fn run(
 
         match store.next_expired(now, batch_size).await {
             Ok((batch, has_more)) => {
-                for id in &batch {
-                    if let Err(e) = store.purge_job(id).await {
-                        tracing::error!(job_id = %id, %e, "purge_job failed");
-                        break;
+                if !batch.is_empty() {
+                    match store.purge_batch(&batch).await {
+                        Ok(count) => {
+                            tracing::debug!(count, "jobs purged");
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, "purge_batch failed");
+                        }
                     }
-                    tracing::debug!(job_id = %id, "job purged");
                 }
 
                 if has_more {
@@ -182,13 +185,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn loops_immediately_when_batch_is_full() {
-        let store = test_store_with_retention(0, 0);
+        // Use retention=1 so mark_completed defers to the reaper instead
+        // of synchronously deleting (retention=0 now hard-deletes inline).
+        let store = test_store_with_retention(1, 1);
         let (clock, clock_fn) = test_clock();
         let (_shutdown_tx, shutdown_rx) = watch::channel(());
 
         let t = clock.load(Ordering::Relaxed);
 
-        // Create 3 jobs, all completed immediately (retention=0).
+        // Create 3 jobs, all completed immediately.
         let mut ids = Vec::new();
         for i in 0..3 {
             store
@@ -203,6 +208,9 @@ mod tests {
             store.mark_completed(t, &job.id).await.unwrap();
             ids.push(job.id);
         }
+
+        // Advance clock past purge_at (t + 1ms retention).
+        clock.store(t + 2, Ordering::Relaxed);
 
         // Use batch_size=2 to force multiple loops.
         tokio::spawn(run(

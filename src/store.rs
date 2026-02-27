@@ -848,6 +848,48 @@ impl ScheduledIndex {
 /// Provides a handle to the persistent store.
 #[derive(Clone)]
 pub struct Store {
+    /// Database handle and all disk keyspaces, shared via `Arc` so that
+    /// cloning the `Store` (or moving into `spawn_blocking`) is a single
+    /// reference-count bump instead of eight.
+    ks: Arc<Keyspaces>,
+
+    /// In-memory priority index for ready jobs (lock-free).
+    ///
+    /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
+    /// no external mutex needed.
+    ready_index: Arc<ReadyIndex>,
+
+    /// In-memory chronological index of scheduled jobs.
+    ///
+    /// Ordered by `(ready_at, job_id)`. Only jobs in the `Scheduled` state
+    /// appear here. A background task scans this index to promote jobs to
+    /// `Ready` once their time arrives.
+    scheduled_index: Arc<ScheduledIndex>,
+
+    /// Default retention period for completed jobs (milliseconds).
+    default_completed_retention_ms: u64,
+
+    /// Default retention period for dead jobs (milliseconds).
+    default_dead_retention_ms: u64,
+
+    /// Default maximum retries before a failed job is killed.
+    default_retry_limit: u32,
+
+    /// Default backoff config applied to jobs that don't specify one.
+    default_backoff: BackoffConfig,
+
+    /// Broadcast channel for store events.
+    ///
+    /// Subscribers receive notifications when jobs are enqueued, completed,
+    /// or otherwise change state. Take handlers use this both to wake up
+    /// when new work is available and to prune their in-flight tracking.
+    event_tx: broadcast::Sender<StoreEvent>,
+}
+
+/// Groups the fjall database handle and all disk keyspaces into a single
+/// cheaply-cloneable unit. Wrapped in `Arc` inside `Store` so that every
+/// async method only bumps one reference count instead of eight.
+struct Keyspaces {
     /// Connection to the underlying database.
     db: SingleWriterTxDatabase,
 
@@ -865,19 +907,6 @@ pub struct Store {
     /// record — less WAL data, less compaction, less time holding the
     /// single-writer lock.
     payloads: SingleWriterTxKeyspace,
-
-    /// In-memory priority index for ready jobs (lock-free).
-    ///
-    /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
-    /// no external mutex needed.
-    ready_index: Arc<ReadyIndex>,
-
-    /// In-memory chronological index of scheduled jobs.
-    ///
-    /// Ordered by `(ready_at, job_id)`. Only jobs in the `Scheduled` state
-    /// appear here. A background task scans this index to promote jobs to
-    /// `Ready` once their time arrives.
-    scheduled_index: Arc<ScheduledIndex>,
 
     /// Reference to the status index keyspace.
     ///
@@ -905,13 +934,6 @@ pub struct Store {
     /// on status transitions.
     jobs_by_type: SingleWriterTxKeyspace,
 
-    /// Error records, keyed by `{job_id}\0{attempt_be_u32}`.
-    ///
-    /// One record per failure (append-only). Enables per-job error
-    /// history via prefix scan. Cleaned up when the job is completed
-    /// or killed (dead).
-    errors: SingleWriterTxKeyspace,
-
     /// Purge-at index for deferred deletion by the reaper.
     ///
     /// Keyed by `{purge_at_be_u64}\0{job_id}` with empty values. The
@@ -919,24 +941,12 @@ pub struct Store {
     /// expired and need hard-deletion.
     jobs_by_purge_at: SingleWriterTxKeyspace,
 
-    /// Default retention period for completed jobs (milliseconds).
-    default_completed_retention_ms: u64,
-
-    /// Default retention period for dead jobs (milliseconds).
-    default_dead_retention_ms: u64,
-
-    /// Default maximum retries before a failed job is killed.
-    default_retry_limit: u32,
-
-    /// Default backoff config applied to jobs that don't specify one.
-    default_backoff: BackoffConfig,
-
-    /// Broadcast channel for store events.
+    /// Error records, keyed by `{job_id}\0{attempt_be_u32}`.
     ///
-    /// Subscribers receive notifications when jobs are enqueued, completed,
-    /// or otherwise change state. Take handlers use this both to wake up
-    /// when new work is available and to prune their in-flight tracking.
-    event_tx: broadcast::Sender<StoreEvent>,
+    /// One record per failure (append-only). Enables per-job error
+    /// history via prefix scan. Cleaned up when the job is completed
+    /// or killed (dead).
+    errors: SingleWriterTxKeyspace,
 }
 
 // --- K-way merge helpers ---
@@ -1396,16 +1406,18 @@ impl Store {
         let (event_tx, _) = broadcast::channel(1024);
 
         Ok(Self {
-            db,
-            jobs,
-            payloads,
+            ks: Arc::new(Keyspaces {
+                db,
+                jobs,
+                payloads,
+                jobs_by_status,
+                jobs_by_queue,
+                jobs_by_type,
+                jobs_by_purge_at,
+                errors,
+            }),
             ready_index: Arc::new(ReadyIndex::new()),
             scheduled_index: Arc::new(ScheduledIndex::new()),
-            jobs_by_status,
-            jobs_by_queue,
-            jobs_by_type,
-            errors,
-            jobs_by_purge_at,
             default_completed_retention_ms: config.default_completed_retention_ms,
             default_dead_retention_ms: config.default_dead_retention_ms,
             default_retry_limit: config.default_retry_limit,
@@ -1424,14 +1436,9 @@ impl Store {
     ///
     /// Subscribers are notified when a job enters the ready state.
     pub async fn enqueue(&self, now: u64, opts: EnqueueOptions) -> Result<Job, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let payloads = self.payloads.clone();
+        let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_type = self.jobs_by_type.clone();
 
         let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
             let id = scru128::new_string();
@@ -1481,12 +1488,12 @@ impl Store {
             let status_key = make_status_key(status, &id);
             let type_key = make_type_key(&job.job_type, &id);
 
-            let mut tx = db.write_tx();
-            tx.insert(&jobs, &id, &meta_bytes);
-            tx.insert(&payloads, &id, &payload_bytes);
-            tx.insert(&jobs_by_queue, &queue_key, b"");
-            tx.insert(&jobs_by_status, &status_key, b"");
-            tx.insert(&jobs_by_type, &type_key, b"");
+            let mut tx = ks.db.write_tx();
+            tx.insert(&ks.jobs, &id, &meta_bytes);
+            tx.insert(&ks.payloads, &id, &payload_bytes);
+            tx.insert(&ks.jobs_by_queue, &queue_key, b"");
+            tx.insert(&ks.jobs_by_status, &status_key, b"");
+            tx.insert(&ks.jobs_by_type, &type_key, b"");
 
             tx.commit()?;
 
@@ -1547,11 +1554,8 @@ impl Store {
         now: u64,
         queues: &HashSet<String>,
     ) -> Result<Option<Job>, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let payloads = self.payloads.clone();
+        let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
         let queues = queues.clone();
 
         let spawn_start = std::time::Instant::now();
@@ -1578,11 +1582,11 @@ impl Store {
             // Acquire the fjall write lock *after* claiming from the index.
             // The index claim already prevents duplicates, so we just need
             // the write lock for the LSM transaction.
-            let mut tx = db.write_tx();
+            let mut tx = ks.db.write_tx();
             let write_tx_elapsed = blocking_start.elapsed();
 
             // Look up job metadata from the jobs keyspace.
-            let meta_bytes = jobs.get(&job_id)?.ok_or_else(|| {
+            let meta_bytes = ks.jobs.get(&job_id)?.ok_or_else(|| {
                 StoreError::Corruption(format!(
                     "job in ready index but missing from jobs keyspace: {job_id:?}",
                 ))
@@ -1600,17 +1604,17 @@ impl Store {
 
             // Update job record and status indexes.
             let commit_start = std::time::Instant::now();
-            tx.insert(&jobs, &job_id, &meta_bytes);
-            tx.remove(&jobs_by_status, &old_status_key);
-            tx.insert(&jobs_by_status, &new_status_key, b"");
+            tx.insert(&ks.jobs, &job_id, &meta_bytes);
+            tx.remove(&ks.jobs_by_status, &old_status_key);
+            tx.insert(&ks.jobs_by_status, &new_status_key, b"");
 
             if let Err(e) = tx.commit() {
                 // Commit failed — the LSM transaction rolled back. Acquire
                 // a new write transaction to serialize against concurrent
                 // writers, check whether the job is still Ready, and
                 // re-insert into the index if so.
-                let _tx = db.write_tx();
-                if let Ok(Some(bytes)) = jobs.get(&job_id) {
+                let _tx = ks.db.write_tx();
+                if let Ok(Some(bytes)) = ks.jobs.get(&job_id) {
                     if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
                         if current.status == JobStatus::Ready as u8 {
                             ready_index.insert(&current.queue, current.priority, current.id);
@@ -1623,7 +1627,7 @@ impl Store {
 
             // Hydrate the payload from the payloads keyspace for the caller.
             let hydrate_start = std::time::Instant::now();
-            if let Some(payload_bytes) = payloads.get(&job_id)? {
+            if let Some(payload_bytes) = ks.payloads.get(&job_id)? {
                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
             let hydrate_elapsed = hydrate_start.elapsed();
@@ -1653,18 +1657,16 @@ impl Store {
     ///
     /// Subscribers are notified on success.
     pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
+        let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
         let default_completed_retention_ms = self.default_completed_retention_ms;
         let id = id.to_string();
         let id_for_event = id.clone();
 
         let completed = task::spawn_blocking(move || {
-            let mut tx = db.write_tx();
+            let mut tx = ks.db.write_tx();
 
-            let job_bytes = match jobs.get(&id)? {
+            let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
                 None => return Ok(false),
             };
@@ -1680,23 +1682,33 @@ impl Store {
                 .as_ref()
                 .and_then(|r| r.completed_ms)
                 .unwrap_or(default_completed_retention_ms);
-            let purge_at = now + retention_ms;
 
-            let old_status_key = make_status_key(JobStatus::Working, &id);
-            let new_status_key = make_status_key(JobStatus::Completed, &id);
-            let purge_key = make_purge_key(purge_at, &id);
+            if retention_ms == 0 {
+                // Zero retention: hard-delete synchronously in this transaction.
+                delete_job_data(&mut tx, &job, JobStatus::Working, &ks);
+            } else {
+                // Non-zero retention: defer deletion to the reaper.
+                let purge_at = now + retention_ms;
 
-            job.status = JobStatus::Completed.into();
-            job.purge_at = Some(purge_at);
-            job.completed_at = Some(now);
-            let meta_bytes = rmp_serde::to_vec_named(&job)?;
+                let old_status_key = make_status_key(JobStatus::Working, &id);
+                let new_status_key = make_status_key(JobStatus::Completed, &id);
+                let purge_key = make_purge_key(purge_at, &id);
 
-            tx.insert(&jobs, &id, &meta_bytes);
-            tx.remove(&jobs_by_status, &old_status_key);
-            tx.insert(&jobs_by_status, &new_status_key, b"");
-            tx.insert(&jobs_by_purge_at, &purge_key, b"");
+                job.status = JobStatus::Completed.into();
+                job.purge_at = Some(purge_at);
+                job.completed_at = Some(now);
+                let meta_bytes = rmp_serde::to_vec_named(&job)?;
+
+                tx.insert(&ks.jobs, &id, &meta_bytes);
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
+            }
 
             tx.commit()?;
+
+            // Defensive: remove from ready_index in case of inconsistency.
+            ready_index.global.remove(&(job.priority, id));
 
             Ok(true)
         })
@@ -1725,13 +1737,9 @@ impl Store {
         id: &str,
         opts: FailureOptions,
     ) -> Result<Option<Job>, StoreError> {
-        let db = self.db.clone();
-
-        let jobs = self.jobs.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
+        let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let errors = self.errors.clone();
+        let ready_index = self.ready_index.clone();
         let default_dead_retention_ms = self.default_dead_retention_ms;
         let default_retry_limit = self.default_retry_limit;
         let default_backoff = self.default_backoff.clone();
@@ -1740,10 +1748,10 @@ impl Store {
         let id_for_event = id.clone();
 
         let result: Result<Option<Job>, StoreError> = task::spawn_blocking(move || {
-            let mut tx = db.write_tx();
+            let mut tx = ks.db.write_tx();
 
             // Load the job to check its status and update it.
-            let job_bytes = match jobs.get(&id)? {
+            let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
                 None => return Ok(None),
             };
@@ -1770,7 +1778,7 @@ impl Store {
                 attempt: job.attempts,
             };
             let error_bytes = rmp_serde::to_vec_named(&error_record)?;
-            tx.insert(&errors, &error_key, &error_bytes);
+            tx.insert(&ks.errors, &error_key, &error_bytes);
 
             // Client options may override the default backoff policy here so
             // we always check those first and then apply the appropriate
@@ -1799,33 +1807,52 @@ impl Store {
                 let new_status_key = make_status_key(JobStatus::Scheduled, &id);
 
                 let meta_bytes = rmp_serde::to_vec_named(&job)?;
-                tx.insert(&jobs, &id, &meta_bytes);
-                tx.remove(&jobs_by_status, &old_status_key);
-                tx.insert(&jobs_by_status, &new_status_key, b"");
+                tx.insert(&ks.jobs, &id, &meta_bytes);
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
                 tx.commit()?;
 
                 // Insert into the in-memory scheduled index after commit succeeds.
                 scheduled_index.insert(job.ready_at, id.clone());
             } else {
-                // Dead: transition to Dead status with purge_at for deferred deletion.
+                // Dead: check retention to decide sync delete vs deferred.
                 let retention_ms = job
                     .retention
                     .as_ref()
                     .and_then(|r| r.dead_ms)
                     .unwrap_or(default_dead_retention_ms);
-                let purge_at = now + retention_ms;
 
-                let new_status_key = make_status_key(JobStatus::Dead, &id);
-                let purge_key = make_purge_key(purge_at, &id);
+                if retention_ms == 0 {
+                    // Zero retention: hard-delete synchronously.
+                    // The error record inserted above in this tx won't be
+                    // visible to error_keys (prefix scan reads committed
+                    // data), so remove it explicitly.
+                    tx.remove_weak(&ks.errors, &error_key);
 
-                job.purge_at = Some(purge_at);
-                let meta_bytes = rmp_serde::to_vec_named(&job)?;
+                    delete_job_data(&mut tx, &job, JobStatus::Working, &ks);
 
-                tx.insert(&jobs, &id, &meta_bytes);
-                tx.remove(&jobs_by_status, &old_status_key);
-                tx.insert(&jobs_by_status, &new_status_key, b"");
-                tx.insert(&jobs_by_purge_at, &purge_key, b"");
+                    // Set status to Dead so event logic works after commit.
+                    job.status = JobStatus::Dead.into();
+                } else {
+                    // Non-zero retention: defer deletion to the reaper.
+                    let purge_at = now + retention_ms;
+
+                    let new_status_key = make_status_key(JobStatus::Dead, &id);
+                    let purge_key = make_purge_key(purge_at, &id);
+
+                    job.purge_at = Some(purge_at);
+                    let meta_bytes = rmp_serde::to_vec_named(&job)?;
+
+                    tx.insert(&ks.jobs, &id, &meta_bytes);
+                    tx.remove(&ks.jobs_by_status, &old_status_key);
+                    tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                    tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
+                }
+
                 tx.commit()?;
+
+                // Defensive: remove from ready_index in case of inconsistency.
+                ready_index.global.remove(&(job.priority, id));
             }
 
             Ok(Some(job))
@@ -1863,12 +1890,11 @@ impl Store {
     /// timestamp has passed (logically invisible before the reaper
     /// physically deletes it).
     pub async fn get_job(&self, now: u64, id: &str) -> Result<Option<Job>, StoreError> {
-        let jobs = self.jobs.clone();
-        let payloads = self.payloads.clone();
+        let ks = self.ks.clone();
         let id = id.to_string();
 
         task::spawn_blocking(move || {
-            let Some(bytes) = jobs.get(&id)? else {
+            let Some(bytes) = ks.jobs.get(&id)? else {
                 return Ok(None);
             };
             let mut job: Job = rmp_serde::from_slice(&bytes)?;
@@ -1879,7 +1905,7 @@ impl Store {
             }
 
             // Hydrate the payload from the payloads keyspace.
-            if let Some(payload_bytes) = payloads.get(&id)? {
+            if let Some(payload_bytes) = ks.payloads.get(&id)? {
                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
 
@@ -1903,25 +1929,23 @@ impl Store {
     ///
     /// Subscribers are notified.
     pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
+        let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
         let id = id.to_string();
 
         // Returns Some((queue_name, priority)) if the job was requeued, None otherwise.
         let requeued = task::spawn_blocking(
             move || -> Result<Option<(String, u16, String)>, StoreError> {
-                let mut tx = db.write_tx();
+                let mut tx = ks.db.write_tx();
 
                 let old_status_key = make_status_key(JobStatus::Working, &id);
-                if jobs_by_status.get(&old_status_key)?.is_none() {
+                if ks.jobs_by_status.get(&old_status_key)?.is_none() {
                     return Ok(None);
                 }
 
                 // The job is still working, so it must still be in the jobs
                 // keyspace (only mark_completed removes from both).
-                let job_bytes = jobs.get(&id)?.ok_or_else(|| {
+                let job_bytes = ks.jobs.get(&id)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
                         "working job missing from jobs keyspace: {id:?}",
                     ))
@@ -1933,9 +1957,9 @@ impl Store {
                 let new_status_key = make_status_key(JobStatus::Ready, &id);
                 let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-                tx.insert(&jobs, &id, &job_bytes);
-                tx.remove(&jobs_by_status, &old_status_key);
-                tx.insert(&jobs_by_status, &new_status_key, b"");
+                tx.insert(&ks.jobs, &id, &job_bytes);
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
                 tx.commit()?;
 
                 // Insert into the in-memory ready index after commit succeeds.
@@ -1998,15 +2022,10 @@ impl Store {
     ///     .await?;
     /// ```
     pub async fn list_jobs(&self, opts: ListJobsOptions) -> Result<ListJobsPage, StoreError> {
-        let db = self.db.clone();
-        let jobs_ks = self.jobs.clone();
-        let payloads_ks = self.payloads.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_type = self.jobs_by_type.clone();
+        let ks = self.ks.clone();
 
         task::spawn_blocking(move || {
-            let snapshot = db.read_tx();
+            let snapshot = ks.db.read_tx();
             // We take 1 more job than requested so that we know if there's a
             // next page or not.
             let fetch = opts.limit + 1;
@@ -2032,12 +2051,12 @@ impl Store {
 
                         match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&jobs_by_queue, (start, end)),
+                                snapshot.range::<Vec<u8>, _>(&ks.jobs_by_queue, (start, end)),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_queue, (start, end))
+                                    .range::<Vec<u8>, _>(&ks.jobs_by_queue, (start, end))
                                     .rev(),
                                 prefix_len
                             ),
@@ -2063,12 +2082,12 @@ impl Store {
 
                         match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&jobs_by_status, (start, end)),
+                                snapshot.range::<Vec<u8>, _>(&ks.jobs_by_status, (start, end)),
                                 2
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_status, (start, end))
+                                    .range::<Vec<u8>, _>(&ks.jobs_by_status, (start, end))
                                     .rev(),
                                 2
                             ),
@@ -2098,12 +2117,12 @@ impl Store {
 
                         match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&jobs_by_type, (start, end)),
+                                snapshot.range::<Vec<u8>, _>(&ks.jobs_by_type, (start, end)),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
                                 snapshot
-                                    .range::<Vec<u8>, _>(&jobs_by_type, (start, end))
+                                    .range::<Vec<u8>, _>(&ks.jobs_by_type, (start, end))
                                     .rev(),
                                 prefix_len
                             ),
@@ -2162,8 +2181,8 @@ impl Store {
                 let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
 
                 rows = load_jobs_by_ids(
-                    &jobs_ks,
-                    &payloads_ks,
+                    &ks.jobs,
+                    &ks.payloads,
                     combined,
                     &source_desc,
                     opts.now,
@@ -2175,10 +2194,10 @@ impl Store {
                     ScanDirection::Asc => {
                         let range = match &opts.from {
                             Some(cursor) => snapshot.range::<&str, _>(
-                                &jobs_ks,
+                                &ks.jobs,
                                 (Bound::Excluded(cursor.as_str()), Bound::Unbounded),
                             ),
-                            None => snapshot.range::<&str, _>(&jobs_ks, ..),
+                            None => snapshot.range::<&str, _>(&ks.jobs, ..),
                         };
 
                         for entry in range {
@@ -2189,7 +2208,7 @@ impl Store {
                                     continue;
                                 }
                             }
-                            if let Some(payload_bytes) = payloads_ks.get(&*key)? {
+                            if let Some(payload_bytes) = ks.payloads.get(&*key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
@@ -2201,10 +2220,10 @@ impl Store {
                     ScanDirection::Desc => {
                         let range = match &opts.from {
                             Some(cursor) => snapshot.range::<&str, _>(
-                                &jobs_ks,
+                                &ks.jobs,
                                 (Bound::Unbounded, Bound::Excluded(cursor.as_str())),
                             ),
-                            None => snapshot.range::<&str, _>(&jobs_ks, ..),
+                            None => snapshot.range::<&str, _>(&ks.jobs, ..),
                         };
 
                         for entry in range.rev() {
@@ -2215,7 +2234,7 @@ impl Store {
                                     continue;
                                 }
                             }
-                            if let Some(payload_bytes) = payloads_ks.get(&*key)? {
+                            if let Some(payload_bytes) = ks.payloads.get(&*key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
@@ -2281,7 +2300,7 @@ impl Store {
     /// follow-up requests. The cursor is the attempt number (u32), which is
     /// the natural sort key within a job's error records.
     pub async fn list_errors(&self, opts: ListErrorsOptions) -> Result<ListErrorsPage, StoreError> {
-        let errors_ks = self.errors.clone();
+        let ks = self.ks.clone();
 
         task::spawn_blocking(move || {
             // We take 1 more record than requested so that we know if there's
@@ -2309,7 +2328,8 @@ impl Store {
 
             match opts.direction {
                 ScanDirection::Asc => {
-                    for entry in errors_ks
+                    for entry in ks
+                        .errors
                         .inner()
                         .range::<Vec<u8>, _>((start, end))
                         .take(fetch)
@@ -2328,7 +2348,8 @@ impl Store {
                     }
                 }
                 ScanDirection::Desc => {
-                    for entry in errors_ks
+                    for entry in ks
+                        .errors
                         .inner()
                         .range::<Vec<u8>, _>((start, end))
                         .rev()
@@ -2402,7 +2423,7 @@ impl Store {
         now: u64,
         limit: usize,
     ) -> Result<(Vec<Job>, Option<u64>), StoreError> {
-        let jobs = self.jobs.clone();
+        let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
 
         task::spawn_blocking(move || -> Result<(Vec<Job>, Option<u64>), StoreError> {
@@ -2410,7 +2431,7 @@ impl Store {
 
             let mut result = Vec::with_capacity(due_entries.len());
             for (_ready_at, job_id) in &due_entries {
-                let job_bytes = jobs.get(job_id)?.ok_or_else(|| {
+                let job_bytes = ks.jobs.get(job_id)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
                         "job in scheduled index but missing from jobs keyspace: {job_id:?}",
                     ))
@@ -2431,11 +2452,9 @@ impl Store {
     ///
     /// Subscribers are notified with `StoreEvent::JobCreated`.
     pub async fn promote_scheduled(&self, job: &Job) -> Result<(), StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
+        let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
 
         let id = job.id.clone();
         let event_queue = job.queue.clone();
@@ -2448,12 +2467,12 @@ impl Store {
             // prevent data races (same as take_next_job).
             scheduled_index.remove(ready_at, &id);
 
-            let mut tx = db.write_tx();
+            let mut tx = ks.db.write_tx();
 
             // Re-read the job inside the write lock to confirm it's still
             // scheduled (a concurrent promote or deletion could have removed
             // it).
-            let job_bytes = match jobs.get(&id)? {
+            let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
                 None => return Ok(()), // Already gone.
             };
@@ -2465,22 +2484,22 @@ impl Store {
             // Swap status indexes: Scheduled -> Ready.
             let old_status_key = make_status_key(JobStatus::Scheduled, &id);
             let new_status_key = make_status_key(JobStatus::Ready, &id);
-            tx.remove(&jobs_by_status, &old_status_key);
-            tx.insert(&jobs_by_status, &new_status_key, b"");
+            tx.remove(&ks.jobs_by_status, &old_status_key);
+            tx.insert(&ks.jobs_by_status, &new_status_key, b"");
 
             // Update the job record itself.
             let mut updated = current;
             updated.status = JobStatus::Ready.into();
             let updated_bytes = rmp_serde::to_vec_named(&updated)?;
-            tx.insert(&jobs, &id, &updated_bytes);
+            tx.insert(&ks.jobs, &id, &updated_bytes);
 
             if let Err(e) = tx.commit() {
                 // Commit failed — the LSM transaction rolled back. Acquire
                 // a new write transaction to serialize against concurrent
                 // writers, check whether the job is still Scheduled, and
                 // re-insert into the index if so.
-                let _tx = db.write_tx();
-                if let Ok(Some(bytes)) = jobs.get(&id) {
+                let _tx = ks.db.write_tx();
+                if let Ok(Some(bytes)) = ks.jobs.get(&id) {
                     if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
                         if current.status == JobStatus::Scheduled as u8 {
                             scheduled_index.insert(ready_at, id);
@@ -2543,9 +2562,7 @@ impl Store {
     /// Does not touch the in-memory ready index — that's handled by
     /// `rebuild_ready_index`, which runs immediately after.
     async fn recover_working_jobs(&self) -> Result<usize, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
+        let ks = self.ks.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Working jobs.
@@ -2555,9 +2572,9 @@ impl Store {
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             // Collect IDs first — we can't hold an iterator across the write tx.
-            let snapshot = db.read_tx();
+            let snapshot = ks.db.read_tx();
             let working_ids: Vec<String> = snapshot
-                .range::<Vec<u8>, _>(&jobs_by_status, range)
+                .range::<Vec<u8>, _>(&ks.jobs_by_status, range)
                 .map(|entry| {
                     let (key, _) = entry.into_inner()?;
                     // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
@@ -2573,10 +2590,10 @@ impl Store {
             }
 
             let count = working_ids.len();
-            let mut tx = db.write_tx();
+            let mut tx = ks.db.write_tx();
 
             for id in &working_ids {
-                let job_bytes = jobs.get(id)?.ok_or_else(|| {
+                let job_bytes = ks.jobs.get(id)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
                         "working job missing from jobs keyspace: {id:?}"
                     ))
@@ -2586,13 +2603,13 @@ impl Store {
                 // Swap status indexes: Working -> Ready.
                 let old_status_key = make_status_key(JobStatus::Working, id);
                 let new_status_key = make_status_key(JobStatus::Ready, id);
-                tx.remove(&jobs_by_status, &old_status_key);
-                tx.insert(&jobs_by_status, &new_status_key, b"");
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
 
                 // Update the job record itself.
                 job.status = JobStatus::Ready.into();
                 let updated_bytes = rmp_serde::to_vec_named(&job)?;
-                tx.insert(&jobs, id, &updated_bytes);
+                tx.insert(&ks.jobs, id, &updated_bytes);
             }
 
             tx.commit()?;
@@ -2607,9 +2624,7 @@ impl Store {
     /// priority, and inserts each entry into the skip list. No mutex needed —
     /// each `insert()` is lock-free, and recovery runs before any consumers.
     async fn rebuild_ready_index(&self) -> Result<usize, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
+        let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
@@ -2619,17 +2634,17 @@ impl Store {
             let end: Vec<u8> = vec![JobStatus::Ready as u8 + 1, 0];
             let range = (Bound::Included(start), Bound::Excluded(end));
 
-            let snapshot = db.read_tx();
+            let snapshot = ks.db.read_tx();
             let mut count = 0;
 
-            for entry in snapshot.range::<Vec<u8>, _>(&jobs_by_status, range) {
+            for entry in snapshot.range::<Vec<u8>, _>(&ks.jobs_by_status, range) {
                 let (key, _) = entry.into_inner()?;
                 // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
                 let job_id = String::from_utf8(key[2..].to_vec()).map_err(|e| {
                     StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
                 })?;
 
-                let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
+                let job_bytes = ks.jobs.get(&job_id)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
                         "ready job missing from jobs keyspace: {job_id:?}"
                     ))
@@ -2650,9 +2665,7 @@ impl Store {
     /// Scans for all Scheduled jobs, reads their metadata to get `ready_at`,
     /// and inserts each entry into the SkipSet.
     async fn rebuild_scheduled_index(&self) -> Result<usize, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
+        let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
@@ -2662,17 +2675,17 @@ impl Store {
             let end: Vec<u8> = vec![JobStatus::Scheduled as u8 + 1, 0];
             let range = (Bound::Included(start), Bound::Excluded(end));
 
-            let snapshot = db.read_tx();
+            let snapshot = ks.db.read_tx();
             let mut count = 0;
 
-            for entry in snapshot.range::<Vec<u8>, _>(&jobs_by_status, range) {
+            for entry in snapshot.range::<Vec<u8>, _>(&ks.jobs_by_status, range) {
                 let (key, _) = entry.into_inner()?;
                 // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
                 let job_id = String::from_utf8(key[2..].to_vec()).map_err(|e| {
                     StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
                 })?;
 
-                let job_bytes = jobs.get(&job_id)?.ok_or_else(|| {
+                let job_bytes = ks.jobs.get(&job_id)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
                         "scheduled job missing from jobs keyspace: {job_id:?}"
                     ))
@@ -2697,7 +2710,7 @@ impl Store {
         now: u64,
         limit: usize,
     ) -> Result<(Vec<String>, bool), StoreError> {
-        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
+        let ks = self.ks.clone();
 
         task::spawn_blocking(move || -> Result<(Vec<String>, bool), StoreError> {
             // Scan from the start of the index up to `now` (inclusive).
@@ -2706,7 +2719,7 @@ impl Store {
             let range = (Bound::<Vec<u8>>::Unbounded, Bound::Excluded(end_key));
 
             let mut ids = Vec::new();
-            for entry in jobs_by_purge_at.inner().range::<Vec<u8>, _>(range) {
+            for entry in ks.jobs_by_purge_at.inner().range::<Vec<u8>, _>(range) {
                 let (key, _) = entry.into_inner()?;
                 // Extract job_id: skip 8 bytes (purge_at) + 1 byte (null separator).
                 let job_id = String::from_utf8(key[9..].to_vec()).map_err(|e| {
@@ -2732,21 +2745,14 @@ impl Store {
     /// Called by the reaper for each expired job. Returns `true` if the
     /// job was found and deleted, `false` if already purged.
     pub async fn purge_job(&self, id: &str) -> Result<bool, StoreError> {
-        let db = self.db.clone();
-        let jobs = self.jobs.clone();
-        let payloads = self.payloads.clone();
-        let jobs_by_status = self.jobs_by_status.clone();
-        let jobs_by_queue = self.jobs_by_queue.clone();
-        let jobs_by_type = self.jobs_by_type.clone();
-        let jobs_by_purge_at = self.jobs_by_purge_at.clone();
-        let errors = self.errors.clone();
+        let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let id = id.to_string();
 
         task::spawn_blocking(move || -> Result<bool, StoreError> {
-            let mut tx = db.write_tx();
+            let mut tx = ks.db.write_tx();
 
-            let job_bytes = match jobs.get(&id)? {
+            let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
                 None => return Ok(false), // Already purged.
             };
@@ -2756,27 +2762,7 @@ impl Store {
                 StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
             })?;
 
-            // Remove from all indexes.
-            let status_key = make_status_key(status, &id);
-            let queue_key = make_queue_key(&job.queue, &id);
-            let type_key = make_type_key(&job.job_type, &id);
-
-            tx.remove(&jobs, &id);
-            tx.remove_weak(&payloads, &id);
-            tx.remove(&jobs_by_status, &status_key);
-            tx.remove_weak(&jobs_by_queue, &queue_key);
-            tx.remove_weak(&jobs_by_type, &type_key);
-
-            // Remove from purge_at index.
-            if let Some(purge_at) = job.purge_at {
-                let purge_key = make_purge_key(purge_at, &id);
-                tx.remove(&jobs_by_purge_at, &purge_key);
-            }
-
-            // Clean up all error records.
-            for key in error_keys(&errors, &id) {
-                tx.remove_weak(&errors, &key);
-            }
+            delete_job_data(&mut tx, &job, status, &ks);
 
             tx.commit()?;
 
@@ -2784,6 +2770,52 @@ impl Store {
             ready_index.global.remove(&(job.priority, id));
 
             Ok(true)
+        })
+        .await?
+    }
+
+    /// Hard-delete a batch of jobs in a single transaction.
+    ///
+    /// Opens one write transaction, deletes all found jobs, and commits once.
+    /// Returns the count of actually deleted jobs. Missing jobs are silently
+    /// skipped.
+    pub async fn purge_batch(&self, ids: &[String]) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
+        let ids = ids.to_vec();
+
+        task::spawn_blocking(move || -> Result<usize, StoreError> {
+            let mut tx = ks.db.write_tx();
+            let mut deleted = Vec::new();
+
+            for id in &ids {
+                let job_bytes = match ks.jobs.get(id)? {
+                    Some(bytes) => bytes,
+                    None => continue, // Already purged.
+                };
+
+                let job: Job = rmp_serde::from_slice(&job_bytes)?;
+                let status = JobStatus::try_from(job.status).map_err(|v| {
+                    StoreError::Corruption(format!(
+                        "job {} has unrecognized status byte: {v}",
+                        job.id
+                    ))
+                })?;
+
+                delete_job_data(&mut tx, &job, status, &ks);
+
+                deleted.push((job.priority, id.clone()));
+            }
+
+            let count = deleted.len();
+            tx.commit()?;
+
+            // Defensive: remove from ready_index in case of inconsistency.
+            for (priority, id) in deleted {
+                ready_index.global.remove(&(priority, id));
+            }
+
+            Ok(count)
         })
         .await?
     }
@@ -2845,15 +2877,47 @@ fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
 /// The returned iterator yields owned key bytes that the caller can pass
 /// to `tx.remove`. The fjall `Iter` is an owned value (no borrow on the
 /// keyspace), so it's safe to interleave iteration with mutable tx ops.
-fn error_keys(errors: &SingleWriterTxKeyspace, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
+fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
     let mut prefix = Vec::with_capacity(job_id.len() + 1);
     prefix.extend_from_slice(job_id.as_bytes());
     prefix.push(0);
 
-    errors
+    ks.errors
         .inner()
         .prefix(&prefix)
         .filter_map(|guard| guard.key().ok().map(|k| k.to_vec()))
+}
+
+/// Remove all data for a job within an existing open transaction.
+///
+/// Removes from: jobs, payloads, jobs_by_status, jobs_by_queue,
+/// jobs_by_type, jobs_by_purge_at (if set), and all error records.
+/// Does NOT commit — the caller decides when to commit.
+fn delete_job_data(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    job: &Job,
+    status: JobStatus,
+    ks: &Keyspaces,
+) {
+    let id = &job.id;
+    let status_key = make_status_key(status, id);
+    let queue_key = make_queue_key(&job.queue, id);
+    let type_key = make_type_key(&job.job_type, id);
+
+    tx.remove(&ks.jobs, id);
+    tx.remove_weak(&ks.payloads, id);
+    tx.remove(&ks.jobs_by_status, &status_key);
+    tx.remove_weak(&ks.jobs_by_queue, &queue_key);
+    tx.remove_weak(&ks.jobs_by_type, &type_key);
+
+    if let Some(purge_at) = job.purge_at {
+        let purge_key = make_purge_key(purge_at, id);
+        tx.remove(&ks.jobs_by_purge_at, &purge_key);
+    }
+
+    for key in error_keys(ks, id) {
+        tx.remove_weak(&ks.errors, &key);
+    }
 }
 
 /// Compute the backoff delay in milliseconds for a given attempt count.
@@ -2888,6 +2952,16 @@ mod tests {
     fn test_store() -> Store {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
+        std::mem::forget(dir);
+        store
+    }
+
+    fn test_store_with_retention(completed_ms: u64, dead_ms: u64) -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageConfig::default();
+        config.default_completed_retention_ms = completed_ms;
+        config.default_dead_retention_ms = dead_ms;
+        let store = Store::open(dir.path().join("data"), config).unwrap();
         std::mem::forget(dir);
         store
     }
@@ -6152,7 +6226,7 @@ mod tests {
 
         // Read the error record from the errors keyspace.
         let key = make_error_key(&job.id, 1);
-        let raw = store.errors.inner().get(&key).unwrap().unwrap();
+        let raw = store.ks.errors.inner().get(&key).unwrap().unwrap();
         let err: ErrorRecord = rmp_serde::from_slice(&raw).unwrap();
 
         assert_eq!(err.message, "connection timeout");
@@ -6178,12 +6252,12 @@ mod tests {
             .unwrap();
 
         // Error records should still exist (cleanup deferred to reaper).
-        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
         assert!(!keys.is_empty());
 
         // purge_job should clean them up.
         store.purge_job(&job.id).await.unwrap();
-        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
         assert!(keys.is_empty());
     }
 
@@ -6193,7 +6267,7 @@ mod tests {
         let job = enqueue_and_take(&store).await;
 
         // Verify payload exists before kill.
-        assert!(store.payloads.inner().get(&job.id).unwrap().is_some());
+        assert!(store.ks.payloads.inner().get(&job.id).unwrap().is_some());
 
         let mut opts = test_failure_opts();
         opts.kill = true;
@@ -6205,11 +6279,11 @@ mod tests {
             .unwrap();
 
         // Payload should still exist (cleanup deferred to reaper).
-        assert!(store.payloads.inner().get(&job.id).unwrap().is_some());
+        assert!(store.ks.payloads.inner().get(&job.id).unwrap().is_some());
 
         // purge_job should clean it up.
         store.purge_job(&job.id).await.unwrap();
-        assert!(store.payloads.inner().get(&job.id).unwrap().is_none());
+        assert!(store.ks.payloads.inner().get(&job.id).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -6326,7 +6400,9 @@ mod tests {
 
     #[tokio::test]
     async fn mark_completed_retains_error_records_for_reaper() {
-        let store = test_store();
+        // Use non-zero retention so mark_completed defers to the reaper
+        // instead of synchronously deleting.
+        let store = test_store_with_retention(60_000, 60_000);
         let job = enqueue_and_take(&store).await;
 
         // Fail once (retry), then promote, take, and complete.
@@ -6348,12 +6424,12 @@ mod tests {
             .unwrap();
 
         // Error records are now retained until the reaper purges the job.
-        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
         assert!(!keys.is_empty());
 
         // purge_job should clean them up.
         store.purge_job(&job.id).await.unwrap();
-        let keys: Vec<_> = error_keys(&store.errors, &job.id).collect();
+        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
         assert!(keys.is_empty());
     }
 
