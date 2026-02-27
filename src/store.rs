@@ -26,13 +26,13 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use dashmap::DashMap;
 
 use fjall::config::FilterPolicy;
-use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
+use fjall::{PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::task;
@@ -886,6 +886,174 @@ pub struct Store {
     event_tx: broadcast::Sender<StoreEvent>,
 }
 
+/// Result type sent through the group commit oneshot channel.
+/// `Ok(())` means durable; `Err(msg)` means the persist failed.
+type SyncResult = Result<(), String>;
+
+/// A waiter queued for group commit. The background thread notifies the
+/// oneshot when the waiter's batch is durable (or failed).
+struct CommitWaiter {
+    sequence: u64,
+    mode: CommitMode,
+    done: tokio::sync::oneshot::Sender<SyncResult>,
+}
+
+/// Batches multiple journal persists into a single fsync.
+///
+/// Each `tx.commit()` writes to an in-memory BufWriter. Callers then call
+/// `persist()` which enqueues a waiter and returns a oneshot receiver. A
+/// dedicated OS thread drains waiters, calls `db.persist()` once per batch,
+/// and notifies all waiters whose sequence was covered.
+struct GroupCommitter {
+    tx: std::sync::mpsc::SyncSender<CommitWaiter>,
+    sequence: Arc<AtomicU64>,
+}
+
+/// Fsync all journal files in the given directory.
+///
+/// We open a second fd to each `.jnl` file and call `sync_data()` on it
+/// (fdatasync). This is equivalent to `sync_all()` (fsync) for durability
+/// here because fjall pre-allocates journal files with `set_len()` at
+/// creation — writes don't change the file size, so metadata sync is
+/// unnecessary. The only skipped work is redundant mtime updates.
+///
+/// Using a second fd avoids holding fjall's internal journal writer mutex
+/// (which `db.persist(SyncAll)` would hold for the entire fsync duration,
+/// blocking all concurrent `tx.commit()` calls).
+///
+/// Safety with respect to journal rotation:
+///
+/// Rotation is performed by fjall's background worker pool while holding
+/// the same journal writer mutex that `db.persist(Buffer)` holds. Since
+/// we call `persist(Buffer)` first (which acquires and releases that
+/// mutex), rotation cannot happen *during* our persist(Buffer) call.
+///
+/// If rotation happens *between* our `persist(Buffer)` and our fsync,
+/// that's fine: `Writer::rotate()` calls `persist(SyncAll)` on the old
+/// journal before switching to the new one, so our data is already
+/// durable. Our subsequent fsync on the old file is a harmless no-op.
+fn fsync_journal_files(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jnl") {
+            std::fs::File::open(&path)?.sync_data()?;
+        }
+    }
+    Ok(())
+}
+
+impl GroupCommitter {
+    /// Start the group commit background thread.
+    ///
+    /// The thread runs until the `SyncSender` is dropped (i.e. when
+    /// `GroupCommitter` is dropped as part of `Keyspaces` cleanup).
+    /// All in-flight waiters are drained and notified before the
+    /// thread performs a final `SyncAll` and exits.
+    fn start(db: SingleWriterTxDatabase, data_dir: std::path::PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommitWaiter>(4096);
+        let sequence = Arc::new(AtomicU64::new(0));
+
+        {
+            let sequence = sequence.clone();
+            std::thread::Builder::new()
+                .name("group-committer".into())
+                .spawn(move || {
+                    // Tracks the outcome of the last persist so that
+                    // waiters from a failed batch get the error, while
+                    // waiters in a new epoch trigger a fresh attempt.
+                    let mut last_result: SyncResult = Ok(());
+                    let mut was_fsynced = false;
+
+                    // Flush the BufWriter to the OS page cache (fast,
+                    // releases fjall's journal writer mutex quickly).
+                    let do_flush = {
+                        let db = db.clone();
+                        move || -> SyncResult {
+                            db.persist(PersistMode::Buffer).map_err(|e| {
+                                let msg = format!("group commit flush failed: {e}");
+                                tracing::error!("{msg}");
+                                msg
+                            })
+                        }
+                    };
+
+                    // Fsync journal files via a second fd (slow, but
+                    // doesn't hold fjall's journal writer mutex so
+                    // concurrent tx.commit() calls can proceed).
+                    let do_fsync = || -> SyncResult {
+                        fsync_journal_files(&data_dir).map_err(|e| {
+                            let msg = format!("group commit fsync failed: {e}");
+                            tracing::error!("{msg}");
+                            msg
+                        })
+                    };
+
+                    // Process a single waiter: if its epoch is already
+                    // settled, replay the result (upgrading to fsync if
+                    // needed). Otherwise advance the epoch and flush,
+                    // then fsync only if the waiter requests it.
+                    let mut handle = |waiter: CommitWaiter| {
+                        if waiter.sequence < sequence.load(Ordering::Relaxed) {
+                            // Batched — epoch already settled.
+                            if waiter.mode == CommitMode::Fsync && !was_fsynced {
+                                last_result = do_fsync();
+                                was_fsynced = true;
+                            }
+                            let _ = waiter.done.send(last_result.clone());
+                            return;
+                        }
+
+                        // New epoch — always flush.
+                        sequence.fetch_add(1, Ordering::Release);
+                        last_result = do_flush();
+                        was_fsynced = false;
+
+                        if last_result.is_ok() && waiter.mode == CommitMode::Fsync {
+                            last_result = do_fsync();
+                            was_fsynced = true;
+                        }
+
+                        let _ = waiter.done.send(last_result.clone());
+                    };
+
+                    // Runs until the SyncSender is dropped, which
+                    // closes the channel and causes recv() to return
+                    // Err. All queued waiters are drained first.
+                    while let Ok(waiter) = rx.recv() {
+                        handle(waiter);
+                    }
+
+                    // Final sync on shutdown to flush any remaining data.
+                    if let Err(e) = db.persist(PersistMode::SyncAll) {
+                        tracing::error!("group commit final sync failed: {e:?}");
+                    }
+                })
+                .expect("failed to spawn group committer thread");
+        }
+
+        Self { tx, sequence }
+    }
+
+    /// Enqueue a persist request and return a receiver that resolves when
+    /// this commit's data is durable.
+    ///
+    /// Called inside `spawn_blocking` — blocks on the bounded channel to
+    /// provide natural backpressure.
+    fn persist(&self, mode: CommitMode) -> tokio::sync::oneshot::Receiver<SyncResult> {
+        let sequence = self.sequence.load(Ordering::Acquire);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        // If the channel is full or disconnected, the recv side will get
+        // an error which surfaces as a store error.
+        let _ = self.tx.send(CommitWaiter {
+            sequence,
+            mode,
+            done: done_tx,
+        });
+        done_rx
+    }
+}
+
 /// Groups the fjall database handle and all disk keyspaces into a single
 /// cheaply-cloneable unit. Wrapped in `Arc` inside `Store` so that every
 /// async method only bumps one reference count instead of eight.
@@ -947,6 +1115,69 @@ struct Keyspaces {
     /// history via prefix scan. Cleaned up when the job is completed
     /// or killed (dead).
     errors: SingleWriterTxKeyspace,
+
+    /// Group committer for batching journal persists.
+    ///
+    /// Shutdown is driven by dropping this field (which drops the
+    /// `SyncSender`, closing the channel). The background thread
+    /// drains remaining waiters and performs a final `SyncAll`.
+    group_committer: GroupCommitter,
+
+    /// Default commit mode for most operations (dequeue, complete, fail, etc.).
+    default_commit_mode: CommitMode,
+
+    /// Commit mode for enqueue operations (resolved at construction;
+    /// inherits the default when not overridden).
+    enqueue_commit_mode: CommitMode,
+}
+
+impl Keyspaces {
+    /// Acquire the single-writer transaction lock.
+    fn write_tx(&self) -> fjall::SingleWriterWriteTx<'_> {
+        self.db.write_tx()
+    }
+
+    /// Commit a transaction and enqueue a group persist.
+    ///
+    /// Returns the oneshot receiver that resolves with `Ok(())` when
+    /// durable, or `Err(msg)` if the persist failed.
+    fn commit(
+        &self,
+        tx: fjall::SingleWriterWriteTx<'_>,
+        mode: CommitMode,
+    ) -> Result<tokio::sync::oneshot::Receiver<SyncResult>, StoreError> {
+        tx.commit()?;
+        Ok(self.group_committer.persist(mode))
+    }
+}
+
+/// Await an optional group commit sync, returning the value on success.
+///
+/// All `spawn_blocking` closures return `(T, Option<Receiver>)` — `Some`
+/// when a commit happened, `None` on early-return paths. This helper
+/// unwraps the `Result`, awaits the sync if present, and returns `T`.
+async fn await_sync<T>(
+    result: Result<(T, Option<tokio::sync::oneshot::Receiver<SyncResult>>), StoreError>,
+) -> Result<T, StoreError> {
+    let (value, rx) = result?;
+    if let Some(rx) = rx {
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                return Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    msg,
+                ))));
+            }
+            Err(_) => {
+                return Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "group committer channel closed",
+                ))));
+            }
+        }
+    }
+    Ok(value)
 }
 
 // --- K-way merge helpers ---
@@ -1202,6 +1433,21 @@ fn load_jobs_by_ids(
     Ok(rows)
 }
 
+/// Controls whether the group committer does a full fsync after each batch.
+///
+/// - `Buffered`: only flushes the BufWriter to the OS page cache. Survives
+///   process crashes (data is in the kernel page cache) but NOT OS/power
+///   failure. Very fast — limited only by lock contention.
+/// - `Fsync`: flushes to page cache then fsyncs journal files via a second
+///   fd. Survives OS/power failure. Throughput is bounded by disk fsync
+///   latency (~3-5 ms on macOS NVMe, <1 ms on Linux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitMode {
+    #[default]
+    Buffered,
+    Fsync,
+}
+
 /// Tuning parameters for the underlying LSM storage engine.
 ///
 /// Job queue workloads are high-churn: jobs are enqueued, processed,
@@ -1243,6 +1489,13 @@ pub struct StorageConfig {
 
     /// Default backoff config applied to jobs that don't specify one.
     pub default_backoff: BackoffConfig,
+
+    /// Default commit mode for most operations.
+    pub default_commit_mode: CommitMode,
+
+    /// Optional per-operation commit mode for enqueue. When `None`,
+    /// enqueue inherits `default_commit_mode`.
+    pub enqueue_commit_mode: Option<CommitMode>,
 }
 
 /// Default target size for data SST files (64 MiB).
@@ -1291,6 +1544,8 @@ impl Default for StorageConfig {
                 base_ms: DEFAULT_BACKOFF_BASE_MS,
                 jitter_ms: DEFAULT_BACKOFF_JITTER_MS,
             },
+            default_commit_mode: CommitMode::default(),
+            enqueue_commit_mode: None,
         }
     }
 }
@@ -1306,6 +1561,8 @@ impl StorageConfig {
     /// | `ZANXIO_INDEX_TABLE_SIZE`   | `index_table_size` |
     /// | `ZANXIO_JOURNAL_SIZE`       | `journal_size`     |
     /// | `ZANXIO_L0_THRESHOLD`       | `l0_threshold`     |
+    /// | `ZANXIO_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
+    /// | `ZANXIO_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
         Ok(Self {
@@ -1319,6 +1576,27 @@ impl StorageConfig {
             default_dead_retention_ms: defaults.default_dead_retention_ms,
             default_retry_limit: defaults.default_retry_limit,
             default_backoff: defaults.default_backoff,
+            default_commit_mode: match std::env::var("ZANXIO_DEFAULT_COMMIT_MODE").ok().as_deref() {
+                Some("fsync") => CommitMode::Fsync,
+                Some("buffered") | None => CommitMode::Buffered,
+                Some(other) => {
+                    return Err(EnvConfigError {
+                        name: "ZANXIO_DEFAULT_COMMIT_MODE".into(),
+                        value: other.into(),
+                    });
+                }
+            },
+            enqueue_commit_mode: match std::env::var("ZANXIO_ENQUEUE_COMMIT_MODE").ok().as_deref() {
+                Some("fsync") => Some(CommitMode::Fsync),
+                Some("buffered") => Some(CommitMode::Buffered),
+                None => None,
+                Some(other) => {
+                    return Err(EnvConfigError {
+                        name: "ZANXIO_ENQUEUE_COMMIT_MODE".into(),
+                        value: other.into(),
+                    });
+                }
+            },
         })
     }
 }
@@ -1363,7 +1641,9 @@ impl Store {
         path: impl AsRef<std::path::Path>,
         config: StorageConfig,
     ) -> Result<Self, StoreError> {
+        let path = path.as_ref();
         let db = SingleWriterTxDatabase::builder(path)
+            .manual_journal_persist(true)
             .max_journaling_size(config.journal_size)
             .open()?;
 
@@ -1405,6 +1685,16 @@ impl Store {
 
         let (event_tx, _) = broadcast::channel(1024);
 
+        // Resolve per-operation commit modes: enqueue inherits the
+        // default when not explicitly overridden.
+        let default_commit_mode = config.default_commit_mode;
+        let enqueue_commit_mode = config.enqueue_commit_mode.unwrap_or(default_commit_mode);
+
+        // Start the group committer — a dedicated OS thread that batches
+        // journal persists. Shuts down when Keyspaces is dropped (the
+        // SyncSender closes, the thread drains and does a final SyncAll).
+        let group_committer = GroupCommitter::start(db.clone(), path.to_path_buf());
+
         Ok(Self {
             ks: Arc::new(Keyspaces {
                 db,
@@ -1415,6 +1705,9 @@ impl Store {
                 jobs_by_type,
                 jobs_by_purge_at,
                 errors,
+                group_committer,
+                default_commit_mode,
+                enqueue_commit_mode,
             }),
             ready_index: Arc::new(ReadyIndex::new()),
             scheduled_index: Arc::new(ScheduledIndex::new()),
@@ -1440,7 +1733,7 @@ impl Store {
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
 
-        let job = task::spawn_blocking(move || -> Result<Job, StoreError> {
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             let id = scru128::new_string();
 
             // Read the `ready_at` timestamp, defaulting to now if not present.
@@ -1488,14 +1781,14 @@ impl Store {
             let status_key = make_status_key(status, &id);
             let type_key = make_type_key(&job.job_type, &id);
 
-            let mut tx = ks.db.write_tx();
+            let mut tx = ks.write_tx();
             tx.insert(&ks.jobs, &id, &meta_bytes);
             tx.insert(&ks.payloads, &id, &payload_bytes);
             tx.insert(&ks.jobs_by_queue, &queue_key, b"");
             tx.insert(&ks.jobs_by_status, &status_key, b"");
             tx.insert(&ks.jobs_by_type, &type_key, b"");
 
-            tx.commit()?;
+            let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
 
             // Insert into the in-memory indexes after commit succeeds.
             // Ready jobs go into the ready index; scheduled jobs go into the
@@ -1506,9 +1799,11 @@ impl Store {
                 ready_index.insert(&job.queue, job.priority, job.id.clone());
             }
 
-            Ok(job)
+            Ok((job, Some(sync)))
         })
-        .await??;
+        .await?;
+
+        let job = await_sync(result).await?;
 
         match JobStatus::try_from(job.status) {
             Ok(JobStatus::Ready) => {
@@ -1559,7 +1854,7 @@ impl Store {
         let queues = queues.clone();
 
         let spawn_start = std::time::Instant::now();
-        task::spawn_blocking(move || {
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             let blocking_start = std::time::Instant::now();
             let spawn_wait = blocking_start.duration_since(spawn_start);
 
@@ -1574,7 +1869,7 @@ impl Store {
                         spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
                         "take_next_job: empty"
                     );
-                    return Ok(None);
+                    return Ok((None, None));
                 }
             };
             let scan_elapsed = scan_start.elapsed();
@@ -1582,7 +1877,7 @@ impl Store {
             // Acquire the fjall write lock *after* claiming from the index.
             // The index claim already prevents duplicates, so we just need
             // the write lock for the LSM transaction.
-            let mut tx = ks.db.write_tx();
+            let mut tx = ks.write_tx();
             let write_tx_elapsed = blocking_start.elapsed();
 
             // Look up job metadata from the jobs keyspace.
@@ -1608,21 +1903,24 @@ impl Store {
             tx.remove(&ks.jobs_by_status, &old_status_key);
             tx.insert(&ks.jobs_by_status, &new_status_key, b"");
 
-            if let Err(e) = tx.commit() {
-                // Commit failed — the LSM transaction rolled back. Acquire
-                // a new write transaction to serialize against concurrent
-                // writers, check whether the job is still Ready, and
-                // re-insert into the index if so.
-                let _tx = ks.db.write_tx();
-                if let Ok(Some(bytes)) = ks.jobs.get(&job_id) {
-                    if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
-                        if current.status == JobStatus::Ready as u8 {
-                            ready_index.insert(&current.queue, current.priority, current.id);
+            let sync = match ks.commit(tx, ks.default_commit_mode) {
+                Ok(sync) => sync,
+                Err(e) => {
+                    // Commit failed — the LSM transaction rolled back. Acquire
+                    // a new write transaction to serialize against concurrent
+                    // writers, check whether the job is still Ready, and
+                    // re-insert into the index if so.
+                    let _tx = ks.write_tx();
+                    if let Ok(Some(bytes)) = ks.jobs.get(&job_id) {
+                        if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
+                            if current.status == JobStatus::Ready as u8 {
+                                ready_index.insert(&current.queue, current.priority, current.id);
+                            }
                         }
                     }
+                    return Err(e);
                 }
-                return Err(e.into());
-            }
+            };
             let commit_elapsed = commit_start.elapsed();
 
             // Hydrate the payload from the payloads keyspace for the caller.
@@ -1644,9 +1942,11 @@ impl Store {
                 "take_next_job"
             );
 
-            Ok(Some(job))
+            Ok((Some(job), Some(sync)))
         })
-        .await?
+        .await?;
+
+        Ok(await_sync(result).await?)
     }
 
     /// Mark a job as successfully completed.
@@ -1663,18 +1963,18 @@ impl Store {
         let id = id.to_string();
         let id_for_event = id.clone();
 
-        let completed = task::spawn_blocking(move || {
-            let mut tx = ks.db.write_tx();
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let mut tx = ks.write_tx();
 
             let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
-                None => return Ok(false),
+                None => return Ok((false, None)),
             };
 
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
 
             if job.status != JobStatus::Working as u8 {
-                return Ok(false);
+                return Ok((false, None));
             }
 
             let retention_ms = job
@@ -1705,20 +2005,22 @@ impl Store {
                 tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
             }
 
-            tx.commit()?;
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
             ready_index.global.remove(&(job.priority, id));
 
-            Ok(true)
+            Ok((true, Some(sync)))
         })
         .await?;
 
-        if let Ok(true) = &completed {
+        let completed = await_sync(result).await?;
+
+        if completed {
             let _ = self.event_tx.send(StoreEvent::JobCompleted(id_for_event));
         }
 
-        completed
+        Ok(completed)
     }
 
     /// Record a job failure and either schedule a retry or kill the job
@@ -1747,20 +2049,20 @@ impl Store {
         let id = id.to_string();
         let id_for_event = id.clone();
 
-        let result: Result<Option<Job>, StoreError> = task::spawn_blocking(move || {
-            let mut tx = ks.db.write_tx();
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let mut tx = ks.write_tx();
 
             // Load the job to check its status and update it.
             let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
-                None => return Ok(None),
+                None => return Ok((None, None)),
             };
 
             let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
 
             // Can only fail a job that is currently being worked on.
             if job.status != JobStatus::Working as u8 {
-                return Ok(None);
+                return Ok((None, None));
             }
 
             // Record the failure time and increment the count.
@@ -1810,10 +2112,12 @@ impl Store {
                 tx.insert(&ks.jobs, &id, &meta_bytes);
                 tx.remove(&ks.jobs_by_status, &old_status_key);
                 tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-                tx.commit()?;
+                let sync = ks.commit(tx, ks.default_commit_mode)?;
 
                 // Insert into the in-memory scheduled index after commit succeeds.
                 scheduled_index.insert(job.ready_at, id.clone());
+
+                Ok((Some(job), Some(sync)))
             } else {
                 // Dead: check retention to decide sync delete vs deferred.
                 let retention_ms = job
@@ -1849,18 +2153,20 @@ impl Store {
                     tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
                 }
 
-                tx.commit()?;
+                let sync = ks.commit(tx, ks.default_commit_mode)?;
 
                 // Defensive: remove from ready_index in case of inconsistency.
                 ready_index.global.remove(&(job.priority, id));
-            }
 
-            Ok(Some(job))
+                Ok((Some(job), Some(sync)))
+            }
         })
         .await?;
 
+        let result = await_sync(result).await?;
+
         // Emit events outside spawn_blocking due to &self.event_tx.
-        if let Ok(Some(ref job)) = result {
+        if let Some(ref job) = result {
             // Always emit JobFailed first so workers prune their
             // in-flight set before any downstream events arrive.
             //
@@ -1881,7 +2187,7 @@ impl Store {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Look up a job by ID.
@@ -1933,44 +2239,39 @@ impl Store {
         let ready_index = self.ready_index.clone();
         let id = id.to_string();
 
-        // Returns Some((queue_name, priority)) if the job was requeued, None otherwise.
-        let requeued = task::spawn_blocking(
-            move || -> Result<Option<(String, u16, String)>, StoreError> {
-                let mut tx = ks.db.write_tx();
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let mut tx = ks.write_tx();
 
-                let old_status_key = make_status_key(JobStatus::Working, &id);
-                if ks.jobs_by_status.get(&old_status_key)?.is_none() {
-                    return Ok(None);
-                }
+            let old_status_key = make_status_key(JobStatus::Working, &id);
+            if ks.jobs_by_status.get(&old_status_key)?.is_none() {
+                return Ok((None, None));
+            }
 
-                // The job is still working, so it must still be in the jobs
-                // keyspace (only mark_completed removes from both).
-                let job_bytes = ks.jobs.get(&id)?.ok_or_else(|| {
-                    StoreError::Corruption(format!(
-                        "working job missing from jobs keyspace: {id:?}",
-                    ))
-                })?;
-                let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
-                let queue = job.queue.clone();
-                let priority = job.priority;
-                job.status = JobStatus::Ready.into();
-                let new_status_key = make_status_key(JobStatus::Ready, &id);
-                let job_bytes = rmp_serde::to_vec_named(&job)?;
+            // The job is still working, so it must still be in the jobs
+            // keyspace (only mark_completed removes from both).
+            let job_bytes = ks.jobs.get(&id)?.ok_or_else(|| {
+                StoreError::Corruption(format!("working job missing from jobs keyspace: {id:?}",))
+            })?;
+            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+            let queue = job.queue.clone();
+            let priority = job.priority;
+            job.status = JobStatus::Ready.into();
+            let new_status_key = make_status_key(JobStatus::Ready, &id);
+            let job_bytes = rmp_serde::to_vec_named(&job)?;
 
-                tx.insert(&ks.jobs, &id, &job_bytes);
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-                tx.commit()?;
+            tx.insert(&ks.jobs, &id, &job_bytes);
+            tx.remove(&ks.jobs_by_status, &old_status_key);
+            tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                // Insert into the in-memory ready index after commit succeeds.
-                ready_index.insert(&queue, priority, id.clone());
+            // Insert into the in-memory ready index after commit succeeds.
+            ready_index.insert(&queue, priority, id.clone());
 
-                Ok(Some((queue, priority, id)))
-            },
-        )
-        .await??;
+            Ok((Some(queue), Some(sync)))
+        })
+        .await?;
 
-        if let Some((queue, _, _)) = requeued {
+        if let Some(queue) = await_sync(result).await? {
             let _ = self.event_tx.send(StoreEvent::JobCreated {
                 queue,
                 token: Arc::new(AtomicBool::new(false)),
@@ -2462,23 +2763,23 @@ impl Store {
         let priority = job.priority;
         let ready_at = job.ready_at;
 
-        task::spawn_blocking(move || -> Result<(), StoreError> {
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // Remove from the in-memory scheduled index *before* commit to
             // prevent data races (same as take_next_job).
             scheduled_index.remove(ready_at, &id);
 
-            let mut tx = ks.db.write_tx();
+            let mut tx = ks.write_tx();
 
             // Re-read the job inside the write lock to confirm it's still
             // scheduled (a concurrent promote or deletion could have removed
             // it).
             let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
-                None => return Ok(()), // Already gone.
+                None => return Ok(((), None)), // Already gone.
             };
             let current: Job = rmp_serde::from_slice(&job_bytes)?;
             if current.status != JobStatus::Scheduled as u8 {
-                return Ok(()); // No longer scheduled.
+                return Ok(((), None)); // No longer scheduled.
             }
 
             // Swap status indexes: Scheduled -> Ready.
@@ -2493,28 +2794,33 @@ impl Store {
             let updated_bytes = rmp_serde::to_vec_named(&updated)?;
             tx.insert(&ks.jobs, &id, &updated_bytes);
 
-            if let Err(e) = tx.commit() {
-                // Commit failed — the LSM transaction rolled back. Acquire
-                // a new write transaction to serialize against concurrent
-                // writers, check whether the job is still Scheduled, and
-                // re-insert into the index if so.
-                let _tx = ks.db.write_tx();
-                if let Ok(Some(bytes)) = ks.jobs.get(&id) {
-                    if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
-                        if current.status == JobStatus::Scheduled as u8 {
-                            scheduled_index.insert(ready_at, id);
+            let sync = match ks.commit(tx, ks.default_commit_mode) {
+                Ok(sync) => sync,
+                Err(e) => {
+                    // Commit failed — the LSM transaction rolled back. Acquire
+                    // a new write transaction to serialize against concurrent
+                    // writers, check whether the job is still Scheduled, and
+                    // re-insert into the index if so.
+                    let _tx = ks.write_tx();
+                    if let Ok(Some(bytes)) = ks.jobs.get(&id) {
+                        if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
+                            if current.status == JobStatus::Scheduled as u8 {
+                                scheduled_index.insert(ready_at, id);
+                            }
                         }
                     }
+                    return Err(e);
                 }
-                return Err(e.into());
-            }
+            };
 
             // Insert into the in-memory ready index after commit succeeds.
             ready_index.insert(&queue, priority, id);
 
-            Ok(())
+            Ok(((), Some(sync)))
         })
-        .await??;
+        .await?;
+
+        await_sync(result).await?;
 
         let _ = self.event_tx.send(StoreEvent::JobCreated {
             queue: event_queue,
@@ -2564,7 +2870,7 @@ impl Store {
     async fn recover_working_jobs(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
 
-        task::spawn_blocking(move || -> Result<usize, StoreError> {
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // Scan the status index for all Working jobs.
             // Working = 2, so the prefix range is [2, 0]..[3, 0].
             let start: Vec<u8> = vec![JobStatus::Working as u8, 0];
@@ -2586,11 +2892,11 @@ impl Store {
             drop(snapshot);
 
             if working_ids.is_empty() {
-                return Ok(0);
+                return Ok((0, None));
             }
 
             let count = working_ids.len();
-            let mut tx = ks.db.write_tx();
+            let mut tx = ks.write_tx();
 
             for id in &working_ids {
                 let job_bytes = ks.jobs.get(id)?.ok_or_else(|| {
@@ -2612,10 +2918,12 @@ impl Store {
                 tx.insert(&ks.jobs, id, &updated_bytes);
             }
 
-            tx.commit()?;
-            Ok(count)
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
+            Ok((count, Some(sync)))
         })
-        .await?
+        .await?;
+
+        Ok(await_sync(result).await?)
     }
 
     /// Populate the in-memory ready index from the `jobs_by_status` index.
@@ -2749,12 +3057,12 @@ impl Store {
         let ready_index = self.ready_index.clone();
         let id = id.to_string();
 
-        task::spawn_blocking(move || -> Result<bool, StoreError> {
-            let mut tx = ks.db.write_tx();
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let mut tx = ks.write_tx();
 
             let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
-                None => return Ok(false), // Already purged.
+                None => return Ok((false, None)), // Already purged.
             };
 
             let job: Job = rmp_serde::from_slice(&job_bytes)?;
@@ -2764,14 +3072,16 @@ impl Store {
 
             delete_job_data(&mut tx, &job, status, &ks);
 
-            tx.commit()?;
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
             ready_index.global.remove(&(job.priority, id));
 
-            Ok(true)
+            Ok((true, Some(sync)))
         })
-        .await?
+        .await?;
+
+        Ok(await_sync(result).await?)
     }
 
     /// Hard-delete a batch of jobs in a single transaction.
@@ -2784,8 +3094,8 @@ impl Store {
         let ready_index = self.ready_index.clone();
         let ids = ids.to_vec();
 
-        task::spawn_blocking(move || -> Result<usize, StoreError> {
-            let mut tx = ks.db.write_tx();
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let mut tx = ks.write_tx();
             let mut deleted = Vec::new();
 
             for id in &ids {
@@ -2808,16 +3118,18 @@ impl Store {
             }
 
             let count = deleted.len();
-            tx.commit()?;
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
             for (priority, id) in deleted {
                 ready_index.global.remove(&(priority, id));
             }
 
-            Ok(count)
+            Ok((count, Some(sync)))
         })
-        .await?
+        .await?;
+
+        Ok(await_sync(result).await?)
     }
 }
 
@@ -6662,5 +6974,46 @@ mod tests {
         // Attempts are 1-based: first failure = 1, second = 2.
         assert_eq!(page.errors[0].attempt, 1);
         assert_eq!(page.errors[1].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn fsync_commit_mode_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageConfig::default();
+        config.default_commit_mode = CommitMode::Fsync;
+        let store = Store::open(dir.path().join("data"), config).unwrap();
+
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({"x": 1})),
+            )
+            .await
+            .unwrap();
+
+        let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.id, job.id);
+        assert_eq!(fetched.status, u8::from(JobStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn fsync_enqueue_commit_mode_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageConfig::default();
+        config.default_commit_mode = CommitMode::Buffered;
+        config.enqueue_commit_mode = Some(CommitMode::Fsync);
+        let store = Store::open(dir.path().join("data"), config).unwrap();
+
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({"x": 1})),
+            )
+            .await
+            .unwrap();
+
+        let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.id, job.id);
+        assert_eq!(fetched.status, u8::from(JobStatus::Ready));
     }
 }

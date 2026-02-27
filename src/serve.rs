@@ -20,6 +20,17 @@ use crate::store::{self, Store};
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";
 
+/// Parse a commit mode string into a `CommitMode` enum variant.
+fn parse_commit_mode(s: &str) -> Result<store::CommitMode, String> {
+    match s {
+        "buffered" => Ok(store::CommitMode::Buffered),
+        "fsync" => Ok(store::CommitMode::Fsync),
+        _ => Err(format!(
+            "invalid commit mode '{s}', expected 'buffered' or 'fsync'"
+        )),
+    }
+}
+
 /// Parse a duration string into milliseconds.
 ///
 /// Accepts either a bare number (interpreted as milliseconds) or a
@@ -92,6 +103,29 @@ pub struct Args {
     /// Interval between reaper scans (e.g. 30s, 1m).
     #[arg(long = "reaper-check-interval", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_REAPER_CHECK_INTERVAL")]
     reaper_check_interval_ms: u64,
+
+    /// Default commit durability mode for most operations.
+    /// "buffered" flushes to the OS page cache (durability is guaranteed
+    /// even if the server process crashes after commit).
+    /// "fsync" is the same as "buffered" but also fsyncs the WAL to disk
+    /// (durability is guaranteed even in the event of power failure after
+    /// commit).
+    /// Expect to pay a significant throughput penalty for fsync. You may not
+    /// need this guarantee. If you only care about at-last-once execution of
+    /// jobs, see --enqueue-commit-mode.
+    #[arg(long, default_value = "buffered", value_name = "MODE", value_parser = parse_commit_mode, env = "ZANXIO_DEFAULT_COMMIT_MODE")]
+    default_commit_mode: store::CommitMode,
+
+    /// Commit durability mode for enqueue operations only.
+    /// Overrides --default-commit-mode for enqueues. When unset, enqueue
+    /// inherits the default commit mode.
+    /// Use "--default-commit-mode buffered --enqueue-commit-mode fsync"
+    /// to get fsync durability for enqueues while keeping dequeue and
+    /// other operations fast. This basically provides at-least-once guarantees
+    /// while accepting jobs may be dequeued more than once in the case of a
+    /// system failure, such as sudden loss of power.
+    #[arg(long, value_name = "MODE", value_parser = parse_commit_mode, env = "ZANXIO_ENQUEUE_COMMIT_MODE")]
+    enqueue_commit_mode: Option<store::CommitMode>,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -110,6 +144,8 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         base_ms: args.default_backoff_base_ms as u32,
         jitter_ms: args.default_backoff_jitter_ms as u32,
     };
+    storage_config.default_commit_mode = args.default_commit_mode;
+    storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
