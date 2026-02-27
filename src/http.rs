@@ -1688,7 +1688,7 @@ async fn take_jobs(
                                     match state.store.take_next_job(now, &queues).await {
                                         Ok(Some(job)) => {
                                             tracing::trace!(
-                                                take_us = take_start.elapsed().as_micros(),
+                                                take_ms = take_start.elapsed().as_secs_f64() * 1000.0,
                                                 job_id = %job.id,
                                                 "take loop: got job"
                                             );
@@ -1724,7 +1724,7 @@ async fn take_jobs(
                                         }
                                         Ok(None) => {
                                             tracing::trace!(
-                                                take_us = take_start.elapsed().as_micros(),
+                                                take_ms = take_start.elapsed().as_secs_f64() * 1000.0,
                                                 "take loop: queue empty"
                                             );
                                             // Queue is empty. The CAS

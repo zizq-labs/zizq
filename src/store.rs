@@ -1571,7 +1571,7 @@ impl Store {
                 Some(entry) => entry,
                 None => {
                     tracing::trace!(
-                        spawn_wait_us = spawn_wait.as_micros(),
+                        spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
                         "take_next_job: empty"
                     );
                     return Ok(None);
@@ -1633,12 +1633,12 @@ impl Store {
             let hydrate_elapsed = hydrate_start.elapsed();
 
             tracing::trace!(
-                spawn_wait_us = spawn_wait.as_micros(),
-                write_tx_us = write_tx_elapsed.as_micros(),
-                scan_us = scan_elapsed.as_micros(),
-                commit_us = commit_elapsed.as_micros(),
-                hydrate_us = hydrate_elapsed.as_micros(),
-                total_us = blocking_start.elapsed().as_micros(),
+                spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
+                write_tx_ms = write_tx_elapsed.as_secs_f64() * 1000.0,
+                scan_ms = scan_elapsed.as_secs_f64() * 1000.0,
+                commit_ms = commit_elapsed.as_secs_f64() * 1000.0,
+                hydrate_ms = hydrate_elapsed.as_secs_f64() * 1000.0,
+                total_ms = blocking_start.elapsed().as_secs_f64() * 1000.0,
                 job_id = %job.id,
                 queue = %queue,
                 "take_next_job"
