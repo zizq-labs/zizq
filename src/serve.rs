@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
+use crate::license::License;
 use crate::store::{self, Store};
 
 /// Location of the internal database within the root directory.
@@ -94,7 +95,7 @@ pub struct Args {
 }
 
 /// Initializes the database and starts the HTTP server.
-pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error::Error>> {
     // Make sure the root dir exists.
     let root = std::path::Path::new(&args.root_dir);
     std::fs::create_dir_all(root)?;
@@ -126,6 +127,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize shared state accessible to all request handlers.
     let state = Arc::new(AppState {
+        license,
         store,
         heartbeat_interval_ms: Duration::from_millis(args.heartbeat_interval_ms),
         global_working_limit: args.global_working_limit,

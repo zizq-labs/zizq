@@ -7,6 +7,7 @@
 //! integration tests without duplicating the module tree.
 
 pub mod http;
+pub mod license;
 pub mod logging;
 pub mod reaper;
 pub mod scheduler;

@@ -177,6 +177,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
     std::mem::forget(shutdown_tx);
 
     let state = Arc::new(AppState {
+        license: zanxio::license::License::Free,
         store: store.clone(),
         heartbeat_interval_ms: Duration::from_millis(200),
         global_working_limit: DEFAULT_GLOBAL_WORKING_LIMIT,

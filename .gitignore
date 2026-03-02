@@ -1,2 +1,4 @@
 /target
 zanxio-root
+.cargo/config.toml
+.keys

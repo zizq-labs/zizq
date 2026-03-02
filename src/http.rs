@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::license::License;
 use crate::store::{self, ListErrorsOptions, ListJobsOptions, ScanDirection, Store, StoreEvent};
 use axum::Router;
 use axum::body::Body;
@@ -674,6 +675,9 @@ struct ListErrorsPages {
 
 /// Shared server state, passed to all request handlers.
 pub struct AppState {
+    /// Validated license determining which paid features are available.
+    pub license: License,
+
     /// Persistent store for job queue operations.
     pub store: Store,
 
@@ -1913,6 +1917,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
         let state = AppState {
+            license: License::Free,
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_working_limit: 0,
@@ -3911,6 +3916,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
         let state = Arc::new(AppState {
+            license: License::Free,
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_working_limit: 2,
