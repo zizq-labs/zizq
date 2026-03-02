@@ -32,7 +32,7 @@ use crossbeam_skiplist::{SkipMap, SkipSet};
 use dashmap::DashMap;
 
 use fjall::config::FilterPolicy;
-use fjall::{PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
+use fjall::{PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace, Slice};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::task;
@@ -1858,91 +1858,110 @@ impl Store {
             let blocking_start = std::time::Instant::now();
             let spawn_wait = blocking_start.duration_since(spawn_start);
 
-            // Claim the best candidate from the lock-free ready index.
-            // This atomically removes the entry — two concurrent callers
-            // each get a different job (no mutex needed).
-            let scan_start = std::time::Instant::now();
-            let (_priority, job_id, queue) = match ready_index.claim(&queues) {
-                Some(entry) => entry,
-                None => {
-                    tracing::trace!(
-                        spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
-                        "take_next_job: empty"
-                    );
-                    return Ok((None, None));
-                }
-            };
-            let scan_elapsed = scan_start.elapsed();
-
-            // Acquire the fjall write lock *after* claiming from the index.
-            // The index claim already prevents duplicates, so we just need
-            // the write lock for the LSM transaction.
-            let mut tx = ks.write_tx();
-            let write_tx_elapsed = blocking_start.elapsed();
-
-            // Look up job metadata from the jobs keyspace.
-            let meta_bytes = ks.jobs.get(&job_id)?.ok_or_else(|| {
-                StoreError::Corruption(format!(
-                    "job in ready index but missing from jobs keyspace: {job_id:?}",
-                ))
-            })?;
-
-            let mut job: Job = rmp_serde::from_slice(&meta_bytes)?;
-            let old_status_key = make_status_key(JobStatus::Ready, &job.id);
-            job.status = JobStatus::Working.into();
-            job.dequeued_at = Some(now);
-            let new_status_key = make_status_key(JobStatus::Working, &job.id);
-
-            // Only write metadata back — payload is immutable and stays in
-            // its own keyspace.
-            let meta_bytes = rmp_serde::to_vec_named(&job)?;
-
-            // Update job record and status indexes.
-            let commit_start = std::time::Instant::now();
-            tx.insert(&ks.jobs, &job_id, &meta_bytes);
-            tx.remove(&ks.jobs_by_status, &old_status_key);
-            tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-
-            let sync = match ks.commit(tx, ks.default_commit_mode) {
-                Ok(sync) => sync,
-                Err(e) => {
-                    // Commit failed — the LSM transaction rolled back. Acquire
-                    // a new write transaction to serialize against concurrent
-                    // writers, check whether the job is still Ready, and
-                    // re-insert into the index if so.
-                    let _tx = ks.write_tx();
-                    if let Ok(Some(bytes)) = ks.jobs.get(&job_id) {
-                        if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
-                            if current.status == JobStatus::Ready as u8 {
-                                ready_index.insert(&current.queue, current.priority, current.id);
-                            }
-                        }
+            // Outer loop: claim candidates from the lock-free ready index.
+            // Re-claims if a candidate turns out to be missing or no longer
+            // Ready (e.g. deleted or taken by another path).
+            loop {
+                let (_priority, job_id, queue) = match ready_index.claim(&queues) {
+                    Some(entry) => entry,
+                    None => {
+                        tracing::trace!(
+                            spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
+                            "take_next_job: empty"
+                        );
+                        return Ok((None, None));
                     }
-                    return Err(e);
+                };
+
+                // Inner loop: pre-read and pre-compute changes outside the tx,
+                // then compare-and-write inside. Retries on stale pre-reads
+                // (update job metadata race). Breaks with None to re-claim
+                // from the outer loop if the candidate is invalid.
+                let outcome = loop {
+                    // ---- outside tx ----
+                    let pre_bytes = match ks.jobs.get(&job_id)? {
+                        Some(bytes) => bytes,
+                        None => break None, // Deleted; try next candidate.
+                    };
+
+                    let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+                    if job.status != JobStatus::Ready as u8 {
+                        break None; // No longer ready; try next candidate.
+                    }
+
+                    let old_status_key = make_status_key(JobStatus::Ready, &job.id);
+                    let new_status_key = make_status_key(JobStatus::Working, &job.id);
+
+                    job.status = JobStatus::Working.into();
+                    job.dequeued_at = Some(now);
+
+                    let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+                    // ---- inside tx (writes only) ----
+                    let mut tx = ks.write_tx();
+
+                    let prev =
+                        tx.fetch_update(&ks.jobs, &job_id, |_| Some(updated_slice.clone()))?;
+
+                    if prev.as_deref() != Some(&*pre_bytes) {
+                        drop(tx);
+                        continue; // Stale pre-read; retry same job.
+                    }
+
+                    tx.remove(&ks.jobs_by_status, &old_status_key);
+                    tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+
+                    let sync = match ks.commit(tx, ks.default_commit_mode) {
+                        Ok(sync) => sync,
+                        Err(e) => {
+                            // Commit failed — re-insert into the ready index
+                            // if the job is still Ready.
+                            let _tx = ks.write_tx();
+                            if let Ok(Some(bytes)) = ks.jobs.get(&job_id) {
+                                if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
+                                    if current.status == JobStatus::Ready as u8 {
+                                        ready_index.insert(
+                                            &current.queue,
+                                            current.priority,
+                                            current.id,
+                                        );
+                                    }
+                                }
+                            }
+                            return Err(e);
+                        }
+                    };
+
+                    break Some((job, sync));
+                };
+
+                let Some((mut job, sync)) = outcome else {
+                    continue; // Bad candidate; re-claim from outer loop.
+                };
+
+                let write_tx_elapsed = blocking_start.elapsed();
+
+                // Hydrate the payload from the payloads keyspace for the caller.
+                let hydrate_start = std::time::Instant::now();
+
+                if let Some(payload_bytes) = ks.payloads.get(&job_id)? {
+                    job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                 }
-            };
-            let commit_elapsed = commit_start.elapsed();
 
-            // Hydrate the payload from the payloads keyspace for the caller.
-            let hydrate_start = std::time::Instant::now();
-            if let Some(payload_bytes) = ks.payloads.get(&job_id)? {
-                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
+                let hydrate_elapsed = hydrate_start.elapsed();
+
+                tracing::trace!(
+                    spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
+                    write_tx_ms = write_tx_elapsed.as_secs_f64() * 1000.0,
+                    hydrate_ms = hydrate_elapsed.as_secs_f64() * 1000.0,
+                    total_ms = blocking_start.elapsed().as_secs_f64() * 1000.0,
+                    job_id = %job.id,
+                    queue = %queue,
+                    "take_next_job"
+                );
+
+                return Ok((Some(job), Some(sync)));
             }
-            let hydrate_elapsed = hydrate_start.elapsed();
-
-            tracing::trace!(
-                spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
-                write_tx_ms = write_tx_elapsed.as_secs_f64() * 1000.0,
-                scan_ms = scan_elapsed.as_secs_f64() * 1000.0,
-                commit_ms = commit_elapsed.as_secs_f64() * 1000.0,
-                hydrate_ms = hydrate_elapsed.as_secs_f64() * 1000.0,
-                total_ms = blocking_start.elapsed().as_secs_f64() * 1000.0,
-                job_id = %job.id,
-                queue = %queue,
-                "take_next_job"
-            );
-
-            Ok((Some(job), Some(sync)))
         })
         .await?;
 
@@ -1964,29 +1983,48 @@ impl Store {
         let id_for_event = id.clone();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let mut tx = ks.write_tx();
+            // Retry loop: pre-read and pre-compute changes outside the tx,
+            // then compare-and-write inside. Retries only if a concurrent job
+            // metadata update modified the job between the pre-read and lock
+            // acquisition.
+            loop {
+                // ---- outside tx ----
+                let pre_bytes = match ks.jobs.get(&id)? {
+                    Some(bytes) => bytes,
+                    None => return Ok((false, None)),
+                };
 
-            let job_bytes = match ks.jobs.get(&id)? {
-                Some(bytes) => bytes,
-                None => return Ok((false, None)),
-            };
+                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+                if job.status != JobStatus::Working as u8 {
+                    return Ok((false, None));
+                }
 
-            if job.status != JobStatus::Working as u8 {
-                return Ok((false, None));
-            }
+                let retention_ms = job
+                    .retention
+                    .as_ref()
+                    .and_then(|r| r.completed_ms)
+                    .unwrap_or(default_completed_retention_ms);
 
-            let retention_ms = job
-                .retention
-                .as_ref()
-                .and_then(|r| r.completed_ms)
-                .unwrap_or(default_completed_retention_ms);
+                if retention_ms == 0 {
+                    // Zero retention: prepare deletion keys outside tx.
+                    let del = prepare_job_deletion(&job, JobStatus::Working, &ks);
 
-            if retention_ms == 0 {
-                // Zero retention: hard-delete synchronously in this transaction.
-                delete_job_data(&mut tx, &job, JobStatus::Working, &ks);
-            } else {
+                    // ---- inside tx ----
+                    let mut tx = ks.write_tx();
+                    let prev = tx.take(&ks.jobs, &id)?;
+                    if prev.as_deref() != Some(&*pre_bytes) {
+                        drop(tx);
+                        continue;
+                    }
+                    apply_job_deletion(&mut tx, &del, &ks);
+                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+                    ready_index.global.remove(&(job.priority, id));
+
+                    return Ok((true, Some(sync)));
+                }
+
                 // Non-zero retention: defer deletion to the reaper.
                 let purge_at = now + retention_ms;
 
@@ -1997,20 +2035,29 @@ impl Store {
                 job.status = JobStatus::Completed.into();
                 job.purge_at = Some(purge_at);
                 job.completed_at = Some(now);
-                let meta_bytes = rmp_serde::to_vec_named(&job)?;
 
-                tx.insert(&ks.jobs, &id, &meta_bytes);
+                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+                // ---- inside tx ----
+                let mut tx = ks.write_tx();
+
+                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+
+                if prev.as_deref() != Some(&*pre_bytes) {
+                    drop(tx);
+                    continue;
+                }
+
                 tx.remove(&ks.jobs_by_status, &old_status_key);
                 tx.insert(&ks.jobs_by_status, &new_status_key, b"");
                 tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
+
+                let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+                ready_index.global.remove(&(job.priority, id));
+
+                return Ok((true, Some(sync)));
             }
-
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
-
-            // Defensive: remove from ready_index in case of inconsistency.
-            ready_index.global.remove(&(job.priority, id));
-
-            Ok((true, Some(sync)))
         })
         .await?;
 
@@ -2050,75 +2097,89 @@ impl Store {
         let id_for_event = id.clone();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let mut tx = ks.write_tx();
+            // Extract fields from opts before the retry loop so they can
+            // be cloned on each iteration.
+            let kill = opts.kill;
+            let retry_at = opts.retry_at;
+            let error_message = opts.error;
+            let error_type_opt = opts.error_type;
+            let error_backtrace = opts.backtrace;
 
-            // Load the job to check its status and update it.
-            let job_bytes = match ks.jobs.get(&id)? {
-                Some(bytes) => bytes,
-                None => return Ok((None, None)),
-            };
+            // Retry loop: pre-read and pre-compute updates outside the tx,
+            // then compare-and-write inside. Retries only if a concurrent job
+            // metadata update modified the job between the pre-read and lock
+            // acquisition.
+            let (job, sync) = loop {
+                // ---- outside tx ----
+                let pre_bytes = match ks.jobs.get(&id)? {
+                    Some(bytes) => bytes,
+                    None => return Ok((None, None)),
+                };
 
-            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-            // Can only fail a job that is currently being worked on.
-            if job.status != JobStatus::Working as u8 {
-                return Ok((None, None));
-            }
+                if job.status != JobStatus::Working as u8 {
+                    return Ok((None, None));
+                }
 
-            // Record the failure time and increment the count.
-            job.attempts += 1;
-            job.failed_at = Some(now);
+                job.attempts += 1;
+                job.failed_at = Some(now);
 
-            // Write the error record (append-only).
-            let error_key = make_error_key(&id, job.attempts);
-            let error_record = ErrorRecord {
-                message: opts.error,
-                error_type: opts.error_type,
-                backtrace: opts.backtrace,
-                dequeued_at: job.dequeued_at.unwrap_or(0),
-                failed_at: now,
-                attempt: job.attempts,
-            };
-            let error_bytes = rmp_serde::to_vec_named(&error_record)?;
-            tx.insert(&ks.errors, &error_key, &error_bytes);
+                let error_key = make_error_key(&id, job.attempts);
 
-            // Client options may override the default backoff policy here so
-            // we always check those first and then apply the appropriate
-            // backoff policy.
+                let error_record = ErrorRecord {
+                    message: error_message.clone(),
+                    error_type: error_type_opt.clone(),
+                    backtrace: error_backtrace.clone(),
+                    dequeued_at: job.dequeued_at.unwrap_or(0),
+                    failed_at: now,
+                    attempt: job.attempts,
+                };
 
-            let retry_limit = job.retry_limit.unwrap_or(default_retry_limit);
+                let error_bytes = rmp_serde::to_vec_named(&error_record)?;
 
-            if opts.kill {
-                job.status = JobStatus::Dead.into();
-            } else if let Some(retry_at) = opts.retry_at {
-                job.status = JobStatus::Scheduled.into();
-                job.ready_at = retry_at;
-            } else if job.attempts > retry_limit {
-                job.status = JobStatus::Dead.into();
-            } else {
-                let backoff = job.backoff.as_ref().unwrap_or(&default_backoff);
-                let delay_ms = compute_backoff(job.attempts, backoff);
-                job.status = JobStatus::Scheduled.into();
-                job.ready_at = now + delay_ms;
-            };
+                let retry_limit = job.retry_limit.unwrap_or(default_retry_limit);
 
-            let old_status_key = make_status_key(JobStatus::Working, &id);
+                if kill {
+                    job.status = JobStatus::Dead.into();
+                } else if let Some(ra) = retry_at {
+                    job.status = JobStatus::Scheduled.into();
+                    job.ready_at = ra;
+                } else if job.attempts > retry_limit {
+                    job.status = JobStatus::Dead.into();
+                } else {
+                    let backoff = job.backoff.as_ref().unwrap_or(&default_backoff);
+                    let delay_ms = compute_backoff(job.attempts, backoff);
+                    job.status = JobStatus::Scheduled.into();
+                    job.ready_at = now + delay_ms;
+                };
 
-            if job.status == JobStatus::Scheduled as u8 {
-                // Move job back into the scheduled index.
-                let new_status_key = make_status_key(JobStatus::Scheduled, &id);
+                let old_status_key = make_status_key(JobStatus::Working, &id);
 
-                let meta_bytes = rmp_serde::to_vec_named(&job)?;
-                tx.insert(&ks.jobs, &id, &meta_bytes);
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-                let sync = ks.commit(tx, ks.default_commit_mode)?;
+                if job.status == JobStatus::Scheduled as u8 {
+                    let new_status_key = make_status_key(JobStatus::Scheduled, &id);
+                    let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
 
-                // Insert into the in-memory scheduled index after commit succeeds.
-                scheduled_index.insert(job.ready_at, id.clone());
+                    // ---- inside tx (writes only, plus one compare) ----
+                    let mut tx = ks.write_tx();
 
-                Ok((Some(job), Some(sync)))
-            } else {
+                    let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+
+                    if prev.as_deref() != Some(&*pre_bytes) {
+                        drop(tx);
+                        continue;
+                    }
+
+                    tx.insert(&ks.errors, &error_key, &error_bytes);
+                    tx.remove(&ks.jobs_by_status, &old_status_key);
+                    tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+                    scheduled_index.insert(job.ready_at, id.clone());
+
+                    break (job, sync);
+                }
+
                 // Dead: check retention to decide sync delete vs deferred.
                 let retention_ms = job
                     .retention
@@ -2127,39 +2188,56 @@ impl Store {
                     .unwrap_or(default_dead_retention_ms);
 
                 if retention_ms == 0 {
-                    // Zero retention: hard-delete synchronously.
-                    // The error record inserted above in this tx won't be
-                    // visible to error_keys (prefix scan reads committed
-                    // data), so remove it explicitly.
-                    tx.remove_weak(&ks.errors, &error_key);
+                    // Zero retention: prepare deletion keys outside tx.
+                    let del = prepare_job_deletion(&job, JobStatus::Working, &ks);
 
-                    delete_job_data(&mut tx, &job, JobStatus::Working, &ks);
-
-                    // Set status to Dead so event logic works after commit.
+                    // ---- inside tx ----
+                    let mut tx = ks.write_tx();
+                    let prev = tx.take(&ks.jobs, &id)?;
+                    if prev.as_deref() != Some(&*pre_bytes) {
+                        drop(tx);
+                        continue;
+                    }
+                    apply_job_deletion(&mut tx, &del, &ks);
                     job.status = JobStatus::Dead.into();
-                } else {
-                    // Non-zero retention: defer deletion to the reaper.
-                    let purge_at = now + retention_ms;
+                    let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                    let new_status_key = make_status_key(JobStatus::Dead, &id);
-                    let purge_key = make_purge_key(purge_at, &id);
+                    ready_index.global.remove(&(job.priority, id));
 
-                    job.purge_at = Some(purge_at);
-                    let meta_bytes = rmp_serde::to_vec_named(&job)?;
-
-                    tx.insert(&ks.jobs, &id, &meta_bytes);
-                    tx.remove(&ks.jobs_by_status, &old_status_key);
-                    tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-                    tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
+                    break (job, sync);
                 }
+
+                // Non-zero retention: defer deletion to the reaper.
+                let purge_at = now + retention_ms;
+                let new_status_key = make_status_key(JobStatus::Dead, &id);
+                let purge_key = make_purge_key(purge_at, &id);
+
+                job.purge_at = Some(purge_at);
+                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+                // ---- inside tx ----
+                let mut tx = ks.write_tx();
+
+                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+
+                if prev.as_deref() != Some(&*pre_bytes) {
+                    drop(tx);
+                    continue;
+                }
+
+                tx.insert(&ks.errors, &error_key, &error_bytes);
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                // Defensive: remove from ready_index in case of inconsistency.
                 ready_index.global.remove(&(job.priority, id));
 
-                Ok((Some(job), Some(sync)))
-            }
+                break (job, sync);
+            };
+
+            Ok((Some(job), Some(sync)))
         })
         .await?;
 
@@ -2240,34 +2318,52 @@ impl Store {
         let id = id.to_string();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let mut tx = ks.write_tx();
+            // Retry loop: pre-read and pre-compute updates outside the tx,
+            // then compare-and-write inside. Retries only if a concurrent job
+            // metadata update modified the job between the pre-read and lock
+            // acquisition.
+            loop {
+                // ---- outside tx ----
+                let pre_bytes = match ks.jobs.get(&id)? {
+                    Some(bytes) => bytes,
+                    None => return Ok((None, None)),
+                };
 
-            let old_status_key = make_status_key(JobStatus::Working, &id);
-            if ks.jobs_by_status.get(&old_status_key)?.is_none() {
-                return Ok((None, None));
+                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+
+                if job.status != JobStatus::Working as u8 {
+                    return Ok((None, None));
+                }
+
+                let old_status_key = make_status_key(JobStatus::Working, &id);
+                let new_status_key = make_status_key(JobStatus::Ready, &id);
+
+                let queue = job.queue.clone();
+                let priority = job.priority;
+                job.status = JobStatus::Ready.into();
+
+                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+                // ---- inside tx (writes only, plus one compare) ----
+                let mut tx = ks.write_tx();
+
+                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+
+                if prev.as_deref() != Some(&*pre_bytes) {
+                    drop(tx);
+                    continue;
+                }
+
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+
+                let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+                // Insert into the in-memory ready index after commit succeeds.
+                ready_index.insert(&queue, priority, id.clone());
+
+                return Ok((Some(queue), Some(sync)));
             }
-
-            // The job is still working, so it must still be in the jobs
-            // keyspace (only mark_completed removes from both).
-            let job_bytes = ks.jobs.get(&id)?.ok_or_else(|| {
-                StoreError::Corruption(format!("working job missing from jobs keyspace: {id:?}",))
-            })?;
-            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
-            let queue = job.queue.clone();
-            let priority = job.priority;
-            job.status = JobStatus::Ready.into();
-            let new_status_key = make_status_key(JobStatus::Ready, &id);
-            let job_bytes = rmp_serde::to_vec_named(&job)?;
-
-            tx.insert(&ks.jobs, &id, &job_bytes);
-            tx.remove(&ks.jobs_by_status, &old_status_key);
-            tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
-
-            // Insert into the in-memory ready index after commit succeeds.
-            ready_index.insert(&queue, priority, id.clone());
-
-            Ok((Some(queue), Some(sync)))
         })
         .await?;
 
@@ -2768,55 +2864,66 @@ impl Store {
             // prevent data races (same as take_next_job).
             scheduled_index.remove(ready_at, &id);
 
-            let mut tx = ks.write_tx();
+            // Retry loop: pre-read and pre-compute updates outside the tx,
+            // then compare-and-write inside. Retries only if a concurrent job
+            // metadata update modified the job between the pre-read and lock
+            // acquisition.
+            loop {
+                // ---- outside tx ----
+                let pre_bytes = match ks.jobs.get(&id)? {
+                    Some(bytes) => bytes,
+                    None => return Ok(((), None)), // Already gone.
+                };
 
-            // Re-read the job inside the write lock to confirm it's still
-            // scheduled (a concurrent promote or deletion could have removed
-            // it).
-            let job_bytes = match ks.jobs.get(&id)? {
-                Some(bytes) => bytes,
-                None => return Ok(((), None)), // Already gone.
-            };
-            let current: Job = rmp_serde::from_slice(&job_bytes)?;
-            if current.status != JobStatus::Scheduled as u8 {
-                return Ok(((), None)); // No longer scheduled.
-            }
+                let current: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-            // Swap status indexes: Scheduled -> Ready.
-            let old_status_key = make_status_key(JobStatus::Scheduled, &id);
-            let new_status_key = make_status_key(JobStatus::Ready, &id);
-            tx.remove(&ks.jobs_by_status, &old_status_key);
-            tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                if current.status != JobStatus::Scheduled as u8 {
+                    return Ok(((), None)); // No longer scheduled.
+                }
 
-            // Update the job record itself.
-            let mut updated = current;
-            updated.status = JobStatus::Ready.into();
-            let updated_bytes = rmp_serde::to_vec_named(&updated)?;
-            tx.insert(&ks.jobs, &id, &updated_bytes);
+                let old_status_key = make_status_key(JobStatus::Scheduled, &id);
+                let new_status_key = make_status_key(JobStatus::Ready, &id);
 
-            let sync = match ks.commit(tx, ks.default_commit_mode) {
-                Ok(sync) => sync,
-                Err(e) => {
-                    // Commit failed — the LSM transaction rolled back. Acquire
-                    // a new write transaction to serialize against concurrent
-                    // writers, check whether the job is still Scheduled, and
-                    // re-insert into the index if so.
-                    let _tx = ks.write_tx();
-                    if let Ok(Some(bytes)) = ks.jobs.get(&id) {
-                        if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
-                            if current.status == JobStatus::Scheduled as u8 {
-                                scheduled_index.insert(ready_at, id);
+                let mut updated = current;
+                updated.status = JobStatus::Ready.into();
+
+                let updated_slice: Slice = rmp_serde::to_vec_named(&updated)?.into();
+
+                // ---- inside tx (writes only, plus one compare) ----
+                let mut tx = ks.write_tx();
+
+                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+
+                if prev.as_deref() != Some(&*pre_bytes) {
+                    drop(tx);
+                    continue;
+                }
+
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+
+                let sync = match ks.commit(tx, ks.default_commit_mode) {
+                    Ok(sync) => sync,
+                    Err(e) => {
+                        // Commit failed — re-insert into the scheduled index
+                        // if the job is still Scheduled.
+                        let _tx = ks.write_tx();
+                        if let Ok(Some(bytes)) = ks.jobs.get(&id) {
+                            if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
+                                if current.status == JobStatus::Scheduled as u8 {
+                                    scheduled_index.insert(ready_at, id);
+                                }
                             }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-            };
+                };
 
-            // Insert into the in-memory ready index after commit succeeds.
-            ready_index.insert(&queue, priority, id);
+                // Insert into the in-memory ready index after commit succeeds.
+                ready_index.insert(&queue, priority, id);
 
-            Ok(((), Some(sync)))
+                return Ok(((), Some(sync)));
+            }
         })
         .await?;
 
@@ -2895,6 +3002,8 @@ impl Store {
                 return Ok((0, None));
             }
 
+            // Recovery runs at startup before concurrent access, so we
+            // can safely read and write in place inside the tx.
             let count = working_ids.len();
             let mut tx = ks.write_tx();
 
@@ -2906,16 +3015,14 @@ impl Store {
                 })?;
                 let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                // Swap status indexes: Working -> Ready.
                 let old_status_key = make_status_key(JobStatus::Working, id);
                 let new_status_key = make_status_key(JobStatus::Ready, id);
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-
-                // Update the job record itself.
                 job.status = JobStatus::Ready.into();
                 let updated_bytes = rmp_serde::to_vec_named(&job)?;
+
                 tx.insert(&ks.jobs, id, &updated_bytes);
+                tx.remove(&ks.jobs_by_status, &old_status_key);
+                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
             }
 
             let sync = ks.commit(tx, ks.default_commit_mode)?;
@@ -3058,8 +3165,7 @@ impl Store {
         let id = id.to_string();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let mut tx = ks.write_tx();
-
+            // ---- outside tx ----
             let job_bytes = match ks.jobs.get(&id)? {
                 Some(bytes) => bytes,
                 None => return Ok((false, None)), // Already purged.
@@ -3070,8 +3176,11 @@ impl Store {
                 StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
             })?;
 
-            delete_job_data(&mut tx, &job, status, &ks);
+            let del = prepare_job_deletion(&job, status, &ks);
 
+            // ---- inside tx (writes only) ----
+            let mut tx = ks.write_tx();
+            apply_job_deletion(&mut tx, &del, &ks);
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
@@ -3095,8 +3204,8 @@ impl Store {
         let ids = ids.to_vec();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let mut tx = ks.write_tx();
-            let mut deleted = Vec::new();
+            // ---- outside tx: prepare all deletions ----
+            let mut deletions: Vec<(JobDeletion, u16)> = Vec::new();
 
             for id in &ids {
                 let job_bytes = match ks.jobs.get(id)? {
@@ -3112,17 +3221,21 @@ impl Store {
                     ))
                 })?;
 
-                delete_job_data(&mut tx, &job, status, &ks);
-
-                deleted.push((job.priority, id.clone()));
+                let priority = job.priority;
+                deletions.push((prepare_job_deletion(&job, status, &ks), priority));
             }
 
-            let count = deleted.len();
+            // ---- inside tx (writes only) ----
+            let count = deletions.len();
+            let mut tx = ks.write_tx();
+            for (del, _) in &deletions {
+                apply_job_deletion(&mut tx, del, &ks);
+            }
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
-            for (priority, id) in deleted {
-                ready_index.global.remove(&(priority, id));
+            for (del, priority) in deletions {
+                ready_index.global.remove(&(priority, del.id));
             }
 
             Ok((count, Some(sync)))
@@ -3200,35 +3313,46 @@ fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
         .filter_map(|guard| guard.key().ok().map(|k| k.to_vec()))
 }
 
-/// Remove all data for a job within an existing open transaction.
+/// Pre-computed keys for deleting all data associated with a job.
 ///
-/// Removes from: jobs, payloads, jobs_by_status, jobs_by_queue,
-/// jobs_by_type, jobs_by_purge_at (if set), and all error records.
-/// Does NOT commit — the caller decides when to commit.
-fn delete_job_data(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
-    job: &Job,
-    status: JobStatus,
-    ks: &Keyspaces,
-) {
+/// Built by `prepare_job_deletion` (no tx required), applied by
+/// `apply_job_deletion` (write-only inside an open tx).
+struct JobDeletion {
+    id: String,
+    status_key: Vec<u8>,
+    queue_key: Vec<u8>,
+    type_key: Vec<u8>,
+    purge_key: Option<Vec<u8>>,
+    error_keys: Vec<Vec<u8>>,
+}
+
+/// Collect all keys needed to delete a job. No tx required.
+fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDeletion {
     let id = &job.id;
-    let status_key = make_status_key(status, id);
-    let queue_key = make_queue_key(&job.queue, id);
-    let type_key = make_type_key(&job.job_type, id);
+    JobDeletion {
+        id: id.clone(),
+        status_key: make_status_key(status, id),
+        queue_key: make_queue_key(&job.queue, id),
+        type_key: make_type_key(&job.job_type, id),
+        purge_key: job.purge_at.map(|purge_at| make_purge_key(purge_at, id)),
+        error_keys: error_keys(ks, id).collect(),
+    }
+}
 
-    tx.remove(&ks.jobs, id);
-    tx.remove_weak(&ks.payloads, id);
-    tx.remove(&ks.jobs_by_status, &status_key);
-    tx.remove_weak(&ks.jobs_by_queue, &queue_key);
-    tx.remove_weak(&ks.jobs_by_type, &type_key);
+/// Apply pre-computed deletion inside an open tx. No reads.
+fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion, ks: &Keyspaces) {
+    tx.remove(&ks.jobs, &del.id);
+    tx.remove_weak(&ks.payloads, &del.id);
+    tx.remove(&ks.jobs_by_status, &del.status_key);
+    tx.remove_weak(&ks.jobs_by_queue, &del.queue_key);
+    tx.remove_weak(&ks.jobs_by_type, &del.type_key);
 
-    if let Some(purge_at) = job.purge_at {
-        let purge_key = make_purge_key(purge_at, id);
-        tx.remove(&ks.jobs_by_purge_at, &purge_key);
+    if let Some(ref purge_key) = del.purge_key {
+        tx.remove(&ks.jobs_by_purge_at, purge_key);
     }
 
-    for key in error_keys(ks, id) {
-        tx.remove_weak(&ks.errors, &key);
+    for key in &del.error_keys {
+        tx.remove_weak(&ks.errors, key);
     }
 }
 
