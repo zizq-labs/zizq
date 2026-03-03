@@ -10,10 +10,9 @@
 //!
 //! Commands:
 //!   serve    Start the server (default)
+//!   tui      Launch the terminal UI dashboard (requires Pro license)
 //!
 //! Options:
-//!      --log-format <FORMAT>
-//!      --log-level <LEVEL>
 //!  -k, --license-key <KEY>
 //!  -h, --help
 //!  -V, --version
@@ -33,28 +32,17 @@
 //! ZANXIO_SCHEDULER_BATCH_SIZE: Max scheduled jobs to promote per iteration
 //!                              (default: 200).
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
-use zanxio::{license::License, logging, serve};
+use zanxio::{
+    license::{Feature, License},
+    serve, tui,
+};
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
 #[command(name = "zanxio", version, about = "A self-contained job queue server")]
 struct Cli {
-    /// Log output format.
-    #[arg(long, default_value = "pretty", value_name = "FORMAT", global = true)]
-    log_format: logging::LogFormat,
-
-    /// Log level for zanxio.
-    #[arg(
-        long,
-        default_value = "info",
-        value_name = "LEVEL",
-        env = "ZANXIO_LOG_LEVEL",
-        global = true
-    )]
-    log_level: logging::LogLevel,
-
     /// License key string or filename for access to paid features.
     /// The format is an Ed25519 signed JWT.
     /// Prefixing with @ reads from a file (e.g. @/etc/zanxio/license.jwt).
@@ -77,6 +65,9 @@ struct Cli {
 enum Command {
     /// Start the server.
     Serve(serve::Args),
+
+    /// Launch the terminal UI dashboard (requires Pro license).
+    Tui(tui::Args),
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
@@ -94,52 +85,54 @@ fn resolve_license_key(value: &str) -> Result<String, Box<dyn std::error::Error>
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    logging::init(&cli.log_format, &cli.log_level);
-
     // Load the software license if present so it can be provided to each
     // subcommand for feature gating.
     let license = match cli.license_key {
         Some(ref value) => {
             let token = resolve_license_key(value)?;
-
-            let license =
-                License::from_token(&token).map_err(|e| format!("invalid license key: {e}"))?;
-
-            match &license {
-                License::Licensed {
-                    licensee_name,
-                    tier,
-                    expires_at,
-                    ..
-                } => {
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-
-                    let remaining = humantime::format_duration(std::time::Duration::from_secs(
-                        expires_at.saturating_sub(now_secs),
-                    ));
-
-                    tracing::info!(
-                        licensee = %licensee_name,
-                        %tier,
-                        expires_at,
-                        %remaining,
-                        "license validated"
-                    );
-                }
-                License::Free => unreachable!(),
-            }
-            license
+            License::from_token(&token).map_err(|e| format!("invalid license key: {e}"))?
         }
-        None => {
-            tracing::info!("no license key provided, running in free tier");
-            License::Free
-        }
+        None => License::Free,
     };
 
+    eprintln!("Zanxio {}", env!("CARGO_PKG_VERSION"));
+    eprintln!();
+
     match cli.command {
+        Some(Command::Tui(args)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            if let Err(msg) = license.require(now, Feature::Tui) {
+                // Capitalize the first letter of the error message.
+                let msg = {
+                    let mut chars = msg.chars();
+                    match chars.next() {
+                        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                        None => msg,
+                    }
+                };
+
+                eprintln!("{msg}. See --license-key.");
+                eprintln!();
+
+                // Build the full command tree so global args are
+                // propagated into the subcommand help output.
+                let mut cmd = Cli::command();
+                cmd.build();
+                cmd.find_subcommand("tui")
+                    .unwrap()
+                    .clone()
+                    .name("zanxio tui")
+                    .print_help()
+                    .ok();
+                std::process::exit(2);
+            }
+
+            tui::run(args).await
+        }
         Some(Command::Serve(args)) => serve::run(args, license).await,
         None => serve::run(serve::Args::parse_from(std::env::args()), license).await,
     }

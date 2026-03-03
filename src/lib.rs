@@ -6,6 +6,7 @@
 //! Re-exports the core modules so they can be used by benchmarks and
 //! integration tests without duplicating the module tree.
 
+pub mod admin;
 pub mod http;
 pub mod license;
 pub mod logging;
@@ -14,3 +15,4 @@ pub mod scheduler;
 pub mod serve;
 pub mod store;
 pub mod time;
+pub mod tui;

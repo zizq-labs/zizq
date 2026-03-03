@@ -42,6 +42,8 @@ impl std::fmt::Display for Tier {
 /// `min_tier()`, add a check in the relevant handler.
 #[derive(Debug, Clone, Copy)]
 pub enum Feature {
+    /// Terminal UI dashboard.
+    Tui,
     /// Example Pro feature for testing the gating machinery.
     ProExample,
     /// Example Enterprise feature for testing the gating machinery.
@@ -52,6 +54,7 @@ impl Feature {
     /// Minimum tier required for this feature.
     pub fn min_tier(self) -> Tier {
         match self {
+            Feature::Tui => Tier::Pro,
             Feature::ProExample => Tier::Pro,
             Feature::EnterpriseExample => Tier::Enterprise,
         }
@@ -61,6 +64,7 @@ impl Feature {
 impl std::fmt::Display for Feature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
+            Feature::Tui => write!(f, "terminal UI"),
             Feature::ProExample => write!(f, "pro example"),
             Feature::EnterpriseExample => write!(f, "enterprise example"),
         }

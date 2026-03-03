@@ -699,6 +699,9 @@ pub struct AppState {
     /// In production, this is `time::now_millis`; tests can inject a
     /// custom clock for deterministic timestamps.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+
+    /// Broadcast channel for admin dashboard events (heartbeats, etc.).
+    pub admin_events: broadcast::Sender<crate::admin::AdminEvent>,
 }
 
 // --- Content negotiation ---
@@ -1916,6 +1919,7 @@ mod tests {
         std::mem::forget(dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
+        let (admin_events, _) = broadcast::channel(64);
         let state = AppState {
             license: License::Free,
             store,
@@ -1924,6 +1928,7 @@ mod tests {
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: clock_fn,
+            admin_events,
         };
         (clock, state)
     }
@@ -3915,6 +3920,7 @@ mod tests {
         std::mem::forget(dir);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
+        let (admin_events, _) = broadcast::channel(64);
         let state = Arc::new(AppState {
             license: License::Free,
             store,
@@ -3923,6 +3929,7 @@ mod tests {
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(crate::time::now_millis),
+            admin_events,
         });
         let router = app(state.clone());
 

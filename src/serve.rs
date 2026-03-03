@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
 use crate::license::License;
+use crate::logging;
 use crate::store::{self, Store};
 
 /// Location of the internal database within the root directory.
@@ -47,6 +48,19 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
 /// Arguments for the `serve` subcommand.
 #[derive(Parser)]
 pub struct Args {
+    /// Log output format.
+    #[arg(long, default_value = "pretty", value_name = "FORMAT")]
+    log_format: logging::LogFormat,
+
+    /// Log level for zanxio.
+    #[arg(
+        long,
+        default_value = "info",
+        value_name = "LEVEL",
+        env = "ZANXIO_LOG_LEVEL"
+    )]
+    log_level: logging::LogLevel,
+
     /// Root directory for all server data and configuration.
     #[arg(
         long,
@@ -126,10 +140,25 @@ pub struct Args {
     /// system failure, such as sudden loss of power.
     #[arg(long, value_name = "MODE", value_parser = parse_commit_mode, env = "ZANXIO_ENQUEUE_COMMIT_MODE")]
     enqueue_commit_mode: Option<store::CommitMode>,
+
+    /// Address to bind the admin API server to.
+    #[arg(long, default_value = "127.0.0.1", env = "ZANXIO_ADMIN_HOST")]
+    admin_host: String,
+
+    /// Port to listen for admin API connections on.
+    #[arg(long, default_value_t = 8901, env = "ZANXIO_ADMIN_PORT")]
+    admin_port: u16,
+
+    /// Disable the admin API listener.
+    #[arg(long, default_value_t = false, env = "ZANXIO_NO_ADMIN")]
+    no_admin: bool,
 }
 
 /// Initializes the database and starts the HTTP server.
 pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error::Error>> {
+    logging::init(&args.log_format, &args.log_level);
+    log_license(&license);
+
     // Make sure the root dir exists.
     let root = std::path::Path::new(&args.root_dir);
     std::fs::create_dir_all(root)?;
@@ -161,6 +190,10 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     // Shutdown signal for long-lived take tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
+    // Admin event broadcast channel. The receiver is dropped — subscribers
+    // get their own via `.subscribe()`.
+    let (admin_events_tx, _) = tokio::sync::broadcast::channel(64);
+
     // Initialize shared state accessible to all request handlers.
     let state = Arc::new(AppState {
         license,
@@ -170,6 +203,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx,
         clock: Arc::new(crate::time::now_millis),
+        admin_events: admin_events_tx,
     });
 
     // Start the background scheduler that promotes scheduled jobs to Ready
@@ -196,12 +230,56 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         reaper_shutdown,
     ));
 
+    // Start the admin API listener (unless disabled).
+    if !args.no_admin {
+        // Start the admin event producer.
+        let admin_events = state.admin_events.clone();
+        let admin_shutdown = state.shutdown.clone();
+        let start_time = std::time::Instant::now();
+
+        tokio::spawn(async move {
+            let mut shutdown = admin_shutdown;
+
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                        let _ = admin_events.send(crate::admin::AdminEvent::Heartbeat {
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                            uptime_ms: start_time.elapsed().as_millis() as u64,
+                        });
+                    }
+                    _ = shutdown.changed() => break,
+                }
+            }
+        });
+
+        let admin_addr: std::net::SocketAddr =
+            format!("{}:{}", args.admin_host, args.admin_port).parse()?;
+        let admin_listener = TcpListener::bind(admin_addr).await?;
+        tracing::info!(addr = %admin_addr, "admin API listening");
+
+        eprintln!("Accepting admin connections on {admin_addr}");
+
+        let admin_state = state.clone();
+        let admin_shutdown = state.shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin_listener, crate::admin::app(admin_state))
+                .with_graceful_shutdown(async move {
+                    let mut rx = admin_shutdown;
+                    let _ = rx.changed().await;
+                })
+                .await
+            {
+                tracing::error!(error = %e, "admin API listener failed");
+            }
+        });
+    }
+
     // Set up the TCP socket for incoming connections.
     let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "listening");
 
-    eprintln!("Zanxio {}", env!("CARGO_PKG_VERSION"));
     eprintln!("Accepting connections on {addr}");
 
     // Start the server with graceful shutdown. Signal the watch channel
@@ -216,6 +294,41 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
 
     eprintln!("Server stopped.");
     Ok(())
+}
+
+/// Async function that returns once a signal is received.
+///
+/// Axum handles waiting for this signal before shutting down.
+/// Log license status after the tracing subscriber has been initialized.
+fn log_license(license: &License) {
+    match license {
+        License::Licensed {
+            licensee_name,
+            tier,
+            expires_at,
+            ..
+        } => {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let remaining = humantime::format_duration(std::time::Duration::from_secs(
+                expires_at.saturating_sub(now_secs),
+            ));
+
+            tracing::info!(
+                licensee = %licensee_name,
+                %tier,
+                expires_at,
+                %remaining,
+                "license validated"
+            );
+        }
+        License::Free => {
+            tracing::info!("no license key provided, running in free tier");
+        }
+    }
 }
 
 /// Async function that returns once a signal is received.
