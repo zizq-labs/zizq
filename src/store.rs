@@ -4,22 +4,21 @@
 //! Persistent storage layer to manage job queues.
 //!
 //! Wraps fjall (database) to provide transactional queue operations across
-//! seven keyspaces plus two in-memory indexes:
+//! two keyspaces plus two in-memory indexes:
 //!
-//! - `jobs`: source of truth, keyed by job ID, stores job metadata (no payload).
-//! - `payloads`: immutable job payloads, keyed by job ID.
-//! - `jobs_by_status`: status index, keyed by `{status_u8}\0{job_id}`.
-//! - `jobs_by_queue`: queue membership index, keyed by `{queue_name}\0{job_id}`.
-//! - `jobs_by_type`: type membership index, keyed by `{job_type}\0{job_id}`.
-//! - `jobs_by_purge_at`: expiry index for the reaper, keyed by `{purge_at_be_u64}\0{job_id}`.
-//! - `errors`: error records per failure, keyed by `{job_id}\0{attempt_be_u32}`.
+//! - `data`: jobs (`J` tag), payloads (`P` tag), and error records (`E` tag).
+//!   Uses bloom filters and a larger memtable. See `RecordKind` for key layouts.
+//! - `index`: status (`S` tag), queue (`Q` tag), type (`T` tag), and purge-at
+//!   (`A` tag) secondary indexes. No bloom filters, smaller memtable. See
+//!   `IndexKind` for key layouts.
 //! - In-memory `ReadyIndex`: lock-free crossbeam skip-list priority index of
-//!   ready jobs, rebuilt from the `jobs` keyspace on startup.
+//!   ready jobs, rebuilt from the status index on startup.
 //! - In-memory `ScheduledIndex`: lock-free crossbeam skip-set chronological
-//!   index of scheduled jobs, rebuilt from the `jobs` keyspace on startup.
+//!   index of scheduled jobs, rebuilt from the status index on startup.
 //!
-//! Combined filters (e.g. queue + status) use sorted stream intersection
-//! across the individual indexes rather than a compound index.
+//! Each tag byte occupies a disjoint prefix range so that all record/index
+//! types coexist without collision. Combined filters (e.g. queue + status)
+//! use sorted stream intersection across the tag-prefixed ranges.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -1058,67 +1057,45 @@ impl GroupCommitter {
     }
 }
 
+/// One-byte tag prefix for records in the `data` keyspace.
+///
+/// Each record kind occupies a disjoint prefix range so that jobs, payloads,
+/// and errors coexist in the same fjall keyspace without collision.
+#[repr(u8)]
+enum RecordKind {
+    Error = b'E',
+    Job = b'J',
+    Payload = b'P',
+}
+
+/// One-byte tag prefix for entries in the `index` keyspace.
+///
+/// Each index kind occupies a disjoint prefix range so that all secondary
+/// indexes coexist in the same fjall keyspace without collision.
+#[repr(u8)]
+enum IndexKind {
+    PurgeAt = b'A',
+    Queue = b'Q',
+    Status = b'S',
+    Type = b'T',
+}
+
 /// Groups the fjall database handle and all disk keyspaces into a single
 /// cheaply-cloneable unit. Wrapped in `Arc` inside `Store` so that every
-/// async method only bumps one reference count instead of eight.
+/// async method only bumps one reference count instead of three.
 struct Keyspaces {
     /// Connection to the underlying database.
     db: SingleWriterTxDatabase,
 
-    /// Reference to the jobs keyspace.
-    ///
-    /// Jobs are keyed by their scru128 identifier which provides basic FIFO
-    /// semantics. This is the authoritative source of job metadata, but it
-    /// is not priority ordered. Payloads are stored separately.
-    jobs: SingleWriterTxKeyspace,
+    /// Data keyspace — stores jobs (`J` tag), payloads (`P` tag), and
+    /// error records (`E` tag). Uses bloom filters and a larger memtable.
+    /// See `RecordKind` for the tag layout.
+    data: SingleWriterTxKeyspace,
 
-    /// Immutable job payloads, keyed by job ID.
-    ///
-    /// Separated from the `jobs` keyspace so that status-change operations
-    /// (take, requeue, promote, recover) only re-write the small metadata
-    /// record — less WAL data, less compaction, less time holding the
-    /// single-writer lock.
-    payloads: SingleWriterTxKeyspace,
-
-    /// Reference to the status index keyspace.
-    ///
-    /// Keyed by `{status_u8}\0{job_id}` with empty values. Enables efficient
-    /// range scans for jobs in a particular status without scanning the entire
-    /// `jobs` keyspace.
-    jobs_by_status: SingleWriterTxKeyspace,
-
-    /// Queue membership index.
-    ///
-    /// Keyed by `{queue_name}\0{job_id}` with empty values. Enables
-    /// efficient lookup of all jobs belonging to one or more queues.
-    ///
-    /// Currently write-once/remove-once (written at enqueue, removed at
-    /// completion/death), so removals use `remove_weak` to avoid
-    /// tombstone buildup. If we add queue-move support in the future,
-    /// the same key could be re-inserted and this must revert to
-    /// regular `remove`.
-    jobs_by_queue: SingleWriterTxKeyspace,
-
-    /// Type membership index.
-    ///
-    /// Keyed by `{job_type}\0{job_id}` with empty values. Immutable —
-    /// only written at enqueue and removed at completion. No updates
-    /// on status transitions.
-    jobs_by_type: SingleWriterTxKeyspace,
-
-    /// Purge-at index for deferred deletion by the reaper.
-    ///
-    /// Keyed by `{purge_at_be_u64}\0{job_id}` with empty values. The
-    /// reaper scans this index to find jobs whose retention period has
-    /// expired and need hard-deletion.
-    jobs_by_purge_at: SingleWriterTxKeyspace,
-
-    /// Error records, keyed by `{job_id}\0{attempt_be_u32}`.
-    ///
-    /// One record per failure (append-only). Enables per-job error
-    /// history via prefix scan. Cleaned up when the job is completed
-    /// or killed (dead).
-    errors: SingleWriterTxKeyspace,
+    /// Index keyspace — stores status (`S` tag), queue (`Q` tag), type
+    /// (`T` tag), and purge-at (`A` tag) secondary indexes. No bloom
+    /// filters, smaller memtable. See `IndexKind` for the tag layout.
+    index: SingleWriterTxKeyspace,
 
     /// Group committer for batching journal persists.
     ///
@@ -1391,16 +1368,15 @@ fn intersect_streams<'a>(
 }
 
 /// Look up full job records from an iterator of raw IDs, returning an error
-/// if any ID is missing from the `jobs` keyspace (data corruption). Hydrates
-/// each job's payload from the separate `payloads` keyspace.
+/// if any ID is missing from the `data` keyspace (data corruption). Hydrates
+/// each job's payload from the same keyspace using the `P` tag prefix.
 ///
 /// When `now` is `Some`, jobs with `purge_at <= now` are skipped (logically
 /// invisible before the reaper physically deletes them). The iterator
 /// continues scanning past expired jobs until `limit` entries are collected
 /// or the stream is exhausted.
 fn load_jobs_by_ids(
-    jobs_ks: &SingleWriterTxKeyspace,
-    payloads_ks: &SingleWriterTxKeyspace,
+    data_ks: &SingleWriterTxKeyspace,
     ids: impl Iterator<Item = Result<Vec<u8>, StoreError>>,
     source: &str,
     now: Option<u64>,
@@ -1409,9 +1385,13 @@ fn load_jobs_by_ids(
     let mut rows = Vec::new();
     for id in ids {
         let id = id?;
-        let bytes = jobs_ks.get(&id)?.ok_or_else(|| {
+        let job_key = make_job_key(
+            std::str::from_utf8(&id)
+                .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))?,
+        );
+        let bytes = data_ks.get(&job_key)?.ok_or_else(|| {
             StoreError::Corruption(format!(
-                "job in {source} but missing from jobs keyspace: {:?}",
+                "job in {source} but missing from data keyspace: {:?}",
                 String::from_utf8_lossy(&id),
             ))
         })?;
@@ -1424,8 +1404,9 @@ fn load_jobs_by_ids(
             }
         }
 
-        // Hydrate the payload from the payloads keyspace.
-        if let Some(payload_bytes) = payloads_ks.get(&id)? {
+        // Hydrate the payload from the data keyspace.
+        let payload_key = make_payload_key(&job.id);
+        if let Some(payload_bytes) = data_ks.get(&payload_key)? {
             job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
         }
 
@@ -1461,13 +1442,13 @@ pub enum CommitMode {
 /// faster tombstone reclamation and tighter disk usage.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
-    /// Target size for SST files in data keyspaces (jobs, payloads, errors).
+    /// Target size for SST files in the `data` keyspace (jobs, payloads, errors).
     /// The memtable is sized to match so flushes produce appropriately-sized
     /// L0 tables.
     pub data_table_size: u64,
 
-    /// Target size for SST files in index keyspaces (status, queue, type,
-    /// priority indexes). These store tiny entries so smaller tables are
+    /// Target size for SST files in the `index` keyspace (status, queue, type,
+    /// purge-at indexes). These store tiny entries so smaller tables are
     /// appropriate. The memtable is sized to match.
     pub index_table_size: u64,
 
@@ -1678,13 +1659,8 @@ impl Store {
                 .filter_policy(FilterPolicy::disabled())
         };
 
-        let jobs = db.keyspace("jobs", &data_opts)?;
-        let payloads = db.keyspace("payloads", &data_opts)?;
-        let jobs_by_status = db.keyspace("jobs_by_status", &index_opts)?;
-        let jobs_by_queue = db.keyspace("jobs_by_queue", &index_opts)?;
-        let jobs_by_type = db.keyspace("jobs_by_type", &index_opts)?;
-        let errors = db.keyspace("errors", &data_opts)?;
-        let jobs_by_purge_at = db.keyspace("jobs_by_purge_at", &index_opts)?;
+        let data = db.keyspace("data", &data_opts)?;
+        let index = db.keyspace("index", &index_opts)?;
 
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -1701,13 +1677,8 @@ impl Store {
         Ok(Self {
             ks: Arc::new(Keyspaces {
                 db,
-                jobs,
-                payloads,
-                jobs_by_status,
-                jobs_by_queue,
-                jobs_by_type,
-                jobs_by_purge_at,
-                errors,
+                data,
+                index,
                 group_committer,
                 default_commit_mode,
                 enqueue_commit_mode,
@@ -1780,16 +1751,18 @@ impl Store {
             meta.payload = None;
             let meta_bytes = rmp_serde::to_vec_named(&meta)?;
 
+            let job_key = make_job_key(&id);
+            let payload_key = make_payload_key(&id);
             let queue_key = make_queue_key(&job.queue, &id);
             let status_key = make_status_key(status, &id);
             let type_key = make_type_key(&job.job_type, &id);
 
             let mut tx = ks.write_tx();
-            tx.insert(&ks.jobs, &id, &meta_bytes);
-            tx.insert(&ks.payloads, &id, &payload_bytes);
-            tx.insert(&ks.jobs_by_queue, &queue_key, b"");
-            tx.insert(&ks.jobs_by_status, &status_key, b"");
-            tx.insert(&ks.jobs_by_type, &type_key, b"");
+            tx.insert(&ks.data, &job_key, &meta_bytes);
+            tx.insert(&ks.data, &payload_key, &payload_bytes);
+            tx.insert(&ks.index, &queue_key, b"");
+            tx.insert(&ks.index, &status_key, b"");
+            tx.insert(&ks.index, &type_key, b"");
 
             let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
 
@@ -1882,9 +1855,10 @@ impl Store {
                 // then compare-and-write inside. Retries on stale pre-reads
                 // (update job metadata race). Breaks with None to re-claim
                 // from the outer loop if the candidate is invalid.
+                let job_key = make_job_key(&job_id);
                 let outcome = loop {
                     // ---- outside tx ----
-                    let pre_bytes = match ks.jobs.get(&job_id)? {
+                    let pre_bytes = match ks.data.get(&job_key)? {
                         Some(bytes) => bytes,
                         None => break None, // Deleted; try next candidate.
                     };
@@ -1906,15 +1880,15 @@ impl Store {
                     let mut tx = ks.write_tx();
 
                     let prev =
-                        tx.fetch_update(&ks.jobs, &job_id, |_| Some(updated_slice.clone()))?;
+                        tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
 
                     if prev.as_deref() != Some(&*pre_bytes) {
                         drop(tx);
                         continue; // Stale pre-read; retry same job.
                     }
 
-                    tx.remove(&ks.jobs_by_status, &old_status_key);
-                    tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                    tx.remove(&ks.index, &old_status_key);
+                    tx.insert(&ks.index, &new_status_key, b"");
 
                     let sync = match ks.commit(tx, ks.default_commit_mode) {
                         Ok(sync) => sync,
@@ -1922,7 +1896,7 @@ impl Store {
                             // Commit failed — re-insert into the ready index
                             // if the job is still Ready.
                             let _tx = ks.write_tx();
-                            if let Ok(Some(bytes)) = ks.jobs.get(&job_id) {
+                            if let Ok(Some(bytes)) = ks.data.get(&job_key) {
                                 if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
                                     if current.status == JobStatus::Ready as u8 {
                                         ready_index.insert(
@@ -1946,10 +1920,11 @@ impl Store {
 
                 let write_tx_elapsed = blocking_start.elapsed();
 
-                // Hydrate the payload from the payloads keyspace for the caller.
+                // Hydrate the payload from the data keyspace for the caller.
                 let hydrate_start = std::time::Instant::now();
 
-                if let Some(payload_bytes) = ks.payloads.get(&job_id)? {
+                let payload_key = make_payload_key(&job_id);
+                if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                     job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                 }
 
@@ -2000,9 +1975,10 @@ impl Store {
             // then compare-and-write inside. Retries only if a concurrent job
             // metadata update modified the job between the pre-read and lock
             // acquisition.
+            let job_key = make_job_key(&id);
             loop {
                 // ---- outside tx ----
-                let pre_bytes = match ks.jobs.get(&id)? {
+                let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
                     None => return Ok((false, None)),
                 };
@@ -2025,7 +2001,7 @@ impl Store {
 
                     // ---- inside tx ----
                     let mut tx = ks.write_tx();
-                    let prev = tx.take(&ks.jobs, &id)?;
+                    let prev = tx.take(&ks.data, &job_key)?;
                     if prev.as_deref() != Some(&*pre_bytes) {
                         drop(tx);
                         continue;
@@ -2054,16 +2030,16 @@ impl Store {
                 // ---- inside tx ----
                 let mut tx = ks.write_tx();
 
-                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
 
                 if prev.as_deref() != Some(&*pre_bytes) {
                     drop(tx);
                     continue;
                 }
 
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-                tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
+                tx.remove(&ks.index, &old_status_key);
+                tx.insert(&ks.index, &new_status_key, b"");
+                tx.insert(&ks.index, &purge_key, b"");
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
@@ -2124,9 +2100,10 @@ impl Store {
             // then compare-and-write inside. Retries only if a concurrent job
             // metadata update modified the job between the pre-read and lock
             // acquisition.
+            let job_key = make_job_key(&id);
             let (job, sync) = loop {
                 // ---- outside tx ----
-                let pre_bytes = match ks.jobs.get(&id)? {
+                let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
                     None => return Ok((None, None)),
                 };
@@ -2178,16 +2155,17 @@ impl Store {
                     // ---- inside tx (writes only, plus one compare) ----
                     let mut tx = ks.write_tx();
 
-                    let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+                    let prev =
+                        tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
 
                     if prev.as_deref() != Some(&*pre_bytes) {
                         drop(tx);
                         continue;
                     }
 
-                    tx.insert(&ks.errors, &error_key, &error_bytes);
-                    tx.remove(&ks.jobs_by_status, &old_status_key);
-                    tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                    tx.insert(&ks.data, &error_key, &error_bytes);
+                    tx.remove(&ks.index, &old_status_key);
+                    tx.insert(&ks.index, &new_status_key, b"");
                     let sync = ks.commit(tx, ks.default_commit_mode)?;
 
                     scheduled_index.insert(job.ready_at, id.clone());
@@ -2208,7 +2186,7 @@ impl Store {
 
                     // ---- inside tx ----
                     let mut tx = ks.write_tx();
-                    let prev = tx.take(&ks.jobs, &id)?;
+                    let prev = tx.take(&ks.data, &job_key)?;
                     if prev.as_deref() != Some(&*pre_bytes) {
                         drop(tx);
                         continue;
@@ -2233,17 +2211,17 @@ impl Store {
                 // ---- inside tx ----
                 let mut tx = ks.write_tx();
 
-                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
 
                 if prev.as_deref() != Some(&*pre_bytes) {
                     drop(tx);
                     continue;
                 }
 
-                tx.insert(&ks.errors, &error_key, &error_bytes);
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
-                tx.insert(&ks.jobs_by_purge_at, &purge_key, b"");
+                tx.insert(&ks.data, &error_key, &error_bytes);
+                tx.remove(&ks.index, &old_status_key);
+                tx.insert(&ks.index, &new_status_key, b"");
+                tx.insert(&ks.index, &purge_key, b"");
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
@@ -2294,7 +2272,8 @@ impl Store {
         let id = id.to_string();
 
         task::spawn_blocking(move || {
-            let Some(bytes) = ks.jobs.get(&id)? else {
+            let job_key = make_job_key(&id);
+            let Some(bytes) = ks.data.get(&job_key)? else {
                 return Ok(None);
             };
             let mut job: Job = rmp_serde::from_slice(&bytes)?;
@@ -2304,8 +2283,9 @@ impl Store {
                 return Ok(None);
             }
 
-            // Hydrate the payload from the payloads keyspace.
-            if let Some(payload_bytes) = ks.payloads.get(&id)? {
+            // Hydrate the payload from the data keyspace.
+            let payload_key = make_payload_key(&id);
+            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
 
@@ -2339,9 +2319,10 @@ impl Store {
             // then compare-and-write inside. Retries only if a concurrent job
             // metadata update modified the job between the pre-read and lock
             // acquisition.
+            let job_key = make_job_key(&id);
             loop {
                 // ---- outside tx ----
-                let pre_bytes = match ks.jobs.get(&id)? {
+                let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
                     None => return Ok((None, None)),
                 };
@@ -2364,15 +2345,15 @@ impl Store {
                 // ---- inside tx (writes only, plus one compare) ----
                 let mut tx = ks.write_tx();
 
-                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
 
                 if prev.as_deref() != Some(&*pre_bytes) {
                     drop(tx);
                     continue;
                 }
 
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                tx.remove(&ks.index, &old_status_key);
+                tx.insert(&ks.index, &new_status_key, b"");
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
@@ -2454,25 +2435,25 @@ impl Store {
                 queues
                     .iter()
                     .map(|queue_name| {
-                        let prefix_len = queue_name.len() + 1;
+                        let prefix_len = queue_name.len() + 3;
                         let start = match from {
                             Some(cursor) => Bound::Excluded(make_queue_key(queue_name, cursor)),
                             None => Bound::Included(make_queue_key(queue_name, "")),
                         };
-                        let mut end_key = Vec::with_capacity(queue_name.len() + 1);
+                        let mut end_key = Vec::with_capacity(queue_name.len() + 3);
+                        end_key.push(IndexKind::Queue as u8);
+                        end_key.push(0);
                         end_key.extend_from_slice(queue_name.as_bytes());
                         end_key.push(1);
                         let end = Bound::Excluded(end_key);
 
                         match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.jobs_by_queue, (start, end)),
+                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
-                                snapshot
-                                    .range::<Vec<u8>, _>(&ks.jobs_by_queue, (start, end))
-                                    .rev(),
+                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)).rev(),
                                 prefix_len
                             ),
                         }
@@ -2491,20 +2472,18 @@ impl Store {
                         let prefix = *status as u8;
                         let start = match from {
                             Some(cursor) => Bound::Excluded(make_status_key(*status, cursor)),
-                            None => Bound::Included(vec![prefix, 0]),
+                            None => Bound::Included(vec![IndexKind::Status as u8, 0, prefix, 0]),
                         };
-                        let end = Bound::Excluded(vec![prefix + 1, 0]);
+                        let end = Bound::Excluded(vec![IndexKind::Status as u8, 0, prefix + 1, 0]);
 
                         match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.jobs_by_status, (start, end)),
-                                2
+                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)),
+                                4
                             ),
                             ScanDirection::Desc => range_source!(
-                                snapshot
-                                    .range::<Vec<u8>, _>(&ks.jobs_by_status, (start, end))
-                                    .rev(),
-                                2
+                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)).rev(),
+                                4
                             ),
                         }
                     })
@@ -2520,25 +2499,25 @@ impl Store {
                 types
                     .iter()
                     .map(|type_name| {
-                        let prefix_len = type_name.len() + 1;
+                        let prefix_len = type_name.len() + 3;
                         let start = match from {
                             Some(cursor) => Bound::Excluded(make_type_key(type_name, cursor)),
                             None => Bound::Included(make_type_key(type_name, "")),
                         };
-                        let mut end_key = Vec::with_capacity(type_name.len() + 1);
+                        let mut end_key = Vec::with_capacity(type_name.len() + 3);
+                        end_key.push(IndexKind::Type as u8);
+                        end_key.push(0);
                         end_key.extend_from_slice(type_name.as_bytes());
                         end_key.push(1);
                         let end = Bound::Excluded(end_key);
 
                         match direction {
                             ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.jobs_by_type, (start, end)),
+                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)),
                                 prefix_len
                             ),
                             ScanDirection::Desc => range_source!(
-                                snapshot
-                                    .range::<Vec<u8>, _>(&ks.jobs_by_type, (start, end))
-                                    .rev(),
+                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)).rev(),
                                 prefix_len
                             ),
                         }
@@ -2595,24 +2574,29 @@ impl Store {
                 let first = iter.next().unwrap();
                 let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
 
-                rows = load_jobs_by_ids(
-                    &ks.jobs,
-                    &ks.payloads,
-                    combined,
-                    &source_desc,
-                    opts.now,
-                    fetch,
-                )?;
+                rows = load_jobs_by_ids(&ks.data, combined, &source_desc, opts.now, fetch)?;
             } else {
-                // No filter — scan the jobs keyspace directly.
+                // No filter — scan the data keyspace for J-tagged keys.
+                // Range: [J, 0]..[J, 1] covers all job metadata entries.
+                let job_prefix_start: Vec<u8> = vec![RecordKind::Job as u8, 0];
+                let job_prefix_end: Vec<u8> = vec![RecordKind::Job as u8, 1];
                 match opts.direction {
                     ScanDirection::Asc => {
                         let range = match &opts.from {
-                            Some(cursor) => snapshot.range::<&str, _>(
-                                &ks.jobs,
-                                (Bound::Excluded(cursor.as_str()), Bound::Unbounded),
+                            Some(cursor) => snapshot.range::<Vec<u8>, _>(
+                                &ks.data,
+                                (
+                                    Bound::Excluded(make_job_key(cursor)),
+                                    Bound::Excluded(job_prefix_end),
+                                ),
                             ),
-                            None => snapshot.range::<&str, _>(&ks.jobs, ..),
+                            None => snapshot.range::<Vec<u8>, _>(
+                                &ks.data,
+                                (
+                                    Bound::Included(job_prefix_start),
+                                    Bound::Excluded(job_prefix_end),
+                                ),
+                            ),
                         };
 
                         for entry in range {
@@ -2623,7 +2607,10 @@ impl Store {
                                     continue;
                                 }
                             }
-                            if let Some(payload_bytes) = ks.payloads.get(&*key)? {
+                            // Swap J tag for P tag to look up payload.
+                            let mut payload_key = key.to_vec();
+                            payload_key[0] = RecordKind::Payload as u8;
+                            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
@@ -2634,11 +2621,20 @@ impl Store {
                     }
                     ScanDirection::Desc => {
                         let range = match &opts.from {
-                            Some(cursor) => snapshot.range::<&str, _>(
-                                &ks.jobs,
-                                (Bound::Unbounded, Bound::Excluded(cursor.as_str())),
+                            Some(cursor) => snapshot.range::<Vec<u8>, _>(
+                                &ks.data,
+                                (
+                                    Bound::Included(job_prefix_start),
+                                    Bound::Excluded(make_job_key(cursor)),
+                                ),
                             ),
-                            None => snapshot.range::<&str, _>(&ks.jobs, ..),
+                            None => snapshot.range::<Vec<u8>, _>(
+                                &ks.data,
+                                (
+                                    Bound::Included(job_prefix_start),
+                                    Bound::Excluded(job_prefix_end),
+                                ),
+                            ),
                         };
 
                         for entry in range.rev() {
@@ -2649,7 +2645,10 @@ impl Store {
                                     continue;
                                 }
                             }
-                            if let Some(payload_bytes) = ks.payloads.get(&*key)? {
+                            // Swap J tag for P tag to look up payload.
+                            let mut payload_key = key.to_vec();
+                            payload_key[0] = RecordKind::Payload as u8;
+                            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
                             rows.push(job);
@@ -2726,7 +2725,8 @@ impl Store {
                     break;
                 }
                 let ((_priority, job_id), _queue) = (entry.key(), entry.value());
-                if let Some(bytes) = ks.jobs.get(job_id)? {
+                let job_key = make_job_key(job_id);
+                if let Some(bytes) = ks.data.get(&job_key)? {
                     let job: Job = rmp_serde::from_slice(&bytes)?;
                     jobs.push(job);
                 }
@@ -2771,14 +2771,18 @@ impl Store {
             // a next page or not.
             let fetch = opts.limit.saturating_add(1);
 
-            // Build the prefix for this job: `{job_id}\0`
-            let mut prefix = Vec::with_capacity(opts.job_id.len() + 1);
+            // Build the prefix for this job: `E\0{job_id}\0`
+            let mut prefix = Vec::with_capacity(opts.job_id.len() + 3);
+            prefix.push(RecordKind::Error as u8);
+            prefix.push(0);
             prefix.extend_from_slice(opts.job_id.as_bytes());
             prefix.push(0);
 
-            // End sentinel: `{job_id}\x01` — one byte past the null separator,
-            // so the range covers all `{job_id}\0{...}` keys.
-            let mut end_sentinel = Vec::with_capacity(opts.job_id.len() + 1);
+            // End sentinel: `E\0{job_id}\x01` — one byte past the null separator,
+            // so the range covers all `E\0{job_id}\0{...}` keys.
+            let mut end_sentinel = Vec::with_capacity(opts.job_id.len() + 3);
+            end_sentinel.push(RecordKind::Error as u8);
+            end_sentinel.push(0);
             end_sentinel.extend_from_slice(opts.job_id.as_bytes());
             end_sentinel.push(1);
 
@@ -2793,7 +2797,7 @@ impl Store {
             match opts.direction {
                 ScanDirection::Asc => {
                     for entry in ks
-                        .errors
+                        .data
                         .inner()
                         .range::<Vec<u8>, _>((start, end))
                         .take(fetch)
@@ -2813,7 +2817,7 @@ impl Store {
                 }
                 ScanDirection::Desc => {
                     for entry in ks
-                        .errors
+                        .data
                         .inner()
                         .range::<Vec<u8>, _>((start, end))
                         .rev()
@@ -2895,9 +2899,10 @@ impl Store {
 
             let mut result = Vec::with_capacity(due_entries.len());
             for (_ready_at, job_id) in &due_entries {
-                let job_bytes = ks.jobs.get(job_id)?.ok_or_else(|| {
+                let job_key = make_job_key(job_id);
+                let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
-                        "job in scheduled index but missing from jobs keyspace: {job_id:?}",
+                        "job in scheduled index but missing from data keyspace: {job_id:?}",
                     ))
                 })?;
                 result.push(rmp_serde::from_slice(&job_bytes)?);
@@ -2936,9 +2941,10 @@ impl Store {
             // then compare-and-write inside. Retries only if a concurrent job
             // metadata update modified the job between the pre-read and lock
             // acquisition.
+            let job_key = make_job_key(&id);
             loop {
                 // ---- outside tx ----
-                let pre_bytes = match ks.jobs.get(&id)? {
+                let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
                     None => return Ok(((), None)), // Already gone.
                 };
@@ -2960,15 +2966,15 @@ impl Store {
                 // ---- inside tx (writes only, plus one compare) ----
                 let mut tx = ks.write_tx();
 
-                let prev = tx.fetch_update(&ks.jobs, &id, |_| Some(updated_slice.clone()))?;
+                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
 
                 if prev.as_deref() != Some(&*pre_bytes) {
                     drop(tx);
                     continue;
                 }
 
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                tx.remove(&ks.index, &old_status_key);
+                tx.insert(&ks.index, &new_status_key, b"");
 
                 let sync = match ks.commit(tx, ks.default_commit_mode) {
                     Ok(sync) => sync,
@@ -2976,7 +2982,7 @@ impl Store {
                         // Commit failed — re-insert into the scheduled index
                         // if the job is still Scheduled.
                         let _tx = ks.write_tx();
-                        if let Ok(Some(bytes)) = ks.jobs.get(&id) {
+                        if let Ok(Some(bytes)) = ks.data.get(&job_key) {
                             if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
                                 if current.status == JobStatus::Scheduled as u8 {
                                     scheduled_index.insert(ready_at, id);
@@ -3048,19 +3054,19 @@ impl Store {
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // Scan the status index for all Working jobs.
-            // Working = 2, so the prefix range is [2, 0]..[3, 0].
-            let start: Vec<u8> = vec![JobStatus::Working as u8, 0];
-            let end: Vec<u8> = vec![JobStatus::Working as u8 + 1, 0];
+            // Working = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
+            let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Working as u8, 0];
+            let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Working as u8 + 1, 0];
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             // Collect IDs first — we can't hold an iterator across the write tx.
             let snapshot = ks.db.read_tx();
             let working_ids: Vec<String> = snapshot
-                .range::<Vec<u8>, _>(&ks.jobs_by_status, range)
+                .range::<Vec<u8>, _>(&ks.index, range)
                 .map(|entry| {
                     let (key, _) = entry.into_inner()?;
-                    // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
-                    String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                    // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
+                    String::from_utf8(key[4..].to_vec()).map_err(|e| {
                         StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
                     })
                 })
@@ -3077,9 +3083,10 @@ impl Store {
             let mut tx = ks.write_tx();
 
             for id in &working_ids {
-                let job_bytes = ks.jobs.get(id)?.ok_or_else(|| {
+                let job_key = make_job_key(id);
+                let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
-                        "working job missing from jobs keyspace: {id:?}"
+                        "working job missing from data keyspace: {id:?}"
                     ))
                 })?;
                 let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
@@ -3089,9 +3096,9 @@ impl Store {
                 job.status = JobStatus::Ready.into();
                 let updated_bytes = rmp_serde::to_vec_named(&job)?;
 
-                tx.insert(&ks.jobs, id, &updated_bytes);
-                tx.remove(&ks.jobs_by_status, &old_status_key);
-                tx.insert(&ks.jobs_by_status, &new_status_key, b"");
+                tx.insert(&ks.data, &job_key, &updated_bytes);
+                tx.remove(&ks.index, &old_status_key);
+                tx.insert(&ks.index, &new_status_key, b"");
             }
 
             let sync = ks.commit(tx, ks.default_commit_mode)?;
@@ -3113,24 +3120,25 @@ impl Store {
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Ready jobs.
-            // Ready = 1, so the prefix range is [1, 0]..[2, 0].
-            let start: Vec<u8> = vec![JobStatus::Ready as u8, 0];
-            let end: Vec<u8> = vec![JobStatus::Ready as u8 + 1, 0];
+            // Ready = 1, so the prefix range is [S, 0, 1, 0]..[S, 0, 2, 0].
+            let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Ready as u8, 0];
+            let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Ready as u8 + 1, 0];
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             let snapshot = ks.db.read_tx();
             let mut count = 0;
 
-            for entry in snapshot.range::<Vec<u8>, _>(&ks.jobs_by_status, range) {
+            for entry in snapshot.range::<Vec<u8>, _>(&ks.index, range) {
                 let (key, _) = entry.into_inner()?;
-                // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
-                let job_id = String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
+                let job_id = String::from_utf8(key[4..].to_vec()).map_err(|e| {
                     StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
                 })?;
 
-                let job_bytes = ks.jobs.get(&job_id)?.ok_or_else(|| {
+                let job_key = make_job_key(&job_id);
+                let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
-                        "ready job missing from jobs keyspace: {job_id:?}"
+                        "ready job missing from data keyspace: {job_id:?}"
                     ))
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
@@ -3154,24 +3162,30 @@ impl Store {
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Scheduled jobs.
-            // Scheduled = 0, so the prefix range is [0, 0]..[1, 0].
-            let start: Vec<u8> = vec![JobStatus::Scheduled as u8, 0];
-            let end: Vec<u8> = vec![JobStatus::Scheduled as u8 + 1, 0];
+            // Scheduled = 0, so the prefix range is [S, 0, 0, 0]..[S, 0, 1, 0].
+            let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Scheduled as u8, 0];
+            let end: Vec<u8> = vec![
+                IndexKind::Status as u8,
+                0,
+                JobStatus::Scheduled as u8 + 1,
+                0,
+            ];
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             let snapshot = ks.db.read_tx();
             let mut count = 0;
 
-            for entry in snapshot.range::<Vec<u8>, _>(&ks.jobs_by_status, range) {
+            for entry in snapshot.range::<Vec<u8>, _>(&ks.index, range) {
                 let (key, _) = entry.into_inner()?;
-                // Key layout: {status_u8}\0{job_id} — skip the 2-byte prefix.
-                let job_id = String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
+                let job_id = String::from_utf8(key[4..].to_vec()).map_err(|e| {
                     StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
                 })?;
 
-                let job_bytes = ks.jobs.get(&job_id)?.ok_or_else(|| {
+                let job_key = make_job_key(&job_id);
+                let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
-                        "scheduled job missing from jobs keyspace: {job_id:?}"
+                        "scheduled job missing from data keyspace: {job_id:?}"
                     ))
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
@@ -3197,16 +3211,17 @@ impl Store {
         let ks = self.ks.clone();
 
         task::spawn_blocking(move || -> Result<(Vec<String>, bool), StoreError> {
-            // Scan from the start of the index up to `now` (inclusive).
-            // Key layout: {purge_at_be_u64}\0{job_id}
+            // Scan from the start of the purge-at index up to `now` (inclusive).
+            // Key layout: A\0{purge_at_be_u64}\0{job_id}
+            let start_key: Vec<u8> = vec![IndexKind::PurgeAt as u8, 0];
             let end_key = make_purge_key(now + 1, "");
-            let range = (Bound::<Vec<u8>>::Unbounded, Bound::Excluded(end_key));
+            let range = (Bound::Included(start_key), Bound::Excluded(end_key));
 
             let mut ids = Vec::new();
-            for entry in ks.jobs_by_purge_at.inner().range::<Vec<u8>, _>(range) {
+            for entry in ks.index.inner().range::<Vec<u8>, _>(range) {
                 let (key, _) = entry.into_inner()?;
-                // Extract job_id: skip 8 bytes (purge_at) + 1 byte (null separator).
-                let job_id = String::from_utf8(key[9..].to_vec()).map_err(|e| {
+                // Extract job_id: skip 2 bytes (tag) + 8 bytes (purge_at) + 1 byte (null separator).
+                let job_id = String::from_utf8(key[11..].to_vec()).map_err(|e| {
                     StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
                 })?;
                 ids.push(job_id);
@@ -3235,7 +3250,8 @@ impl Store {
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // ---- outside tx ----
-            let job_bytes = match ks.jobs.get(&id)? {
+            let job_key = make_job_key(&id);
+            let job_bytes = match ks.data.get(&job_key)? {
                 Some(bytes) => bytes,
                 None => return Ok((false, None)), // Already purged.
             };
@@ -3277,7 +3293,8 @@ impl Store {
             let mut deletions: Vec<(JobDeletion, u16)> = Vec::new();
 
             for id in &ids {
-                let job_bytes = match ks.jobs.get(id)? {
+                let job_key = make_job_key(id);
+                let job_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
                     None => continue, // Already purged.
                 };
@@ -3315,51 +3332,79 @@ impl Store {
     }
 }
 
-/// Build a status index key: `{status_byte}\0{job_id}`.
-fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
+/// Build a job metadata key: `J\0{job_id}`.
+fn make_job_key(job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + job_id.len());
+    key.push(RecordKind::Job as u8);
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
+/// Build a payload key: `P\0{job_id}`.
+fn make_payload_key(job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + job_id.len());
+    key.push(RecordKind::Payload as u8);
+    key.push(0);
+    key.extend_from_slice(job_id.as_bytes());
+    key
+}
+
+/// Build a status index key: `S\0{status_byte}\0{job_id}`.
+fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + job_id.len());
+    key.push(IndexKind::Status as u8);
+    key.push(0);
     key.push(status as u8);
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
 }
 
-/// Build a queue membership index key: `{queue_name}\0{job_id}`.
+/// Build a queue membership index key: `Q\0{queue_name}\0{job_id}`.
 fn make_queue_key(queue_name: &str, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(queue_name.len() + 1 + job_id.len());
+    let mut key = Vec::with_capacity(queue_name.len() + 3 + job_id.len());
+    key.push(IndexKind::Queue as u8);
+    key.push(0);
     key.extend_from_slice(queue_name.as_bytes());
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
 }
 
-/// Build a type membership index key: `{job_type}\0{job_id}`.
+/// Build a type membership index key: `T\0{job_type}\0{job_id}`.
 fn make_type_key(job_type: &str, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(job_type.len() + 1 + job_id.len());
+    let mut key = Vec::with_capacity(job_type.len() + 3 + job_id.len());
+    key.push(IndexKind::Type as u8);
+    key.push(0);
     key.extend_from_slice(job_type.as_bytes());
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
 }
 
-/// Build a purge-at index key: `{purge_at_be_u64}\0{job_id}`.
+/// Build a purge-at index key: `A\0{purge_at_be_u64}\0{job_id}`.
 ///
 /// Big-endian encoding gives chronological ordering so the reaper can
 /// range-scan from the start to find expired entries.
 fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(8 + 1 + job_id.len());
+    let mut key = Vec::with_capacity(8 + 3 + job_id.len());
+    key.push(IndexKind::PurgeAt as u8);
+    key.push(0);
     key.extend_from_slice(&purge_at.to_be_bytes());
     key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key
 }
 
-/// Build an error record key: `{job_id}\0{attempt_be_u32}`.
+/// Build an error record key: `E\0{job_id}\0{attempt_be_u32}`.
 ///
 /// The null separator lets us prefix-scan all errors for a given job,
 /// and the big-endian attempt number gives chronological ordering.
 fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(job_id.len() + 1 + 4);
+    let mut key = Vec::with_capacity(job_id.len() + 3 + 4);
+    key.push(RecordKind::Error as u8);
+    key.push(0);
     key.extend_from_slice(job_id.as_bytes());
     key.push(0);
     key.extend_from_slice(&attempt.to_be_bytes());
@@ -3372,11 +3417,13 @@ fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
 /// to `tx.remove`. The fjall `Iter` is an owned value (no borrow on the
 /// keyspace), so it's safe to interleave iteration with mutable tx ops.
 fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
-    let mut prefix = Vec::with_capacity(job_id.len() + 1);
+    let mut prefix = Vec::with_capacity(job_id.len() + 3);
+    prefix.push(RecordKind::Error as u8);
+    prefix.push(0);
     prefix.extend_from_slice(job_id.as_bytes());
     prefix.push(0);
 
-    ks.errors
+    ks.data
         .inner()
         .prefix(&prefix)
         .filter_map(|guard| guard.key().ok().map(|k| k.to_vec()))
@@ -3410,18 +3457,18 @@ fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDele
 
 /// Apply pre-computed deletion inside an open tx. No reads.
 fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion, ks: &Keyspaces) {
-    tx.remove(&ks.jobs, &del.id);
-    tx.remove_weak(&ks.payloads, &del.id);
-    tx.remove(&ks.jobs_by_status, &del.status_key);
-    tx.remove_weak(&ks.jobs_by_queue, &del.queue_key);
-    tx.remove_weak(&ks.jobs_by_type, &del.type_key);
+    tx.remove(&ks.data, &make_job_key(&del.id));
+    tx.remove_weak(&ks.data, &make_payload_key(&del.id));
+    tx.remove(&ks.index, &del.status_key);
+    tx.remove_weak(&ks.index, &del.queue_key);
+    tx.remove_weak(&ks.index, &del.type_key);
 
     if let Some(ref purge_key) = del.purge_key {
-        tx.remove(&ks.jobs_by_purge_at, purge_key);
+        tx.remove(&ks.index, purge_key);
     }
 
     for key in &del.error_keys {
-        tx.remove_weak(&ks.errors, key);
+        tx.remove_weak(&ks.data, key);
     }
 }
 
@@ -6729,9 +6776,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Read the error record from the errors keyspace.
+        // Read the error record from the data keyspace.
         let key = make_error_key(&job.id, 1);
-        let raw = store.ks.errors.inner().get(&key).unwrap().unwrap();
+        let raw = store.ks.data.inner().get(&key).unwrap().unwrap();
         let err: ErrorRecord = rmp_serde::from_slice(&raw).unwrap();
 
         assert_eq!(err.message, "connection timeout");
@@ -6772,7 +6819,8 @@ mod tests {
         let job = enqueue_and_take(&store).await;
 
         // Verify payload exists before kill.
-        assert!(store.ks.payloads.inner().get(&job.id).unwrap().is_some());
+        let payload_key = make_payload_key(&job.id);
+        assert!(store.ks.data.inner().get(&payload_key).unwrap().is_some());
 
         let mut opts = test_failure_opts();
         opts.kill = true;
@@ -6784,11 +6832,11 @@ mod tests {
             .unwrap();
 
         // Payload should still exist (cleanup deferred to reaper).
-        assert!(store.ks.payloads.inner().get(&job.id).unwrap().is_some());
+        assert!(store.ks.data.inner().get(&payload_key).unwrap().is_some());
 
         // purge_job should clean it up.
         store.purge_job(&job.id).await.unwrap();
-        assert!(store.ks.payloads.inner().get(&job.id).unwrap().is_none());
+        assert!(store.ks.data.inner().get(&payload_key).unwrap().is_none());
     }
 
     #[tokio::test]
