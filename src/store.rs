@@ -635,12 +635,16 @@ pub enum StoreEvent {
     /// events, and a single-use claim token (`Arc<AtomicBool>`) so that
     /// only one worker per event hits the database.
     JobCreated {
+        id: String,
         queue: String,
         token: Arc<AtomicBool>,
     },
 
+    /// A job was taken from the ready queue and is now being worked on.
+    JobWorking { id: String },
+
     /// A job was successfully completed and removed.
-    JobCompleted(String),
+    JobCompleted { id: String },
 
     /// A job failed (either rescheduled for retry or killed).
     ///
@@ -658,7 +662,7 @@ pub enum StoreEvent {
     ///
     /// The scheduler listens for this to wake up early if the new job is
     /// due sooner than whatever it was sleeping until. Workers ignore it.
-    JobScheduled { ready_at: u64 },
+    JobScheduled { id: String, ready_at: u64 },
 }
 
 /// In-memory priority index for ready jobs (lock-free).
@@ -1808,12 +1812,14 @@ impl Store {
         match JobStatus::try_from(job.status) {
             Ok(JobStatus::Ready) => {
                 let _ = self.event_tx.send(StoreEvent::JobCreated {
+                    id: job.id.clone(),
                     queue: job.queue.clone(),
                     token: Arc::new(AtomicBool::new(false)),
                 });
             }
             Ok(JobStatus::Scheduled) => {
                 let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                    id: job.id.clone(),
                     ready_at: job.ready_at,
                 });
             }
@@ -1965,7 +1971,15 @@ impl Store {
         })
         .await?;
 
-        Ok(await_sync(result).await?)
+        let job = await_sync(result).await?;
+
+        if let Some(ref job) = job {
+            let _ = self
+                .event_tx
+                .send(StoreEvent::JobWorking { id: job.id.clone() });
+        }
+
+        Ok(job)
     }
 
     /// Mark a job as successfully completed.
@@ -2064,7 +2078,9 @@ impl Store {
         let completed = await_sync(result).await?;
 
         if completed {
-            let _ = self.event_tx.send(StoreEvent::JobCompleted(id_for_event));
+            let _ = self
+                .event_tx
+                .send(StoreEvent::JobCompleted { id: id_for_event });
         }
 
         Ok(completed)
@@ -2260,6 +2276,7 @@ impl Store {
                 // Rescheduled for retry — tell the scheduler to wake up
                 // at the new ready_at.
                 let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                    id: job.id.clone(),
                     ready_at: job.ready_at,
                 });
             }
@@ -2316,6 +2333,7 @@ impl Store {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let id = id.to_string();
+        let event_id = id.clone();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // Retry loop: pre-read and pre-compute updates outside the tx,
@@ -2369,6 +2387,7 @@ impl Store {
 
         if let Some(queue) = await_sync(result).await? {
             let _ = self.event_tx.send(StoreEvent::JobCreated {
+                id: event_id,
                 queue,
                 token: Arc::new(AtomicBool::new(false)),
             });
@@ -2425,8 +2444,8 @@ impl Store {
             let snapshot = ks.db.read_tx();
             // We take 1 more job than requested so that we know if there's a
             // next page or not.
-            let fetch = opts.limit + 1;
-            let mut rows = Vec::with_capacity(fetch);
+            let fetch = opts.limit.saturating_add(1);
+            let mut rows = Vec::with_capacity(fetch.min(1024));
 
             // Helper: build queue-index MergeSources for the given queues.
             let queue_sources = |queues: &HashSet<String>,
@@ -2691,6 +2710,55 @@ impl Store {
         .await?
     }
 
+    /// List ready jobs in priority order from the in-memory index.
+    ///
+    /// Iterates the `ReadyIndex` SkipMap and hydrates job metadata from
+    /// the `jobs` keyspace. Skips jobs whose metadata is missing (claimed
+    /// between index scan and disk read — next snapshot corrects). Does
+    /// NOT hydrate payloads.
+    pub async fn list_ready_jobs(&self, limit: usize) -> Result<Vec<Job>, StoreError> {
+        let ready_index = self.ready_index.clone();
+        let ks = self.ks.clone();
+
+        task::spawn_blocking(move || {
+            let mut jobs = Vec::with_capacity(limit);
+            for entry in ready_index.global.iter() {
+                if jobs.len() >= limit {
+                    break;
+                }
+                let ((_priority, job_id), _queue) = (entry.key(), entry.value());
+                if let Some(bytes) = ks.jobs.get(job_id)? {
+                    let job: Job = rmp_serde::from_slice(&bytes)?;
+                    jobs.push(job);
+                }
+            }
+            Ok(jobs)
+        })
+        .await?
+    }
+
+    /// Scan the in-memory ReadyIndex and return up to `limit` priority keys.
+    ///
+    /// Returns `Vec<(priority, job_id)>` in priority order — zero disk I/O.
+    /// Used by the admin event handler to diff capped ready windows.
+    pub async fn scan_ready_ids(&self, limit: usize) -> Vec<(u16, String)> {
+        let ready_index = self.ready_index.clone();
+
+        task::spawn_blocking(move || {
+            let mut ids = Vec::with_capacity(limit);
+            for entry in ready_index.global.iter() {
+                if ids.len() >= limit {
+                    break;
+                }
+                let (priority, job_id) = entry.key();
+                ids.push((*priority, job_id.clone()));
+            }
+            ids
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// List error records for a job with cursor-based pagination.
     ///
     /// Returns a page of `ErrorRecord`s plus `next` / `prev` cursors for
@@ -2702,7 +2770,7 @@ impl Store {
         task::spawn_blocking(move || {
             // We take 1 more record than requested so that we know if there's
             // a next page or not.
-            let fetch = opts.limit + 1;
+            let fetch = opts.limit.saturating_add(1);
 
             // Build the prefix for this job: `{job_id}\0`
             let mut prefix = Vec::with_capacity(opts.job_id.len() + 1);
@@ -2721,7 +2789,7 @@ impl Store {
             };
             let end = Bound::Excluded(end_sentinel);
 
-            let mut rows = Vec::with_capacity(fetch);
+            let mut rows = Vec::with_capacity(fetch.min(1024));
 
             match opts.direction {
                 ScanDirection::Asc => {
@@ -2854,6 +2922,7 @@ impl Store {
         let scheduled_index = self.scheduled_index.clone();
 
         let id = job.id.clone();
+        let event_id = job.id.clone();
         let event_queue = job.queue.clone();
         let queue = job.queue.clone();
         let priority = job.priority;
@@ -2930,6 +2999,7 @@ impl Store {
         await_sync(result).await?;
 
         let _ = self.event_tx.send(StoreEvent::JobCreated {
+            id: event_id,
             queue: event_queue,
             token: Arc::new(AtomicBool::new(false)),
         });
@@ -4104,7 +4174,7 @@ mod tests {
         store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         match rx.recv().await.unwrap() {
-            StoreEvent::JobCompleted(id) => assert_eq!(id, job.id),
+            StoreEvent::JobCompleted { id } => assert_eq!(id, job.id),
             other => panic!("expected JobCompleted, got {other:?}"),
         }
     }
@@ -6179,7 +6249,7 @@ mod tests {
 
         assert!(matches!(
             rx.recv().await.unwrap(),
-            StoreEvent::JobScheduled { ready_at } if ready_at == future
+            StoreEvent::JobScheduled { ready_at, .. } if ready_at == future
         ));
     }
 
@@ -6746,7 +6816,7 @@ mod tests {
 
         // Second event: JobScheduled so the scheduler wakes up.
         match rx.recv().await.unwrap() {
-            StoreEvent::JobScheduled { ready_at } => assert!(ready_at > 0),
+            StoreEvent::JobScheduled { ready_at, .. } => assert!(ready_at > 0),
             other => panic!("expected JobScheduled, got {other:?}"),
         }
     }
@@ -7139,5 +7209,91 @@ mod tests {
         let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
         assert_eq!(fetched.id, job.id);
         assert_eq!(fetched.status, u8::from(JobStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn list_ready_jobs_returns_priority_order() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue jobs at different priorities.
+        let low = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(10),
+            )
+            .await
+            .unwrap();
+        let high = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(0),
+            )
+            .await
+            .unwrap();
+        let mid = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(5),
+            )
+            .await
+            .unwrap();
+
+        let jobs = store.list_ready_jobs(10).await.unwrap();
+        let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec![high.id, mid.id, low.id]);
+    }
+
+    #[tokio::test]
+    async fn list_ready_jobs_respects_limit() {
+        let store = test_store();
+        let now = now_millis();
+
+        for _ in 0..5 {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let jobs = store.list_ready_jobs(3).await.unwrap();
+        assert_eq!(jobs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_ready_jobs_empty_store() {
+        let store = test_store();
+        let jobs = store.list_ready_jobs(10).await.unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_ready_jobs_excludes_working() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        // Take one job — it moves to Working.
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+
+        let jobs = store.list_ready_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
     }
 }

@@ -232,7 +232,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
 
     // Start the admin API listener (unless disabled).
     if !args.no_admin {
-        // Start the admin event producer.
+        // Start the admin heartbeat producer.
         let admin_events = state.admin_events.clone();
         let admin_shutdown = state.shutdown.clone();
         let start_time = std::time::Instant::now();

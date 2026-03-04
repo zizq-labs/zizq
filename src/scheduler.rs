@@ -112,7 +112,7 @@ pub async fn run(
                 _ = &mut sleep => break,
                 event = event_rx.recv() => {
                     match event {
-                        Ok(StoreEvent::JobScheduled { ready_at })
+                        Ok(StoreEvent::JobScheduled { ready_at, .. })
                             if ready_at < sleep_until =>
                         {
                             // New job is due sooner — reset the timer.

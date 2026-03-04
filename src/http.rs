@@ -1761,7 +1761,7 @@ async fn take_jobs(
                     // without going back to the top of the loop.
                     event = event_rx.recv() => {
                         match event {
-                            Ok(StoreEvent::JobCreated { queue, token }) => {
+                            Ok(StoreEvent::JobCreated { queue, token, .. }) => {
                                 // Store the latest matching token. We
                                 // don't CAS yet — we'll claim it when
                                 // reserve() tells us the client can
@@ -1772,7 +1772,7 @@ async fn take_jobs(
                                     claim_token = token;
                                 }
                             }
-                            Ok(StoreEvent::JobCompleted(ref id)) => {
+                            Ok(StoreEvent::JobCompleted { ref id }) => {
                                 if in_flight.remove(id).is_some() {
                                     tracing::debug!(
                                         job_id = %id,
@@ -1814,6 +1814,7 @@ async fn take_jobs(
                                         );
                                 }
                             }
+                            Ok(StoreEvent::JobWorking { .. }) => {}
                             Ok(StoreEvent::JobScheduled { .. }) => {}
                             Err(broadcast::error::RecvError::Lagged(n))
                             => {

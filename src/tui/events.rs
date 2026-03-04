@@ -8,6 +8,8 @@
 
 use tokio::sync::mpsc;
 
+use crate::admin::{AdminEvent, AdminJobSummary, JobChangeStatus};
+
 /// Unified event type for the TUI event loop.
 pub enum Event {
     /// User requested quit (e.g. pressed 'q').
@@ -18,6 +20,17 @@ pub enum Event {
     ServerConnected,
     /// Heartbeat received from server.
     ServerHeartbeat { version: String, uptime_ms: u64 },
+    /// Snapshot of ready and working job queues.
+    ServerJobSnapshot {
+        ready: Vec<AdminJobSummary>,
+        working: Vec<AdminJobSummary>,
+    },
+    /// Incremental change to a single job's status.
+    ServerJobChanged {
+        id: String,
+        status: JobChangeStatus,
+        job: Option<AdminJobSummary>,
+    },
     /// Server connection lost.
     ServerDisconnected,
 }
@@ -43,21 +56,13 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
 /// automatically reconnecting on failure.
 pub fn manage_ws_connection(tx: mpsc::Sender<Event>, base_url: String) {
     tokio::spawn(async move {
-        // Convert http(s):// to ws(s)://.
-        let ws_url = if base_url.starts_with("https://") {
-            format!("wss://{}/events", &base_url["https://".len()..])
-        } else if base_url.starts_with("http://") {
-            format!("ws://{}/events", &base_url["http://".len()..])
-        } else {
-            format!("{base_url}/events")
-        };
+        let url = format!("{base_url}/events");
 
         loop {
             let _ = tx.send(Event::ServerConnecting).await;
 
-            match connect_ws(&ws_url, &tx).await {
-                Ok(()) => {}
-                Err(_) => {}
+            if let Err(e) = connect_ws(&url, &tx).await {
+                eprintln!("WebSocket connection error: {e}");
             }
 
             let _ = tx.send(Event::ServerDisconnected).await;
@@ -74,15 +79,14 @@ async fn connect_ws(
     tx: &mpsc::Sender<Event>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
-    use tokio_tungstenite::tungstenite::Message;
+    use reqwest_websocket::{Message, RequestBuilderExt};
 
-    let (stream, _response) = tokio_tungstenite::connect_async(url).await?;
+    let response = reqwest::Client::new().get(url).upgrade().send().await?;
+    let mut websocket = response.into_websocket().await?;
 
     let _ = tx.send(Event::ServerConnected).await;
 
-    let (_sender, mut receiver) = stream.split();
-
-    while let Some(msg) = receiver.next().await {
+    while let Some(msg) = websocket.next().await {
         let msg = msg?;
         if let Message::Text(text) = msg {
             if let Some(event) = parse_ws_message(&text) {
@@ -96,17 +100,105 @@ async fn connect_ws(
     Ok(())
 }
 
-/// Parse a WebSocket text message into a TUI Event.
+/// Parse a WebSocket JSON text message into a TUI Event.
 fn parse_ws_message(text: &str) -> Option<Event> {
-    let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
-    let event_type = parsed["event"].as_str()?;
+    let admin_event: AdminEvent = serde_json::from_str(text).ok()?;
 
-    match event_type {
-        "heartbeat" => {
-            let version = parsed["version"].as_str()?.to_string();
-            let uptime_ms = parsed["uptime_ms"].as_u64()?;
+    match admin_event {
+        AdminEvent::Heartbeat { version, uptime_ms } => {
             Some(Event::ServerHeartbeat { version, uptime_ms })
         }
-        _ => None,
+        AdminEvent::JobSnapshot { ready, working } => {
+            Some(Event::ServerJobSnapshot { ready, working })
+        }
+        AdminEvent::JobChanged { id, status, job } => {
+            Some(Event::ServerJobChanged { id, status, job })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_heartbeat() {
+        let json = r#"{"event":"heartbeat","version":"1.0.0","uptime_ms":5000}"#;
+        let event = parse_ws_message(json).unwrap();
+
+        match event {
+            Event::ServerHeartbeat { version, uptime_ms } => {
+                assert_eq!(version, "1.0.0");
+                assert_eq!(uptime_ms, 5000);
+            }
+            _ => panic!("expected ServerHeartbeat"),
+        }
+    }
+
+    #[test]
+    fn parses_job_snapshot() {
+        let json = r#"{
+            "event": "job_snapshot",
+            "ready": [{"id":"r1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0}],
+            "working": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}]
+        }"#;
+        let event = parse_ws_message(json).unwrap();
+
+        match event {
+            Event::ServerJobSnapshot { ready, working } => {
+                assert_eq!(ready.len(), 1);
+                assert_eq!(ready[0].id, "r1");
+                assert_eq!(working.len(), 1);
+                assert_eq!(working[0].id, "w1");
+            }
+            _ => panic!("expected ServerJobSnapshot"),
+        }
+    }
+
+    #[test]
+    fn parses_job_changed_with_job() {
+        let json = r#"{
+            "event": "job_changed",
+            "id": "j1",
+            "status": "ready",
+            "job": {"id":"j1","queue":"q","job_type":"t","priority":5,"ready_at":1000,"attempts":0}
+        }"#;
+        let event = parse_ws_message(json).unwrap();
+
+        match event {
+            Event::ServerJobChanged { id, status, job } => {
+                assert_eq!(id, "j1");
+                assert_eq!(status, JobChangeStatus::Ready);
+                let job = job.unwrap();
+                assert_eq!(job.priority, 5);
+            }
+            _ => panic!("expected ServerJobChanged"),
+        }
+    }
+
+    #[test]
+    fn parses_job_changed_without_job() {
+        let json = r#"{"event":"job_changed","id":"j1","status":"completed"}"#;
+        let event = parse_ws_message(json).unwrap();
+
+        match event {
+            Event::ServerJobChanged { id, status, job } => {
+                assert_eq!(id, "j1");
+                assert_eq!(status, JobChangeStatus::Completed);
+                assert!(job.is_none());
+            }
+            _ => panic!("expected ServerJobChanged"),
+        }
+    }
+
+    #[test]
+    fn returns_none_for_invalid_json() {
+        assert!(parse_ws_message("not json").is_none());
+    }
+
+    #[test]
+    fn returns_none_for_unknown_event_type() {
+        let json = r#"{"event":"unknown","data":123}"#;
+        assert!(parse_ws_message(json).is_none());
     }
 }

@@ -36,6 +36,10 @@ pub struct Args {
         env = "ZANXIO_ADMIN_URL"
     )]
     url: String,
+
+    /// UI refresh rate in milliseconds.
+    #[arg(long, short = 'r', value_name = "MILLISECONDS", default_value = "500")]
+    refresh_rate: u64,
 }
 
 /// Run the TUI dashboard.
@@ -57,20 +61,50 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new();
 
-    // Main event loop.
-    loop {
-        terminal.draw(|f| ui::render(&app, f))?;
+    // Main event loop — process events as they arrive, redraw on tick.
+    let mut tick = tokio::time::interval(Duration::from_millis(args.refresh_rate));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Wait for the next event with a timeout for periodic redraws.
-        match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-            Ok(Some(event)) => {
-                if app.handle_event(event) {
-                    break;
+    let mut should_quit = false;
+
+    loop {
+        // Process events until the next tick fires.
+        loop {
+            tokio::select! {
+                biased;
+                _ = tick.tick() => break,
+                event = rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            if app.handle_event(event) {
+                                should_quit = true;
+                                break;
+                            }
+                        }
+                        None => { should_quit = true; break; }
+                    }
                 }
             }
-            Ok(None) => break, // Channel closed.
-            Err(_) => {}       // Timeout — just redraw.
         }
+
+        // Drain any remaining buffered events.
+        while !should_quit {
+            match rx.try_recv() {
+                Ok(event) => {
+                    if app.handle_event(event) {
+                        should_quit = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if should_quit {
+            break;
+        }
+
+        app.now_ms = crate::time::now_millis();
+        terminal.draw(|f| ui::render(&app, f))?;
     }
 
     // Restore terminal.

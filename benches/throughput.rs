@@ -23,7 +23,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use zanxio::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
 use zanxio::store::Store;
@@ -176,6 +176,8 @@ async fn start_server() -> (String, JoinHandle<()>) {
     // Leak the sender so the shutdown signal is never triggered.
     std::mem::forget(shutdown_tx);
 
+    let (admin_events, _) = broadcast::channel(64);
+
     let state = Arc::new(AppState {
         license: zanxio::license::License::Free,
         store: store.clone(),
@@ -184,6 +186,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx.clone(),
         clock: Arc::new(zanxio::time::now_millis),
+        admin_events,
     });
 
     // Spawn the background scheduler.

@@ -28,7 +28,8 @@ jsonwebtoken = "9"
 ratatui = "0.30"
 crossterm = "0.29"
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.26", features = ["connect", "handshake"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest-websocket = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
@@ -37,7 +38,7 @@ tower = { version = "0.5", features = ["util"] }
 rmp = "0.8.15"
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-reqwest = { version = "0.12", features = ["stream", "json"] }
+tokio-tungstenite = { version = "0.26", features = ["connect", "handshake"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
 rand = "0.8"
