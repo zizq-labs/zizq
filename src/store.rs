@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Persistent storage layer to manage job queues.
@@ -1561,42 +1561,41 @@ impl StorageConfig {
     ///
     /// | Variable                    | Field              |
     /// |-----------------------------|--------------------|
-    /// | `ZANXIO_DATA_TABLE_SIZE`    | `data_table_size`  |
-    /// | `ZANXIO_INDEX_TABLE_SIZE`   | `index_table_size` |
-    /// | `ZANXIO_JOURNAL_SIZE`       | `journal_size`     |
-    /// | `ZANXIO_L0_THRESHOLD`       | `l0_threshold`     |
-    /// | `ZANXIO_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
-    /// | `ZANXIO_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
+    /// | `ZIZQ_DATA_TABLE_SIZE`    | `data_table_size`  |
+    /// | `ZIZQ_INDEX_TABLE_SIZE`   | `index_table_size` |
+    /// | `ZIZQ_JOURNAL_SIZE`       | `journal_size`     |
+    /// | `ZIZQ_L0_THRESHOLD`       | `l0_threshold`     |
+    /// | `ZIZQ_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
+    /// | `ZIZQ_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
         Ok(Self {
-            data_table_size: env_parse("ZANXIO_DATA_TABLE_SIZE")?
-                .unwrap_or(defaults.data_table_size),
-            index_table_size: env_parse("ZANXIO_INDEX_TABLE_SIZE")?
+            data_table_size: env_parse("ZIZQ_DATA_TABLE_SIZE")?.unwrap_or(defaults.data_table_size),
+            index_table_size: env_parse("ZIZQ_INDEX_TABLE_SIZE")?
                 .unwrap_or(defaults.index_table_size),
-            journal_size: env_parse("ZANXIO_JOURNAL_SIZE")?.unwrap_or(defaults.journal_size),
-            l0_threshold: env_parse("ZANXIO_L0_THRESHOLD")?.unwrap_or(defaults.l0_threshold),
+            journal_size: env_parse("ZIZQ_JOURNAL_SIZE")?.unwrap_or(defaults.journal_size),
+            l0_threshold: env_parse("ZIZQ_L0_THRESHOLD")?.unwrap_or(defaults.l0_threshold),
             default_completed_retention_ms: defaults.default_completed_retention_ms,
             default_dead_retention_ms: defaults.default_dead_retention_ms,
             default_retry_limit: defaults.default_retry_limit,
             default_backoff: defaults.default_backoff,
-            default_commit_mode: match std::env::var("ZANXIO_DEFAULT_COMMIT_MODE").ok().as_deref() {
+            default_commit_mode: match std::env::var("ZIZQ_DEFAULT_COMMIT_MODE").ok().as_deref() {
                 Some("fsync") => CommitMode::Fsync,
                 Some("buffered") | None => CommitMode::Buffered,
                 Some(other) => {
                     return Err(EnvConfigError {
-                        name: "ZANXIO_DEFAULT_COMMIT_MODE".into(),
+                        name: "ZIZQ_DEFAULT_COMMIT_MODE".into(),
                         value: other.into(),
                     });
                 }
             },
-            enqueue_commit_mode: match std::env::var("ZANXIO_ENQUEUE_COMMIT_MODE").ok().as_deref() {
+            enqueue_commit_mode: match std::env::var("ZIZQ_ENQUEUE_COMMIT_MODE").ok().as_deref() {
                 Some("fsync") => Some(CommitMode::Fsync),
                 Some("buffered") => Some(CommitMode::Buffered),
                 None => None,
                 Some(other) => {
                     return Err(EnvConfigError {
-                        name: "ZANXIO_ENQUEUE_COMMIT_MODE".into(),
+                        name: "ZIZQ_ENQUEUE_COMMIT_MODE".into(),
                         value: other.into(),
                     });
                 }

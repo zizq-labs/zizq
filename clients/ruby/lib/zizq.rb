@@ -1,27 +1,27 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-require_relative "zanxio/version"
-require_relative "zanxio/error"
-require_relative "zanxio/configuration"
+require_relative "zizq/version"
+require_relative "zizq/error"
+require_relative "zizq/configuration"
 
 # Autoloaded when first accessed — avoids loading heavy deps at require time.
 autoload :HTTPX, "httpx"
 autoload :MessagePack, "msgpack"
 
-module Zanxio
-  autoload :Client,    "zanxio/client"
-  autoload :Job,       "zanxio/job"
-  autoload :Resources, "zanxio/resources"
-  autoload :Worker,    "zanxio/worker"
+module Zizq
+  autoload :Client,    "zizq/client"
+  autoload :Job,       "zizq/job"
+  autoload :Resources, "zizq/resources"
+  autoload :Worker,    "zizq/worker"
 
   class << self
     # Returns the client configuration.
     #
-    # The configuration can be updated by calling [`Zanxio::configure`].
+    # The configuration can be updated by calling [`Zizq::configure`].
     #
     # This configuration is for the client only. Worker parameters are
     # configured on a per-run basis for flexibility.
@@ -33,7 +33,7 @@ module Zanxio
     # during application initialization, before any jobs are enqueued or
     # worked.
     #
-    #   Zanxio.configure do |c|
+    #   Zizq.configure do |c|
     #     c.url = "http://localhost:7890"
     #     c.format = :msgpack
     #   end
@@ -63,12 +63,12 @@ module Zanxio
 
     # Convenience method to enqueue a job by class with a given payload.
     #
-    # Keyword options provided to `Zanxio::enqueue` override options specified
+    # Keyword options provided to `Zizq::enqueue` override options specified
     # in the job class (which override the default options set on the server).
     #
-    #   Zanxio.enqueue(SendEmailJob, { user_id: 42 })
-    #   Zanxio.enqueue(SendEmailJob, { user_id: 42 }, queue: "priority", priority: 100)
-    #   Zanxio.enqueue(SendEmailJob, { user_id: 42 }, delay: 60)
+    #   Zizq.enqueue(SendEmailJob, { user_id: 42 })
+    #   Zizq.enqueue(SendEmailJob, { user_id: 42 }, queue: "priority", priority: 100)
+    #   Zizq.enqueue(SendEmailJob, { user_id: 42 }, delay: 60)
     #
     # @rbs job_class: Class
     # @rbs payload: Hash[String | Symbol, untyped]
@@ -77,8 +77,8 @@ module Zanxio
     # @rbs delay: (Float | Integer)?
     # @rbs ready_at: Float?
     # @rbs retry_limit: Integer?
-    # @rbs backoff: Zanxio::backoff?
-    # @rbs retention: Zanxio::retention?
+    # @rbs backoff: Zizq::backoff?
+    # @rbs retention: Zizq::retention?
     # @rbs return: Hash[String, untyped]
     def enqueue(
       job_class,
@@ -91,21 +91,21 @@ module Zanxio
       backoff: nil,
       retention: nil
     )
-      unless job_class.is_a?(Class) && job_class < Zanxio::Job
-        raise ArgumentError, "#{job_class.inspect} must include Zanxio::Job"
+      unless job_class.is_a?(Class) && job_class < Zizq::Job
+        raise ArgumentError, "#{job_class.inspect} must include Zizq::Job"
       end
 
-      # After the runtime guard above, we know job_class includes Zanxio::Job
+      # After the runtime guard above, we know job_class includes Zizq::Job
       # and therefore has ClassMethods extended. Assert this for steep.
-      zanxio_job_class = job_class #: Zanxio::job_class
+      zizq_job_class = job_class #: Zizq::job_class
 
-      type = zanxio_job_class.name
+      type = zizq_job_class.name
       raise ArgumentError, "Cannot enqueue anonymous class" if type.nil?
 
-      queue ||= zanxio_job_class.zanxio_queue
-      retry_limit ||= zanxio_job_class.zanxio_retry_limit
-      backoff ||= zanxio_job_class.zanxio_backoff
-      retention ||= zanxio_job_class.zanxio_retention
+      queue ||= zizq_job_class.zizq_queue
+      retry_limit ||= zizq_job_class.zizq_retry_limit
+      backoff ||= zizq_job_class.zizq_backoff
+      retention ||= zizq_job_class.zizq_retention
 
       params = { type:, queue:, payload: } #: Hash[Symbol, untyped]
       params[:priority] = priority if priority

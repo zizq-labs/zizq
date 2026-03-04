@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
@@ -6,7 +6,7 @@
 
 require "logger"
 
-module Zanxio
+module Zizq
   # Orchestrates fetching jobs from the server and dispatching them to
   # a pool of worker tasks for processing.
   #
@@ -37,7 +37,7 @@ module Zanxio
     #
     # For applications that cannot handle multi-fiber execution, this should be
     # set to 1. Any value greater than 1 requires loading 'async', which must
-    # be made available by the application itself. Zanxio does not directly
+    # be made available by the application itself. Zizq does not directly
     # depend on async (default: 1).
     attr_reader :fiber_count #: Integer
 
@@ -76,7 +76,7 @@ module Zanxio
 
     # Proc to derive a worker ID string for each thread and fiber.
     #
-    # When not present, the Zanxio server assigns a random worker ID.
+    # When not present, the Zizq server assigns a random worker ID.
     attr_reader :worker_id_proc #: (^(Integer, Integer) -> String?)?
 
     # An instance of a Logger to be used for worker logging.
@@ -117,7 +117,7 @@ module Zanxio
       @max_reconnect_interval = max_reconnect_interval.to_f
       @reconnect_exponent = reconnect_exponent.to_f
       @worker_id_proc = worker_id
-      @logger = logger || Zanxio.configuration.logger
+      @logger = logger || Zizq.configuration.logger
       @shutdown = false
       @dispatch_queue = Thread::Queue.new
       @shutdown_latch = Thread::Queue.new
@@ -130,7 +130,7 @@ module Zanxio
     def run #: () -> void
       install_signal_handlers
 
-      logger.info { "Zanxio worker starting: #{thread_count} threads, #{fiber_count} fibers, prefetch=#{prefetch}" }
+      logger.info { "Zizq worker starting: #{thread_count} threads, #{fiber_count} fibers, prefetch=#{prefetch}" }
       logger.info { "Queues: #{queues.empty? ? '(all)' : queues.join(', ')}" }
 
       # Everything runs in the background initially.
@@ -153,7 +153,7 @@ module Zanxio
       # Workers get the full shutdown timeout to drain remaining jobs.
       join_with_deadline(worker_threads)
 
-      logger.info { "Zanxio worker stopped" }
+      logger.info { "Zizq worker stopped" }
     end
 
     private
@@ -172,12 +172,12 @@ module Zanxio
 
     def start_producer_thread #: () -> Thread
       Thread.new do
-        Thread.current.name = "zanxio-producer"
+        Thread.current.name = "zizq-producer"
         current_interval = reconnect_interval
 
         until @shutdown
           begin
-            client = Zanxio.client
+            client = Zizq.client
             logger.info { "Connecting to #{client.url}..." }
 
             client.take_jobs(
@@ -200,7 +200,7 @@ module Zanxio
 
             # Stream ended normally — reset backoff for next reconnect.
             current_interval = reconnect_interval
-          rescue Zanxio::ConnectionError, Zanxio::StreamError => e
+          rescue Zizq::ConnectionError, Zizq::StreamError => e
             break if @shutdown
 
             logger.warn { "#{e.message}; reconnecting in #{current_interval}s..." }
@@ -228,7 +228,7 @@ module Zanxio
     def start_worker_threads #: () -> Array[Thread]
       (0...thread_count).map do |thread_idx|
         Thread.new(thread_idx) do |tidx|
-          Thread.current.name = "zanxio-worker-#{tidx}"
+          Thread.current.name = "zizq-worker-#{tidx}"
 
           if fiber_count > 1
             run_fiber_workers(tidx)
@@ -246,7 +246,7 @@ module Zanxio
     # and drained.
     def run_loop(thread_idx, fiber_idx) #: (Integer, Integer) -> void
       wid = resolve_worker_id(thread_idx, fiber_idx)
-      client = Zanxio.client
+      client = Zizq.client
 
       loop do
         job_hash = @dispatch_queue.pop
@@ -284,7 +284,7 @@ module Zanxio
       logger.debug { "Processing #{job_type} (#{job_id})" }
 
       # Resolve the job class from the type string and validate that it
-      # includes Zanxio::Job. Object.const_get naturally triggers
+      # includes Zizq::Job. Object.const_get naturally triggers
       # Zeitwerk/autoload if configured.
       job_class = begin
         Object.const_get(job_type)
@@ -294,19 +294,19 @@ module Zanxio
         return
       end
 
-      unless job_class.is_a?(Class) && job_class.include?(Zanxio::Job)
-        logger.error { "#{job_type} (#{job_id}) does not include Zanxio::Job" }
+      unless job_class.is_a?(Class) && job_class.include?(Zizq::Job)
+        logger.error { "#{job_type} (#{job_id}) does not include Zizq::Job" }
         safe_nack(
           client,
           job_id,
-          RuntimeError.new("#{job_type} does not include Zanxio::Job"),
+          RuntimeError.new("#{job_type} does not include Zizq::Job"),
           worker_id:,
         )
         return
       end
 
       job_instance = job_class.new
-      job_instance.set_zanxio_job(job)
+      job_instance.set_zizq_job(job)
 
       begin
         job_instance.perform(job.payload || {})

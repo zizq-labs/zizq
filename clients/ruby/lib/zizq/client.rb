@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
@@ -10,32 +10,32 @@ require "json"
 require "stringio"
 require "uri"
 
-module Zanxio
-  # Low-level HTTP wrapper for the Zanxio job queue server API.
+module Zizq
+  # Low-level HTTP wrapper for the Zizq job queue server API.
   #
   # Supports both JSON and MessagePack serialization formats, determined at
   # construction time.
   class Client
-    CONTENT_TYPES = { #: Hash[Zanxio::format, String]
+    CONTENT_TYPES = { #: Hash[Zizq::format, String]
       msgpack: "application/msgpack",
       json: "application/json"
     }.freeze
 
-    STREAM_ACCEPT = { #: Hash[Zanxio::format, String]
-      msgpack: "application/vnd.zanxio.msgpack-stream",
+    STREAM_ACCEPT = { #: Hash[Zizq::format, String]
+      msgpack: "application/vnd.zizq.msgpack-stream",
       json: "application/x-ndjson"
     }.freeze
 
-    # The base URL of the Zanxio server (e.g. "https://localhost:7890")
+    # The base URL of the Zizq server (e.g. "https://localhost:7890")
     attr_reader :url #: String
 
     # The message format to use for all communication between the client and
     # the server (default = `:msgpack`).
-    attr_reader :format #: Zanxio::format
+    attr_reader :format #: Zizq::format
 
     # Initialize a new instance of the client with the given base URL and
     # optional format options.
-    def initialize(url:, format: :msgpack) #: (url: String, ?format: Zanxio::format) -> void
+    def initialize(url:, format: :msgpack) #: (url: String, ?format: Zizq::format) -> void
       @url = url.chomp("/")
       @format = format
 
@@ -50,8 +50,8 @@ module Zanxio
     # Enqueue a new job.
     #
     # This is a low-level primitive that makes a direct API call to the server
-    # using the Zanxio API's expected inputs. Callers should generally use
-    # [`Zanxio::enqueue`] instead.
+    # using the Zizq API's expected inputs. Callers should generally use
+    # [`Zizq::enqueue`] instead.
     #
     # Returns a resource instance of the new job wrapping the API response.
     #
@@ -94,7 +94,7 @@ module Zanxio
     # @rbs queue: (String | Array[String])?
     # @rbs type: (String | Array[String])?
     # @rbs from: String?
-    # @rbs order: Zanxio::sort_direction?
+    # @rbs order: Zizq::sort_direction?
     # @rbs limit: Integer?
     # @rbs return: Resources::JobPage
     def list_jobs(status: nil, queue: nil, type: nil, from: nil, order: nil, limit: nil)
@@ -109,7 +109,7 @@ module Zanxio
     #
     # @rbs id: String
     # @rbs from: String?
-    # @rbs order: Zanxio::sort_direction?
+    # @rbs order: Zizq::sort_direction?
     # @rbs limit: Integer?
     # @rbs return: Resources::ErrorPage
     def list_errors(id, from: nil, order: nil, limit: nil)
@@ -135,7 +135,7 @@ module Zanxio
     # Mark a job as successfully completed (ack).
     #
     # If this method (or [`#report_failure`]) is not called upon job
-    # completion, the Zanxio server will consider it in-flight and will not
+    # completion, the Zizq server will consider it in-flight and will not
     # send any more jobs if the prefetch limit has been reached, or the
     # server's global in-flight limit has been reached. Jobs must be either
     # acknowledged or failed before new jobs are sent.
@@ -146,7 +146,7 @@ module Zanxio
     # provided to another worker. Clients should be prepared to see the same
     # job more than once for this reason.
     #
-    # The Zanxio server sends heartbeat messages to connected workers so that
+    # The Zizq server sends heartbeat messages to connected workers so that
     # it can quickly detect and handle disconnected clients.
     def report_success(id) #: (String) -> nil
       response = raw_post("/jobs/#{id}/success")
@@ -159,7 +159,7 @@ module Zanxio
     # Returns the updated job metadata.
     #
     # If this method is not called when errors occur processing jobs, the
-    # Zanxio server will consider it in-flight and will not send any more jobs
+    # Zizq server will consider it in-flight and will not send any more jobs
     # if the prefetch limit has been reached, or the server's global in-flight
     # limit has been reached. Jobs must be either acknowledged or failed before
     # new jobs are sent.
@@ -170,7 +170,7 @@ module Zanxio
     # provided to another worker. Clients should be prepared to see the same
     # job more than once for this reason.
     #
-    # The Zanxio server sends heartbeat messages to connected workers so that
+    # The Zizq server sends heartbeat messages to connected workers so that
     # it can quickly detect and handle disconnected clients.
     #
     # @rbs id: String
@@ -214,7 +214,7 @@ module Zanxio
     # provided to another worker. Clients should be prepared to see the same
     # job more than once for this reason.
     #
-    # The Zanxio server sends periodic heartbeat messages to the client which
+    # The Zizq server sends periodic heartbeat messages to the client which
     # are silently consumed.
     #
     # Example:

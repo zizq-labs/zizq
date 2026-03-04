@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # frozen_string_literal: true
@@ -9,14 +9,14 @@ class TestResources < Minitest::Test
   URL = "http://localhost:7890"
 
   def setup
-    @client = Zanxio::Client.new(url: URL, format: :json)
+    @client = Zizq::Client.new(url: URL, format: :json)
   end
 
   # --- Resource base ---
 
   def test_to_h_returns_raw_data
     data = { "id" => "j1", "type" => "Foo" }
-    resource = Zanxio::Resources::Resource.new(@client, data)
+    resource = Zizq::Resources::Resource.new(@client, data)
     assert_equal data, resource.to_h
   end
 
@@ -28,7 +28,7 @@ class TestResources < Minitest::Test
       "priority" => 100, "status" => "ready", "attempts" => 2,
       "retry_limit" => 5
     }
-    job = Zanxio::Resources::Job.new(@client, data)
+    job = Zizq::Resources::Job.new(@client, data)
 
     assert_equal "j1", job.id
     assert_equal "SendEmail", job.type
@@ -46,7 +46,7 @@ class TestResources < Minitest::Test
       "dequeued_at" => 1_700_000_001_500,
       "failed_at" => 1_700_000_002_750
     }
-    job = Zanxio::Resources::Job.new(@client, data)
+    job = Zizq::Resources::Job.new(@client, data)
 
     assert_in_delta 1_700_000_000.0, job.ready_at, 0.001
     assert_in_delta 1_700_000_001.5, job.dequeued_at, 0.001
@@ -55,7 +55,7 @@ class TestResources < Minitest::Test
 
   def test_job_nil_optional_fields
     data = { "id" => "j1", "type" => "Foo", "queue" => "default" }
-    job = Zanxio::Resources::Job.new(@client, data)
+    job = Zizq::Resources::Job.new(@client, data)
 
     assert_nil job.payload
     assert_nil job.dequeued_at
@@ -67,7 +67,7 @@ class TestResources < Minitest::Test
   def test_job_payload_present
     data = { "id" => "j1", "type" => "Foo", "queue" => "default",
              "payload" => { "user_id" => 42 } }
-    job = Zanxio::Resources::Job.new(@client, data)
+    job = Zizq::Resources::Job.new(@client, data)
 
     assert_equal({ "user_id" => 42 }, job.payload)
   end
@@ -75,15 +75,15 @@ class TestResources < Minitest::Test
   def test_job_backoff_converts_from_wire_format
     data = { "id" => "j1", "type" => "Foo", "queue" => "default",
              "backoff" => { "exponent" => 4.0, "base_ms" => 15_000, "jitter_ms" => 30_000 } }
-    job = Zanxio::Resources::Job.new(@client, data)
+    job = Zizq::Resources::Job.new(@client, data)
 
-    # Wire format ms values are converted to seconds matching Zanxio::backoff
+    # Wire format ms values are converted to seconds matching Zizq::backoff
     assert_equal({ exponent: 4.0, base: 15.0, jitter: 30.0 }, job.backoff)
   end
 
   def test_job_to_h
     data = { "id" => "j1", "type" => "Foo", "queue" => "default" }
-    job = Zanxio::Resources::Job.new(@client, data)
+    job = Zizq::Resources::Job.new(@client, data)
 
     assert_equal data, job.to_h
   end
@@ -100,10 +100,10 @@ class TestResources < Minitest::Test
       .to_return(status: 200, body: JSON.generate(error_response),
                  headers: { "Content-Type" => "application/json" })
 
-    job = Zanxio::Resources::Job.new(@client, { "id" => "j1" })
+    job = Zizq::Resources::Job.new(@client, { "id" => "j1" })
     page = job.errors
 
-    assert_instance_of Zanxio::Resources::ErrorPage, page
+    assert_instance_of Zizq::Resources::ErrorPage, page
     assert_equal 1, page.errors.size
     assert_equal "boom", page.errors[0].message
   end
@@ -112,7 +112,7 @@ class TestResources < Minitest::Test
     stub_request(:post, "#{URL}/jobs/j1/success")
       .to_return(status: 204, body: "")
 
-    job = Zanxio::Resources::Job.new(@client, { "id" => "j1" })
+    job = Zizq::Resources::Job.new(@client, { "id" => "j1" })
     result = job.complete!
 
     assert_nil result
@@ -124,10 +124,10 @@ class TestResources < Minitest::Test
       .to_return(status: 200, body: JSON.generate(updated),
                  headers: { "Content-Type" => "application/json" })
 
-    job = Zanxio::Resources::Job.new(@client, { "id" => "j1" })
+    job = Zizq::Resources::Job.new(@client, { "id" => "j1" })
     result = job.fail!(error: "oops")
 
-    assert_instance_of Zanxio::Resources::Job, result
+    assert_instance_of Zizq::Resources::Job, result
     assert_equal "scheduled", result.status
   end
 
@@ -139,7 +139,7 @@ class TestResources < Minitest::Test
       "error_type" => "Timeout::Error", "backtrace" => "line1\nline2",
       "dequeued_at" => 1_700_000_000_000, "failed_at" => 1_700_000_001_500
     }
-    record = Zanxio::Resources::ErrorRecord.new(@client, data)
+    record = Zizq::Resources::ErrorRecord.new(@client, data)
 
     assert_equal 3, record.attempt
     assert_equal "connection timeout", record.message
@@ -152,7 +152,7 @@ class TestResources < Minitest::Test
   def test_error_record_nil_optional_fields
     data = { "attempt" => 1, "message" => "boom",
              "dequeued_at" => 1000, "failed_at" => 2000 }
-    record = Zanxio::Resources::ErrorRecord.new(@client, data)
+    record = Zizq::Resources::ErrorRecord.new(@client, data)
 
     assert_nil record.error_type
     assert_nil record.backtrace
@@ -168,24 +168,24 @@ class TestResources < Minitest::Test
       ],
       "pages" => { "self" => "/jobs" }
     }
-    page = Zanxio::Resources::JobPage.new(@client, data)
+    page = Zizq::Resources::JobPage.new(@client, data)
 
     assert_equal 2, page.jobs.size
-    assert_instance_of Zanxio::Resources::Job, page.jobs[0]
+    assert_instance_of Zizq::Resources::Job, page.jobs[0]
     assert_equal "j1", page.jobs[0].id
     assert_equal "j2", page.jobs[1].id
   end
 
   def test_job_page_items_alias
     data = { "jobs" => [{ "id" => "j1" }], "pages" => {} }
-    page = Zanxio::Resources::JobPage.new(@client, data)
+    page = Zizq::Resources::JobPage.new(@client, data)
 
     assert_equal page.jobs, page.items
   end
 
   def test_job_page_to_h
     data = { "jobs" => [], "pages" => {} }
-    page = Zanxio::Resources::JobPage.new(@client, data)
+    page = Zizq::Resources::JobPage.new(@client, data)
     assert_equal data, page.to_h
   end
 
@@ -198,16 +198,16 @@ class TestResources < Minitest::Test
       ],
       "pages" => { "self" => "/jobs/j1/errors" }
     }
-    page = Zanxio::Resources::ErrorPage.new(@client, data)
+    page = Zizq::Resources::ErrorPage.new(@client, data)
 
     assert_equal 1, page.errors.size
-    assert_instance_of Zanxio::Resources::ErrorRecord, page.errors[0]
+    assert_instance_of Zizq::Resources::ErrorRecord, page.errors[0]
     assert_equal "boom", page.errors[0].message
   end
 
   def test_error_page_items_alias
     data = { "errors" => [{ "attempt" => 1, "message" => "x", "dequeued_at" => 1, "failed_at" => 2 }], "pages" => {} }
-    page = Zanxio::Resources::ErrorPage.new(@client, data)
+    page = Zizq::Resources::ErrorPage.new(@client, data)
 
     assert_equal page.errors, page.items
   end
@@ -215,7 +215,7 @@ class TestResources < Minitest::Test
   # --- Page navigation ---
 
   def test_page_next_and_prev_predicates
-    page_with = Zanxio::Resources::JobPage.new(@client, {
+    page_with = Zizq::Resources::JobPage.new(@client, {
       "jobs" => [],
       "pages" => { "self" => "/jobs", "next" => "/jobs?from=abc", "prev" => "/jobs?from=xyz&order=desc" }
     })
@@ -223,7 +223,7 @@ class TestResources < Minitest::Test
     assert page_with.has_next?
     assert page_with.has_prev?
 
-    page_without = Zanxio::Resources::JobPage.new(@client, {
+    page_without = Zizq::Resources::JobPage.new(@client, {
       "jobs" => [],
       "pages" => { "self" => "/jobs" }
     })
@@ -247,10 +247,10 @@ class TestResources < Minitest::Test
       .to_return(status: 200, body: JSON.generate(page2_data),
                  headers: { "Content-Type" => "application/json" })
 
-    page1 = Zanxio::Resources::JobPage.new(@client, page1_data)
+    page1 = Zizq::Resources::JobPage.new(@client, page1_data)
     page2 = page1.next_page
 
-    assert_instance_of Zanxio::Resources::JobPage, page2
+    assert_instance_of Zizq::Resources::JobPage, page2
     assert_equal 1, page2.jobs.size
     assert_equal "j2", page2.jobs[0].id
   end
@@ -269,15 +269,15 @@ class TestResources < Minitest::Test
       .to_return(status: 200, body: JSON.generate(page1_data),
                  headers: { "Content-Type" => "application/json" })
 
-    page2 = Zanxio::Resources::JobPage.new(@client, page2_data)
+    page2 = Zizq::Resources::JobPage.new(@client, page2_data)
     page1 = page2.prev_page
 
-    assert_instance_of Zanxio::Resources::JobPage, page1
+    assert_instance_of Zizq::Resources::JobPage, page1
     assert_equal "j1", page1.jobs[0].id
   end
 
   def test_page_next_page_returns_nil_when_absent
-    page = Zanxio::Resources::JobPage.new(@client, {
+    page = Zizq::Resources::JobPage.new(@client, {
       "jobs" => [], "pages" => { "self" => "/jobs" }
     })
 
@@ -285,7 +285,7 @@ class TestResources < Minitest::Test
   end
 
   def test_page_prev_page_returns_nil_when_absent
-    page = Zanxio::Resources::JobPage.new(@client, {
+    page = Zizq::Resources::JobPage.new(@client, {
       "jobs" => [], "pages" => { "self" => "/jobs" }
     })
 
@@ -306,10 +306,10 @@ class TestResources < Minitest::Test
       .to_return(status: 200, body: JSON.generate(page2_data),
                  headers: { "Content-Type" => "application/json" })
 
-    page1 = Zanxio::Resources::ErrorPage.new(@client, page1_data)
+    page1 = Zizq::Resources::ErrorPage.new(@client, page1_data)
     page2 = page1.next_page
 
-    assert_instance_of Zanxio::Resources::ErrorPage, page2
+    assert_instance_of Zizq::Resources::ErrorPage, page2
     assert_equal "bang", page2.errors[0].message
   end
 end

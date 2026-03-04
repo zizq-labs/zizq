@@ -1,9 +1,9 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # Manual RBS declarations that rbs-inline can't generate.
 
-module Zanxio
+module Zizq
   # Serialization format for communication with the server.
   type format = :json | :msgpack
 
@@ -16,23 +16,23 @@ module Zanxio
   # Retention configuration expressed in fractional seconds.
   type retention = { ?completed: Float, ?dead: Float }
 
-  # Structural type for a class that includes Zanxio::Job.
+  # Structural type for a class that includes Zizq::Job.
   #
-  # When a class includes Zanxio::Job, the `included` callback extends
+  # When a class includes Zizq::Job, the `included` callback extends
   # ClassMethods onto the class. Steep can't infer this from the runtime
   # `extend` call, so we describe the resulting shape as an interface.
   #
   # The `_` prefix is mandatory RBS syntax for interfaces. The `job_class`
   # type alias below provides a cleaner name for use in source annotations.
   interface _JobClass
-    def zanxio_queue: (?String?) -> String
-    def zanxio_retry_limit: (?Integer?) -> Integer?
-    def zanxio_backoff: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> backoff?
-    def zanxio_retention: (?completed: Numeric?, ?dead: Numeric?) -> retention?
+    def zizq_queue: (?String?) -> String
+    def zizq_retry_limit: (?Integer?) -> Integer?
+    def zizq_backoff: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> backoff?
+    def zizq_retention: (?completed: Numeric?, ?dead: Numeric?) -> retention?
     def name: () -> String?
     def new: () -> Job
   end
 
-  # Alias so source code can write `Zanxio::job_class` instead of `_JobClass`.
+  # Alias so source code can write `Zizq::job_class` instead of `_JobClass`.
   type job_class = _JobClass
 end

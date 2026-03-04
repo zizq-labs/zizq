@@ -1,10 +1,10 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # RBS stubs for external gems that don't ship their own RBS declarations.
 #
 # The type coverage here is intentionally not exhaustive and is simply enough
-# for steep to do its static analysis of the Zanxio code.
+# for steep to do its static analysis of the Zizq code.
 
 # HTTP/2 compatible HTTP client.
 module HTTPX
@@ -58,7 +58,7 @@ end
 # Async gem — only loaded when fibers > 1.
 # Behavior is context-dependent: inside an existing event loop it spawns a
 # background Task; at top level (no reactor) it creates one and blocks.
-# The Zanxio worker calls it at the top of a thread, so it blocks there.
+# The Zizq worker calls it at the top of a thread, so it blocks there.
 module Async
   # Async tasks are generic over some return type that is returned when the
   # task is waited on.

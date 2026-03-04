@@ -1,7 +1,7 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Terminal UI dashboard for Zanxio.
+//! Terminal UI dashboard for Zizq.
 //!
 //! Connects to the admin API via WebSocket and renders a live
 //! dashboard using ratatui. Requires a Pro license.
@@ -30,11 +30,7 @@ use self::events::Event;
 #[derive(Parser)]
 pub struct Args {
     /// Admin API base URL to connect to.
-    #[arg(
-        long,
-        default_value = "http://127.0.0.1:8901",
-        env = "ZANXIO_ADMIN_URL"
-    )]
+    #[arg(long, default_value = "http://127.0.0.1:8901", env = "ZIZQ_ADMIN_URL")]
     url: String,
 
     /// UI refresh rate in milliseconds.

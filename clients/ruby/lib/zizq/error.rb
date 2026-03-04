@@ -1,11 +1,11 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-module Zanxio
-  # Base error class for all Zanxio errors.
+module Zizq
+  # Base error class for all Zizq errors.
   class Error < StandardError; end
 
   # Network-level failure (connection refused, DNS, timeout etc).
@@ -14,7 +14,7 @@ module Zanxio
   # HTTP error — the server returned a non-success status code.
   # Carries the status code and parsed body.
   class ResponseError < Error
-    # The HTTP response status from the Zanxio server.
+    # The HTTP response status from the Zizq server.
     attr_reader :status #: Integer
 
     # The decoded body of the error response.

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Background scheduler that promotes scheduled jobs to the Ready state.
@@ -15,7 +15,7 @@ use crate::store::{Store, StoreEvent};
 
 /// Default number of due jobs to fetch per iteration.
 ///
-/// Override with the `ZANXIO_SCHEDULER_BATCH_SIZE` environment variable.
+/// Override with the `ZIZQ_SCHEDULER_BATCH_SIZE` environment variable.
 pub const DEFAULT_BATCH_SIZE: usize = 200;
 
 /// Run the scheduler loop until the shutdown signal is received.

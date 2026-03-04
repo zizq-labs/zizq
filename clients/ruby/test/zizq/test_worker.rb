@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # frozen_string_literal: true
@@ -7,9 +7,9 @@ require "test_helper"
 
 # A simple job that records what it received.
 class RecordingJob
-  include Zanxio::Job
+  include Zizq::Job
 
-  zanxio_queue "test"
+  zizq_queue "test"
 
   # Class-level storage so we can inspect results from the test.
   @results = []
@@ -21,17 +21,17 @@ class RecordingJob
   def perform(payload)
     self.class.results << {
       payload: payload,
-      id: zanxio_id,
-      attempts: zanxio_attempts,
-      queue: zanxio_queue,
-      priority: zanxio_priority
+      id: zizq_id,
+      attempts: zizq_attempts,
+      queue: zizq_queue,
+      priority: zizq_priority
     }
   end
 end
 
 # A job that raises on perform.
 class FailingJob
-  include Zanxio::Job
+  include Zizq::Job
 
   @fail_count = 0
 
@@ -49,14 +49,14 @@ class TestWorker < Minitest::Test
   URL = "http://localhost:7890"
 
   def setup
-    Zanxio.reset!
-    Zanxio.configure { |c| c.url = URL; c.format = :json }
+    Zizq.reset!
+    Zizq.configure { |c| c.url = URL; c.format = :json }
     RecordingJob.results = []
     FailingJob.fail_count = 0
   end
 
   def test_defaults
-    worker = Zanxio::Worker.new
+    worker = Zizq::Worker.new
     assert_equal 5, worker.thread_count
     assert_equal 1, worker.fiber_count
     assert_equal 5, worker.prefetch
@@ -67,12 +67,12 @@ class TestWorker < Minitest::Test
   end
 
   def test_custom_prefetch
-    worker = Zanxio::Worker.new(thread_count: 4, fiber_count: 2, prefetch: 10)
+    worker = Zizq::Worker.new(thread_count: 4, fiber_count: 2, prefetch: 10)
     assert_equal 10, worker.prefetch
   end
 
   def test_default_prefetch_is_threads_times_fibers
-    worker = Zanxio::Worker.new(thread_count: 4, fiber_count: 3)
+    worker = Zizq::Worker.new(thread_count: 4, fiber_count: 3)
     assert_equal 12, worker.prefetch
   end
 
@@ -94,7 +94,7 @@ class TestWorker < Minitest::Test
     ack_stub = stub_request(:post, "#{URL}/jobs/j1/success")
       .to_return(status: 204)
 
-    worker = Zanxio::Worker.new(thread_count: 1, queues: [], prefetch: 1,
+    worker = Zizq::Worker.new(thread_count: 1, queues: [], prefetch: 1,
                                  logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
@@ -141,7 +141,7 @@ class TestWorker < Minitest::Test
       .to_return(status: 200, body: JSON.generate({ "id" => "j1", "status" => "scheduled" }),
                  headers: { "Content-Type" => "application/json" })
 
-    worker = Zanxio::Worker.new(thread_count: 1, prefetch: 1,
+    worker = Zizq::Worker.new(thread_count: 1, prefetch: 1,
                                  logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
@@ -178,7 +178,7 @@ class TestWorker < Minitest::Test
       .to_return(status: 200, body: JSON.generate({ "id" => "j1", "status" => "scheduled" }),
                  headers: { "Content-Type" => "application/json" })
 
-    worker = Zanxio::Worker.new(thread_count: 1, prefetch: 1,
+    worker = Zizq::Worker.new(thread_count: 1, prefetch: 1,
                                  logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
@@ -220,7 +220,7 @@ class TestWorker < Minitest::Test
       .to_return(status: 204)
 
     # 1 thread with 2 fibers exercises the Async code path
-    worker = Zanxio::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
+    worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
                                  logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
@@ -260,7 +260,7 @@ class TestWorker < Minitest::Test
       .to_return(status: 200, body: JSON.generate({ "id" => "j1", "status" => "scheduled" }),
                  headers: { "Content-Type" => "application/json" })
 
-    worker = Zanxio::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
+    worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
                                  logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
@@ -296,7 +296,7 @@ class TestWorker < Minitest::Test
     stub_request(:post, %r{#{URL}/jobs/j[12]/success})
       .to_return(status: 204)
 
-    worker = Zanxio::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
+    worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
                                  logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
@@ -315,7 +315,7 @@ class TestWorker < Minitest::Test
   end
 
   def test_worker_id_proc
-    worker = Zanxio::Worker.new(
+    worker = Zizq::Worker.new(
       worker_id: ->(t, f) { "app-#{Process.pid}-t#{t}-f#{f}" }
     )
 
@@ -324,7 +324,7 @@ class TestWorker < Minitest::Test
   end
 
   def test_worker_id_nil_by_default
-    worker = Zanxio::Worker.new
+    worker = Zizq::Worker.new
     wid = worker.send(:resolve_worker_id, 0, 0)
     assert_nil wid
   end

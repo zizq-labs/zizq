@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
@@ -6,24 +6,24 @@
 
 require "logger"
 
-module Zanxio
-  # Global configuration for the Zanxio client.
+module Zizq
+  # Global configuration for the Zizq client.
   #
   # The configuration stores only client-level concerns: server URL,
   # serialization format, and logger. Worker-specific settings (queues,
   # threads, etc.) are passed directly to the Worker.
   #
-  # See: [`Zanxio::configure]`.
-  # See: [`Zanxio::configuration]`.
+  # See: [`Zizq::configure]`.
+  # See: [`Zizq::configuration]`.
   class Configuration
-    # Base URL of the Zanxio server (default: "http://localhost:7890").
+    # Base URL of the Zizq server (default: "http://localhost:7890").
     attr_accessor :url #: String
 
-    # Choice of content-type encoding used in communication with the Zanxio
+    # Choice of content-type encoding used in communication with the Zizq
     # server.
     #
     # One of: `:json`, `:msgpack` (default)
-    attr_accessor :format #: Zanxio::format
+    attr_accessor :format #: Zizq::format
 
     # Logger instance to which to write log messages.
     attr_accessor :logger #: Logger
@@ -36,10 +36,10 @@ module Zanxio
 
     # Validates that required configuration is present.
     def validate! #: () -> void
-      raise ArgumentError, "Zanxio.configure: url is required" if url.empty?
+      raise ArgumentError, "Zizq.configure: url is required" if url.empty?
 
       unless %i[msgpack json].include?(format)
-        raise ArgumentError, "Zanxio.configure: format must be :msgpack or :json, got #{format.inspect}"
+        raise ArgumentError, "Zizq.configure: format must be :msgpack or :json, got #{format.inspect}"
       end
     end
   end

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Ratatui rendering for the TUI dashboard.
@@ -59,7 +59,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let status_bar = Paragraph::new(Line::from(status_spans)).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Zanxio {}", env!("CARGO_PKG_VERSION"))),
+            .title(format!("Zizq {}", env!("CARGO_PKG_VERSION"))),
     );
 
     frame.render_widget(status_bar, chunks[0]);

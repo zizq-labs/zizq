@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    zanxio (0.1.0)
+    zizq (0.1.0)
       httpx (~> 1.4)
       msgpack (~> 1.7)
 
@@ -149,7 +149,7 @@ DEPENDENCIES
   rbs-inline (~> 0.10)
   steep (~> 1.9)
   webmock (~> 3.0)
-  zanxio!
+  zizq!
 
 BUNDLED WITH
    2.5.22

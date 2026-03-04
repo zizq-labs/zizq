@@ -1,10 +1,10 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-module Zanxio
+module Zizq
   module Resources
     # Base class for all typed response wrappers. Holds a reference to the
     # Client (for following links) and the raw response hash.
@@ -12,7 +12,7 @@ module Zanxio
       # Returns the client instance that returned this resource.
       attr_reader :client #: Client
 
-      # @rbs client: Zanxio::Client
+      # @rbs client: Zizq::Client
       # @rbs data: Hash[String, untyped]
       # @rbs return: void
       def initialize(client, data)

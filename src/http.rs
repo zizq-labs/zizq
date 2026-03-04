@@ -1,7 +1,7 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! HTTP layer for the Zanxio server.
+//! HTTP layer for the Zizq server.
 //!
 //! Defines the router, request handlers, content negotiation, take framing,
 //! and all request/response types.
@@ -58,7 +58,7 @@ enum TakeFormat {
 const SUPPORTED_TAKE_TYPES: &[&str] = &[
     "text/event-stream",
     "application/x-ndjson",
-    "application/vnd.zanxio.msgpack-stream",
+    "application/vnd.zizq.msgpack-stream",
 ];
 
 /// Extractor that reads the `Accept` header and resolves a `TakeFormat` for the take endpoint.
@@ -80,7 +80,7 @@ where
                 let value = value.to_str().unwrap_or("");
                 if value.contains("text/event-stream") {
                     Ok(TakeAccept(TakeFormat::Sse))
-                } else if value.contains("application/vnd.zanxio.msgpack-stream")
+                } else if value.contains("application/vnd.zizq.msgpack-stream")
                     || value.contains("application/msgpack")
                 {
                     Ok(TakeAccept(TakeFormat::MsgPackStream))
@@ -954,7 +954,7 @@ fn build_msgpack_stream_response(rx: mpsc::Receiver<TakeMessage>) -> Response {
     let mut res = Response::new(Body::from_stream(stream));
     res.headers_mut().insert(
         CONTENT_TYPE,
-        "application/vnd.zanxio.msgpack-stream".parse().unwrap(),
+        "application/vnd.zizq.msgpack-stream".parse().unwrap(),
     );
     res
 }
@@ -3745,12 +3745,12 @@ mod tests {
             .await
             .unwrap();
 
-        let req = request_with_accept("GET", "/jobs/take", "application/vnd.zanxio.msgpack-stream");
+        let req = request_with_accept("GET", "/jobs/take", "application/vnd.zizq.msgpack-stream");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(
             res.headers().get("content-type").unwrap(),
-            "application/vnd.zanxio.msgpack-stream"
+            "application/vnd.zizq.msgpack-stream"
         );
 
         let mut body = res.into_body();
@@ -3777,7 +3777,7 @@ mod tests {
         let supported = body["supported"].as_array().unwrap();
         assert!(supported.contains(&"text/event-stream".into()));
         assert!(supported.contains(&"application/x-ndjson".into()));
-        assert!(supported.contains(&"application/vnd.zanxio.msgpack-stream".into()));
+        assert!(supported.contains(&"application/vnd.zizq.msgpack-stream".into()));
     }
 
     #[tokio::test]

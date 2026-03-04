@@ -1,10 +1,10 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-module Zanxio
+module Zizq
   module Resources
     # Typed wrapper around a job response hash.
     #
@@ -26,8 +26,8 @@ module Zanxio
       def retry_limit   = @data["retry_limit"] #: () -> Integer?
 
       # Backoff configuration converted from the wire format (ms) to the
-      # Ruby-idiomatic format (seconds), matching the Zanxio::backoff type.
-      def backoff #: () -> Zanxio::backoff?
+      # Ruby-idiomatic format (seconds), matching the Zizq::backoff type.
+      def backoff #: () -> Zizq::backoff?
         raw = @data["backoff"]
         return nil unless raw
 
@@ -39,8 +39,8 @@ module Zanxio
       end
 
       # Retention configuration converted from the wire format (ms) to the
-      # Ruby-idiomatic format (seconds), matching the Zanxio::retention type.
-      def retention #: () -> Zanxio::retention?
+      # Ruby-idiomatic format (seconds), matching the Zizq::retention type.
+      def retention #: () -> Zizq::retention?
         raw = @data["retention"]
         return nil unless raw
 
@@ -53,7 +53,7 @@ module Zanxio
       # Fetch the error history for this job.
       #
       # @rbs from: String?
-      # @rbs order: Zanxio::sort_direction?
+      # @rbs order: Zizq::sort_direction?
       # @rbs limit: Integer?
       # @rbs return: ErrorPage
       def errors(from: nil, order: nil, limit: nil)

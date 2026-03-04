@@ -1,11 +1,11 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! License validation for paid feature gating.
 //!
 //! License keys are Ed25519-signed JWTs containing licensee info, tier, and
 //! expiry. The public key is embedded at compile time via the
-//! `ZANXIO_LICENSE_PUBLIC_KEY` environment variable. Dev builds without the
+//! `ZIZQ_LICENSE_PUBLIC_KEY` environment variable. Dev builds without the
 //! key cannot validate licenses (and that's fine).
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -13,12 +13,12 @@ use serde::Deserialize;
 
 /// Compile-time public key for license verification.
 ///
-/// Set `ZANXIO_LICENSE_PUBLIC_KEY` to a PEM-encoded Ed25519 public key when
+/// Set `ZIZQ_LICENSE_PUBLIC_KEY` to a PEM-encoded Ed25519 public key when
 /// building release binaries. When unset, `from_token()` returns an error.
 ///
 /// In development, this can be done by setting the env var in
 /// .cargo/config.toml.
-const LICENSE_PUBLIC_KEY: Option<&str> = option_env!("ZANXIO_LICENSE_PUBLIC_KEY");
+const LICENSE_PUBLIC_KEY: Option<&str> = option_env!("ZIZQ_LICENSE_PUBLIC_KEY");
 
 /// Available license tiers, ordered by capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -1,7 +1,7 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Zanxio CLI `serve` command entry point.
+//! Zizq CLI `serve` command entry point.
 //!
 //! Parses CLI arguments, initializes the database, and starts the HTTP server.
 
@@ -52,70 +52,70 @@ pub struct Args {
     #[arg(long, default_value = "pretty", value_name = "FORMAT")]
     log_format: logging::LogFormat,
 
-    /// Log level for zanxio.
+    /// Log level for zizq.
     #[arg(
         long,
         default_value = "info",
         value_name = "LEVEL",
-        env = "ZANXIO_LOG_LEVEL"
+        env = "ZIZQ_LOG_LEVEL"
     )]
     log_level: logging::LogLevel,
 
     /// Root directory for all server data and configuration.
     #[arg(
         long,
-        default_value = "./zanxio-root",
+        default_value = "./zizq-root",
         value_name = "PATH",
-        env = "ZANXIO_ROOT_DIR"
+        env = "ZIZQ_ROOT_DIR"
     )]
     root_dir: String,
 
     /// Address to bind the HTTP server to.
-    #[arg(long, default_value = "127.0.0.1", env = "ZANXIO_HOST")]
+    #[arg(long, default_value = "127.0.0.1", env = "ZIZQ_HOST")]
     host: String,
 
     /// Port to listen for HTTP connections on.
-    #[arg(long, default_value_t = 7890, env = "ZANXIO_PORT")]
+    #[arg(long, default_value_t = 7890, env = "ZIZQ_PORT")]
     port: u16,
 
     /// Interval between heartbeat frames on idle take connections (e.g. 3s, 500ms).
-    #[arg(long = "heartbeat-interval", default_value = "3s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_HEARTBEAT_INTERVAL")]
+    #[arg(long = "heartbeat-interval", default_value = "3s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_HEARTBEAT_INTERVAL")]
     heartbeat_interval_ms: u64,
 
     /// Maximum number of jobs in the working set across all connections.
     /// 0 means no limit.
-    #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, value_name = "NUMBER", env = "ZANXIO_GLOBAL_WORKING_LIMIT")]
+    #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, value_name = "NUMBER", env = "ZIZQ_GLOBAL_WORKING_LIMIT")]
     global_working_limit: u64,
 
     /// Default maximum retries before a failed job is killed.
     /// Jobs can override this at enqueue time with a per-job retry_limit.
-    #[arg(long, default_value_t = store::DEFAULT_RETRY_LIMIT, value_name = "NUMBER", env = "ZANXIO_DEFAULT_RETRY_LIMIT")]
+    #[arg(long, default_value_t = store::DEFAULT_RETRY_LIMIT, value_name = "NUMBER", env = "ZIZQ_DEFAULT_RETRY_LIMIT")]
     default_retry_limit: u32,
 
     /// Default backoff exponent (power curve steepness).
-    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_EXPONENT, value_name = "NUMBER", env = "ZANXIO_DEFAULT_BACKOFF_EXPONENT")]
+    #[arg(long, default_value_t = store::DEFAULT_BACKOFF_EXPONENT, value_name = "NUMBER", env = "ZIZQ_DEFAULT_BACKOFF_EXPONENT")]
     default_backoff_exponent: f32,
 
     /// Default backoff base delay (e.g. 15s, 500ms).
-    #[arg(long = "default-backoff-base", default_value = "15s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_BACKOFF_BASE")]
+    #[arg(long = "default-backoff-base", default_value = "15s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_DEFAULT_BACKOFF_BASE")]
     default_backoff_base_ms: u64,
 
     /// Default backoff jitter — max random delay per attempt multiplier (e.g. 30s, 500ms).
-    #[arg(long = "default-backoff-jitter", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_BACKOFF_JITTER")]
+    #[arg(long = "default-backoff-jitter", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_DEFAULT_BACKOFF_JITTER")]
     default_backoff_jitter_ms: u64,
 
     /// Default retention period for completed jobs (e.g. 0, 1h, 7d).
     /// 0 means completed jobs are purged immediately.
-    #[arg(long = "default-completed-job-retention", default_value = "0", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_COMPLETED_JOB_RETENTION")]
+    #[arg(long = "default-completed-job-retention", default_value = "0", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_DEFAULT_COMPLETED_JOB_RETENTION")]
     default_completed_job_retention_ms: u64,
 
     /// Default retention period for dead jobs (e.g. 7d, 24h).
     /// 0 means dead jobs are purged immediately.
-    #[arg(long = "default-dead-job-retention", default_value = "7d", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_DEFAULT_DEAD_JOB_RETENTION")]
+    #[arg(long = "default-dead-job-retention", default_value = "7d", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_DEFAULT_DEAD_JOB_RETENTION")]
     default_dead_job_retention_ms: u64,
 
     /// Interval between reaper scans (e.g. 30s, 1m).
-    #[arg(long = "reaper-check-interval", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZANXIO_REAPER_CHECK_INTERVAL")]
+    #[arg(long = "reaper-check-interval", default_value = "30s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_REAPER_CHECK_INTERVAL")]
     reaper_check_interval_ms: u64,
 
     /// Default commit durability mode for most operations.
@@ -127,7 +127,7 @@ pub struct Args {
     /// Expect to pay a significant throughput penalty for fsync. You may not
     /// need this guarantee. If you only care about at-last-once execution of
     /// jobs, see --enqueue-commit-mode.
-    #[arg(long, default_value = "buffered", value_name = "MODE", value_parser = parse_commit_mode, env = "ZANXIO_DEFAULT_COMMIT_MODE")]
+    #[arg(long, default_value = "buffered", value_name = "MODE", value_parser = parse_commit_mode, env = "ZIZQ_DEFAULT_COMMIT_MODE")]
     default_commit_mode: store::CommitMode,
 
     /// Commit durability mode for enqueue operations only.
@@ -138,19 +138,19 @@ pub struct Args {
     /// other operations fast. This basically provides at-least-once guarantees
     /// while accepting jobs may be dequeued more than once in the case of a
     /// system failure, such as sudden loss of power.
-    #[arg(long, value_name = "MODE", value_parser = parse_commit_mode, env = "ZANXIO_ENQUEUE_COMMIT_MODE")]
+    #[arg(long, value_name = "MODE", value_parser = parse_commit_mode, env = "ZIZQ_ENQUEUE_COMMIT_MODE")]
     enqueue_commit_mode: Option<store::CommitMode>,
 
     /// Address to bind the admin API server to.
-    #[arg(long, default_value = "127.0.0.1", env = "ZANXIO_ADMIN_HOST")]
+    #[arg(long, default_value = "127.0.0.1", env = "ZIZQ_ADMIN_HOST")]
     admin_host: String,
 
     /// Port to listen for admin API connections on.
-    #[arg(long, default_value_t = 8901, env = "ZANXIO_ADMIN_PORT")]
+    #[arg(long, default_value_t = 8901, env = "ZIZQ_ADMIN_PORT")]
     admin_port: u16,
 
     /// Disable the admin API listener.
-    #[arg(long, default_value_t = false, env = "ZANXIO_NO_ADMIN")]
+    #[arg(long, default_value_t = false, env = "ZIZQ_NO_ADMIN")]
     no_admin: bool,
 }
 
@@ -209,7 +209,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     // Start the background scheduler that promotes scheduled jobs to Ready
     // once their ready_at timestamp arrives.
     let scheduler_shutdown = state.shutdown.clone();
-    let scheduler_batch_size = std::env::var("ZANXIO_SCHEDULER_BATCH_SIZE")
+    let scheduler_batch_size = std::env::var("ZIZQ_SCHEDULER_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(crate::scheduler::DEFAULT_BATCH_SIZE);

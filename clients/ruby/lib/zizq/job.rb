@@ -1,21 +1,21 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-module Zanxio
+module Zizq
   # Mixin which all valid job classes must include.
   #
-  # Include this module in a class to make it a valid Zanxio job. The class
+  # Include this module in a class to make it a valid Zizq job. The class
   # name becomes the job type, and the worker resolves types back to classes
   # via `Object.const_get` (which naturally triggers any Zeitwerk/autoload
   # logic).
   #
   #   class SendEmailJob
-  #     include Zanxio::Job
+  #     include Zizq::Job
   #
-  #     zanxio_queue "emails"   # optional, defaults to "default"
+  #     zizq_queue "emails"   # optional, defaults to "default"
   #
   #     def perform(payload)
   #       puts "Sending email to user #{payload['user_id']}"
@@ -32,12 +32,12 @@ module Zanxio
       #
       # If not called, defaults to "default". Jobs enqueued for this class will
       # use the specified queue unless explicitly overridden in
-      # [`Zanxio::enqueue`].
-      def zanxio_queue(name = nil) #: (?String?) -> String
+      # [`Zizq::enqueue`].
+      def zizq_queue(name = nil) #: (?String?) -> String
         if name
-          @zanxio_queue = name
+          @zizq_queue = name
         else
-          @zanxio_queue || "default"
+          @zizq_queue || "default"
         end
       end
 
@@ -48,11 +48,11 @@ module Zanxio
       # job is killed and becomes part of the dead set.
       #
       # If not called, the server's default is used.
-      def zanxio_retry_limit(limit = nil) #: (?Integer?) -> Integer?
+      def zizq_retry_limit(limit = nil) #: (?Integer?) -> Integer?
         if limit
-          @zanxio_retry_limit = limit
+          @zizq_retry_limit = limit
         else
-          @zanxio_retry_limit
+          @zizq_retry_limit
         end
       end
 
@@ -68,18 +68,18 @@ module Zanxio
       #
       # Example:
       #
-      #   zanxio_backoff exponent: 4.0, base: 15, jitter: 30
+      #   zizq_backoff exponent: 4.0, base: 15, jitter: 30
       #
       # If not called, the server's default is used.
-      def zanxio_backoff(exponent: nil, base: nil, jitter: nil) #: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> Zanxio::backoff?
+      def zizq_backoff(exponent: nil, base: nil, jitter: nil) #: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> Zizq::backoff?
         if exponent || base || jitter
           unless exponent && base && jitter
             raise ArgumentError, "all of exponent:, base:, jitter: are required"
           end
 
-          @zanxio_backoff = { exponent: exponent.to_f, base: base.to_f, jitter: jitter.to_f }
+          @zizq_backoff = { exponent: exponent.to_f, base: base.to_f, jitter: jitter.to_f }
         else
-          @zanxio_backoff
+          @zizq_backoff
         end
       end
 
@@ -93,17 +93,17 @@ module Zanxio
       #
       # Example:
       #
-      #   zanxio_retention completed: 0, dead: 7 * 86_400
+      #   zizq_retention completed: 0, dead: 7 * 86_400
       #
       # If not called, the server's default is used.
-      def zanxio_retention(completed: nil, dead: nil) #: (?completed: Numeric?, ?dead: Numeric?) -> Zanxio::retention?
+      def zizq_retention(completed: nil, dead: nil) #: (?completed: Numeric?, ?dead: Numeric?) -> Zizq::retention?
         if completed || dead
           result = {} #: Hash[Symbol, Float]
           result[:completed] = completed.to_f if completed
           result[:dead] = dead.to_f if dead
-          @zanxio_retention = result
+          @zizq_retention = result
         else
-          @zanxio_retention
+          @zizq_retention
         end
       end
     end
@@ -121,29 +121,29 @@ module Zanxio
     # metadata.
 
     # The unique job ID assigned by the server.
-    def zanxio_id = @zanxio_job&.id         #: () -> String?
+    def zizq_id = @zizq_job&.id         #: () -> String?
 
     # How many times this job has previously been attempted (0 on the first
     # run, 1 on the second, etc...).
-    def zanxio_attempts = @zanxio_job&.attempts   #: () -> Integer?
+    def zizq_attempts = @zizq_job&.attempts   #: () -> Integer?
 
     # The queue this job was dequeued from.
-    def zanxio_queue = @zanxio_job&.queue      #: () -> String?
+    def zizq_queue = @zizq_job&.queue      #: () -> String?
 
     # The priority this job was enqueued with.
-    def zanxio_priority = @zanxio_job&.priority   #: () -> Integer?
+    def zizq_priority = @zizq_job&.priority   #: () -> Integer?
 
     # Time at which this job was dequeued (fractional seconds since the Unix
     # epoch). This can be converted to `Time` by using `Time.at(dequeued_at)`
     # but that is intentionally left to the caller due to time zone
     # considerations. Already in seconds (converted from ms by Resources::Job).
-    def zanxio_dequeued_at = @zanxio_job&.dequeued_at #: () -> Float?
+    def zizq_dequeued_at = @zizq_job&.dequeued_at #: () -> Float?
 
     # @api private
     # Set by the worker before calling #perform. Receives the full
     # Resources::Job object so all metadata is available through delegation.
-    def set_zanxio_job(job) #: (Resources::Job) -> void
-      @zanxio_job = job
+    def set_zizq_job(job) #: (Resources::Job) -> void
+      @zizq_job = job
     end
   end
 end

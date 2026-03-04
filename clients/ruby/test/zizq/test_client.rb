@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # frozen_string_literal: true
@@ -9,8 +9,8 @@ class TestClient < Minitest::Test
   URL = "http://localhost:7890"
 
   def setup
-    @json_client = Zanxio::Client.new(url: URL, format: :json)
-    @msgpack_client = Zanxio::Client.new(url: URL, format: :msgpack)
+    @json_client = Zizq::Client.new(url: URL, format: :json)
+    @msgpack_client = Zizq::Client.new(url: URL, format: :msgpack)
   end
 
   # --- enqueue ---
@@ -29,7 +29,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.enqueue(type: "SendEmail", queue: "emails", payload: { user_id: 42 })
-    assert_instance_of Zanxio::Resources::Job, result
+    assert_instance_of Zizq::Resources::Job, result
     assert_equal "abc123", result.id
     assert_equal "SendEmail", result.type
   end
@@ -48,7 +48,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/msgpack" })
 
     result = @msgpack_client.enqueue(type: "SendEmail", queue: "emails", payload: { user_id: 42 })
-    assert_instance_of Zanxio::Resources::Job, result
+    assert_instance_of Zizq::Resources::Job, result
     assert_equal "abc123", result.id
   end
 
@@ -76,7 +76,7 @@ class TestClient < Minitest::Test
       .to_return(status: 400, body: JSON.generate({ "error" => "queue is required" }),
                  headers: { "Content-Type" => "application/json" })
 
-    err = assert_raises(Zanxio::ClientError) do
+    err = assert_raises(Zizq::ClientError) do
       @json_client.enqueue(type: "", queue: "", payload: {})
     end
     assert_equal 400, err.status
@@ -96,7 +96,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.get_job("job1")
-    assert_instance_of Zanxio::Resources::Job, result
+    assert_instance_of Zizq::Resources::Job, result
     assert_equal "job1", result.id
     assert_equal({ "key" => "value" }, result.payload)
   end
@@ -106,7 +106,7 @@ class TestClient < Minitest::Test
       .to_return(status: 404, body: JSON.generate({ "error" => "not found" }),
                  headers: { "Content-Type" => "application/json" })
 
-    assert_raises(Zanxio::NotFoundError) { @json_client.get_job("missing") }
+    assert_raises(Zizq::NotFoundError) { @json_client.get_job("missing") }
   end
 
   # --- list_jobs ---
@@ -120,7 +120,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.list_jobs
-    assert_instance_of Zanxio::Resources::JobPage, result
+    assert_instance_of Zizq::Resources::JobPage, result
     assert_equal [], result.jobs
   end
 
@@ -147,7 +147,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.list_errors("j1")
-    assert_instance_of Zanxio::Resources::ErrorPage, result
+    assert_instance_of Zizq::Resources::ErrorPage, result
     assert_equal 1, result.errors.size
     assert_equal "boom", result.errors[0].message
   end
@@ -206,7 +206,7 @@ class TestClient < Minitest::Test
       .to_return(status: 404, body: JSON.generate({ "error" => "not found" }),
                  headers: { "Content-Type" => "application/json" })
 
-    assert_raises(Zanxio::NotFoundError) { @json_client.report_success("missing") }
+    assert_raises(Zizq::NotFoundError) { @json_client.report_success("missing") }
   end
 
   # --- report_failure (nack) ---
@@ -228,7 +228,7 @@ class TestClient < Minitest::Test
                                          error: "RuntimeError: boom",
                                          error_type: "RuntimeError",
                                          backtrace: "line1\nline2")
-    assert_instance_of Zanxio::Resources::Job, result
+    assert_instance_of Zizq::Resources::Job, result
     assert_equal "scheduled", result.status
     assert_equal 1, result.attempts
   end
@@ -258,7 +258,7 @@ class TestClient < Minitest::Test
       .to_return(status: 500, body: JSON.generate({ "error" => "internal" }),
                  headers: { "Content-Type" => "application/json" })
 
-    err = assert_raises(Zanxio::ServerError) { @json_client.health }
+    err = assert_raises(Zizq::ServerError) { @json_client.health }
     assert_equal 500, err.status
   end
 
@@ -277,7 +277,7 @@ class TestClient < Minitest::Test
     jobs = []
     @json_client.take_jobs(prefetch: 5) { |job| jobs << job }
     assert_equal 2, jobs.size
-    assert_instance_of Zanxio::Resources::Job, jobs[0]
+    assert_instance_of Zizq::Resources::Job, jobs[0]
     assert_equal "j1", jobs[0].id
     assert_equal "j2", jobs[1].id
   end
@@ -354,14 +354,14 @@ class TestClient < Minitest::Test
     body << [packed2.bytesize].pack("N") << packed2
 
     stub_request(:get, "#{URL}/jobs/take?prefetch=2")
-      .with(headers: { "Accept" => "application/vnd.zanxio.msgpack-stream" })
+      .with(headers: { "Accept" => "application/vnd.zizq.msgpack-stream" })
       .to_return(status: 200, body: body,
-                 headers: { "Content-Type" => "application/vnd.zanxio.msgpack-stream" })
+                 headers: { "Content-Type" => "application/vnd.zizq.msgpack-stream" })
 
     jobs = []
     @msgpack_client.take_jobs(prefetch: 2) { |job| jobs << job }
     assert_equal 2, jobs.size
-    assert_instance_of Zanxio::Resources::Job, jobs[0]
+    assert_instance_of Zizq::Resources::Job, jobs[0]
     assert_equal "j1", jobs[0].id
     assert_equal "j2", jobs[1].id
   end
@@ -374,7 +374,7 @@ class TestClient < Minitest::Test
 
     stub_request(:get, "#{URL}/jobs/take?prefetch=1")
       .to_return(status: 200, body: body,
-                 headers: { "Content-Type" => "application/vnd.zanxio.msgpack-stream" })
+                 headers: { "Content-Type" => "application/vnd.zizq.msgpack-stream" })
 
     jobs = []
     @msgpack_client.take_jobs(prefetch: 1) { |job| jobs << job }
@@ -389,7 +389,7 @@ class TestClient < Minitest::Test
     chunks = ["#{JSON.generate(job1)}\n\n#{JSON.generate(job2)}\n"]
 
     jobs = []
-    Zanxio::Client.parse_ndjson(chunks) { |job| jobs << job }
+    Zizq::Client.parse_ndjson(chunks) { |job| jobs << job }
     assert_equal 2, jobs.size
     assert_equal "j1", jobs[0]["id"]
     assert_equal "j2", jobs[1]["id"]
@@ -402,14 +402,14 @@ class TestClient < Minitest::Test
     chunk2 = "#{full_line[5..]}\n"
 
     jobs = []
-    Zanxio::Client.parse_ndjson([chunk1, chunk2]) { |job| jobs << job }
+    Zizq::Client.parse_ndjson([chunk1, chunk2]) { |job| jobs << job }
     assert_equal 1, jobs.size
     assert_equal "j1", jobs[0]["id"]
   end
 
   def test_parse_ndjson_skips_blank_lines
     jobs = []
-    Zanxio::Client.parse_ndjson(["\n\n\n"]) { |job| jobs << job }
+    Zizq::Client.parse_ndjson(["\n\n\n"]) { |job| jobs << job }
     assert_equal 0, jobs.size
   end
 
@@ -425,7 +425,7 @@ class TestClient < Minitest::Test
     data << [packed2.bytesize].pack("N") << packed2
 
     jobs = []
-    Zanxio::Client.parse_msgpack_stream([data]) { |job| jobs << job }
+    Zizq::Client.parse_msgpack_stream([data]) { |job| jobs << job }
     assert_equal 2, jobs.size
     assert_equal "j1", jobs[0]["id"]
     assert_equal "j2", jobs[1]["id"]
@@ -437,7 +437,7 @@ class TestClient < Minitest::Test
 
     # Split the frame across two chunks: header in first, payload in second
     jobs = []
-    Zanxio::Client.parse_msgpack_stream([header, packed]) { |job| jobs << job }
+    Zizq::Client.parse_msgpack_stream([header, packed]) { |job| jobs << job }
     assert_equal 1, jobs.size
     assert_equal "j1", jobs[0]["id"]
   end
@@ -448,14 +448,14 @@ class TestClient < Minitest::Test
     data << [0].pack("N")
 
     jobs = []
-    Zanxio::Client.parse_msgpack_stream([data]) { |job| jobs << job }
+    Zizq::Client.parse_msgpack_stream([data]) { |job| jobs << job }
     assert_equal 0, jobs.size
   end
 
   # --- url normalization ---
 
   def test_trailing_slash_stripped
-    client = Zanxio::Client.new(url: "http://localhost:7890/", format: :json)
+    client = Zizq::Client.new(url: "http://localhost:7890/", format: :json)
     assert_equal "http://localhost:7890", client.url
   end
 end

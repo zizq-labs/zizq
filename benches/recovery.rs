@@ -1,7 +1,7 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Recovery latency benchmark for the Zanxio job queue.
+//! Recovery latency benchmark for the Zizq job queue.
 //!
 //! Simulates repeated restart cycles with a growing backlog of unprocessed
 //! jobs. Each cycle enqueues K jobs, takes only half, then restarts. This
@@ -21,8 +21,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use zanxio::store::{EnqueueOptions, StorageConfig, Store};
-use zanxio::time::now_millis;
+use zizq::store::{EnqueueOptions, StorageConfig, Store};
+use zizq::time::now_millis;
 
 // ---------------------------------------------------------------------------
 // Configuration

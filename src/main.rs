@@ -1,12 +1,12 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Zanxio CLI entry point.
+//! Zizq CLI entry point.
 //!
 //! Parses CLI arguments and dispatches to the appropriate subcommand.
 //!
 //! ```text
-//! Usage: zanxio [OPTIONS] [COMMAND]
+//! Usage: zizq [OPTIONS] [COMMAND]
 //!
 //! Commands:
 //!   serve    Start the server (default)
@@ -20,37 +20,37 @@
 //!
 //! The following environment variables are also supported:
 //!
-//! ZANXIO_ROOT_DIR:             Same as --root-dir, specifies where Zanxio stores data
-//! ZANXIO_HOST:                 Same as --host, specifies the address to bind to
-//! ZANXIO_PORT:                 Same as --port, specifies the port to listen on
-//! ZANXIO_LOG_LEVEL:            Same as --log-level, specifies how verbose logs are
-//! ZANXIO_LOG_FILTER:           EnvFilter string for the tracing crate (overrides
+//! ZIZQ_ROOT_DIR:             Same as --root-dir, specifies where Zizq stores data
+//! ZIZQ_HOST:                 Same as --host, specifies the address to bind to
+//! ZIZQ_PORT:                 Same as --port, specifies the port to listen on
+//! ZIZQ_LOG_LEVEL:            Same as --log-level, specifies how verbose logs are
+//! ZIZQ_LOG_FILTER:           EnvFilter string for the tracing crate (overrides
 //!                              --log-level). This is useful when debugging
 //!                              dependencies.
-//! ZANXIO_LICENSE_KEY:          Same as --license-key, Ed25519-signed JWT for paid
+//! ZIZQ_LICENSE_KEY:          Same as --license-key, Ed25519-signed JWT for paid
 //!                              features. Prefix with @ to read from a file.
-//! ZANXIO_SCHEDULER_BATCH_SIZE: Max scheduled jobs to promote per iteration
+//! ZIZQ_SCHEDULER_BATCH_SIZE: Max scheduled jobs to promote per iteration
 //!                              (default: 200).
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use zanxio::{
+use zizq::{
     license::{Feature, License},
     serve, tui,
 };
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
-#[command(name = "zanxio", version, about = "A self-contained job queue server")]
+#[command(name = "zizq", version, about = "A self-contained job queue server")]
 struct Cli {
     /// License key string or filename for access to paid features.
     /// The format is an Ed25519 signed JWT.
-    /// Prefixing with @ reads from a file (e.g. @/etc/zanxio/license.jwt).
+    /// Prefixing with @ reads from a file (e.g. @/etc/zizq/license.jwt).
     #[arg(
         long = "license-key",
         short = 'k',
         value_name = "KEY",
-        env = "ZANXIO_LICENSE_KEY",
+        env = "ZIZQ_LICENSE_KEY",
         global = true
     )]
     license_key: Option<String>,
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => License::Free,
     };
 
-    eprintln!("Zanxio {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("Zizq {}", env!("CARGO_PKG_VERSION"));
     eprintln!();
 
     match cli.command {
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cmd.find_subcommand("tui")
                     .unwrap()
                     .clone()
-                    .name("zanxio tui")
+                    .name("zizq tui")
                     .print_help()
                     .ok();
                 std::process::exit(2);

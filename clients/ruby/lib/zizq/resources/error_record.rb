@@ -1,10 +1,10 @@
-# Copyright (c) 2026 Chris Corbyn <chris@zanxio.io>
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 # Licensed under the MIT License. See LICENSE file for details.
 
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-module Zanxio
+module Zizq
   module Resources
     # Typed wrapper around a single error record from the job error history.
     class ErrorRecord < Resource

@@ -1,7 +1,7 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Admin API for the Zanxio dashboard.
+//! Admin API for the Zizq dashboard.
 //!
 //! Provides a separate HTTP listener for monitoring and management.
 //! Clients connect via WebSocket to `/events` for live updates.

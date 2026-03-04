@@ -1,11 +1,11 @@
 [package]
-name = "zanxio"
+name = "zizq"
 version = "0.1.0"
 edition = "2024"
 license = "BUSL-1.1"
 
 [lib]
-name = "zanxio"
+name = "zizq"
 path = "src/lib.rs"
 doctest = false
 

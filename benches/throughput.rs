@@ -1,7 +1,7 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zanxio.io>
+// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Throughput benchmarks for the Zanxio job queue.
+//! Throughput benchmarks for the Zizq job queue.
 //!
 //! Each scenario starts an in-process axum server on a random port and
 //! drives it with reqwest as the HTTP client. Queue names are unique per
@@ -25,8 +25,8 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
-use zanxio::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
-use zanxio::store::Store;
+use zizq::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
+use zizq::store::Store;
 
 // ---------------------------------------------------------------------------
 // Bench configuration
@@ -128,7 +128,7 @@ impl BenchConfig {
     fn stream_accept(&self) -> &'static str {
         match self.format {
             Format::Json => "application/x-ndjson",
-            Format::MsgPack => "application/vnd.zanxio.msgpack-stream",
+            Format::MsgPack => "application/vnd.zizq.msgpack-stream",
         }
     }
 
@@ -170,7 +170,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
     // Leak so the directory isn't cleaned up while the bench runs.
     std::mem::forget(dir);
 
-    let store = Store::open(&path, zanxio::store::StorageConfig::from_env().unwrap()).unwrap();
+    let store = Store::open(&path, zizq::store::StorageConfig::from_env().unwrap()).unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     // Leak the sender so the shutdown signal is never triggered.
@@ -179,21 +179,21 @@ async fn start_server() -> (String, JoinHandle<()>) {
     let (admin_events, _) = broadcast::channel(64);
 
     let state = Arc::new(AppState {
-        license: zanxio::license::License::Free,
+        license: zizq::license::License::Free,
         store: store.clone(),
         heartbeat_interval_ms: Duration::from_millis(200),
         global_working_limit: DEFAULT_GLOBAL_WORKING_LIMIT,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx.clone(),
-        clock: Arc::new(zanxio::time::now_millis),
+        clock: Arc::new(zizq::time::now_millis),
         admin_events,
     });
 
     // Spawn the background scheduler.
-    tokio::spawn(zanxio::scheduler::run(
+    tokio::spawn(zizq::scheduler::run(
         store,
-        zanxio::time::now_millis,
-        zanxio::scheduler::DEFAULT_BATCH_SIZE,
+        zizq::time::now_millis,
+        zizq::scheduler::DEFAULT_BATCH_SIZE,
         shutdown_rx,
     ));
 
