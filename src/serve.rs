@@ -178,14 +178,25 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
-    // Recover orphaned working jobs and rebuild the in-memory indexes.
-    // Must complete before accepting requests.
-    let (recovered, ready_indexed, scheduled_indexed) = store.recover().await?;
-    if recovered > 0 {
-        tracing::info!(count = recovered, "recovered orphaned working jobs");
-    }
-    tracing::info!(count = ready_indexed, "ready index rebuilt");
-    tracing::info!(count = scheduled_indexed, "scheduled index rebuilt");
+    // Recover orphaned working jobs and rebuild the in-memory indexes
+    // asynchronously so that the server starts accepting connections
+    // immediately. Workers wait (sending heartbeats) until the indexes
+    // are ready; the TUI Ready panel shows empty until then.
+    let store_for_rebuild = store.clone();
+    tokio::spawn(async move {
+        match store_for_rebuild.rebuild_indexes().await {
+            Ok((recovered, ready, scheduled)) => {
+                if recovered > 0 {
+                    tracing::info!(count = recovered, "recovered orphaned working jobs");
+                }
+                tracing::info!(ready, scheduled, "in-memory indexes rebuilt");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "recovery failed");
+                std::process::abort();
+            }
+        }
+    });
 
     // Shutdown signal for long-lived take tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(());

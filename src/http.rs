@@ -1816,6 +1816,13 @@ async fn take_jobs(
                             }
                             Ok(StoreEvent::JobWorking { .. }) => {}
                             Ok(StoreEvent::JobScheduled { .. }) => {}
+                            Ok(StoreEvent::IndexRebuilt) => {
+                                // Indexes just became available — mint
+                                // an unclaimed token so the drain phase
+                                // activates.
+                                claim_token =
+                                    Arc::new(AtomicBool::new(false));
+                            }
                             Err(broadcast::error::RecvError::Lagged(n))
                             => {
                                 tracing::warn!(

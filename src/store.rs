@@ -662,6 +662,13 @@ pub enum StoreEvent {
     /// The scheduler listens for this to wake up early if the new job is
     /// due sooner than whatever it was sleeping until. Workers ignore it.
     JobScheduled { id: String, ready_at: u64 },
+
+    /// Recovery and index rebuilding completed.
+    ///
+    /// Emitted once when `rebuild_indexes()` finishes. Wakes sleeping
+    /// workers (so they attempt a drain) and the scheduler (so it polls
+    /// immediately for due jobs).
+    IndexRebuilt,
 }
 
 /// In-memory priority index for ready jobs (lock-free).
@@ -880,6 +887,14 @@ pub struct Store {
 
     /// Default backoff config applied to jobs that don't specify one.
     default_backoff: BackoffConfig,
+
+    /// Whether the in-memory indexes have been fully rebuilt.
+    ///
+    /// Set to `true` in `open()` (fresh/empty indexes are trivially
+    /// consistent) and toggled to `false`/`true` around `rebuild_indexes()`.
+    /// Guards on `take_next_job`, `list_ready_jobs`, and `scan_ready_ids`
+    /// return empty results while `false`.
+    index_ready: Arc<AtomicBool>,
 
     /// Broadcast channel for store events.
     ///
@@ -1689,6 +1704,7 @@ impl Store {
             default_dead_retention_ms: config.default_dead_retention_ms,
             default_retry_limit: config.default_retry_limit,
             default_backoff: config.default_backoff,
+            index_ready: Arc::new(AtomicBool::new(true)),
             event_tx,
         })
     }
@@ -1827,6 +1843,10 @@ impl Store {
         now: u64,
         queues: &HashSet<String>,
     ) -> Result<Option<Job>, StoreError> {
+        if !self.index_ready.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let queues = queues.clone();
@@ -2715,6 +2735,10 @@ impl Store {
     /// between index scan and disk read — next snapshot corrects). Does
     /// NOT hydrate payloads.
     pub async fn list_ready_jobs(&self, limit: usize) -> Result<Vec<Job>, StoreError> {
+        if !self.index_ready.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+
         let ready_index = self.ready_index.clone();
         let ks = self.ks.clone();
 
@@ -2741,6 +2765,10 @@ impl Store {
     /// Returns `Vec<(priority, job_id)>` in priority order — zero disk I/O.
     /// Used by the admin event handler to diff capped ready windows.
     pub async fn scan_ready_ids(&self, limit: usize) -> Vec<(u16, String)> {
+        if !self.index_ready.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+
         let ready_index = self.ready_index.clone();
 
         task::spawn_blocking(move || {
@@ -3038,11 +3066,36 @@ impl Store {
     /// of orphaned working jobs moved back to Ready, the total number of
     /// Ready jobs in the index, and the total number of Scheduled jobs in
     /// the index.
-    pub async fn recover(&self) -> Result<(usize, usize, usize), StoreError> {
-        let recovered = self.recover_working_jobs().await?;
+    /// Rebuild all in-memory indexes asynchronously.
+    ///
+    /// Sets `index_ready` to `false` while rebuilding. Scheduled-index
+    /// rebuild runs concurrently with working-job recovery (disjoint status
+    /// ranges). The ready-index rebuild waits for recovery so its snapshot
+    /// includes the Working→Ready transitions. Emits `IndexRebuilt` when
+    /// all three complete.
+    pub async fn rebuild_indexes(&self) -> Result<(usize, usize, usize), StoreError> {
+        self.index_ready.store(false, Ordering::Release);
+
+        // Scheduled-index rebuild can run alongside working-job recovery
+        // since they scan disjoint status ranges.
+        let (recovered, scheduled) =
+            tokio::try_join!(self.recover_working_jobs(), self.rebuild_scheduled_index(),)?;
+
+        // Ready-index rebuild must wait for recovery so its snapshot
+        // includes the Working→Ready transitions.
         let ready = self.rebuild_ready_index().await?;
-        let scheduled = self.rebuild_scheduled_index().await?;
+
+        self.index_ready.store(true, Ordering::Release);
+        let _ = self.event_tx.send(StoreEvent::IndexRebuilt);
         Ok((recovered, ready, scheduled))
+    }
+
+    /// Recover orphaned working jobs and rebuild indexes.
+    ///
+    /// Convenience wrapper around `rebuild_indexes()` so that tests and
+    /// callers that used `recover()` keep working unchanged.
+    pub async fn recover(&self) -> Result<(usize, usize, usize), StoreError> {
+        self.rebuild_indexes().await
     }
 
     /// Move orphaned working jobs back to Ready in the LSM indexes.

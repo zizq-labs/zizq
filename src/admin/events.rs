@@ -270,6 +270,7 @@ async fn process_store_event(
             events
         }
         StoreEvent::JobScheduled { .. } => Vec::new(),
+        StoreEvent::IndexRebuilt => diff_ready(store, conn).await,
     }
 }
 

@@ -127,6 +127,7 @@ pub async fn run(
                         Ok(StoreEvent::JobScheduled { .. }) => {
                             // New job is due later — keep sleeping.
                         }
+                        Ok(StoreEvent::IndexRebuilt) => break,
                         Err(broadcast::error::RecvError::Lagged(_)) => break,
                         Err(broadcast::error::RecvError::Closed) => {
                             tracing::debug!("scheduler stopped");
