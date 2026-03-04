@@ -61,9 +61,10 @@ pub fn manage_ws_connection(tx: mpsc::Sender<Event>, base_url: String) {
         loop {
             let _ = tx.send(Event::ServerConnecting).await;
 
-            if let Err(e) = connect_ws(&url, &tx).await {
-                eprintln!("WebSocket connection error: {e}");
-            }
+            // Error is intentionally ignored — the UI shows "Connecting"
+            // status until a connection succeeds, so the retry loop
+            // handles failures gracefully without console output.
+            let _ = connect_ws(&url, &tx).await;
 
             let _ = tx.send(Event::ServerDisconnected).await;
 
