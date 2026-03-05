@@ -13,10 +13,11 @@ autoload :HTTPX, "httpx"
 autoload :MessagePack, "msgpack"
 
 module Zizq
-  autoload :Client,    "zizq/client"
-  autoload :Job,       "zizq/job"
-  autoload :Resources, "zizq/resources"
-  autoload :Worker,    "zizq/worker"
+  autoload :Client,         "zizq/client"
+  autoload :EnqueueOptions, "zizq/enqueue_options"
+  autoload :Job,            "zizq/job"
+  autoload :Resources,      "zizq/resources"
+  autoload :Worker,         "zizq/worker"
 
   class << self
     # Returns the client configuration.
@@ -61,36 +62,47 @@ module Zizq
       @configuration = nil
     end
 
-    # Convenience method to enqueue a job by class with a given payload.
+    # Enqueue a job by class with positional and keyword arguments.
     #
-    # Keyword options provided to `Zizq::enqueue` override options specified
-    # in the job class (which override the default options set on the server).
+    # By default all arguments are serialized as JSON, which means hashes with
+    # symbol keys will become hashes with string keys. The serialization
+    # behaviour can be changed by implementing `::zizq_serialize` and
+    # `::zizq_deserialize` as class methods on the job class.
     #
-    #   Zizq.enqueue(SendEmailJob, { user_id: 42 })
-    #   Zizq.enqueue(SendEmailJob, { user_id: 42 }, queue: "priority", priority: 100)
-    #   Zizq.enqueue(SendEmailJob, { user_id: 42 }, delay: 60)
+    # Default job options can be overridden at enqueue-time by providing a
+    # block which receives a mutable `Zizq::EnqueueOptions` instance.
     #
-    # @rbs job_class: Class
-    # @rbs payload: Hash[String | Symbol, untyped]
-    # @rbs queue: String?
-    # @rbs priority: Integer?
-    # @rbs delay: (Float | Integer)?
-    # @rbs ready_at: Float?
-    # @rbs retry_limit: Integer?
-    # @rbs backoff: Zizq::backoff?
-    # @rbs retention: Zizq::retention?
-    # @rbs return: Hash[String, untyped]
-    def enqueue(
-      job_class,
-      payload,
-      queue: nil,
-      priority: nil,
-      delay: nil,
-      ready_at: nil,
-      retry_limit: nil,
-      backoff: nil,
-      retention: nil
-    )
+    #   Zizq.enqueue(SendEmailJob, 42, template: "welcome")
+    #   Zizq.enqueue(SendEmailJob, 42) { |o| o.queue = "priority" }
+    #
+    # Job classes may also override `::zizq_enqueue_options` to implement
+    # dynamically computed options, such as dynamic prioritisation. This class
+    # method accepts the same arguments as the `#perform` method and returns an
+    # instance of `Zizq::EnqueueOptions`. Any overrides may call `super` and
+    # modify the result.
+    #
+    #   class SendEmailJob
+    #     include Zizq::Job
+    #
+    #     zizq_priority 1000
+    #
+    #     def self.zizq_enqueue_options(user_id, template:)
+    #       opts = super
+    #       opts.priority /= 2 if template == "welcome"
+    #       opts
+    #     end
+    #
+    #     def perform(user_id, template:)
+    #       # ...
+    #     end
+    #   end
+    #
+    # @rbs job_class: Class & Zizq::job_class
+    # @rbs args: Array[untyped]
+    # @rbs kwargs: Hash[Symbol, untyped]
+    # @rbs &block: ?(EnqueueOptions) -> void
+    # @rbs return: Resources::Job
+    def enqueue(job_class, *args, **kwargs, &block)
       unless job_class.is_a?(Class) && job_class < Zizq::Job
         raise ArgumentError, "#{job_class.inspect} must include Zizq::Job"
       end
@@ -102,19 +114,20 @@ module Zizq
       type = zizq_job_class.name
       raise ArgumentError, "Cannot enqueue anonymous class" if type.nil?
 
-      queue ||= zizq_job_class.zizq_queue
-      retry_limit ||= zizq_job_class.zizq_retry_limit
-      backoff ||= zizq_job_class.zizq_backoff
-      retention ||= zizq_job_class.zizq_retention
+      opts = zizq_job_class.zizq_enqueue_options(*args, **kwargs)
+      yield opts if block_given?
 
-      params = { type:, queue:, payload: } #: Hash[Symbol, untyped]
-      params[:priority] = priority if priority
-      params[:ready_at] = ready_at if ready_at
-      params[:retry_limit] = retry_limit if retry_limit
+      payload = zizq_job_class.zizq_serialize(*args, **kwargs)
+
+      params = { type:, queue: opts.queue, payload: } #: Hash[Symbol, untyped]
+      params[:priority] = opts.priority if opts.priority
+      params[:ready_at] = opts.ready_at if opts.ready_at
+      params[:retry_limit] = opts.retry_limit if opts.retry_limit
 
       # Backoff times are specified in seconds in Ruby but the server
       # expects milliseconds. Convert here at the boundary.
-      if backoff
+      if opts.backoff
+        backoff = opts.backoff
         params[:backoff] = {
           exponent: backoff[:exponent].to_f,
           base_ms: (backoff[:base].to_f * 1000).to_f,
@@ -124,7 +137,8 @@ module Zizq
 
       # Retention times are specified in seconds in Ruby but the server
       # expects milliseconds. Convert here at the boundary.
-      if retention
+      if opts.retention
+        retention = opts.retention
         wire = {} #: Hash[Symbol, Integer]
         wire[:completed_ms] = (retention[:completed].to_f * 1000).to_i if retention[:completed]
         wire[:dead_ms] = (retention[:dead].to_f * 1000).to_i if retention[:dead]
@@ -134,7 +148,7 @@ module Zizq
       # Support ActiveSupport::Duration and Numeric alike.
       # Both ready_at and delay are in fractional seconds; the Client
       # handles the conversion to the server's millisecond format.
-      params[:ready_at] = Time.now.to_f + delay.to_f if delay
+      params[:ready_at] = Time.now.to_f + opts.delay.to_f if opts.delay
 
       client.enqueue(**params)
     end

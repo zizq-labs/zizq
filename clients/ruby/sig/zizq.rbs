@@ -29,6 +29,9 @@ module Zizq
     def zizq_retry_limit: (?Integer?) -> Integer?
     def zizq_backoff: (?exponent: Numeric?, ?base: Numeric?, ?jitter: Numeric?) -> backoff?
     def zizq_retention: (?completed: Numeric?, ?dead: Numeric?) -> retention?
+    def zizq_serialize: (*untyped, **untyped) -> Hash[String, untyped]
+    def zizq_deserialize: (Hash[String, untyped]) -> [Array[untyped], Hash[Symbol, untyped]]
+    def zizq_enqueue_options: (*untyped, **untyped) -> EnqueueOptions
     def name: () -> String?
     def new: () -> Job
   end

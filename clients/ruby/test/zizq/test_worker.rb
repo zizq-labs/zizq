@@ -18,9 +18,10 @@ class RecordingJob
     attr_accessor :results
   end
 
-  def perform(payload)
+  def perform(user_id, action: nil)
     self.class.results << {
-      payload: payload,
+      user_id: user_id,
+      action: action,
       id: zizq_id,
       attempts: zizq_attempts,
       queue: zizq_queue,
@@ -39,7 +40,7 @@ class FailingJob
     attr_accessor :fail_count
   end
 
-  def perform(_payload)
+  def perform(*)
     self.class.fail_count += 1
     raise RuntimeError, "boom"
   end
@@ -77,12 +78,11 @@ class TestWorker < Minitest::Test
   end
 
   def test_dispatches_job_successfully
+    payload = { "args" => [42], "kwargs" => { "action" => "signup" } }
     job1 = { "id" => "j1", "type" => "RecordingJob", "queue" => "test",
              "priority" => 100, "attempts" => 1, "dequeued_at" => 1000,
-             "payload" => { "user_id" => 42 } }
+             "payload" => payload }
 
-    # Return the job on first request, then empty body on subsequent ones.
-    # This prevents the producer reconnect loop from re-delivering the job.
     stub_request(:get, "#{URL}/jobs/take?prefetch=1")
       .to_return(
         { status: 200, body: "#{JSON.generate(job1)}\n",
@@ -99,18 +99,17 @@ class TestWorker < Minitest::Test
 
     t = Thread.new { worker.run }
 
-    # Wait for the job to be processed
     deadline = Time.now + 5
     sleep 0.05 while RecordingJob.results.empty? && Time.now < deadline
 
-    # Trigger shutdown
     worker.instance_variable_set(:@shutdown, true)
     worker.instance_variable_get(:@dispatch_queue).close rescue nil
     t.join(5)
 
     assert_equal 1, RecordingJob.results.size
     result = RecordingJob.results.first
-    assert_equal({ "user_id" => 42 }, result[:payload])
+    assert_equal 42, result[:user_id]
+    assert_equal "signup", result[:action]
     assert_equal "j1", result[:id]
     assert_equal 1, result[:attempts]
     assert_equal "test", result[:queue]
@@ -120,8 +119,9 @@ class TestWorker < Minitest::Test
   end
 
   def test_nacks_failing_job
+    payload = { "args" => [], "kwargs" => {} }
     job1 = { "id" => "j1", "type" => "FailingJob", "queue" => "default",
-             "priority" => 32_768, "attempts" => 1, "payload" => {} }
+             "priority" => 32_768, "attempts" => 1, "payload" => payload }
 
     stub_request(:get, "#{URL}/jobs/take?prefetch=1")
       .to_return(
@@ -169,7 +169,7 @@ class TestWorker < Minitest::Test
           headers: { "Content-Type" => "application/x-ndjson" } }
       )
 
-    # Should nack without kill — just a normal failure so backoff retry kicks in
+    # Should nack without kill -- just a normal failure so backoff retry kicks in
     nack_stub = stub_request(:post, "#{URL}/jobs/j1/failure")
       .with { |req|
         body = JSON.parse(req.body)
@@ -204,9 +204,10 @@ class TestWorker < Minitest::Test
   end
 
   def test_dispatches_job_with_fibers
+    payload = { "args" => [42], "kwargs" => { "action" => "signup" } }
     job1 = { "id" => "j1", "type" => "RecordingJob", "queue" => "test",
              "priority" => 100, "attempts" => 1, "dequeued_at" => 1000,
-             "payload" => { "user_id" => 42 } }
+             "payload" => payload }
 
     stub_request(:get, "#{URL}/jobs/take?prefetch=2")
       .to_return(
@@ -234,14 +235,16 @@ class TestWorker < Minitest::Test
 
     assert_equal 1, RecordingJob.results.size
     result = RecordingJob.results.first
-    assert_equal({ "user_id" => 42 }, result[:payload])
+    assert_equal 42, result[:user_id]
+    assert_equal "signup", result[:action]
     assert_equal "j1", result[:id]
     assert_requested(ack_stub, at_least_times: 1)
   end
 
   def test_nacks_failing_job_with_fibers
+    payload = { "args" => [], "kwargs" => {} }
     job1 = { "id" => "j1", "type" => "FailingJob", "queue" => "default",
-             "priority" => 32_768, "attempts" => 1, "payload" => {} }
+             "priority" => 32_768, "attempts" => 1, "payload" => payload }
 
     stub_request(:get, "#{URL}/jobs/take?prefetch=2")
       .to_return(
@@ -277,12 +280,14 @@ class TestWorker < Minitest::Test
   end
 
   def test_multiple_fibers_process_concurrently
+    payload1 = { "args" => [1], "kwargs" => {} }
+    payload2 = { "args" => [2], "kwargs" => {} }
     job1 = { "id" => "j1", "type" => "RecordingJob", "queue" => "test",
              "priority" => 100, "attempts" => 1, "dequeued_at" => 1000,
-             "payload" => { "n" => 1 } }
+             "payload" => payload1 }
     job2 = { "id" => "j2", "type" => "RecordingJob", "queue" => "test",
              "priority" => 100, "attempts" => 1, "dequeued_at" => 1001,
-             "payload" => { "n" => 2 } }
+             "payload" => payload2 }
 
     stub_request(:get, "#{URL}/jobs/take?prefetch=2")
       .to_return(

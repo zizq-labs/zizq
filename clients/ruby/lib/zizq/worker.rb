@@ -7,11 +7,11 @@
 require "logger"
 
 module Zizq
-  # Orchestrates fetching jobs from the server and dispatching them to
-  # a pool of worker tasks for processing.
+  # Top-level worker process which orchestrates fetching jobs from the server
+  # and dispatching them to a pool of worker tasks for processing.
   #
-  # Fiber support (`fiber_count > 1`) requires the `async` gem. When
-  # `fiber_count == 1`, no async dependency is loaded.
+  # Fiber support (when `fiber_count > 1`) requires the `async` gem to be
+  # available. When `fiber_count == 1`, no async dependency is loaded.
   #
   # Total concurrency is calculated as `thread_count * fiber_count`.
   class Worker
@@ -141,7 +141,7 @@ module Zizq
       # The latch is closed by the signal handler or the producer's ensure
       # block — pop returns nil in either case, waking the main thread.
       @shutdown_latch.pop
-      logger.info { "Shutting down; waiting up to #{shutdown_timeout}s for workers to finish..." }
+      logger.info { "Shutting down. Waiting up to #{shutdown_timeout}s for workers to finish..." }
 
       # The producer has no work to drain — kill it immediately. It may
       # be blocked in a streaming HTTP read that neither Thread#raise nor
@@ -184,7 +184,7 @@ module Zizq
               prefetch:,
               queues:,
               on_connect: -> {
-                logger.info { "Connected; listening for jobs." }
+                logger.info { "Connected. Listening for jobs." }
                 current_interval = reconnect_interval
               }
             ) do |job_hash|
@@ -203,7 +203,7 @@ module Zizq
           rescue Zizq::ConnectionError, Zizq::StreamError => e
             break if @shutdown
 
-            logger.warn { "#{e.message}; reconnecting in #{current_interval}s..." }
+            logger.warn { "#{e.message}. Reconnecting in #{current_interval}s..." }
             sleep current_interval
             current_interval = [current_interval * reconnect_exponent, max_reconnect_interval].min
           rescue => e
@@ -271,7 +271,8 @@ module Zizq
     end
 
     # Process a single job: resolve and validate the job class, instantiate,
-    # set job metadata, call perform, then report success or failure.
+    # set job metadata, deserialize payload, call perform, then report success
+    # or failure.
     #
     # The outer rescue Exception catches anything the inner rescue misses,
     # including non-StandardError exceptions and errors from malformed job
@@ -290,7 +291,7 @@ module Zizq
         Object.const_get(job_type)
       rescue NameError => e
         logger.error { "Unknown job type '#{job_type}' (#{job_id}): #{e.message}" }
-        safe_nack(client, job_id, e, worker_id: worker_id)
+        safe_nack(client, job_id, e, worker_id:)
         return
       end
 
@@ -305,21 +306,29 @@ module Zizq
         return
       end
 
-      job_instance = job_class.new
+      # After the runtime guard above, we know job_class includes Zizq::Job.
+      zizq_job_class = job_class #: Zizq::job_class
+
+      job_instance = zizq_job_class.new
       job_instance.set_zizq_job(job)
 
       begin
-        job_instance.perform(job.payload || {})
-        safe_ack(client, job_id, worker_id: worker_id)
+        args, kwargs = zizq_job_class.zizq_deserialize(
+          job.payload || { "args" => [], "kwargs" => {} }
+        )
+        job_instance.perform(*args, **kwargs)
+
+        safe_ack(client, job_id, worker_id:)
+
         logger.debug { "Completed #{job_type} (#{job_id})" }
       rescue Exception => e # Intentionally rescuing all Exceptions here
         logger.error { "#{job_type} (#{job_id}) failed: #{e.class}: #{e.message}" }
-        safe_nack(client, job_id, e, worker_id: worker_id)
+        safe_nack(client, job_id, e, worker_id:)
       end
     rescue Exception => e
       # Last resort in the case of something truly unexpected.
       logger.error { "Dispatch error (#{job_id || 'unknown'}): #{e.class}: #{e.message}" }
-      safe_nack(client, job_id, e, worker_id: worker_id) if job_id
+      safe_nack(client, job_id, e, worker_id:) if job_id
     end
 
     def safe_ack(client, job_id, worker_id: nil) #: (Client, String, ?worker_id: String?) -> void
@@ -358,7 +367,7 @@ module Zizq
           next # Thread finished cleanly
         end
 
-        logger.warn { "Shutdown timeout reached; killing thread #{t.name}" }
+        logger.warn { "Shutdown timeout reached. Killing thread #{t.name}" }
         t.kill
       end
     end
