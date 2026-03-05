@@ -413,6 +413,18 @@ struct EnqueueRequest {
     retention: Option<RetentionConfig>,
 }
 
+/// Request shape for bulk job enqueue.
+#[derive(Deserialize)]
+struct BulkEnqueueRequest {
+    jobs: Vec<EnqueueRequest>,
+}
+
+/// Response shape for bulk job enqueue.
+#[derive(Serialize)]
+struct BulkEnqueueResponse {
+    jobs: Vec<Job>,
+}
+
 /// Client-facing backoff configuration with human-readable field names.
 ///
 /// The store uses compact single-letter keys (`x`, `b`, `j`) for storage
@@ -967,6 +979,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/jobs", get(list_jobs).post(enqueue))
+        .route("/jobs/bulk", post(bulk_enqueue))
         .route("/jobs/take", get(take_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
@@ -1097,6 +1110,104 @@ async fn enqueue(
         }
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /jobs/bulk` — enqueue a batch of jobs atomically.
+async fn bulk_enqueue(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    NegotiatedBody(req): NegotiatedBody<BulkEnqueueRequest>,
+) -> Response {
+    // Validate all jobs up front.
+    for (i, job) in req.jobs.iter().enumerate() {
+        if let Err(msg) = validate_name("type", &job.job_type) {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("jobs[{i}]: {msg}"),
+                },
+            );
+        }
+        if let Err(msg) = validate_name("queue", &job.queue) {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("jobs[{i}]: {msg}"),
+                },
+            );
+        }
+    }
+
+    // Convert to store options.
+    let opts: Vec<store::EnqueueOptions> = req
+        .jobs
+        .into_iter()
+        .map(|enqueue_req| {
+            let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
+            let mut opts = store::EnqueueOptions::new(
+                enqueue_req.job_type,
+                enqueue_req.queue,
+                enqueue_req.payload,
+            )
+            .priority(priority);
+
+            if let Some(ready_at) = enqueue_req.ready_at {
+                opts = opts.ready_at(ready_at);
+            }
+            if let Some(retry_limit) = enqueue_req.retry_limit {
+                opts = opts.retry_limit(retry_limit);
+            }
+            if let Some(backoff) = enqueue_req.backoff {
+                opts = opts.backoff(backoff.into());
+            }
+            if let Some(retention) = enqueue_req.retention {
+                opts = opts.retention(retention.into());
+            }
+            opts
+        })
+        .collect();
+
+    let now = (state.clock)();
+    match state.store.enqueue_bulk(now, opts).await {
+        Ok(store_jobs) => {
+            let jobs: Result<Vec<Job>, store::StoreError> = store_jobs
+                .into_iter()
+                .map(|sj| {
+                    let mut job = Job::try_from(sj)?;
+                    job.payload = None;
+                    Ok(job)
+                })
+                .collect();
+            match jobs {
+                Ok(jobs) => {
+                    tracing::debug!(count = jobs.len(), "bulk enqueue succeeded");
+                    respond(fmt, StatusCode::CREATED, &BulkEnqueueResponse { jobs })
+                }
+                Err(e) => {
+                    tracing::error!(%e, "bulk enqueue job conversion failed");
+                    respond(
+                        fmt,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse {
+                            error: "internal server error".into(),
+                        },
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(%e, "bulk enqueue failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4799,5 +4910,231 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["error"], "job not found");
+    }
+
+    // --- Bulk enqueue tests ---
+
+    #[tokio::test]
+    async fn bulk_enqueue_returns_201() {
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "test", "queue": "default", "payload": "a"},
+                    {"type": "test", "queue": "default", "payload": "b"},
+                ]
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_returns_jobs_in_order() {
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "alpha", "queue": "q1", "payload": 1},
+                    {"type": "beta",  "queue": "q2", "payload": 2},
+                    {"type": "gamma", "queue": "q3", "payload": 3},
+                ]
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0]["type"], "alpha");
+        assert_eq!(jobs[0]["queue"], "q1");
+        assert_eq!(jobs[1]["type"], "beta");
+        assert_eq!(jobs[1]["queue"], "q2");
+        assert_eq!(jobs[2]["type"], "gamma");
+        assert_eq!(jobs[2]["queue"], "q3");
+
+        // IDs should be monotonically increasing (SCRU128 order).
+        let id0 = jobs[0]["id"].as_str().unwrap();
+        let id1 = jobs[1]["id"].as_str().unwrap();
+        let id2 = jobs[2]["id"].as_str().unwrap();
+        assert!(id0 < id1);
+        assert!(id1 < id2);
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_is_atomic() {
+        let (state, app) = test_state_and_app();
+
+        // Second job has an invalid queue name — entire batch should fail.
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "test", "queue": "good", "payload": "a"},
+                    {"type": "test", "queue": "", "payload": "b"},
+                ]
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // No jobs should have been created.
+        let list = state
+            .store
+            .list_jobs(store::ListJobsOptions::new())
+            .await
+            .unwrap();
+        assert!(list.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_validates_all_jobs() {
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "good", "queue": "default", "payload": "a"},
+                    {"type": "",     "queue": "default", "payload": "b"},
+                ]
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("jobs[1]"),
+            "error should identify job index: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_empty_array_returns_201() {
+        let req = json_request("POST", "/jobs/bulk", &serde_json::json!({"jobs": []}));
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_mixed_ready_and_scheduled() {
+        let (clock, state) = test_app_state();
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        let future_ts = now + 60_000;
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "test", "queue": "default", "payload": "ready"},
+                    {"type": "test", "queue": "default", "payload": "scheduled", "ready_at": future_ts},
+                ]
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs[0]["status"], "ready");
+        assert_eq!(jobs[1]["status"], "scheduled");
+        assert_eq!(jobs[1]["ready_at"], future_ts);
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_with_options() {
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {
+                        "type": "test",
+                        "queue": "default",
+                        "payload": "opts",
+                        "priority": 5,
+                        "retry_limit": 10,
+                        "backoff": {"exponent": 2.0, "base_ms": 1000, "jitter_ms": 500},
+                        "retention": {"completed_ms": 3600000, "dead_ms": 7200000},
+                    }
+                ]
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job = &body["jobs"][0];
+        assert_eq!(job["priority"], 5);
+        assert_eq!(job["retry_limit"], 10);
+        assert_eq!(job["backoff"]["exponent"], 2.0);
+        assert_eq!(job["backoff"]["base_ms"], 1000);
+        assert_eq!(job["backoff"]["jitter_ms"], 500);
+        assert_eq!(job["retention"]["completed_ms"], 3600000);
+        assert_eq!(job["retention"]["dead_ms"], 7200000);
+    }
+
+    #[tokio::test]
+    async fn bulk_enqueue_supports_msgpack() {
+        #[derive(Serialize)]
+        struct MsgPackBulk {
+            jobs: Vec<MsgPackJob>,
+        }
+        #[derive(Serialize)]
+        struct MsgPackJob {
+            #[serde(rename = "type")]
+            job_type: &'static str,
+            queue: &'static str,
+            payload: &'static str,
+        }
+
+        let body = rmp_serde::to_vec_named(&MsgPackBulk {
+            jobs: vec![
+                MsgPackJob {
+                    job_type: "test",
+                    queue: "q1",
+                    payload: "a",
+                },
+                MsgPackJob {
+                    job_type: "test",
+                    queue: "q2",
+                    payload: "b",
+                },
+            ],
+        })
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs/bulk")
+            .header("content-type", "application/msgpack")
+            .header("accept", "application/msgpack")
+            .body(Body::from(body))
+            .unwrap();
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/msgpack"
+        );
+
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["queue"], "q1");
+        assert_eq!(jobs[1]["queue"], "q2");
     }
 }

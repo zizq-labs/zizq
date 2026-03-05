@@ -1823,6 +1823,151 @@ impl Store {
         Ok(job)
     }
 
+    /// Enqueue multiple jobs in a single transaction.
+    ///
+    /// All jobs are serialized and inserted under one write transaction with
+    /// a single commit. In-memory indexes are updated after commit succeeds.
+    /// Events are broadcast after the sync completes.
+    pub async fn enqueue_bulk(
+        &self,
+        now: u64,
+        batch: Vec<EnqueueOptions>,
+    ) -> Result<Vec<Job>, StoreError> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
+        let scheduled_index = self.scheduled_index.clone();
+
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            // Pre-build all jobs and serialize before acquiring the write lock.
+            struct PreparedJob {
+                job: Job,
+                meta_bytes: Vec<u8>,
+                payload_bytes: Vec<u8>,
+                job_key: Vec<u8>,
+                payload_key: Vec<u8>,
+                queue_key: Vec<u8>,
+                status_key: Vec<u8>,
+                type_key: Vec<u8>,
+                scheduled: bool,
+            }
+
+            let prepared: Vec<PreparedJob> = batch
+                .into_iter()
+                .map(|opts| {
+                    let id = scru128::new_string();
+                    let ready_at = opts.ready_at.unwrap_or(now);
+                    let scheduled = ready_at > now;
+                    let status = if scheduled {
+                        JobStatus::Scheduled
+                    } else {
+                        JobStatus::Ready
+                    };
+
+                    let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
+
+                    let job = Job {
+                        id: id.clone(),
+                        job_type: opts.job_type,
+                        queue: opts.queue,
+                        priority: opts.priority,
+                        payload: Some(opts.payload),
+                        status: status.into(),
+                        ready_at,
+                        attempts: 0,
+                        retry_limit: opts.retry_limit,
+                        backoff: opts.backoff,
+                        dequeued_at: None,
+                        failed_at: None,
+                        retention: opts.retention,
+                        purge_at: None,
+                        completed_at: None,
+                    };
+
+                    let mut meta = job.clone();
+                    meta.payload = None;
+                    let meta_bytes = rmp_serde::to_vec_named(&meta)?;
+
+                    let job_key = make_job_key(&id);
+                    let payload_key = make_payload_key(&id);
+                    let queue_key = make_queue_key(&job.queue, &id);
+                    let status_key = make_status_key(status, &id);
+                    let type_key = make_type_key(&job.job_type, &id);
+
+                    Ok(PreparedJob {
+                        job,
+                        meta_bytes,
+                        payload_bytes,
+                        job_key,
+                        payload_key,
+                        queue_key,
+                        status_key,
+                        type_key,
+                        scheduled,
+                    })
+                })
+                .collect::<Result<_, StoreError>>()?;
+
+            // Single write transaction for all jobs.
+            let mut tx = ks.write_tx();
+            for p in &prepared {
+                tx.insert(&ks.data, &p.job_key, &p.meta_bytes);
+                tx.insert(&ks.data, &p.payload_key, &p.payload_bytes);
+                tx.insert(&ks.index, &p.queue_key, b"");
+                tx.insert(&ks.index, &p.status_key, b"");
+                tx.insert(&ks.index, &p.type_key, b"");
+            }
+
+            let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
+
+            // Update in-memory indexes after commit succeeds.
+            for p in &prepared {
+                if p.scheduled {
+                    scheduled_index.insert(p.job.ready_at, p.job.id.clone());
+                } else {
+                    ready_index.insert(&p.job.queue, p.job.priority, p.job.id.clone());
+                }
+            }
+
+            let jobs: Vec<Job> = prepared.into_iter().map(|p| p.job).collect();
+            Ok((jobs, Some(sync)))
+        })
+        .await?;
+
+        let jobs = await_sync(result).await?;
+
+        // Broadcast events after sync completes.
+        for job in &jobs {
+            match JobStatus::try_from(job.status) {
+                Ok(JobStatus::Ready) => {
+                    let _ = self.event_tx.send(StoreEvent::JobCreated {
+                        id: job.id.clone(),
+                        queue: job.queue.clone(),
+                        token: Arc::new(AtomicBool::new(false)),
+                    });
+                }
+                Ok(JobStatus::Scheduled) => {
+                    let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                        id: job.id.clone(),
+                        ready_at: job.ready_at,
+                    });
+                }
+                _ => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        status = job.status,
+                        "enqueue_bulk produced unexpected status"
+                    );
+                }
+            }
+        }
+
+        Ok(jobs)
+    }
+
     /// Take the next job from the priority index.
     ///
     /// Atomically claims the highest-priority (lowest number), oldest job
@@ -7395,5 +7540,225 @@ mod tests {
 
         let jobs = store.list_ready_jobs(10).await.unwrap();
         assert_eq!(jobs.len(), 1);
+    }
+
+    // --- enqueue_bulk tests ---
+
+    #[tokio::test]
+    async fn enqueue_bulk_returns_all_jobs() {
+        let store = test_store();
+        let now = now_millis();
+
+        let jobs = store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("a", "q1", serde_json::json!(1)),
+                    EnqueueOptions::new("b", "q2", serde_json::json!(2)),
+                    EnqueueOptions::new("c", "q3", serde_json::json!(3)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].job_type, "a");
+        assert_eq!(jobs[1].job_type, "b");
+        assert_eq!(jobs[2].job_type, "c");
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_ids_are_monotonic() {
+        let store = test_store();
+        let now = now_millis();
+
+        let jobs = store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(jobs[0].id < jobs[1].id);
+        assert!(jobs[1].id < jobs[2].id);
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_empty_is_noop() {
+        let store = test_store();
+        let jobs = store.enqueue_bulk(now_millis(), vec![]).await.unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_jobs_are_retrievable() {
+        let store = test_store();
+        let now = now_millis();
+
+        let jobs = store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "q1", serde_json::json!("a")),
+                    EnqueueOptions::new("test", "q2", serde_json::json!("b")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        for job in &jobs {
+            let fetched = store.get_job(now, &job.id).await.unwrap().unwrap();
+            assert_eq!(fetched.id, job.id);
+            assert_eq!(fetched.queue, job.queue);
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_jobs_are_takeable() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let taken1 = store.take_next_job(now, &HashSet::new()).await.unwrap();
+        let taken2 = store.take_next_job(now, &HashSet::new()).await.unwrap();
+        let taken3 = store.take_next_job(now, &HashSet::new()).await.unwrap();
+
+        assert!(taken1.is_some());
+        assert!(taken2.is_some());
+        assert!(taken3.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_mixed_ready_and_scheduled() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let jobs = store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "default", serde_json::json!(null)),
+                    EnqueueOptions::new("test", "default", serde_json::json!(null))
+                        .ready_at(future),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(jobs[0].status, u8::from(JobStatus::Ready));
+        assert_eq!(jobs[1].status, u8::from(JobStatus::Scheduled));
+        assert_eq!(jobs[1].ready_at, future);
+
+        // Only the ready job should be takeable.
+        let taken = store.take_next_job(now, &HashSet::new()).await.unwrap();
+        assert!(taken.is_some());
+        let none = store.take_next_job(now, &HashSet::new()).await.unwrap();
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_respects_priority() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(100),
+                    EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Higher priority (lower number) should be taken first.
+        let taken = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.payload, Some(serde_json::json!("high")));
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_broadcasts_events() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "q1", serde_json::json!(null)),
+                    EnqueueOptions::new("test", "q2", serde_json::json!(null)).ready_at(future),
+                ],
+            )
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "q1"),
+            other => panic!("expected JobCreated, got {other:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobScheduled { .. } => {}
+            other => panic!("expected JobScheduled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_bulk_preserves_options() {
+        let store = test_store();
+        let now = now_millis();
+
+        let jobs = store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("test", "default", serde_json::json!(null))
+                        .priority(42)
+                        .retry_limit(5)
+                        .backoff(BackoffConfig {
+                            exponent: 3.0,
+                            base_ms: 2000,
+                            jitter_ms: 500,
+                        })
+                        .retention(RetentionConfig {
+                            completed_ms: Some(3600_000),
+                            dead_ms: Some(7200_000),
+                        }),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(jobs[0].priority, 42);
+        assert_eq!(jobs[0].retry_limit, Some(5));
+        let backoff = jobs[0].backoff.as_ref().unwrap();
+        assert_eq!(backoff.exponent, 3.0);
+        assert_eq!(backoff.base_ms, 2000);
+        assert_eq!(backoff.jitter_ms, 500);
+        let retention = jobs[0].retention.as_ref().unwrap();
+        assert_eq!(retention.completed_ms, Some(3600_000));
+        assert_eq!(retention.dead_ms, Some(7200_000));
     }
 }

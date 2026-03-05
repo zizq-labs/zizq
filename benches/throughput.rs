@@ -8,10 +8,11 @@
 //! iteration so accumulated data doesn't interfere between samples.
 //!
 //! Configure via environment variables:
-//!   BENCH_N          — jobs per iteration (default 100)
-//!   BENCH_ENQUEUERS  — parallel enqueue workers (default 4)
-//!   BENCH_DEQUEUERS  — parallel dequeue workers (default 4)
-//!   BENCH_PREFETCH   — per-stream prefetch limit for dequeue (default 10)
+//!   BENCH_N              — jobs per iteration (default 100)
+//!   BENCH_ENQUEUERS      — parallel enqueue workers (default 4)
+//!   BENCH_ENQUEUE_BULK_N — jobs per bulk enqueue request (default 1)
+//!   BENCH_DEQUEUERS      — parallel dequeue workers (default 4)
+//!   BENCH_PREFETCH       — per-stream prefetch limit for dequeue (default 10)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,7 +226,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
 // Scenario: Enqueue
 // ---------------------------------------------------------------------------
 
-/// Request body for POST /jobs.
+/// Request body for a single job in POST /jobs/bulk.
 #[derive(Serialize)]
 struct EnqueueBody<'a> {
     #[serde(rename = "type")]
@@ -234,18 +235,30 @@ struct EnqueueBody<'a> {
     payload: serde_json::Value,
 }
 
-/// Enqueue N jobs and return the wall-clock time (excluding setup).
-async fn enqueue(cfg: &BenchConfig, base_url: &str, n: usize) -> Duration {
+/// Request body for POST /jobs/bulk.
+#[derive(Serialize)]
+struct BulkEnqueueBody<'a> {
+    jobs: Vec<EnqueueBody<'a>>,
+}
+
+/// Enqueue N jobs in chunks of `bulk_n` and return the wall-clock time
+/// (excluding setup).
+async fn enqueue(cfg: &BenchConfig, base_url: &str, n: usize, bulk_n: usize) -> Duration {
     let client = cfg.client();
     let queue = unique_queue();
-    let url = format!("{base_url}/jobs");
+    let url = format!("{base_url}/jobs/bulk");
 
     let start = Instant::now();
-    for i in 0..n {
-        let body = EnqueueBody {
-            job_type: "bench",
-            queue: &queue,
-            payload: json!({"i": i}),
+    for chunk_start in (0..n).step_by(bulk_n) {
+        let chunk_end = (chunk_start + bulk_n).min(n);
+        let body = BulkEnqueueBody {
+            jobs: (chunk_start..chunk_end)
+                .map(|i| EnqueueBody {
+                    job_type: "bench",
+                    queue: &queue,
+                    payload: json!({"i": i}),
+                })
+                .collect(),
         };
         let resp = client
             .post(&url)
@@ -270,31 +283,42 @@ async fn enqueue(cfg: &BenchConfig, base_url: &str, n: usize) -> Duration {
 // Scenario: Concurrent Enqueue
 // ---------------------------------------------------------------------------
 
-/// Enqueue N jobs across K workers and return the wall-clock time. Workers pull
-/// pre-encoded bodies from a shared channel, so the degree of parallelism is
-/// controlled independently from the job count. This exercises h2 multiplexing
-/// (many requests on one connection) vs HTTP/1.1 (one connection per worker).
+/// Enqueue N jobs across K workers and return the wall-clock time. Jobs are
+/// chunked into bulk requests of `bulk_n` each, then distributed to workers
+/// via a shared channel. Workers pull pre-encoded bodies so serialization
+/// doesn't count against the concurrent send timing. This exercises h2
+/// multiplexing (many requests on one connection) vs HTTP/1.1 (one connection
+/// per worker).
 async fn enqueue_concurrent(
     cfg: &BenchConfig,
     base_url: &str,
     n: usize,
     workers: usize,
+    bulk_n: usize,
 ) -> Duration {
     let client = cfg.client();
     let queue = unique_queue();
-    let url: Arc<str> = format!("{base_url}/jobs").into();
+    let url: Arc<str> = format!("{base_url}/jobs/bulk").into();
     let content_type = cfg.content_type();
     let accept = cfg.accept();
 
-    // Pre-encode all request bodies so serialization doesn't count against
-    // the concurrent send timing.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(n);
-    for i in 0..n {
-        tx.send(cfg.encode(&EnqueueBody {
-            job_type: "bench",
-            queue: &queue,
-            payload: json!({"i": i}),
-        }))
+    // Pre-encode all request bodies (chunked into bulk requests) so
+    // serialization doesn't count against the concurrent send timing.
+    let num_requests = (n + bulk_n - 1) / bulk_n;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(num_requests);
+    for chunk_start in (0..n).step_by(bulk_n) {
+        let chunk_end = (chunk_start + bulk_n).min(n);
+        tx.send(
+            cfg.encode(&BulkEnqueueBody {
+                jobs: (chunk_start..chunk_end)
+                    .map(|i| EnqueueBody {
+                        job_type: "bench",
+                        queue: &queue,
+                        payload: json!({"i": i}),
+                    })
+                    .collect(),
+            }),
+        )
         .await
         .unwrap();
     }
@@ -430,16 +454,22 @@ impl JobStream {
 }
 
 /// Enqueue N jobs to a given queue as untimed setup for dequeue benchmarks.
-/// Always uses JSON for simplicity — the format being benchmarked is the
-/// stream/ack format, not the enqueue format.
-async fn pre_enqueue(client: &Client, base_url: &str, queue: &str, n: usize) {
-    let url = format!("{base_url}/jobs");
+/// Uses the bulk API with chunks of `bulk_n`. Always uses JSON for
+/// simplicity — the format being benchmarked is the stream/ack format, not
+/// the enqueue format.
+async fn pre_enqueue(client: &Client, base_url: &str, queue: &str, n: usize, bulk_n: usize) {
+    let url = format!("{base_url}/jobs/bulk");
 
-    for i in 0..n {
-        let body = EnqueueBody {
-            job_type: "bench",
-            queue,
-            payload: json!({"i": i}),
+    for chunk_start in (0..n).step_by(bulk_n) {
+        let chunk_end = (chunk_start + bulk_n).min(n);
+        let body = BulkEnqueueBody {
+            jobs: (chunk_start..chunk_end)
+                .map(|i| EnqueueBody {
+                    job_type: "bench",
+                    queue,
+                    payload: json!({"i": i}),
+                })
+                .collect(),
         };
         let resp = client
             .post(&url)
@@ -562,11 +592,12 @@ async fn dequeue(
     base_url: &str,
     n: usize,
     prefetch: u64,
+    bulk_n: usize,
 ) -> Duration {
     let queue = unique_queue();
 
     // Untimed setup: seed the queue with jobs.
-    pre_enqueue(&clients[0], base_url, &queue, n).await;
+    pre_enqueue(&clients[0], base_url, &queue, n, bulk_n).await;
 
     let target = n as u64;
     let acked = Arc::new(AtomicU64::new(0));
@@ -634,17 +665,26 @@ async fn pipeline(
     n: usize,
     enqueuers: usize,
     prefetch: u64,
+    bulk_n: usize,
 ) -> Duration {
     let queue = unique_queue();
 
-    // Pre-encode enqueue bodies outside the timer.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(n);
-    for i in 0..n {
-        tx.send(cfg.encode(&EnqueueBody {
-            job_type: "bench",
-            queue: &queue,
-            payload: json!({"i": i}),
-        }))
+    // Pre-encode enqueue bodies (chunked into bulk requests) outside the timer.
+    let num_requests = (n + bulk_n - 1) / bulk_n;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(num_requests);
+    for chunk_start in (0..n).step_by(bulk_n) {
+        let chunk_end = (chunk_start + bulk_n).min(n);
+        tx.send(
+            cfg.encode(&BulkEnqueueBody {
+                jobs: (chunk_start..chunk_end)
+                    .map(|i| EnqueueBody {
+                        job_type: "bench",
+                        queue: &queue,
+                        payload: json!({"i": i}),
+                    })
+                    .collect(),
+            }),
+        )
         .await
         .unwrap();
     }
@@ -690,7 +730,7 @@ async fn pipeline(
     // Spawn enqueuers that pull pre-encoded bodies from the channel.
     let content_type = cfg.content_type();
     let accept = cfg.accept();
-    let enqueue_url: Arc<str> = format!("{base_url}/jobs").into();
+    let enqueue_url: Arc<str> = format!("{base_url}/jobs/bulk").into();
 
     let enqueue_handles: Vec<_> = (0..enqueuers)
         .map(|_| {
@@ -741,6 +781,7 @@ fn bench_enqueue(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let url = rt.block_on(async { start_server().await.0 });
     let n = env_or("BENCH_N", 100) as usize;
+    let bulk_n = env_or("BENCH_ENQUEUE_BULK_N", 1) as usize;
 
     let configs = [
         BenchConfig::new(Protocol::Http1, Persistence::NewConn, Format::Json),
@@ -753,7 +794,7 @@ fn bench_enqueue(c: &mut Criterion) {
         BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
     ];
 
-    let mut group = c.benchmark_group(format!("enqueue (n={n})"));
+    let mut group = c.benchmark_group(format!("enqueue (n={n} bulk_n={bulk_n})"));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
 
@@ -765,7 +806,7 @@ fn bench_enqueue(c: &mut Criterion) {
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += enqueue(&cfg, &url, n).await;
+                        total += enqueue(&cfg, &url, n, bulk_n).await;
                     }
                     total
                 }
@@ -781,6 +822,7 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
     let url = rt.block_on(async { start_server().await.0 });
     let n = env_or("BENCH_N", 100) as usize;
     let enqueuers = env_or("BENCH_ENQUEUERS", 4) as usize;
+    let bulk_n = env_or("BENCH_ENQUEUE_BULK_N", 1) as usize;
 
     // Only keep-alive configs make sense for concurrent sends — the whole
     // point is many requests multiplexed on one connection (h2) vs many
@@ -793,7 +835,9 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
         BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
     ];
 
-    let mut group = c.benchmark_group(format!("enqueue-concurrent (n={n} enqueuers={enqueuers})"));
+    let mut group = c.benchmark_group(format!(
+        "enqueue-concurrent (n={n} enqueuers={enqueuers} bulk_n={bulk_n})"
+    ));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
 
@@ -805,7 +849,7 @@ fn bench_enqueue_concurrent(c: &mut Criterion) {
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += enqueue_concurrent(&cfg, &url, n, enqueuers).await;
+                        total += enqueue_concurrent(&cfg, &url, n, enqueuers, bulk_n).await;
                     }
                     total
                 }
@@ -822,6 +866,7 @@ fn bench_dequeue(c: &mut Criterion) {
     let n = env_or("BENCH_N", 100) as usize;
     let dequeuers = env_or("BENCH_DEQUEUERS", 4) as usize;
     let prefetch = env_or("BENCH_PREFETCH", 10);
+    let bulk_n = env_or("BENCH_ENQUEUE_BULK_N", 1) as usize;
 
     // All dequeue configs use KeepAlive — the stream is inherently a
     // persistent connection, and acks benefit from reuse too.
@@ -894,7 +939,8 @@ fn bench_dequeue(c: &mut Criterion) {
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += dequeue(&cfg, &clients, ack_strategy, &url, n, prefetch).await;
+                        total +=
+                            dequeue(&cfg, &clients, ack_strategy, &url, n, prefetch, bulk_n).await;
                     }
                     total
                 }
@@ -910,6 +956,7 @@ fn bench_pipeline(c: &mut Criterion) {
     let url = rt.block_on(async { start_server().await.0 });
     let n = env_or("BENCH_N", 100) as usize;
     let enqueuers = env_or("BENCH_ENQUEUERS", 4) as usize;
+    let bulk_n = env_or("BENCH_ENQUEUE_BULK_N", 1) as usize;
     let dequeuers = env_or("BENCH_DEQUEUERS", 4) as usize;
     let prefetch = env_or("BENCH_PREFETCH", 10);
 
@@ -949,7 +996,7 @@ fn bench_pipeline(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group(format!(
-        "pipeline (n={n} enqueuers={enqueuers} dequeuers={dequeuers} prefetch={prefetch})"
+        "pipeline (n={n} enqueuers={enqueuers} bulk_n={bulk_n} dequeuers={dequeuers} prefetch={prefetch})"
     ));
     group.throughput(Throughput::Elements(n as u64));
     group.sample_size(10);
@@ -991,6 +1038,7 @@ fn bench_pipeline(c: &mut Criterion) {
                             n,
                             enqueuers,
                             prefetch,
+                            bulk_n,
                         )
                         .await;
                     }
