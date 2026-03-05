@@ -1798,61 +1798,103 @@ async fn take_jobs(
                                     )
                                     .is_ok()
                                 {
-                                    // Won the claim — try to take a job. All
-                                    // other workers with the same claim token
-                                    // will skip and go back to waiting.
+                                    // Won the claim — take a batch of jobs.
                                     let now = (state.clock)();
                                     let take_start = std::time::Instant::now();
-                                    match state.store.take_next_job(now, &queues).await {
-                                        Ok(Some(job)) => {
+
+                                    // Compute how many jobs we want.
+                                    let wanted = if prefetch > 0 {
+                                        prefetch - in_flight.len()
+                                    } else {
+                                        1 // unlimited: permit is the only backpressure
+                                    };
+
+                                    // Cap by global working limit.
+                                    let wanted = if state.global_working_limit > 0 {
+                                        let global_in_flight = state.global_in_flight.load(Ordering::Relaxed);
+                                        wanted.min(
+                                            state.global_working_limit
+                                                .saturating_sub(global_in_flight) as usize,
+                                        )
+                                    } else {
+                                        wanted
+                                    };
+
+                                    // Defensive: we already checked limits earlier
+                                    // with the can_take condition.
+                                    let wanted = wanted.max(1);
+
+                                    match state.store.take_next_n_jobs(now, &queues, wanted).await {
+                                        Ok(jobs) if !jobs.is_empty() => {
+                                            let got = jobs.len();
                                             tracing::trace!(
                                                 take_ms = take_start.elapsed().as_secs_f64() * 1000.0,
-                                                job_id = %job.id,
-                                                "take loop: got job"
+                                                count = got,
+                                                "take loop: got batch"
                                             );
-                                            in_flight.insert(job.id.clone(), job.attempts);
-                                            state.global_in_flight.fetch_add(1, Ordering::Relaxed);
-                                            match Job::try_from(job) {
-                                                Ok(job) => {
-                                                    tracing::debug!(
-                                                        job_id = %job.id,
-                                                        job_type = %job.job_type,
-                                                        queue = %job.queue,
-                                                        priority = job.priority,
-                                                        "job dispatched"
-                                                    );
-                                                    permit.send(TakeMessage::Job(Arc::new(job)));
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(%e, "corrupt job data");
-                                                    break;
+
+                                            // Release the reserved slot — we'll
+                                            // send all jobs uniformly via tx.send().
+                                            drop(permit);
+
+                                            let mut send_err = false;
+                                            for store_job in jobs {
+                                                match Job::try_from(store_job) {
+                                                    Ok(job) => {
+                                                        in_flight.insert(job.id.clone(), job.attempts);
+                                                        state.global_in_flight.fetch_add(1, Ordering::Relaxed);
+                                                        tracing::debug!(
+                                                            job_id = %job.id,
+                                                            job_type = %job.job_type,
+                                                            queue = %job.queue,
+                                                            priority = job.priority,
+                                                            "job dispatched"
+                                                        );
+                                                        if tx.send(TakeMessage::Job(Arc::new(job))).await.is_err() {
+                                                            send_err = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(%e, "corrupt job data");
+                                                        // Skip this job — it's marked Working
+                                                        // in the store but we can't decode it.
+                                                        // Don't track it in in_flight so the
+                                                        // connection stays healthy.
+                                                        continue;
+                                                    }
                                                 }
                                             }
-                                            // Mint a new local unclaimed
-                                            // token so the next iteration
-                                            // tries again — this drives
-                                            // the drain behavior.
-                                            claim_token =
-                                                Arc::new(AtomicBool::new(false));
-                                            // Reset the heartbeat timer
-                                            // since we just sent data.
+
+                                            if send_err {
+                                                break;
+                                            }
+
+                                            // Reset heartbeat — we just sent data.
                                             heartbeat_sleep
                                                 .as_mut()
                                                 .reset(tokio::time::Instant::now() + state.heartbeat_interval_ms);
+
+                                            if got >= wanted {
+                                                // Got everything — mint a new
+                                                // token to continue draining.
+                                                claim_token =
+                                                    Arc::new(AtomicBool::new(false));
+                                            }
+                                            // If got < wanted, the queue is
+                                            // exhausted. Token stays claimed
+                                            // (true) — wait for events.
                                         }
-                                        Ok(None) => {
+                                        Ok(_) => {
+                                            // Empty result — queue exhausted.
                                             tracing::trace!(
                                                 take_ms = take_start.elapsed().as_secs_f64() * 1000.0,
                                                 "take loop: queue empty"
                                             );
-                                            // Queue is empty. The CAS
-                                            // already set the token to
-                                            // true, so has_token will be
-                                            // false — we wait for events.
                                             drop(permit);
                                         }
                                         Err(e) => {
-                                            tracing::error!(%e, "take_next_job failed");
+                                            tracing::error!(%e, "take_next_n_jobs failed");
                                             break;
                                         }
                                     }

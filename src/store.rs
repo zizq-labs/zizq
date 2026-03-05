@@ -1988,12 +1988,32 @@ impl Store {
         now: u64,
         queues: &HashSet<String>,
     ) -> Result<Option<Job>, StoreError> {
-        if !self.index_ready.load(Ordering::Acquire) {
-            return Ok(None);
+        Ok(self
+            .take_next_n_jobs(now, queues, 1)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Take up to `n` ready jobs from the queue in a single batch.
+    ///
+    /// Claims up to `n` candidates from the ready index, validates them,
+    /// writes all status transitions in one transaction, and hydrates
+    /// payloads. Returns a `Vec<Job>` that may be shorter than `n` if
+    /// the queue had fewer ready jobs.
+    pub async fn take_next_n_jobs(
+        &self,
+        now: u64,
+        queues: &HashSet<String>,
+        n: usize,
+    ) -> Result<Vec<Job>, StoreError> {
+        if n == 0 || !self.index_ready.load(Ordering::Acquire) {
+            return Ok(Vec::new());
         }
 
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
+        let event_tx = self.event_tx.clone();
         let queues = queues.clone();
 
         let spawn_start = std::time::Instant::now();
@@ -2001,36 +2021,52 @@ impl Store {
             let blocking_start = std::time::Instant::now();
             let spawn_wait = blocking_start.duration_since(spawn_start);
 
-            // Outer loop: claim candidates from the lock-free ready index.
-            // Re-claims if a candidate turns out to be missing or no longer
-            // Ready (e.g. deleted or taken by another path).
-            loop {
-                let (_priority, job_id, queue) = match ready_index.claim(&queues) {
-                    Some(entry) => entry,
-                    None => {
-                        tracing::trace!(
-                            spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
-                            "take_next_job: empty"
-                        );
-                        return Ok((None, None));
-                    }
-                };
+            // PreRead is declared outside the loop since struct definitions
+            // aren't allowed inside loop bodies in all editions.
+            struct PreRead {
+                job: Job,
+                pre_bytes: Slice,
+                job_key: Vec<u8>,
+                old_status_key: Vec<u8>,
+                new_status_key: Vec<u8>,
+                updated_slice: Slice,
+                job_id: String,
+            }
 
-                // Inner loop: pre-read and pre-compute changes outside the tx,
-                // then compare-and-write inside. Retries on stale pre-reads
-                // (update job metadata race). Breaks with None to re-claim
-                // from the outer loop if the candidate is invalid.
-                let job_key = make_job_key(&job_id);
-                let outcome = loop {
-                    // ---- outside tx ----
+            // Retry loop: on CAS mismatch we re-insert into the ready
+            // index and re-claim, same pattern as take_next_job.
+            loop {
+                // 1. Claim phase — collect up to `n` candidates from the ready index.
+                let mut claimed: Vec<(u16, String, String)> = Vec::with_capacity(n);
+                while claimed.len() < n {
+                    match ready_index.claim(&queues) {
+                        Some(entry) => claimed.push(entry),
+                        None => break,
+                    }
+                }
+
+                if claimed.is_empty() {
+                    tracing::trace!(
+                        spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
+                        "take_next_n_jobs: empty"
+                    );
+                    return Ok((Vec::new(), None));
+                }
+
+                // 2. Pre-read phase — read each claimed job from the data keyspace.
+                //    Filter out any that are deleted or no longer Ready.
+                let mut valid: Vec<PreRead> = Vec::with_capacity(claimed.len());
+
+                for (_priority, job_id, _queue) in &claimed {
+                    let job_key = make_job_key(job_id);
                     let pre_bytes = match ks.data.get(&job_key)? {
                         Some(bytes) => bytes,
-                        None => break None, // Deleted; try next candidate.
+                        None => continue, // Deleted.
                     };
 
                     let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
                     if job.status != JobStatus::Ready as u8 {
-                        break None; // No longer ready; try next candidate.
+                        continue; // No longer ready.
                     }
 
                     let old_status_key = make_status_key(JobStatus::Ready, &job.id);
@@ -2041,84 +2077,122 @@ impl Store {
 
                     let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
 
-                    // ---- inside tx (writes only) ----
-                    let mut tx = ks.write_tx();
+                    valid.push(PreRead {
+                        job,
+                        pre_bytes,
+                        job_key,
+                        old_status_key,
+                        new_status_key,
+                        updated_slice,
+                        job_id: job_id.clone(),
+                    });
+                }
 
-                    let prev =
-                        tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
+                if valid.is_empty() {
+                    tracing::trace!(
+                        spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
+                        claimed = claimed.len(),
+                        "take_next_n_jobs: all claimed candidates invalid"
+                    );
+                    return Ok((Vec::new(), None));
+                }
 
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue; // Stale pre-read; retry same job.
+                // 3. Write phase — one transaction for all valid pre-reads.
+                //    If any CAS fails, abort the entire transaction since
+                //    fetch_update already wrote into the tx buffer.
+                let mut tx = ks.write_tx();
+                let mut cas_conflict_detected = false;
+
+                for pre in &valid {
+                    let prev = tx.fetch_update(&ks.data, &pre.job_key, |_| {
+                        Some(pre.updated_slice.clone())
+                    })?;
+
+                    if prev.as_deref() != Some(&*pre.pre_bytes) {
+                        cas_conflict_detected = true;
+                        break;
                     }
 
-                    tx.remove(&ks.index, &old_status_key);
-                    tx.insert(&ks.index, &new_status_key, b"");
+                    tx.remove(&ks.index, &pre.old_status_key);
+                    tx.insert(&ks.index, &pre.new_status_key, b"");
+                }
 
-                    let sync = match ks.commit(tx, ks.default_commit_mode) {
-                        Ok(sync) => sync,
-                        Err(e) => {
-                            // Commit failed — re-insert into the ready index
-                            // if the job is still Ready.
-                            let _tx = ks.write_tx();
-                            if let Ok(Some(bytes)) = ks.data.get(&job_key) {
-                                if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
-                                    if current.status == JobStatus::Ready as u8 {
-                                        ready_index.insert(
-                                            &current.queue,
-                                            current.priority,
-                                            current.id,
-                                        );
-                                    }
-                                }
-                            }
-                            return Err(e);
-                        }
-                    };
-
-                    break Some((job, sync));
-                };
-
-                let Some((mut job, sync)) = outcome else {
-                    continue; // Bad candidate; re-claim from outer loop.
-                };
+                if cas_conflict_detected {
+                    // CAS mismatch — abort the whole batch, re-insert
+                    // valid entries into the ready index, and retry.
+                    tracing::trace!(
+                        valid = valid.len(),
+                        "take_next_n_jobs: CAS conflict, retrying"
+                    );
+                    drop(tx);
+                    for pre in &valid {
+                        ready_index.insert(&pre.job.queue, pre.job.priority, pre.job_id.clone());
+                    }
+                    continue; // Back to the top of the retry loop
+                }
 
                 let write_tx_elapsed = blocking_start.elapsed();
 
-                // Hydrate the payload from the data keyspace for the caller.
+                let sync = match ks.commit(tx, ks.default_commit_mode) {
+                    Ok(sync) => sync,
+                    Err(e) => {
+                        // 4. Rollback — re-insert valid entries into the
+                        //    ready index and notify workers.
+                        let _tx = ks.write_tx();
+                        for pre in &valid {
+                            ready_index.insert(
+                                &pre.job.queue,
+                                pre.job.priority,
+                                pre.job_id.clone(),
+                            );
+
+                            let _ = event_tx.send(StoreEvent::JobCreated {
+                                id: pre.job_id.clone(),
+                                queue: pre.job.queue.clone(),
+                                token: Arc::new(AtomicBool::new(false)),
+                            });
+                        }
+                        return Err(e);
+                    }
+                };
+
+                // 5. Hydrate phase — read payloads for all committed jobs.
                 let hydrate_start = std::time::Instant::now();
-
-                let payload_key = make_payload_key(&job_id);
-                if let Some(payload_bytes) = ks.data.get(&payload_key)? {
-                    job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
+                for pre in &mut valid {
+                    let payload_key = make_payload_key(&pre.job_id);
+                    if let Some(payload_bytes) = ks.data.get(&payload_key)? {
+                        pre.job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
+                    }
                 }
-
                 let hydrate_elapsed = hydrate_start.elapsed();
+
+                let count = valid.len();
+                let jobs: Vec<Job> = valid.into_iter().map(|pre| pre.job).collect();
 
                 tracing::trace!(
                     spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
                     write_tx_ms = write_tx_elapsed.as_secs_f64() * 1000.0,
                     hydrate_ms = hydrate_elapsed.as_secs_f64() * 1000.0,
                     total_ms = blocking_start.elapsed().as_secs_f64() * 1000.0,
-                    job_id = %job.id,
-                    queue = %queue,
-                    "take_next_job"
+                    count,
+                    "take_next_n_jobs"
                 );
 
-                return Ok((Some(job), Some(sync)));
+                return Ok((jobs, Some(sync)));
             }
         })
         .await?;
 
-        let job = await_sync(result).await?;
+        let jobs = await_sync(result).await?;
 
-        if let Some(ref job) = job {
+        // Broadcast JobWorking for each taken job.
+        for job in &jobs {
             let _ = self
                 .event_tx
                 .send(StoreEvent::JobWorking { id: job.id.clone() });
         }
 
-        Ok(job)
+        Ok(jobs)
     }
 
     /// Mark a job as successfully completed.
@@ -4283,6 +4357,238 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.dequeued_at, taken.dequeued_at);
+    }
+
+    // --- take_next_n_jobs tests ---
+
+    #[tokio::test]
+    async fn take_next_n_jobs_returns_up_to_n() {
+        let store = test_store();
+        for i in 0..5 {
+            store
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", "default", serde_json::json!(i)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 3)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_returns_fewer_when_not_enough() {
+        let store = test_store();
+        for i in 0..2 {
+            store
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", "default", serde_json::json!(i)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 5)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_empty_store() {
+        let store = test_store();
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 5)
+            .await
+            .unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_respects_priority() {
+        let store = test_store();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("mid")).priority(5),
+            )
+            .await
+            .unwrap();
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 3)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].priority, 1);
+        assert_eq!(jobs[1].priority, 5);
+        assert_eq!(jobs[2].priority, 10);
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_fifo_within_priority() {
+        let store = test_store();
+        let first = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("b")),
+            )
+            .await
+            .unwrap();
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 2)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id, first.id);
+        assert_eq!(jobs[1].id, second.id);
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_filters_by_queue() {
+        let store = test_store();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "alpha", serde_json::json!("a1")),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "beta", serde_json::json!("b1")),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "alpha", serde_json::json!("a2")),
+            )
+            .await
+            .unwrap();
+
+        let queues: HashSet<String> = ["alpha".to_string()].into_iter().collect();
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &queues, 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.queue == "alpha"));
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_marks_working() {
+        let store = test_store();
+        for i in 0..3 {
+            store
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("test", "default", serde_json::json!(i)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 3)
+            .await
+            .unwrap();
+        for job in &jobs {
+            assert_eq!(job.status, u8::from(JobStatus::Working));
+            assert!(job.dequeued_at.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_hydrates_payload() {
+        let store = test_store();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({"key": "value"})),
+            )
+            .await
+            .unwrap();
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].payload, Some(serde_json::json!({"key": "value"})));
+    }
+
+    #[tokio::test]
+    async fn take_next_n_jobs_broadcasts_events() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("a")),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("b")),
+            )
+            .await
+            .unwrap();
+
+        // Drain the enqueue events.
+        while let Ok(StoreEvent::JobCreated { .. }) = rx.try_recv() {}
+
+        let jobs = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 2)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+
+        // We should receive exactly 2 JobWorking events.
+        let mut working_ids = Vec::new();
+        for _ in 0..2 {
+            match rx.try_recv() {
+                Ok(StoreEvent::JobWorking { id }) => working_ids.push(id),
+                other => panic!("expected JobWorking, got {:?}", other),
+            }
+        }
+        assert_eq!(working_ids.len(), 2);
+        assert!(working_ids.contains(&jobs[0].id));
+        assert!(working_ids.contains(&jobs[1].id));
     }
 
     #[tokio::test]
