@@ -16,6 +16,9 @@ module Async
   # Async tasks are generic over some return type that is returned when the
   # task is waited on.
   class Task[out T]
+    # Returns the current task if running inside an Async reactor, nil otherwise.
+    def self.current?: () -> Task[untyped]?
+
     # Spawns a new async task that eventually returns the result of the
     # provided block when waited on.
     def async: [U] () { () -> U } -> Task[U]

@@ -5,6 +5,7 @@
 # frozen_string_literal: true
 
 require "async"
+require "async/barrier"
 require "async/http/client"
 require "async/http/endpoint"
 require "protocol/http/body/buffered"
@@ -18,7 +19,16 @@ module Zizq
   #
   # Supports both JSON and MessagePack serialization formats, determined at
   # construction time.
+  #
+  # HTTP requests are dispatched through a persistent background IO thread
+  # when called from non-Async contexts, keeping the HTTP/2 connection alive
+  # across calls and avoiding ephemeral port exhaustion. When called from
+  # within an existing Async reactor, the shared HTTP client is used directly.
   class Client
+    # A fully-read HTTP response (status + decoded body), safe to use outside
+    # the async reactor that produced it.
+    RawResponse = Data.define(:status, :body)
+
     CONTENT_TYPES = { #: Hash[Zizq::format, String]
       msgpack: "application/msgpack",
       json: "application/json"
@@ -42,12 +52,15 @@ module Zizq
       @url = url.chomp("/")
       @format = format
 
-      @client = Async::HTTP::Client.new(
-        Async::HTTP::Endpoint.parse(
-          @url,
-          protocol: Async::HTTP::Protocol::HTTP2,
-        )
+      @endpoint = Async::HTTP::Endpoint.parse(
+        @url,
+        protocol: Async::HTTP::Protocol::HTTP2,
       )
+
+      @http = Async::HTTP::Client.new(@endpoint)
+      @io_mutex = Mutex.new
+      @io_thread = nil #: Thread?
+      @io_queue = nil #: Thread::Queue?
 
       @content_type = CONTENT_TYPES.fetch(format)
       @stream_accept = STREAM_ACCEPT.fetch(format)
@@ -55,7 +68,12 @@ module Zizq
 
     # Close the underlying HTTP client and release connections.
     def close #: () -> void
-      Sync { @client.close }
+      @http.close
+
+      if @io_thread&.alive?
+        @io_queue&.close
+        @io_thread&.join
+      end
     end
 
     # Enqueue a new job.
@@ -251,7 +269,7 @@ module Zizq
       headers["worker-id"] = worker_id if worker_id
 
       Sync do
-        response = @client.get(path, headers)
+        response = @http.get(path, headers)
 
         begin
           raise StreamError, "take jobs stream returned HTTP #{response.status}" unless response.status == 200
@@ -342,9 +360,7 @@ module Zizq
     # so that resource objects like Page can follow links without resorting
     # to `.send`.
     def get_path(path) #: (String) -> Hash[String, untyped]
-      response = Sync do
-        @client.get(path, {"accept" => @content_type})
-      end
+      response = request { |http| consume_response(http.get(path, {"accept" => @content_type})) }
       handle_response!(response, expected: 200)
     end
 
@@ -387,44 +403,126 @@ module Zizq
       end
     end
 
-    def get(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> untyped
+    # Dispatch a block to the appropriate execution context.
+    #
+    # If already inside an Async reactor, yields @http directly.
+    # Otherwise, dispatches via the persistent background IO thread.
+    def request(&block) #: () { (Async::HTTP::Client) -> RawResponse } -> RawResponse
+      if Async::Task.current?
+        yield @http
+      else
+        sync_call(&block)
+      end
+    end
+
+    # Read the response body and close it, returning a RawResponse that is
+    # safe to use outside the reactor.
+    def consume_response(response) #: (untyped) -> RawResponse
+      RawResponse.new(status: response.status, body: response.read)
+    ensure
+      response.close
+    end
+
+    # Push a work block to the background IO thread and block until it
+    # completes, returning the result or re-raising any exception.
+    def sync_call(&block) #: () { (Async::HTTP::Client) -> RawResponse } -> RawResponse
+      ensure_io_thread
+
+      result_queue = Thread::Queue.new
+      @io_queue.push([block, result_queue])
+
+      tag, value = result_queue.pop
+      if tag == :ok
+        value
+      else
+        raise value
+      end
+    rescue ClosedQueueError
+      raise ConnectionError, "client is closed"
+    end
+
+    # Lazily start the background IO thread (double-checked locking).
+    def ensure_io_thread #: () -> void
+      return if @io_thread&.alive?
+
+      @io_mutex.synchronize do
+        return if @io_thread&.alive?
+
+        @io_queue = Thread::Queue.new
+        @io_thread = Thread.new { io_thread_run }
+        @io_thread.name = "zizq-io"
+      end
+    end
+
+    # Main loop for the background IO thread. Mirrors AckProcessor: runs an
+    # Async reactor, pops work from the queue (fiber-scheduler-aware), and
+    # dispatches each call as a concurrent fiber via a barrier.
+    def io_thread_run #: () -> void
       Sync do
-        @client.get(
-          build_path(path, params:),
-          {"accept" => @content_type}
+        http = Async::HTTP::Client.new(@endpoint)
+        barrier = Async::Barrier.new
+
+        begin
+          while (item = @io_queue.pop)
+            block, result_queue = item
+            barrier.async do
+              result_queue.push([:ok, block.call(http)])
+            rescue => e
+              result_queue.push([:error, e])
+            end
+          end
+
+          barrier.wait
+        ensure
+          http.close
+        end
+      end
+    end
+
+    def get(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> RawResponse
+      request do |http|
+        consume_response(
+          http.get(
+            build_path(path, params:),
+            {"accept" => @content_type}
+          )
         )
       end
     end
 
-    def post(path, body) #: (String, Hash[Symbol, untyped]) -> untyped
-      Sync do
-        @client.post(
-          build_path(path),
-          {"content-type" => @content_type, "accept" => @content_type},
-          Protocol::HTTP::Body::Buffered.wrap(encode_body(body))
+    def post(path, body) #: (String, Hash[Symbol, untyped]) -> RawResponse
+      request do |http|
+        consume_response(
+          http.post(
+            build_path(path),
+            {"content-type" => @content_type, "accept" => @content_type},
+            Protocol::HTTP::Body::Buffered.wrap(encode_body(body))
+          )
         )
       end
     end
 
-    def raw_post(path) #: (String) -> untyped
-      Sync do
-        @client.post(
-          build_path(path),
-          {"accept" => @content_type}
+    def raw_post(path) #: (String) -> RawResponse
+      request do |http|
+        consume_response(
+          http.post(
+            build_path(path),
+            {"accept" => @content_type}
+          )
         )
       end
     end
 
     # Check response status and decode body, raising on errors.
-    def handle_response!(response, expected:) #: (untyped, expected: Integer) -> Hash[String, untyped]?
+    def handle_response!(response, expected:) #: (RawResponse, expected: Integer) -> Hash[String, untyped]?
       status = response.status
 
       if status == expected
         return nil if status == 204
-        decode_body(response.read)
+        decode_body(response.body)
       else
         body = begin
-          decode_body(response.read)
+          decode_body(response.body)
         rescue
           nil
         end

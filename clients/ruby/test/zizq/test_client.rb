@@ -13,6 +13,11 @@ class TestClient < Minitest::Test
     @msgpack_client = Zizq::Client.new(url: URL, format: :msgpack)
   end
 
+  def teardown
+    @json_client.close
+    @msgpack_client.close
+  end
+
   # --- enqueue ---
 
   def test_enqueue_json
@@ -457,5 +462,7 @@ class TestClient < Minitest::Test
   def test_trailing_slash_stripped
     client = Zizq::Client.new(url: "http://localhost:7890/", format: :json)
     assert_equal "http://localhost:7890", client.url
+  ensure
+    client&.close
   end
 end
