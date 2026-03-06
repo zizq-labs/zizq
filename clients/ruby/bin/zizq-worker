@@ -13,9 +13,9 @@ thread_count = Integer(ENV.fetch("ZIZQ_THREADS", Zizq::Worker::DEFAULT_THREADS))
 fiber_count = Integer(ENV.fetch("ZIZQ_FIBERS", Zizq::Worker::DEFAULT_FIBERS))
 prefetch = ENV.key?("ZIZQ_PREFETCH") ? Integer(ENV["ZIZQ_PREFETCH"]) : nil
 shutdown_timeout = Float(ENV.fetch("ZIZQ_SHUTDOWN_TIMEOUT", Zizq::Worker::DEFAULT_SHUTDOWN_TIMEOUT))
-reconnect_interval = Float(ENV.fetch("ZIZQ_RECONNECT_INTERVAL", Zizq::Worker::DEFAULT_RECONNECT_INTERVAL))
-max_reconnect_interval = Float(ENV.fetch("ZIZQ_MAX_RECONNECT_INTERVAL", Zizq::Worker::DEFAULT_MAX_RECONNECT_INTERVAL))
-reconnect_exponent = Float(ENV.fetch("ZIZQ_RECONNECT_EXPONENT", Zizq::Worker::DEFAULT_RECONNECT_EXPONENT))
+retry_min_wait = Float(ENV.fetch("ZIZQ_RETRY_MIN_WAIT", Zizq::Worker::DEFAULT_RETRY_MIN_WAIT))
+retry_max_wait = Float(ENV.fetch("ZIZQ_RETRY_MAX_WAIT", Zizq::Worker::DEFAULT_RETRY_MAX_WAIT))
+retry_multiplier = Float(ENV.fetch("ZIZQ_RETRY_MULTIPLIER", Zizq::Worker::DEFAULT_RETRY_MULTIPLIER))
 
 queues = if ENV.key?("ZIZQ_QUEUES")
   ENV["ZIZQ_QUEUES"].split(",").map(&:strip).reject(&:empty?)
@@ -30,7 +30,7 @@ parser = OptionParser.new do |opts|
 
   opts.separator ""
   opts.separator "Start a Zizq worker process. The ENTRYPOINT is a Ruby file that loads your"
-  opts.separator "application (e.g. config/environment.rb for Rails)."
+  opts.separator "application (e.g. config/environment.rb for a Rails app)."
   opts.separator ""
   opts.separator "Client configuration (url, format, logger) should be set in the"
   opts.separator "entrypoint via Zizq.configure."
@@ -45,7 +45,7 @@ parser = OptionParser.new do |opts|
     fiber_count = n
   end
 
-  opts.on("-p", "--prefetch N", Integer, "Prefetch count (default: threads*fibers, env: ZIZQ_PREFETCH)") do |n|
+  opts.on("-p", "--prefetch N", Integer, "Prefetch count (default: 2*threads*fibers, env: ZIZQ_PREFETCH)") do |n|
     prefetch = n
   end
 
@@ -63,16 +63,16 @@ parser = OptionParser.new do |opts|
     shutdown_timeout = n
   end
 
-  opts.on("--reconnect-interval N", Float, "Initial reconnect interval in seconds (default: #{Zizq::Worker::DEFAULT_RECONNECT_INTERVAL}, env: ZIZQ_RECONNECT_INTERVAL)") do |n|
-    reconnect_interval = n
+  opts.on("--retry-min-wait N", Float, "Minimum retry wait in seconds (default: #{Zizq::Worker::DEFAULT_RETRY_MIN_WAIT}, env: ZIZQ_RETRY_MIN_WAIT)") do |n|
+    retry_min_wait = n
   end
 
-  opts.on("--max-reconnect-interval N", Float, "Max reconnect interval in seconds (default: #{Zizq::Worker::DEFAULT_MAX_RECONNECT_INTERVAL}, env: ZIZQ_MAX_RECONNECT_INTERVAL)") do |n|
-    max_reconnect_interval = n
+  opts.on("--retry-max-wait N", Float, "Maximum retry wait in seconds (default: #{Zizq::Worker::DEFAULT_RETRY_MAX_WAIT}, env: ZIZQ_RETRY_MAX_WAIT)") do |n|
+    retry_max_wait = n
   end
 
-  opts.on("--reconnect-exponent N", Float, "Reconnect backoff exponent (default: #{Zizq::Worker::DEFAULT_RECONNECT_EXPONENT}, env: ZIZQ_RECONNECT_EXPONENT)") do |n|
-    reconnect_exponent = n
+  opts.on("--retry-multiplier N", Float, "Retry backoff multiplier (default: #{Zizq::Worker::DEFAULT_RETRY_MULTIPLIER}, env: ZIZQ_RETRY_MULTIPLIER)") do |n|
+    retry_multiplier = n
   end
 
   opts.on("-v", "--version", "Print version and exit") do
@@ -132,7 +132,7 @@ Zizq::Worker.run(
   prefetch:,
   queues:,
   shutdown_timeout:,
-  reconnect_interval:,
-  max_reconnect_interval:,
-  reconnect_exponent:,
+  retry_min_wait:,
+  retry_max_wait:,
+  retry_multiplier:,
 )

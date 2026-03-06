@@ -9,10 +9,11 @@ require_relative "zizq/error"
 require_relative "zizq/configuration"
 
 # Autoloaded when first accessed — avoids loading heavy deps at require time.
-autoload :HTTPX, "httpx"
 autoload :MessagePack, "msgpack"
 
 module Zizq
+  autoload :AckProcessor,   "zizq/ack_processor"
+  autoload :Backoff,        "zizq/backoff"
   autoload :Client,         "zizq/client"
   autoload :EnqueueOptions, "zizq/enqueue_options"
   autoload :Job,            "zizq/job"
@@ -58,6 +59,7 @@ module Zizq
     # Resets all global state: configuration and shared client.
     # Intended for use in tests.
     def reset! #: () -> void
+      @client&.close
       @client = nil
       @configuration = nil
     end

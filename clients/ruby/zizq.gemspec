@@ -24,12 +24,12 @@ Gem::Specification.new do |spec|
                      "essential features most projects eventually need and wish they had."
 
   spec.homepage = "https://github.com/d11wtq/zizq"
-  spec.required_ruby_version = ">= 3.1"
+  spec.required_ruby_version = ">= 3.2"
 
   spec.files = Dir["lib/**/*.rb", "bin/**/*", "LICENSE"]
   spec.executables = ["zizq-worker"]
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "httpx", "~> 1.4"
+  spec.add_dependency "async-http", "~> 0.82"
   spec.add_dependency "msgpack", "~> 1.7"
 end

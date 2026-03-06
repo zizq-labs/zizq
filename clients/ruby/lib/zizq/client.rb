@@ -4,7 +4,10 @@
 # rbs_inline: enabled
 # frozen_string_literal: true
 
-require "httpx"
+require "async"
+require "async/http/client"
+require "async/http/endpoint"
+require "protocol/http/body/buffered"
 require "msgpack"
 require "json"
 require "stringio"
@@ -39,12 +42,20 @@ module Zizq
       @url = url.chomp("/")
       @format = format
 
-      # h2c upgrades the connection to HTTP/2 on the first GET request,
-      # enabling multiplexing for all subsequent requests (including POSTs
-      # for acks/nacks) on the same persistent connection.
-      @http = HTTPX.plugin(:persistent).plugin(:stream).plugin(:h2c)
+      @client = Async::HTTP::Client.new(
+        Async::HTTP::Endpoint.parse(
+          @url,
+          protocol: Async::HTTP::Protocol::HTTP2,
+        )
+      )
+
       @content_type = CONTENT_TYPES.fetch(format)
       @stream_accept = STREAM_ACCEPT.fetch(format)
+    end
+
+    # Close the underlying HTTP client and release connections.
+    def close #: () -> void
+      Sync { @client.close }
     end
 
     # Enqueue a new job.
@@ -214,14 +225,14 @@ module Zizq
     # provided to another worker. Clients should be prepared to see the same
     # job more than once for this reason.
     #
-    # The Zizq server sends periodic heartbeat messages to the client which
-    # are silently consumed.
+    # The Zizq server sends periodic heartbeat messages to the client which are
+    # silently consumed.
     #
     # Example:
     #
-    #    client.take_jobs(prefetch: 5) do |job_hash|
-    #      puts "Got job: #{job_hash.inspect}"
-    #      client.ack(job_hash['id']) # mark the job completed
+    #    client.take_jobs(prefetch: 5) do |job|
+    #      puts "Got job: #{job.inspect}"
+    #      client.ack(job.id) # mark the job completed
     #    end
     #
     # @rbs prefetch: Integer
@@ -235,38 +246,30 @@ module Zizq
       params = { prefetch: } #: Hash[Symbol, untyped]
       params[:queue] = queues.join(",") unless queues.empty?
 
-      headers = { "Accept" => @stream_accept }
-      headers["Worker-Id"] = worker_id if worker_id
+      path = build_path("/jobs/take", params:)
+      headers = { "accept" => @stream_accept }
+      headers["worker-id"] = worker_id if worker_id
 
-      uri = build_uri("/jobs/take", params:)
+      Sync do
+        response = @client.get(path, headers)
 
-      # stream: true returns an HTTPX::StreamResponse whose `each` yields
-      # raw byte chunks as they arrive over the wire, rather than buffering
-      # the entire response body into memory. The StreamResponse also calls
-      # `raise_for_status` internally after the stream ends (or on HTTP
-      # errors), so we don't need a manual status check.
-      stream = @http.get(uri, headers:, stream: true)
-      begin
-        stream.status # force the connection; raises on failure
-        on_connect&.call
-      rescue StopIteration
-        # Empty stream — connection closed before any data arrived.
-        return
+        begin
+          raise StreamError, "take jobs stream returned HTTP #{response.status}" unless response.status == 200
+          on_connect&.call
+
+          # Wrap each parsed hash in a Resources::Job before yielding.
+          wrapper = proc { |data| block.call(Resources::Job.new(self, data)) }
+
+          case @format
+          when :json then self.class.parse_ndjson(response.body, &wrapper)
+          when :msgpack then self.class.parse_msgpack_stream(response.body, &wrapper)
+          end
+        ensure
+          response.close
+        end
       end
-
-      # Wrap each parsed hash in a Resources::Job before yielding.
-      wrapper = proc { |data| block.call(Resources::Job.new(self, data)) }
-
-      case @format
-      when :json then self.class.parse_ndjson(stream, &wrapper)
-      when :msgpack then self.class.parse_msgpack_stream(stream, &wrapper)
-      end
-    rescue HTTPX::HTTPError => e
-      raise StreamError, "take jobs stream returned HTTP #{e.status}"
-    rescue HTTPX::ConnectionError => e
+    rescue SocketError, IOError, EOFError, Errno::ECONNRESET, Errno::EPIPE => e
       raise ConnectionError, e.message
-    rescue IOError, Errno::ECONNRESET, Errno::EPIPE => e
-      raise StreamError, e.message
     end
 
     # Parse an NDJSON stream from an enumerable of byte chunks.
@@ -339,22 +342,20 @@ module Zizq
     # so that resource objects like Page can follow links without resorting
     # to `.send`.
     def get_path(path) #: (String) -> Hash[String, untyped]
-      response = @http.get(
-        "#{@url}#{path}",
-        headers: { "Accept" => @content_type }
-      )
+      response = Sync do
+        @client.get(path, {"accept" => @content_type})
+      end
       handle_response!(response, expected: 200)
     end
 
     private
 
-    # Build a full URI string with optional query parameters.
-    def build_uri(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> String
-      uri = "#{@url}#{path}"
+    # Build a relative path with optional query parameters.
+    def build_path(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> String
       unless params.empty?
-        uri = "#{uri}?#{URI.encode_www_form(params)}"
+        path = "#{path}?#{URI.encode_www_form(params)}"
       end
-      uri
+      path
     end
 
     # Build query params for list endpoints, joining multi-value keys with ",".
@@ -386,43 +387,44 @@ module Zizq
       end
     end
 
-    def get(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> HTTPX::Response
-      @http.get(
-        build_uri(path, params:),
-        headers: { "Accept" => @content_type }
-      )
+    def get(path, params: {}) #: (String, ?params: Hash[Symbol, untyped]) -> untyped
+      Sync do
+        @client.get(
+          build_path(path, params:),
+          {"accept" => @content_type}
+        )
+      end
     end
 
-    def post(path, body) #: (String, Hash[Symbol, untyped]) -> HTTPX::Response
-      @http.post(
-        build_uri(path),
-        headers: { "Content-Type" => @content_type, "Accept" => @content_type },
-        body: encode_body(body)
-      )
+    def post(path, body) #: (String, Hash[Symbol, untyped]) -> untyped
+      Sync do
+        @client.post(
+          build_path(path),
+          {"content-type" => @content_type, "accept" => @content_type},
+          Protocol::HTTP::Body::Buffered.wrap(encode_body(body))
+        )
+      end
     end
 
-    def raw_post(path) #: (String) -> HTTPX::Response
-      @http.post(
-        build_uri(path),
-        headers: { "Accept" => @content_type }
-      )
+    def raw_post(path) #: (String) -> untyped
+      Sync do
+        @client.post(
+          build_path(path),
+          {"accept" => @content_type}
+        )
+      end
     end
 
     # Check response status and decode body, raising on errors.
-    def handle_response!(response, expected:) #: (HTTPX::Response, expected: Integer) -> Hash[String, untyped]?
-      # HTTPX returns an ErrorResponse on connection failure
-      if response.is_a?(HTTPX::ErrorResponse)
-        raise ConnectionError, response.error.message
-      end
-
+    def handle_response!(response, expected:) #: (untyped, expected: Integer) -> Hash[String, untyped]?
       status = response.status
 
       if status == expected
         return nil if status == 204
-        decode_body(response.body.to_s)
+        decode_body(response.read)
       else
         body = begin
-          decode_body(response.body.to_s)
+          decode_body(response.read)
         rescue
           nil
         end

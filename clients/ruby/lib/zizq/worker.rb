@@ -10,17 +10,17 @@ module Zizq
   # Top-level worker process which orchestrates fetching jobs from the server
   # and dispatching them to a pool of worker tasks for processing.
   #
-  # Fiber support (when `fiber_count > 1`) requires the `async` gem to be
-  # available. When `fiber_count == 1`, no async dependency is loaded.
+  # Fiber support (when `fiber_count > 1`) creates an Async context. When
+  # `fiber_count == 1`, no Async context is created.
   #
   # Total concurrency is calculated as `thread_count * fiber_count`.
   class Worker
     DEFAULT_THREADS = 5 #: Integer
     DEFAULT_FIBERS = 1 #: Integer
     DEFAULT_SHUTDOWN_TIMEOUT = 30 #: Integer
-    DEFAULT_RECONNECT_INTERVAL = 1
-    DEFAULT_MAX_RECONNECT_INTERVAL = 30
-    DEFAULT_RECONNECT_EXPONENT = 2
+    DEFAULT_RETRY_MIN_WAIT = 1
+    DEFAULT_RETRY_MAX_WAIT = 30
+    DEFAULT_RETRY_MULTIPLIER = 2
 
     # Convenience class method to create and run a worker.
     def self.run(...) #: (**untyped) -> void
@@ -36,9 +36,8 @@ module Zizq
     # The total number of fibers to run within each worker thread.
     #
     # For applications that cannot handle multi-fiber execution, this should be
-    # set to 1. Any value greater than 1 requires loading 'async', which must
-    # be made available by the application itself. Zizq does not directly
-    # depend on async (default: 1).
+    # set to 1. Any value greater than 1 runs workers inside an Async context
+    # (default: 1).
     attr_reader :fiber_count #: Integer
 
     # The set of queues from which to fetch jobs.
@@ -48,7 +47,8 @@ module Zizq
 
     # The total number of jobs to allow to be sent from the server at once.
     #
-    # This should be at least the number of worker threads * fibers (default).
+    # Defaults to 2x the total concurrency (threads * fibers) to keep the
+    # pipeline full while ack round-trips are in flight.
     attr_reader :prefetch #: Integer
 
     # The maximum amount of time to wait for all workers to wrap up on shutdown.
@@ -58,21 +58,8 @@ module Zizq
     # lost (default: 30).
     attr_reader :shutdown_timeout #: Integer
 
-    # The number of seconds to wait before reconnecting if a disconnect occurs.
-    #
-    # This time is multiplied by the `reconnect_exponent` value on each
-    # attempt (default: 1).
-    attr_reader :reconnect_interval #: Float
-
-    # The maximum number of seconds to wait while attempting to reconnect.
-    #
-    # The wait time increases exponentially (by `reconnect_exponent`) up to
-    # this limit (default: 30).
-    attr_reader :max_reconnect_interval #: Float
-
-    # The multiplier applied to the reconnect interval after each failed
-    # attempt (default: 2).
-    attr_reader :reconnect_exponent #: Float
+    # Backoff configuration used for reconnects and ack/nack retries.
+    attr_reader :backoff #: Backoff
 
     # Proc to derive a worker ID string for each thread and fiber.
     #
@@ -87,9 +74,9 @@ module Zizq
     # @rbs fiber_count: Integer
     # @rbs prefetch: Integer?
     # @rbs shutdown_timeout: Integer
-    # @rbs reconnect_interval: (Float | Integer)
-    # @rbs max_reconnect_interval: (Float | Integer)
-    # @rbs reconnect_exponent: (Float | Integer)
+    # @rbs retry_min_wait: (Float | Integer)
+    # @rbs retry_max_wait: (Float | Integer)
+    # @rbs retry_multiplier: (Float | Integer)
     # @rbs worker_id: (^(Integer, Integer) -> String?)?
     # @rbs logger: Logger?
     # @rbs return: void
@@ -99,9 +86,9 @@ module Zizq
       fiber_count: DEFAULT_FIBERS,
       prefetch: nil,
       shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-      reconnect_interval: DEFAULT_RECONNECT_INTERVAL,
-      max_reconnect_interval: DEFAULT_MAX_RECONNECT_INTERVAL,
-      reconnect_exponent: DEFAULT_RECONNECT_EXPONENT,
+      retry_min_wait: DEFAULT_RETRY_MIN_WAIT,
+      retry_max_wait: DEFAULT_RETRY_MAX_WAIT,
+      retry_multiplier: DEFAULT_RETRY_MULTIPLIER,
       worker_id: nil,
       logger: nil
     )
@@ -111,16 +98,26 @@ module Zizq
       @queues = queues
       @thread_count = thread_count
       @fiber_count = fiber_count
-      @prefetch = prefetch || thread_count * fiber_count
+      @prefetch = prefetch || thread_count * fiber_count * 2
       @shutdown_timeout = shutdown_timeout
-      @reconnect_interval = reconnect_interval.to_f
-      @max_reconnect_interval = max_reconnect_interval.to_f
-      @reconnect_exponent = reconnect_exponent.to_f
+      @backoff = Backoff.new(
+        min_wait:   retry_min_wait,
+        max_wait:   retry_max_wait,
+        multiplier: retry_multiplier
+      )
       @worker_id_proc = worker_id
       @logger = logger || Zizq.configuration.logger
       @shutdown = false
       @dispatch_queue = Thread::Queue.new
       @shutdown_latch = Thread::Queue.new
+
+      Zizq.configuration.validate!
+      @ack_processor = AckProcessor.new(
+        client:   Zizq.client,
+        capacity: @prefetch * 2,
+        logger:   @logger,
+        backoff:  @backoff
+      )
     end
 
     # Start the worker.
@@ -134,6 +131,7 @@ module Zizq
       logger.info { "Queues: #{queues.empty? ? '(all)' : queues.join(', ')}" }
 
       # Everything runs in the background initially.
+      @ack_processor.start
       worker_threads = start_worker_threads
       producer_thread = start_producer_thread
 
@@ -152,6 +150,9 @@ module Zizq
 
       # Workers get the full shutdown timeout to drain remaining jobs.
       join_with_deadline(worker_threads)
+
+      # Drain any pending acks/nacks after all workers have exited.
+      @ack_processor.stop(timeout: 10)
 
       logger.info { "Zizq worker stopped" }
     end
@@ -173,7 +174,6 @@ module Zizq
     def start_producer_thread #: () -> Thread
       Thread.new do
         Thread.current.name = "zizq-producer"
-        current_interval = reconnect_interval
 
         until @shutdown
           begin
@@ -185,10 +185,11 @@ module Zizq
               queues:,
               on_connect: -> {
                 logger.info { "Connected. Listening for jobs." }
-                current_interval = reconnect_interval
+                @backoff.reset
               }
             ) do |job_hash|
               begin
+                logger.debug { "Received #{job_hash.type} (#{job_hash.id}), dispatch queue: #{@dispatch_queue.size}" }
                 @dispatch_queue.push(job_hash)
               rescue ClosedQueueError
                 # Shutdown in progress — stop consuming from stream.
@@ -199,20 +200,18 @@ module Zizq
             end
 
             # Stream ended normally — reset backoff for next reconnect.
-            current_interval = reconnect_interval
+            @backoff.reset
           rescue Zizq::ConnectionError, Zizq::StreamError => e
             break if @shutdown
 
-            logger.warn { "#{e.message}. Reconnecting in #{current_interval}s..." }
-            sleep current_interval
-            current_interval = [current_interval * reconnect_exponent, max_reconnect_interval].min
+            logger.warn { "#{e.message}. Reconnecting in #{@backoff.duration}s..." }
+            @backoff.wait
           rescue => e
             break if @shutdown
 
             logger.error { "Error: #{e.class}: #{e.message}" }
             logger.debug { e.backtrace&.join("\n") }
-            sleep current_interval
-            current_interval = [current_interval * reconnect_exponent, max_reconnect_interval].min
+            @backoff.wait
           end
         end
 
@@ -246,14 +245,13 @@ module Zizq
     # and drained.
     def run_loop(thread_idx, fiber_idx) #: (Integer, Integer) -> void
       wid = resolve_worker_id(thread_idx, fiber_idx)
-      client = Zizq.client
 
       loop do
-        job_hash = @dispatch_queue.pop
         # pop returns nil when queue is closed and empty
-        break if job_hash.nil?
+        job = @dispatch_queue.pop
+        break if job.nil?
 
-        dispatch(client, job_hash, wid)
+        dispatch(job, wid)
       end
     end
 
@@ -278,7 +276,7 @@ module Zizq
     # including non-StandardError exceptions and errors from malformed job
     # hashes. This keeps the worker thread alive regardless of what happens
     # during dispatch.
-    def dispatch(client, job, worker_id) #: (Client, Resources::Job, String?) -> void
+    def dispatch(job, worker_id) #: (Resources::Job, String?) -> void
       job_type = job.type
       job_id = job.id
 
@@ -291,18 +289,13 @@ module Zizq
         Object.const_get(job_type)
       rescue NameError => e
         logger.error { "Unknown job type '#{job_type}' (#{job_id}): #{e.message}" }
-        safe_nack(client, job_id, e, worker_id:)
+        push_nack(job_id, e)
         return
       end
 
       unless job_class.is_a?(Class) && job_class.include?(Zizq::Job)
         logger.error { "#{job_type} (#{job_id}) does not include Zizq::Job" }
-        safe_nack(
-          client,
-          job_id,
-          RuntimeError.new("#{job_type} does not include Zizq::Job"),
-          worker_id:,
-        )
+        push_nack(job_id, RuntimeError.new("#{job_type} does not include Zizq::Job"))
         return
       end
 
@@ -316,36 +309,40 @@ module Zizq
         args, kwargs = zizq_job_class.zizq_deserialize(
           job.payload || { "args" => [], "kwargs" => {} }
         )
+
+        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         job_instance.perform(*args, **kwargs)
+        elapsed_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(1)
 
-        safe_ack(client, job_id, worker_id:)
+        push_ack(job_id)
 
-        logger.debug { "Completed #{job_type} (#{job_id})" }
+        logger.debug { "Completed #{job_type} (#{job_id}) in #{elapsed_ms}ms" }
       rescue Exception => e # Intentionally rescuing all Exceptions here
         logger.error { "#{job_type} (#{job_id}) failed: #{e.class}: #{e.message}" }
-        safe_nack(client, job_id, e, worker_id:)
+        push_nack(job_id, e)
       end
     rescue Exception => e
       # Last resort in the case of something truly unexpected.
       logger.error { "Dispatch error (#{job_id || 'unknown'}): #{e.class}: #{e.message}" }
-      safe_nack(client, job_id, e, worker_id:) if job_id
+      push_nack(job_id, e) if job_id
     end
 
-    def safe_ack(client, job_id, worker_id: nil) #: (Client, String, ?worker_id: String?) -> void
-      client.report_success(job_id)
-    rescue => e
-      logger.error { "Failed to ack #{job_id}: #{e.message}" }
+    # @rbs job_id: String
+    # @rbs return: void
+    def push_ack(job_id)
+      @ack_processor.push(AckProcessor::Ack.new(job_id:))
     end
 
-    def safe_nack(client, job_id, error, worker_id: nil) #: (Client, String, Exception, ?worker_id: String?) -> void
-      client.report_failure(
-        job_id,
-        error: "#{error.class}: #{error.message}",
+    # @rbs job_id: String
+    # @rbs error: Exception
+    # @rbs return: void
+    def push_nack(job_id, error)
+      @ack_processor.push(AckProcessor::Nack.new(
+        job_id:     job_id,
+        error:      "#{error.class}: #{error.message}",
         error_type: error.class.name,
-        backtrace: error.backtrace&.join("\n")
-      )
-    rescue => e
-      logger.error { "Failed to nack #{job_id}: #{e.message}" }
+        backtrace:  error.backtrace&.join("\n")
+      ))
     end
 
     def resolve_worker_id(thread_idx, fiber_idx) #: (Integer, Integer) -> String?

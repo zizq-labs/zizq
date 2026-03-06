@@ -8,8 +8,7 @@ $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "zizq"
 require "minitest/autorun"
 require "webmock/minitest"
-require "httpx/adapters/webmock"
+require "async/http"
+require "webmock/http_lib_adapters/async_http_client_adapter"
 
-# The HTTPX adapter is registered after WebMock.enable! was called,
-# so we need to explicitly enable it.
-WebMock::HttpLibAdapters::HttpxAdapter.enable!
+WebMock::HttpLibAdapters::AsyncHttpClientAdapter.enable!

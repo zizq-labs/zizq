@@ -60,11 +60,11 @@ class TestWorker < Minitest::Test
     worker = Zizq::Worker.new
     assert_equal 5, worker.thread_count
     assert_equal 1, worker.fiber_count
-    assert_equal 5, worker.prefetch
+    assert_equal 10, worker.prefetch
     assert_equal [], worker.queues
     assert_equal 30, worker.shutdown_timeout
-    assert_equal 1, worker.reconnect_interval
-    assert_equal 30, worker.max_reconnect_interval
+    assert_equal 1, worker.backoff.min_wait
+    assert_equal 30, worker.backoff.max_wait
   end
 
   def test_custom_prefetch
@@ -74,7 +74,7 @@ class TestWorker < Minitest::Test
 
   def test_default_prefetch_is_threads_times_fibers
     worker = Zizq::Worker.new(thread_count: 4, fiber_count: 3)
-    assert_equal 12, worker.prefetch
+    assert_equal 24, worker.prefetch
   end
 
   def test_dispatches_job_successfully
