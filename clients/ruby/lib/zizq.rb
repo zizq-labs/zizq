@@ -14,6 +14,7 @@ autoload :MessagePack, "msgpack"
 module Zizq
   autoload :AckProcessor,   "zizq/ack_processor"
   autoload :Backoff,        "zizq/backoff"
+  autoload :BulkEnqueue,    "zizq/bulk_enqueue"
   autoload :Client,         "zizq/client"
   autoload :EnqueueOptions, "zizq/enqueue_options"
   autoload :Job,            "zizq/job"
@@ -105,6 +106,47 @@ module Zizq
     # @rbs &block: ?(EnqueueOptions) -> void
     # @rbs return: Resources::Job
     def enqueue(job_class, *args, **kwargs, &block)
+      client.enqueue(**build_enqueue_params(job_class, *args, **kwargs, &block))
+    end
+
+    # Enqueue multiple jobs atomically in a single bulk request.
+    #
+    # This can significantly imprive throughput when many jobs need to be
+    # enqueued collectively. There is no upper limit on the number of jobs in
+    # the request though generally it is probably wise to keep this to less
+    # than 1000 jobs unless you have strong atomicity requuirements for a
+    # larger number of jobs..
+    #
+    # Yields a builder object whose `#enqueue` method accepts the same
+    # arguments as `Zizq.enqueue`. All collected jobs are sent as a
+    # single `POST /jobs/bulk` request and an array of jobs is returned in the
+    # same order as the inputs.
+    #
+    #   Zizq.enqueue_bulk do |b|
+    #     b.enqueue(ProcessPaymentJob, 7)
+    #     b.enqueue(SendEmailJob, 42, template: "welcome")
+    #     b.enqueue(SendEmailJob, 42) { |o| o.queue = "priority" }
+    #   end
+    #
+    # @rbs &block: (BulkEnqueue) -> void
+    # @rbs return: Array[Resources::Job]
+    def enqueue_bulk(&block)
+      builder = BulkEnqueue.new
+      yield builder
+      jobs_params = builder.jobs
+      return [] if jobs_params.empty?
+      client.enqueue_bulk(jobs: jobs_params)
+    end
+
+    # @api private
+    # Build the params hash for a single enqueue call.
+    #
+    # @rbs job_class: Class & Zizq::job_class
+    # @rbs args: Array[untyped]
+    # @rbs kwargs: Hash[Symbol, untyped]
+    # @rbs &block: ?(EnqueueOptions) -> void
+    # @rbs return: Hash[Symbol, untyped]
+    def build_enqueue_params(job_class, *args, **kwargs, &block)
       unless job_class.is_a?(Class) && job_class < Zizq::Job
         raise ArgumentError, "#{job_class.inspect} must include Zizq::Job"
       end
@@ -152,7 +194,7 @@ module Zizq
       # handles the conversion to the server's millisecond format.
       params[:ready_at] = Time.now.to_f + opts.delay.to_f if opts.delay
 
-      client.enqueue(**params)
+      params
     end
   end
 end

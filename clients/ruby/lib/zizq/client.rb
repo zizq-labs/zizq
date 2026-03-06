@@ -107,6 +107,33 @@ module Zizq
       Resources::Job.new(self, data)
     end
 
+    # Enqueue multiple jobs atomically in a single bulk request.
+    #
+    # This is a low-level primitive that makes a direct API call to the server
+    # using the Zizq API's expected inputs. Callers should generally use
+    # [`Zizq::enqueue_bulk`] instead.
+    #
+    # Returns an array of resource instances wrapping the API response.
+    #
+    # @rbs jobs: Array[Hash[Symbol, untyped]]
+    # @rbs return: Array[Resources::Job]
+    def enqueue_bulk(jobs:)
+      body = { jobs: jobs.map { |j|
+        wire = { type: j[:type], queue: j[:queue], payload: j[:payload] } #: Hash[Symbol, untyped]
+        wire[:priority] = j[:priority] if j[:priority]
+        # ready_at is fractional seconds in Ruby; the server expects ms.
+        wire[:ready_at] = (j[:ready_at] * 1000).to_i if j[:ready_at]
+        wire[:retry_limit] = j[:retry_limit] if j[:retry_limit]
+        wire[:backoff] = j[:backoff] if j[:backoff]
+        wire[:retention] = j[:retention] if j[:retention]
+        wire
+      }}
+
+      response = post("/jobs/bulk", body)
+      data = handle_response!(response, expected: 201)
+      data["jobs"].map { |j| Resources::Job.new(self, j) }
+    end
+
     # Get a single job by ID.
     def get_job(id) #: (String) -> Resources::Job
       response = get("/jobs/#{id}")

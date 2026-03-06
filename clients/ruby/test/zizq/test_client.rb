@@ -88,6 +88,88 @@ class TestClient < Minitest::Test
     assert_equal "queue is required", err.message
   end
 
+  # --- enqueue_bulk ---
+
+  def test_enqueue_bulk_json
+    jobs_response = { "jobs" => [
+      { "id" => "j1", "type" => "SendEmail", "queue" => "emails", "status" => "ready" },
+      { "id" => "j2", "type" => "ProcessOrder", "queue" => "orders", "status" => "ready" }
+    ] }
+
+    stub_request(:post, "#{URL}/jobs/bulk")
+      .with(
+        body: JSON.generate({
+          jobs: [
+            { type: "SendEmail", queue: "emails", payload: { user_id: 42 } },
+            { type: "ProcessOrder", queue: "orders", payload: { order_id: 7 } }
+          ]
+        }),
+        headers: { "Content-Type" => "application/json", "Accept" => "application/json" }
+      )
+      .to_return(status: 201, body: JSON.generate(jobs_response),
+                 headers: { "Content-Type" => "application/json" })
+
+    result = @json_client.enqueue_bulk(jobs: [
+      { type: "SendEmail", queue: "emails", payload: { user_id: 42 } },
+      { type: "ProcessOrder", queue: "orders", payload: { order_id: 7 } }
+    ])
+    assert_instance_of Array, result
+    assert_equal 2, result.size
+    assert_instance_of Zizq::Resources::Job, result[0]
+    assert_equal "j1", result[0].id
+    assert_equal "j2", result[1].id
+  end
+
+  def test_enqueue_bulk_msgpack
+    jobs_response = { "jobs" => [
+      { "id" => "j1", "type" => "SendEmail", "queue" => "emails", "status" => "ready" }
+    ] }
+
+    stub_request(:post, "#{URL}/jobs/bulk")
+      .with(
+        body: MessagePack.pack({
+          jobs: [{ type: "SendEmail", queue: "emails", payload: { user_id: 42 } }]
+        }),
+        headers: { "Content-Type" => "application/msgpack", "Accept" => "application/msgpack" }
+      )
+      .to_return(status: 201, body: MessagePack.pack(jobs_response),
+                 headers: { "Content-Type" => "application/msgpack" })
+
+    result = @msgpack_client.enqueue_bulk(jobs: [
+      { type: "SendEmail", queue: "emails", payload: { user_id: 42 } }
+    ])
+    assert_instance_of Array, result
+    assert_equal 1, result.size
+    assert_instance_of Zizq::Resources::Job, result[0]
+    assert_equal "j1", result[0].id
+  end
+
+  def test_enqueue_bulk_400_raises_client_error
+    stub_request(:post, "#{URL}/jobs/bulk")
+      .to_return(status: 400, body: JSON.generate({ "error" => "invalid job type" }),
+                 headers: { "Content-Type" => "application/json" })
+
+    err = assert_raises(Zizq::ClientError) do
+      @json_client.enqueue_bulk(jobs: [{ type: "", queue: "", payload: {} }])
+    end
+    assert_equal 400, err.status
+    assert_equal "invalid job type", err.message
+  end
+
+  def test_enqueue_bulk_converts_ready_at_to_ms
+    stub_request(:post, "#{URL}/jobs/bulk")
+      .with { |req|
+        body = JSON.parse(req.body)
+        body["jobs"][0]["ready_at"] == 9_999_000
+      }
+      .to_return(status: 201, body: JSON.generate({ "jobs" => [{ "id" => "x" }] }),
+                 headers: { "Content-Type" => "application/json" })
+
+    @json_client.enqueue_bulk(jobs: [
+      { type: "Job", queue: "q", payload: {}, ready_at: 9999.0 }
+    ])
+  end
+
   # --- get_job ---
 
   def test_get_job

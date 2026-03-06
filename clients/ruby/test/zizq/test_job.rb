@@ -325,4 +325,62 @@ class TestJob < Minitest::Test
     klass = Class.new { include Zizq::Job }
     assert_raises(ArgumentError) { Zizq.enqueue(klass) }
   end
+
+  # --- Zizq.enqueue_bulk ---
+
+  def test_enqueue_bulk_collects_and_sends_single_request
+    jobs_response = { "jobs" => [
+      { "id" => "j1", "type" => "SendEmailJob", "queue" => "emails", "status" => "ready" },
+      { "id" => "j2", "type" => "DefaultQueueJob", "queue" => "default", "status" => "ready" }
+    ] }
+
+    stub_request(:post, "#{URL}/jobs/bulk")
+      .with { |req|
+        body = JSON.parse(req.body)
+        body["jobs"].size == 2 &&
+          body["jobs"][0]["type"] == "SendEmailJob" &&
+          body["jobs"][0]["queue"] == "emails" &&
+          body["jobs"][0]["payload"] == { "args" => [42], "kwargs" => { "template" => "welcome" } } &&
+          body["jobs"][1]["type"] == "DefaultQueueJob" &&
+          body["jobs"][1]["queue"] == "default"
+      }
+      .to_return(status: 201, body: JSON.generate(jobs_response),
+                 headers: { "Content-Type" => "application/json" })
+
+    result = Zizq.enqueue_bulk do |b|
+      b.enqueue(SendEmailJob, 42, template: "welcome")
+      b.enqueue(DefaultQueueJob)
+    end
+
+    assert_instance_of Array, result
+    assert_equal 2, result.size
+    assert_equal "j1", result[0].id
+    assert_equal "j2", result[1].id
+  end
+
+  def test_enqueue_bulk_supports_option_overrides
+    stub_request(:post, "#{URL}/jobs/bulk")
+      .with { |req|
+        body = JSON.parse(req.body)
+        body["jobs"][0]["queue"] == "priority" &&
+          body["jobs"][0]["priority"] == 100
+      }
+      .to_return(status: 201, body: JSON.generate({ "jobs" => [{ "id" => "j1" }] }),
+                 headers: { "Content-Type" => "application/json" })
+
+    Zizq.enqueue_bulk do |b|
+      b.enqueue(SendEmailJob, 42) { |o| o.queue = "priority"; o.priority = 100 }
+    end
+  end
+
+  def test_enqueue_bulk_empty_returns_empty_array
+    result = Zizq.enqueue_bulk { |_b| }
+    assert_equal [], result
+  end
+
+  def test_enqueue_bulk_rejects_non_job_class
+    assert_raises(ArgumentError) do
+      Zizq.enqueue_bulk { |b| b.enqueue(String) }
+    end
+  end
 end
