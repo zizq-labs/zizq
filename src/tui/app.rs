@@ -20,7 +20,7 @@ pub struct App {
     pub server_version: Option<String>,
     pub server_uptime_ms: Option<u64>,
     pub ready_jobs: Vec<AdminJobSummary>,
-    pub working_jobs: Vec<AdminJobSummary>,
+    pub in_flight_jobs: Vec<AdminJobSummary>,
     pub now_ms: u64,
 }
 
@@ -31,7 +31,7 @@ impl App {
             server_version: None,
             server_uptime_ms: None,
             ready_jobs: Vec::new(),
-            working_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
             now_ms: 0,
         }
     }
@@ -53,9 +53,9 @@ impl App {
                 self.server_version = Some(version);
                 self.server_uptime_ms = Some(uptime_ms);
             }
-            Event::ServerJobSnapshot { ready, working } => {
+            Event::ServerJobSnapshot { ready, in_flight } => {
                 self.ready_jobs = ready;
-                self.working_jobs = working;
+                self.in_flight_jobs = in_flight;
             }
             Event::ServerJobChanged { id, status, job } => match status {
                 JobChangeStatus::Ready => {
@@ -72,30 +72,30 @@ impl App {
                         }
                     }
                 }
-                JobChangeStatus::Working => {
+                JobChangeStatus::InFlight => {
                     self.ready_jobs.retain(|j| j.id != id);
                     if let Some(job) = job {
                         let dequeued = job.dequeued_at.unwrap_or(0);
                         // Determine where in the list the job should sit.
                         let pos = self
-                            .working_jobs
+                            .in_flight_jobs
                             .partition_point(|j| j.dequeued_at.unwrap_or(0) < dequeued);
                         // Insert the element at this position (unless it would
                         // be a duplicate).
-                        if self.working_jobs.get(pos).is_none_or(|j| j.id != id) {
-                            self.working_jobs.insert(pos, job);
+                        if self.in_flight_jobs.get(pos).is_none_or(|j| j.id != id) {
+                            self.in_flight_jobs.insert(pos, job);
                         }
                     }
                 }
                 JobChangeStatus::ReadyRemoved => {
                     self.ready_jobs.retain(|j| j.id != id);
                 }
-                JobChangeStatus::WorkingRemoved => {
-                    self.working_jobs.retain(|j| j.id != id);
+                JobChangeStatus::InFlightRemoved => {
+                    self.in_flight_jobs.retain(|j| j.id != id);
                 }
                 JobChangeStatus::Completed | JobChangeStatus::Dead => {
                     self.ready_jobs.retain(|j| j.id != id);
-                    self.working_jobs.retain(|j| j.id != id);
+                    self.in_flight_jobs.retain(|j| j.id != id);
                 }
             },
             Event::ServerDisconnected => {
@@ -103,7 +103,7 @@ impl App {
                 self.server_version = None;
                 self.server_uptime_ms = None;
                 self.ready_jobs.clear();
-                self.working_jobs.clear();
+                self.in_flight_jobs.clear();
             }
         }
         false
@@ -135,10 +135,10 @@ mod tests {
         }
     }
 
-    fn working_event(id: &str, dequeued_at: u64) -> Event {
+    fn in_flight_event(id: &str, dequeued_at: u64) -> Event {
         Event::ServerJobChanged {
             id: id.to_string(),
-            status: JobChangeStatus::Working,
+            status: JobChangeStatus::InFlight,
             job: Some(job(id, 0, Some(dequeued_at))),
         }
     }
@@ -183,7 +183,7 @@ mod tests {
         assert!(app.server_version.is_none());
         assert!(app.server_uptime_ms.is_none());
         assert!(app.ready_jobs.is_empty());
-        assert!(app.working_jobs.is_empty());
+        assert!(app.in_flight_jobs.is_empty());
     }
 
     // ── Snapshot ────────────────────────────────────────────────────
@@ -195,11 +195,11 @@ mod tests {
 
         app.handle_event(Event::ServerJobSnapshot {
             ready: vec![job("r1", 0, None)],
-            working: vec![job("w1", 0, Some(100))],
+            in_flight: vec![job("w1", 0, Some(100))],
         });
 
         assert_eq!(ids(&app.ready_jobs), vec!["r1"]);
-        assert_eq!(ids(&app.working_jobs), vec!["w1"]);
+        assert_eq!(ids(&app.in_flight_jobs), vec!["w1"]);
     }
 
     // ── Ready insertion ─────────────────────────────────────────────
@@ -223,36 +223,36 @@ mod tests {
         assert_eq!(app.ready_jobs.len(), 1);
     }
 
-    // ── Working insertion ───────────────────────────────────────────
+    // ── In-flight insertion ──────────────────────────────────────────
 
     #[test]
-    fn working_inserts_in_dequeued_order() {
+    fn in_flight_inserts_in_dequeued_order() {
         let mut app = App::new();
-        app.handle_event(working_event("w2", 200));
-        app.handle_event(working_event("w1", 100));
-        app.handle_event(working_event("w3", 300));
+        app.handle_event(in_flight_event("w2", 200));
+        app.handle_event(in_flight_event("w1", 100));
+        app.handle_event(in_flight_event("w3", 300));
 
-        assert_eq!(ids(&app.working_jobs), vec!["w1", "w2", "w3"]);
+        assert_eq!(ids(&app.in_flight_jobs), vec!["w1", "w2", "w3"]);
     }
 
     #[test]
-    fn working_removes_from_ready() {
+    fn in_flight_removes_from_ready() {
         let mut app = App::new();
         app.handle_event(ready_event("j1", 0));
         assert_eq!(app.ready_jobs.len(), 1);
 
-        app.handle_event(working_event("j1", 100));
+        app.handle_event(in_flight_event("j1", 100));
         assert!(app.ready_jobs.is_empty());
-        assert_eq!(ids(&app.working_jobs), vec!["j1"]);
+        assert_eq!(ids(&app.in_flight_jobs), vec!["j1"]);
     }
 
     #[test]
-    fn working_deduplicates() {
+    fn in_flight_deduplicates() {
         let mut app = App::new();
-        app.handle_event(working_event("j1", 100));
-        app.handle_event(working_event("j1", 100));
+        app.handle_event(in_flight_event("j1", 100));
+        app.handle_event(in_flight_event("j1", 100));
 
-        assert_eq!(app.working_jobs.len(), 1);
+        assert_eq!(app.in_flight_jobs.len(), 1);
     }
 
     // ── Removals ────────────────────────────────────────────────────
@@ -273,25 +273,25 @@ mod tests {
     }
 
     #[test]
-    fn working_removed_removes_from_working() {
+    fn in_flight_removed_removes_from_in_flight() {
         let mut app = App::new();
-        app.handle_event(working_event("j1", 100));
-        app.handle_event(working_event("j2", 200));
+        app.handle_event(in_flight_event("j1", 100));
+        app.handle_event(in_flight_event("j2", 200));
 
         app.handle_event(Event::ServerJobChanged {
             id: "j1".to_string(),
-            status: JobChangeStatus::WorkingRemoved,
+            status: JobChangeStatus::InFlightRemoved,
             job: None,
         });
 
-        assert_eq!(ids(&app.working_jobs), vec!["j2"]);
+        assert_eq!(ids(&app.in_flight_jobs), vec!["j2"]);
     }
 
     #[test]
     fn completed_removes_from_both() {
         let mut app = App::new();
         app.handle_event(ready_event("r1", 0));
-        app.handle_event(working_event("w1", 100));
+        app.handle_event(in_flight_event("w1", 100));
 
         app.handle_event(Event::ServerJobChanged {
             id: "r1".to_string(),
@@ -305,7 +305,7 @@ mod tests {
         });
 
         assert!(app.ready_jobs.is_empty());
-        assert!(app.working_jobs.is_empty());
+        assert!(app.in_flight_jobs.is_empty());
     }
 
     #[test]

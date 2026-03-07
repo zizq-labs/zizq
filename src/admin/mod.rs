@@ -26,10 +26,10 @@ pub enum AdminEvent {
     /// Periodic heartbeat with server metadata.
     Heartbeat { version: String, uptime_ms: u64 },
 
-    /// Snapshot of ready and working job queues.
+    /// Snapshot of ready and in-flight job queues.
     JobSnapshot {
         ready: Vec<AdminJobSummary>,
-        working: Vec<AdminJobSummary>,
+        in_flight: Vec<AdminJobSummary>,
     },
 
     /// Incremental change to a single job's status.
@@ -47,8 +47,8 @@ pub enum AdminEvent {
 pub enum JobChangeStatus {
     Ready,
     ReadyRemoved,
-    Working,
-    WorkingRemoved,
+    InFlight,
+    InFlightRemoved,
     Completed,
     Dead,
 }
@@ -115,7 +115,7 @@ mod tests {
             license: License::Free,
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
-            global_working_limit: 0,
+            global_in_flight_limit: 0,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(now_millis),

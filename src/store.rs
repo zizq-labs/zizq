@@ -106,8 +106,8 @@ pub enum JobStatus {
     /// The job is in the priority queue ready to be worked.
     Ready = 1,
 
-    /// The job is currently being processed by a worker.
-    Working = 2,
+    /// The job has been delivered to a client and is in-flight.
+    InFlight = 2,
 
     /// The job was successfully completed by a worker.
     Completed = 3,
@@ -129,7 +129,7 @@ impl TryFrom<u8> for JobStatus {
         match v {
             0 => Ok(Self::Scheduled),
             1 => Ok(Self::Ready),
-            2 => Ok(Self::Working),
+            2 => Ok(Self::InFlight),
             3 => Ok(Self::Completed),
             4 => Ok(Self::Dead),
             other => Err(other),
@@ -614,7 +614,7 @@ pub struct FailureOptions {
 pub struct BulkCompleteResult {
     /// IDs that were successfully marked as completed.
     pub completed: Vec<String>,
-    /// IDs that were not found in the working set.
+    /// IDs that were not found in the in-flight set.
     pub not_found: Vec<String>,
 }
 
@@ -648,7 +648,7 @@ pub enum StoreEvent {
     },
 
     /// A job was taken from the ready queue and is now being worked on.
-    JobWorking { id: String },
+    JobInFlight { id: String },
 
     /// A job was successfully completed and removed.
     JobCompleted { id: String },
@@ -1466,7 +1466,7 @@ pub enum CommitMode {
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// Block cache capacity in bytes. Shared across all keyspaces.
-    /// Increase when the working set of filter + index + hot data blocks
+    /// Increase when the in-flight set of filter + index + hot data blocks
     /// exceeds the default. Recommended: 20–25 % of available memory.
     pub cache_size: u64,
 
@@ -1994,7 +1994,7 @@ impl Store {
     /// Take the next job from the priority index.
     ///
     /// Atomically claims the highest-priority (lowest number), oldest job
-    /// from the lock-free ready index and marks it as working. Returns `None`
+    /// from the lock-free ready index and marks it as in-flight. Returns `None`
     /// if no ready jobs match.
     ///
     /// When `queues` is non-empty, only jobs in the specified queues are
@@ -2093,9 +2093,9 @@ impl Store {
                     }
 
                     let old_status_key = make_status_key(JobStatus::Ready, &job.id);
-                    let new_status_key = make_status_key(JobStatus::Working, &job.id);
+                    let new_status_key = make_status_key(JobStatus::InFlight, &job.id);
 
-                    job.status = JobStatus::Working.into();
+                    job.status = JobStatus::InFlight.into();
                     job.dequeued_at = Some(now);
 
                     let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
@@ -2208,11 +2208,11 @@ impl Store {
 
         let jobs = await_sync(result).await?;
 
-        // Broadcast JobWorking for each taken job.
+        // Broadcast JobInFlight for each taken job.
         for job in &jobs {
             let _ = self
                 .event_tx
-                .send(StoreEvent::JobWorking { id: job.id.clone() });
+                .send(StoreEvent::JobInFlight { id: job.id.clone() });
         }
 
         Ok(jobs)
@@ -2222,7 +2222,7 @@ impl Store {
     ///
     /// Transitions the job to Completed status and sets `purge_at` so the
     /// reaper will hard-delete it after the retention period. Returns `true`
-    /// if the job was found in the working state, `false` if it was not.
+    /// if the job was found in the in-flight state, `false` if it was not.
     ///
     /// Subscribers are notified on success.
     pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
@@ -2247,7 +2247,7 @@ impl Store {
 
                 let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-                if job.status != JobStatus::Working as u8 {
+                if job.status != JobStatus::InFlight as u8 {
                     return Ok((false, None));
                 }
 
@@ -2259,7 +2259,7 @@ impl Store {
 
                 if retention_ms == 0 {
                     // Zero retention: prepare deletion keys outside tx.
-                    let del = prepare_job_deletion(&job, JobStatus::Working, &ks);
+                    let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
 
                     // ---- inside tx ----
                     let mut tx = ks.write_tx();
@@ -2279,7 +2279,7 @@ impl Store {
                 // Non-zero retention: defer deletion to the reaper.
                 let purge_at = now + retention_ms;
 
-                let old_status_key = make_status_key(JobStatus::Working, &id);
+                let old_status_key = make_status_key(JobStatus::InFlight, &id);
                 let new_status_key = make_status_key(JobStatus::Completed, &id);
                 let purge_key = make_purge_key(purge_at, &id);
 
@@ -2325,7 +2325,7 @@ impl Store {
 
     /// Mark multiple jobs as successfully completed in a single transaction.
     ///
-    /// Jobs not found in the working set are collected in `not_found` but
+    /// Jobs not found in the in-flight set are collected in `not_found` but
     /// do not prevent valid jobs from being committed. Returns a
     /// `BulkCompleteResult` with both lists.
     pub async fn mark_completed_bulk(
@@ -2379,7 +2379,7 @@ impl Store {
 
                     let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-                    if job.status != JobStatus::Working as u8 {
+                    if job.status != JobStatus::InFlight as u8 {
                         not_found.push(id.clone());
                         continue;
                     }
@@ -2391,7 +2391,7 @@ impl Store {
                         .unwrap_or(default_completed_retention_ms);
 
                     if retention_ms == 0 {
-                        let del = prepare_job_deletion(&job, JobStatus::Working, &ks);
+                        let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
                         prepared.push(Prepared {
                             id: id.clone(),
                             pre_bytes,
@@ -2402,7 +2402,7 @@ impl Store {
                         });
                     } else {
                         let purge_at = now + retention_ms;
-                        let old_status_key = make_status_key(JobStatus::Working, id);
+                        let old_status_key = make_status_key(JobStatus::InFlight, id);
                         let new_status_key = make_status_key(JobStatus::Completed, id);
                         let purge_key = make_purge_key(purge_at, id);
 
@@ -2507,9 +2507,9 @@ impl Store {
     /// depending on the backoff policy.
     ///
     /// Returns `Some(job)` with metadata-only fields if the job was found in
-    /// the Working state. The returned job's status will be either `Scheduled`
+    /// the InFlight state. The returned job's status will be either `Scheduled`
     /// in the retry scenario or `Dead` if the retry limit has been reached.
-    /// Returns `None` if the job wasn't found or wasn't in the Working state.
+    /// Returns `None` if the job wasn't found or wasn't in the InFlight state.
     ///
     /// Dead jobs are transitioned to Dead status with a `purge_at` timestamp
     /// so the reaper can hard-delete them after the retention period.
@@ -2552,7 +2552,7 @@ impl Store {
 
                 let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-                if job.status != JobStatus::Working as u8 {
+                if job.status != JobStatus::InFlight as u8 {
                     return Ok((None, None));
                 }
 
@@ -2588,7 +2588,7 @@ impl Store {
                     job.ready_at = now + delay_ms;
                 };
 
-                let old_status_key = make_status_key(JobStatus::Working, &id);
+                let old_status_key = make_status_key(JobStatus::InFlight, &id);
 
                 if job.status == JobStatus::Scheduled as u8 {
                     let new_status_key = make_status_key(JobStatus::Scheduled, &id);
@@ -2624,7 +2624,7 @@ impl Store {
 
                 if retention_ms == 0 {
                     // Zero retention: prepare deletion keys outside tx.
-                    let del = prepare_job_deletion(&job, JobStatus::Working, &ks);
+                    let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
 
                     // ---- inside tx ----
                     let mut tx = ks.write_tx();
@@ -2741,13 +2741,13 @@ impl Store {
         self.event_tx.subscribe()
     }
 
-    /// Atomically move a working job back to the priority queue.
+    /// Atomically move a in-flight job back to the priority queue.
     ///
     /// Looks up the job from the `jobs` keyspace to reconstruct its
     /// prioritised queue keys.
     ///
     /// Returns `true` if the job was actually requeued, `false` if it was
-    /// already acked (no longer in the working state).
+    /// already acked (no longer in the in-flight state).
     ///
     /// Subscribers are notified.
     pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
@@ -2771,11 +2771,11 @@ impl Store {
 
                 let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
-                if job.status != JobStatus::Working as u8 {
+                if job.status != JobStatus::InFlight as u8 {
                     return Ok((None, None));
                 }
 
-                let old_status_key = make_status_key(JobStatus::Working, &id);
+                let old_status_key = make_status_key(JobStatus::InFlight, &id);
                 let new_status_key = make_status_key(JobStatus::Ready, &id);
 
                 let queue = job.queue.clone();
@@ -3466,8 +3466,8 @@ impl Store {
     ///
     /// Three-phase recovery that must run before accepting requests:
     ///
-    /// 1. Working -> Ready: If the server crashed while jobs were being
-    ///    processed, those jobs are stuck in the `Working` state with no
+    /// 1. InFlight -> Ready: If the server crashed while jobs were being
+    ///    processed, those jobs are stuck in the `InFlight` state with no
     ///    client handling them. This phase scans the status index and
     ///    atomically moves them back to `Ready`.
     ///
@@ -3485,26 +3485,28 @@ impl Store {
     /// fired for recovered jobs).
     ///
     /// Returns `(recovered, ready_indexed, scheduled_indexed)` — the number
-    /// of orphaned working jobs moved back to Ready, the total number of
+    /// of orphaned in-flight jobs moved back to Ready, the total number of
     /// Ready jobs in the index, and the total number of Scheduled jobs in
     /// the index.
     /// Rebuild all in-memory indexes asynchronously.
     ///
     /// Sets `index_ready` to `false` while rebuilding. Scheduled-index
-    /// rebuild runs concurrently with working-job recovery (disjoint status
+    /// rebuild runs concurrently with in-flight-job recovery (disjoint status
     /// ranges). The ready-index rebuild waits for recovery so its snapshot
-    /// includes the Working→Ready transitions. Emits `IndexRebuilt` when
+    /// includes the InFlight→Ready transitions. Emits `IndexRebuilt` when
     /// all three complete.
     pub async fn rebuild_indexes(&self) -> Result<(usize, usize, usize), StoreError> {
         self.index_ready.store(false, Ordering::Release);
 
-        // Scheduled-index rebuild can run alongside working-job recovery
+        // Scheduled-index rebuild can run alongside in-flight-job recovery
         // since they scan disjoint status ranges.
-        let (recovered, scheduled) =
-            tokio::try_join!(self.recover_working_jobs(), self.rebuild_scheduled_index(),)?;
+        let (recovered, scheduled) = tokio::try_join!(
+            self.recover_in_flight_jobs(),
+            self.rebuild_scheduled_index(),
+        )?;
 
         // Ready-index rebuild must wait for recovery so its snapshot
-        // includes the Working→Ready transitions.
+        // includes the InFlight→Ready transitions.
         let ready = self.rebuild_ready_index().await?;
 
         self.index_ready.store(true, Ordering::Release);
@@ -3512,7 +3514,7 @@ impl Store {
         Ok((recovered, ready, scheduled))
     }
 
-    /// Recover orphaned working jobs and rebuild indexes.
+    /// Recover orphaned in-flight jobs and rebuild indexes.
     ///
     /// Convenience wrapper around `rebuild_indexes()` so that tests and
     /// callers that used `recover()` keep working unchanged.
@@ -3520,23 +3522,23 @@ impl Store {
         self.rebuild_indexes().await
     }
 
-    /// Move orphaned working jobs back to Ready in the LSM indexes.
+    /// Move orphaned in-flight jobs back to Ready in the LSM indexes.
     ///
     /// Does not touch the in-memory ready index — that's handled by
     /// `rebuild_ready_index`, which runs immediately after.
-    async fn recover_working_jobs(&self) -> Result<usize, StoreError> {
+    async fn recover_in_flight_jobs(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Scan the status index for all Working jobs.
-            // Working = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
-            let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Working as u8, 0];
-            let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::Working as u8 + 1, 0];
+            // Scan the status index for all InFlight jobs.
+            // InFlight = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
+            let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8, 0];
+            let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8 + 1, 0];
             let range = (Bound::Included(start), Bound::Excluded(end));
 
             // Collect IDs first — we can't hold an iterator across the write tx.
             let snapshot = ks.db.read_tx();
-            let working_ids: Vec<String> = snapshot
+            let in_flight_ids: Vec<String> = snapshot
                 .range::<Vec<u8>, _>(&ks.index, range)
                 .map(|entry| {
                     let (key, _) = entry.into_inner()?;
@@ -3548,25 +3550,25 @@ impl Store {
                 .collect::<Result<_, _>>()?;
             drop(snapshot);
 
-            if working_ids.is_empty() {
+            if in_flight_ids.is_empty() {
                 return Ok((0, None));
             }
 
             // Recovery runs at startup before concurrent access, so we
             // can safely read and write in place inside the tx.
-            let count = working_ids.len();
+            let count = in_flight_ids.len();
             let mut tx = ks.write_tx();
 
-            for id in &working_ids {
+            for id in &in_flight_ids {
                 let job_key = make_job_key(id);
                 let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
                     StoreError::Corruption(format!(
-                        "working job missing from data keyspace: {id:?}"
+                        "in-flight job missing from data keyspace: {id:?}"
                     ))
                 })?;
                 let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                let old_status_key = make_status_key(JobStatus::Working, id);
+                let old_status_key = make_status_key(JobStatus::InFlight, id);
                 let new_status_key = make_status_key(JobStatus::Ready, id);
                 job.status = JobStatus::Ready.into();
                 let updated_bytes = rmp_serde::to_vec_named(&job)?;
@@ -4103,7 +4105,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.priority, 1);
-        assert_eq!(job.status, u8::from(JobStatus::Working));
+        assert_eq!(job.status, u8::from(JobStatus::InFlight));
         assert_eq!(job.payload, Some(serde_json::json!("high")));
     }
 
@@ -4308,7 +4310,7 @@ mod tests {
                 let mut taken = Vec::new();
                 while let Some(job) = store.take_next_job(now_millis(), &queues).await.unwrap() {
                     taken.push(job.id.clone());
-                    // Also verify the ack works (job is in Working status).
+                    // Also verify the ack works (job is in InFlight status).
                     assert!(
                         store.mark_completed(now_millis(), &job.id).await.unwrap(),
                         "mark_completed returned false for job {}",
@@ -4711,7 +4713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_next_n_jobs_marks_working() {
+    async fn take_next_n_jobs_marks_in_flight() {
         let store = test_store();
         for i in 0..3 {
             store
@@ -4728,7 +4730,7 @@ mod tests {
             .await
             .unwrap();
         for job in &jobs {
-            assert_eq!(job.status, u8::from(JobStatus::Working));
+            assert_eq!(job.status, u8::from(JobStatus::InFlight));
             assert!(job.dequeued_at.is_some());
         }
     }
@@ -4781,17 +4783,17 @@ mod tests {
             .unwrap();
         assert_eq!(jobs.len(), 2);
 
-        // We should receive exactly 2 JobWorking events.
-        let mut working_ids = Vec::new();
+        // We should receive exactly 2 JobInFlight events.
+        let mut in_flight_ids = Vec::new();
         for _ in 0..2 {
             match rx.try_recv() {
-                Ok(StoreEvent::JobWorking { id }) => working_ids.push(id),
-                other => panic!("expected JobWorking, got {:?}", other),
+                Ok(StoreEvent::JobInFlight { id }) => in_flight_ids.push(id),
+                other => panic!("expected JobInFlight, got {:?}", other),
             }
         }
-        assert_eq!(working_ids.len(), 2);
-        assert!(working_ids.contains(&jobs[0].id));
-        assert!(working_ids.contains(&jobs[1].id));
+        assert_eq!(in_flight_ids.len(), 2);
+        assert!(in_flight_ids.contains(&jobs[0].id));
+        assert!(in_flight_ids.contains(&jobs[1].id));
     }
 
     #[tokio::test]
@@ -4856,7 +4858,7 @@ mod tests {
             .unwrap();
         assert_eq!(retaken.id, high.id);
         assert_eq!(retaken.priority, 1);
-        assert_eq!(retaken.status, u8::from(JobStatus::Working));
+        assert_eq!(retaken.status, u8::from(JobStatus::InFlight));
     }
 
     #[tokio::test]
@@ -5219,7 +5221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_jobs_includes_working_jobs() {
+    async fn list_jobs_includes_in_flight_jobs() {
         let store = test_store();
         let a = store
             .enqueue(
@@ -5244,7 +5246,7 @@ mod tests {
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert_eq!(page.jobs.len(), 2);
         assert_eq!(page.jobs[0].id, a.id);
-        assert_eq!(page.jobs[0].status, u8::from(JobStatus::Working));
+        assert_eq!(page.jobs[0].status, u8::from(JobStatus::InFlight));
         assert_eq!(page.jobs[1].status, u8::from(JobStatus::Ready));
     }
 
@@ -5456,7 +5458,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take the first job so it becomes Working.
+        // Take the first job so it becomes InFlight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -5472,7 +5474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_jobs_filters_by_working_status() {
+    async fn list_jobs_filters_by_in_flight_status() {
         let store = test_store();
         let a = store
             .enqueue(
@@ -5495,12 +5497,12 @@ mod tests {
             .unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, a.id);
-        assert_eq!(page.jobs[0].status, u8::from(JobStatus::Working));
+        assert_eq!(page.jobs[0].status, u8::from(JobStatus::InFlight));
     }
 
     #[tokio::test]
@@ -5515,7 +5517,7 @@ mod tests {
             .unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
@@ -5613,9 +5615,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Now working.
+        // Now in-flight.
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -5624,7 +5626,7 @@ mod tests {
         store.requeue(&a.id).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
@@ -5655,7 +5657,7 @@ mod tests {
             .unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
@@ -5663,7 +5665,7 @@ mod tests {
         store.mark_completed(now_millis(), &taken.id).await.unwrap();
 
         let page = store
-            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::Working])))
+            .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
             .await
             .unwrap();
         assert!(page.jobs.is_empty());
@@ -5927,7 +5929,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a and b so they become Working.
+        // Take a and b so they become InFlight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -5937,11 +5939,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Filter by Ready + Working — should get all 3.
+        // Filter by Ready + InFlight — should get all 3.
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
-                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -5972,12 +5974,12 @@ mod tests {
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
-            .unwrap(); // a -> working
+            .unwrap(); // a -> in-flight
 
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
-                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working]))
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::InFlight]))
                     .direction(ScanDirection::Desc),
             )
             .await
@@ -6014,7 +6016,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a so it becomes Working.
+        // Take a so it becomes InFlight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -6032,12 +6034,12 @@ mod tests {
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, _c.id);
 
-        // Working jobs in emails queue.
+        // InFlight jobs in emails queue.
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into()]))
-                    .statuses(HashSet::from([JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6089,7 +6091,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a and b so they become Working.
+        // Take a and b so they become InFlight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -6099,12 +6101,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Ready + Working in emails + webhooks (excludes reports).
+        // Ready + InFlight in emails + webhooks (excludes reports).
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into(), "webhooks".into()]))
-                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6138,13 +6140,13 @@ mod tests {
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
-            .unwrap(); // a -> working
+            .unwrap(); // a -> in-flight
 
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into()]))
-                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working]))
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::InFlight]))
                     .direction(ScanDirection::Desc),
             )
             .await
@@ -6219,7 +6221,7 @@ mod tests {
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into()]))
-                    .statuses(HashSet::from([JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6240,14 +6242,14 @@ mod tests {
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
-            .unwrap(); // a -> working
+            .unwrap(); // a -> in-flight
 
-        // Working in emails.
+        // InFlight in emails.
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into()]))
-                    .statuses(HashSet::from([JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6260,7 +6262,7 @@ mod tests {
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into()]))
-                    .statuses(HashSet::from([JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6314,12 +6316,12 @@ mod tests {
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].id, b.id);
 
-        // Working should be empty after completion.
+        // InFlight should be empty after completion.
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
                     .queues(HashSet::from(["emails".into()]))
-                    .statuses(HashSet::from([JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6354,12 +6356,12 @@ mod tests {
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
-            .unwrap(); // a -> working
+            .unwrap(); // a -> in-flight
 
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
-                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::Working]))
+                    .statuses(HashSet::from([JobStatus::Ready, JobStatus::InFlight]))
                     .limit(2),
             )
             .await
@@ -6642,18 +6644,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a so it becomes working.
+        // Take a so it becomes in-flight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
             .unwrap();
 
-        // Working send_email jobs only.
+        // InFlight send_email jobs only.
         let page = store
             .list_jobs(
                 ListJobsOptions::new()
                     .types(HashSet::from(["send_email".into()]))
-                    .statuses(HashSet::from([JobStatus::Working])),
+                    .statuses(HashSet::from([JobStatus::InFlight])),
             )
             .await
             .unwrap();
@@ -6693,7 +6695,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a so it becomes working.
+        // Take a so it becomes in-flight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -6710,7 +6712,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.jobs.len(), 1);
-        // b is the only ready send_email in the high queue (a is working).
+        // b is the only ready send_email in the high queue (a is in-flight).
         assert_eq!(page.jobs[0].payload, Some(serde_json::json!("b")));
     }
 
@@ -7078,7 +7080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_moves_working_to_ready() {
+    async fn recover_moves_in_flight_to_ready() {
         let store = test_store();
         let job = store
             .enqueue(
@@ -7088,7 +7090,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take the job so it becomes Working.
+        // Take the job so it becomes InFlight.
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -7120,7 +7122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_returns_zero_when_none_working() {
+    async fn recover_returns_zero_when_none_in_flight() {
         let store = test_store();
 
         // Enqueue a job but don't take it — it stays Ready.
@@ -7158,7 +7160,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take both so they become Working.
+        // Take both so they become InFlight.
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -7217,7 +7219,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Recover should find no working jobs, but index the ready one.
+        // Recover should find no in-flight jobs, but index the ready one.
         let (recovered, indexed, _scheduled) = store.recover().await.unwrap();
         assert_eq!(recovered, 0);
         assert_eq!(indexed, 1);
@@ -7267,7 +7269,7 @@ mod tests {
         store
     }
 
-    /// Enqueue a job and take it so it's in the Working state.
+    /// Enqueue a job and take it so it's in the InFlight state.
     async fn enqueue_and_take(store: &Store) -> Job {
         store
             .enqueue(
@@ -7750,7 +7752,7 @@ mod tests {
 
     // --- list_errors tests ---
 
-    /// Helper: fail a working job, promote+retake it, and return the retaken job.
+    /// Helper: fail a in-flight job, promote+retake it, and return the retaken job.
     ///
     /// This cycles one failure through the store so that `list_errors` has
     /// something to read. The `error_msg` lets callers tag each failure for
@@ -8025,7 +8027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_ready_jobs_excludes_working() {
+    async fn list_ready_jobs_excludes_in_flight() {
         let store = test_store();
         let now = now_millis();
 
@@ -8044,7 +8046,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take one job — it moves to Working.
+        // Take one job — it moves to InFlight.
         store.take_next_job(now, &HashSet::new()).await.unwrap();
 
         let jobs = store.list_ready_jobs(10).await.unwrap();

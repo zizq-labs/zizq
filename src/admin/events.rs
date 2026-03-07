@@ -7,7 +7,7 @@
 //! sends an initial `JobSnapshot`, then streams incremental
 //! `JobChanged` events driven by `StoreEvent` subscriptions.
 //!
-//! Both Ready and Working panes use a snapshot-diff strategy: the
+//! Both Ready and In-Flight panes use a snapshot-diff strategy: the
 //! server holds a full ordered set of IDs and diffs a capped window
 //! (top N) against the previous window to produce add/remove events.
 //! Only genuinely new IDs trigger a `get_job` disk read.
@@ -29,22 +29,22 @@ use crate::time::now_millis;
 /// Maximum number of ready jobs in the capped window.
 const READY_CAP: usize = 200;
 
-/// Maximum number of working jobs in the capped window.
-const WORKING_CAP: usize = 200;
+/// Maximum number of in-flight jobs in the capped window.
+const IN_FLIGHT_CAP: usize = 200;
 
 /// Per-connection state tracking the previous capped windows.
 struct ConnectionState {
     /// Previous ready window: sorted `(priority, id)` keys.
     prev_ready: Vec<(u16, String)>,
 
-    /// Full ordered set of working jobs: `(dequeued_at, id)`.
-    /// Maintained from `StoreEvent`s — append on `JobWorking`,
+    /// Full ordered set of in-flight jobs: `(dequeued_at, id)`.
+    /// Maintained from `StoreEvent`s — append on `JobInFlight`,
     /// remove on `JobCompleted`/`JobFailed`.
-    working_ids: BTreeSet<(u64, String)>,
+    in_flight_ids: BTreeSet<(u64, String)>,
 
-    /// Previous working window: first `WORKING_CAP` entries
-    /// from `working_ids`.
-    prev_working: Vec<(u64, String)>,
+    /// Previous in-flight window: first `IN_FLIGHT_CAP` entries
+    /// from `in_flight_ids`.
+    prev_in_flight: Vec<(u64, String)>,
 }
 
 /// WebSocket endpoint that streams admin events to dashboard clients.
@@ -148,29 +148,29 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     send_task.abort();
 }
 
-/// Query ready + working jobs, send a `JobSnapshot`, and return
+/// Query ready + in-flight jobs, send a `JobSnapshot`, and return
 /// initial `ConnectionState`.
 async fn send_initial_snapshot(
     store: &store::Store,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<ConnectionState, String> {
-    let mut working_jobs = store
+    let mut in_flight_jobs = store
         .list_jobs(
             store::ListJobsOptions::new()
-                .statuses([store::JobStatus::Working].into())
+                .statuses([store::JobStatus::InFlight].into())
                 .limit(usize::MAX),
         )
         .await
         .map(|page| page.jobs)
         .unwrap_or_else(|e| {
-            tracing::error!(%e, "admin ws: failed to list working jobs for snapshot");
+            tracing::error!(%e, "admin ws: failed to list in-flight jobs for snapshot");
             Vec::new()
         });
 
-    working_jobs.sort_by_key(|j| j.dequeued_at.unwrap_or(0));
+    in_flight_jobs.sort_by_key(|j| j.dequeued_at.unwrap_or(0));
 
-    // Build full ordered working ID set from all working jobs.
-    let working_ids: BTreeSet<(u64, String)> = working_jobs
+    // Build full ordered in-flight ID set from all in-flight jobs.
+    let in_flight_ids: BTreeSet<(u64, String)> = in_flight_jobs
         .iter()
         .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
         .collect();
@@ -181,7 +181,8 @@ async fn send_initial_snapshot(
         Vec::new()
     });
 
-    let capped_working: Vec<store::Job> = working_jobs.into_iter().take(WORKING_CAP).collect();
+    let capped_in_flight: Vec<store::Job> =
+        in_flight_jobs.into_iter().take(IN_FLIGHT_CAP).collect();
 
     // Collect keys for diffing logic.
     let prev_ready: Vec<(u16, String)> = capped_ready
@@ -189,7 +190,7 @@ async fn send_initial_snapshot(
         .map(|j| (j.priority, j.id.clone()))
         .collect();
 
-    let prev_working: Vec<(u64, String)> = capped_working
+    let prev_in_flight: Vec<(u64, String)> = capped_in_flight
         .iter()
         .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
         .collect();
@@ -200,7 +201,7 @@ async fn send_initial_snapshot(
             .into_iter()
             .map(AdminJobSummary::from)
             .collect(),
-        working: capped_working
+        in_flight: capped_in_flight
             .into_iter()
             .map(AdminJobSummary::from)
             .collect(),
@@ -215,8 +216,8 @@ async fn send_initial_snapshot(
 
     Ok(ConnectionState {
         prev_ready,
-        working_ids,
-        prev_working,
+        in_flight_ids,
+        prev_in_flight,
     })
 }
 
@@ -228,45 +229,45 @@ async fn process_store_event(
 ) -> Vec<AdminEvent> {
     match event {
         StoreEvent::JobCreated { .. } => diff_ready(store, conn).await,
-        StoreEvent::JobWorking { id } => {
+        StoreEvent::JobInFlight { id } => {
             let mut events = Vec::new();
-            // Insert into working set.
+            // Insert into in-flight set.
             if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
-                conn.working_ids
+                conn.in_flight_ids
                     .insert((job.dequeued_at.unwrap_or(0), id.clone()));
             }
-            // Diff working window (new entry may appear).
-            events.extend(diff_working(store, conn).await);
+            // Diff in-flight window (new entry may appear).
+            events.extend(diff_in_flight(store, conn).await);
             // Diff ready window (job left ready, backfill may be needed).
             events.extend(diff_ready(store, conn).await);
             events
         }
         StoreEvent::JobCompleted { id } => {
             let mut events = Vec::new();
-            // Remove from working set.
-            conn.working_ids.retain(|(_, wid)| wid != &id);
+            // Remove from in-flight set.
+            conn.in_flight_ids.retain(|(_, wid)| wid != &id);
             // Emit semantic "completed" event.
             events.push(AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::Completed,
                 job: None,
             });
-            // Diff working window for backfill.
-            events.extend(diff_working(store, conn).await);
+            // Diff in-flight window for backfill.
+            events.extend(diff_in_flight(store, conn).await);
             events
         }
         StoreEvent::JobFailed { id, .. } => {
             let mut events = Vec::new();
-            // Remove from working set.
-            conn.working_ids.retain(|(_, wid)| wid != &id);
+            // Remove from in-flight set.
+            conn.in_flight_ids.retain(|(_, wid)| wid != &id);
             // Emit semantic "dead" event.
             events.push(AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::Dead,
                 job: None,
             });
-            // Diff working window for backfill.
-            events.extend(diff_working(store, conn).await);
+            // Diff in-flight window for backfill.
+            events.extend(diff_in_flight(store, conn).await);
             events
         }
         StoreEvent::JobScheduled { .. } => Vec::new(),
@@ -305,18 +306,23 @@ async fn diff_ready(store: &store::Store, conn: &mut ConnectionState) -> Vec<Adm
     events
 }
 
-/// Diff the working window: take first WORKING_CAP entries from
-/// `working_ids`, compare against `prev_working`, emit adds/removes.
-async fn diff_working(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current: Vec<(u64, String)> = conn.working_ids.iter().take(WORKING_CAP).cloned().collect();
-    let (adds, removes) = diff_sorted(&current, &conn.prev_working);
+/// Diff the in-flight window: take first IN_FLIGHT_CAP entries from
+/// `in_flight_ids`, compare against `prev_in_flight`, emit adds/removes.
+async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
+    let current: Vec<(u64, String)> = conn
+        .in_flight_ids
+        .iter()
+        .take(IN_FLIGHT_CAP)
+        .cloned()
+        .collect();
+    let (adds, removes) = diff_sorted(&current, &conn.prev_in_flight);
     let mut events = Vec::with_capacity(adds.len() + removes.len());
 
     // Emit removals.
     for (_dequeued_at, id) in removes {
         events.push(AdminEvent::JobChanged {
             id,
-            status: JobChangeStatus::WorkingRemoved,
+            status: JobChangeStatus::InFlightRemoved,
             job: None,
         });
     }
@@ -326,13 +332,13 @@ async fn diff_working(store: &store::Store, conn: &mut ConnectionState) -> Vec<A
         if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
             events.push(AdminEvent::JobChanged {
                 id,
-                status: JobChangeStatus::Working,
+                status: JobChangeStatus::InFlight,
                 job: Some(AdminJobSummary::from(job)),
             });
         }
     }
 
-    conn.prev_working = current;
+    conn.prev_in_flight = current;
     events
 }
 
@@ -342,7 +348,7 @@ async fn diff_working(store: &store::Store, conn: &mut ConnectionState) -> Vec<A
 /// in `current` but not `previous` are "added"; elements in `previous`
 /// but not `current` are "removed".
 ///
-/// Used by both `diff_ready` and `diff_working` to compare capped
+/// Used by both `diff_ready` and `diff_in_flight` to compare capped
 /// windows against their previous state.
 fn diff_sorted<K: Ord + Clone>(
     current: &[(K, String)],
@@ -460,7 +466,7 @@ mod tests {
             license: License::Free,
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
-            global_working_limit: 0,
+            global_in_flight_limit: 0,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(now_millis),
@@ -511,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_contains_ready_and_working_jobs() {
+    async fn snapshot_contains_ready_and_in_flight_jobs() {
         let state = test_state();
         let now = now_millis();
 
@@ -533,7 +539,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take one so it becomes working.
+        // Take one so it becomes in-flight.
         state
             .store
             .take_next_job(now, &HashSet::new())
@@ -545,7 +551,7 @@ mod tests {
 
         assert_eq!(snapshot["event"], "job_snapshot");
         assert_eq!(snapshot["ready"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["working"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -577,7 +583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_job_sends_working_and_ready_removed() {
+    async fn take_job_sends_in_flight_and_ready_removed() {
         let state = test_state();
         let now = now_millis();
 
@@ -593,18 +599,18 @@ mod tests {
 
         let (_addr, mut rx) = connect(state.clone()).await;
 
-        // Consume snapshot (has 1 ready, 0 working).
+        // Consume snapshot (has 1 ready, 0 in-flight).
         let snapshot = next_json(&mut rx).await;
         assert_eq!(snapshot["ready"].as_array().unwrap().len(), 1);
 
-        // Take the job — triggers JobWorking.
+        // Take the job — triggers JobInFlight.
         state
             .store
             .take_next_job(now, &HashSet::new())
             .await
             .unwrap();
 
-        // We should get events for the working window add and ready
+        // We should get events for the in-flight window add and ready
         // window removal (order may vary, collect both).
         let mut statuses = Vec::new();
         for _ in 0..2 {
@@ -614,11 +620,11 @@ mod tests {
             statuses.push(msg["status"].as_str().unwrap().to_string());
         }
         statuses.sort();
-        assert_eq!(statuses, vec!["ready_removed", "working"]);
+        assert_eq!(statuses, vec!["in_flight", "ready_removed"]);
     }
 
     #[tokio::test]
-    async fn complete_job_sends_completed_and_working_removed() {
+    async fn complete_job_sends_completed_and_in_flight_removed() {
         let state = test_state();
         let now = now_millis();
 
@@ -639,14 +645,14 @@ mod tests {
 
         let (_addr, mut rx) = connect(state.clone()).await;
 
-        // Consume snapshot (0 ready, 1 working).
+        // Consume snapshot (0 ready, 1 in-flight).
         let snapshot = next_json(&mut rx).await;
-        assert_eq!(snapshot["working"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
 
         // Complete the job.
         state.store.mark_completed(now, &job.id).await.unwrap();
 
-        // Should get "completed" + "working_removed" for the same job.
+        // Should get "completed" + "in_flight_removed" for the same job.
         let mut statuses = Vec::new();
         for _ in 0..2 {
             let msg = next_json(&mut rx).await;
@@ -655,6 +661,6 @@ mod tests {
             statuses.push(msg["status"].as_str().unwrap().to_string());
         }
         statuses.sort();
-        assert_eq!(statuses, vec!["completed", "working_removed"]);
+        assert_eq!(statuses, vec!["completed", "in_flight_removed"]);
     }
 }

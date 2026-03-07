@@ -73,10 +73,10 @@ pub fn render(app: &App, frame: &mut Frame) {
         .block(Block::default().borders(Borders::ALL).title("Ready"));
     frame.render_widget(ready_table, panes[0]);
 
-    // Working pane (right).
-    let working_table = job_table_working(&app.working_jobs, app.now_ms)
-        .block(Block::default().borders(Borders::ALL).title("Working"));
-    frame.render_widget(working_table, panes[1]);
+    // In-Flight pane (right).
+    let in_flight_table = job_table_in_flight(&app.in_flight_jobs, app.now_ms)
+        .block(Block::default().borders(Borders::ALL).title("In-Flight"));
+    frame.render_widget(in_flight_table, panes[1]);
 }
 
 /// Build a table widget for the Ready pane.
@@ -113,8 +113,8 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     .header(header)
 }
 
-/// Build a table widget for the Working pane.
-fn job_table_working(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
+/// Build a table widget for the In-Flight pane.
+fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     let header = Row::new(["ID", "Pri", "Queue", "Type", "Since", "Att"])
         .style(Style::default().add_modifier(Modifier::BOLD))
         .bottom_margin(0);
@@ -202,7 +202,7 @@ mod tests {
             server_version: None,
             server_uptime_ms: None,
             ready_jobs: Vec::new(),
-            working_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
             now_ms: 0,
         }
     }
@@ -225,7 +225,7 @@ mod tests {
         }
     }
 
-    fn sample_working_job(
+    fn sample_in_flight_job(
         queue: &str,
         job_type: &str,
         dequeued_at: u64,
@@ -257,7 +257,7 @@ mod tests {
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(65_000),
             ready_jobs: Vec::new(),
-            working_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
             now_ms: 0,
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
@@ -270,7 +270,7 @@ mod tests {
             server_version: None,
             server_uptime_ms: None,
             ready_jobs: Vec::new(),
-            working_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
             now_ms: 0,
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
@@ -287,9 +287,9 @@ mod tests {
                 sample_ready_job("emails", "send_email", now_ms - 5_200, 0),
                 sample_ready_job("reports", "gen_report", now_ms - 62_000, 2),
             ],
-            working_jobs: vec![
-                sample_working_job("emails", "send_email", now_ms - 3_100, 1, None),
-                sample_working_job(
+            in_flight_jobs: vec![
+                sample_in_flight_job("emails", "send_email", now_ms - 3_100, 1, None),
+                sample_in_flight_job(
                     "billing",
                     "charge",
                     now_ms - 150_000,
@@ -309,7 +309,7 @@ mod tests {
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(10_000),
             ready_jobs: Vec::new(),
-            working_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
             now_ms: 1_700_000_000_000,
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));
@@ -322,7 +322,7 @@ mod tests {
             server_version: None,
             server_uptime_ms: None,
             ready_jobs: Vec::new(),
-            working_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
             now_ms: 0,
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));

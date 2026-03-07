@@ -20,10 +20,10 @@ pub enum Event {
     ServerConnected,
     /// Heartbeat received from server.
     ServerHeartbeat { version: String, uptime_ms: u64 },
-    /// Snapshot of ready and working job queues.
+    /// Snapshot of ready and in-flight job queues.
     ServerJobSnapshot {
         ready: Vec<AdminJobSummary>,
-        working: Vec<AdminJobSummary>,
+        in_flight: Vec<AdminJobSummary>,
     },
     /// Incremental change to a single job's status.
     ServerJobChanged {
@@ -109,8 +109,8 @@ fn parse_ws_message(text: &str) -> Option<Event> {
         AdminEvent::Heartbeat { version, uptime_ms } => {
             Some(Event::ServerHeartbeat { version, uptime_ms })
         }
-        AdminEvent::JobSnapshot { ready, working } => {
-            Some(Event::ServerJobSnapshot { ready, working })
+        AdminEvent::JobSnapshot { ready, in_flight } => {
+            Some(Event::ServerJobSnapshot { ready, in_flight })
         }
         AdminEvent::JobChanged { id, status, job } => {
             Some(Event::ServerJobChanged { id, status, job })
@@ -141,16 +141,16 @@ mod tests {
         let json = r#"{
             "event": "job_snapshot",
             "ready": [{"id":"r1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0}],
-            "working": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}]
+            "in_flight": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}]
         }"#;
         let event = parse_ws_message(json).unwrap();
 
         match event {
-            Event::ServerJobSnapshot { ready, working } => {
+            Event::ServerJobSnapshot { ready, in_flight } => {
                 assert_eq!(ready.len(), 1);
                 assert_eq!(ready[0].id, "r1");
-                assert_eq!(working.len(), 1);
-                assert_eq!(working[0].id, "w1");
+                assert_eq!(in_flight.len(), 1);
+                assert_eq!(in_flight[0].id, "w1");
             }
             _ => panic!("expected ServerJobSnapshot"),
         }

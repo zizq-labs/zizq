@@ -214,11 +214,11 @@ class TestClient < Minitest::Test
   def test_list_jobs_with_filters
     response = { "jobs" => [{ "id" => "j1" }], "pages" => { "self" => "/jobs" } }
 
-    stub_request(:get, "#{URL}/jobs?status=ready,working&queue=emails&limit=10")
+    stub_request(:get, "#{URL}/jobs?status=ready,in_flight&queue=emails&limit=10")
       .to_return(status: 200, body: JSON.generate(response),
                  headers: { "Content-Type" => "application/json" })
 
-    result = @json_client.list_jobs(status: %w[ready working], queue: "emails", limit: 10)
+    result = @json_client.list_jobs(status: %w[ready in_flight], queue: "emails", limit: 10)
     assert_equal 1, result.jobs.size
   end
 

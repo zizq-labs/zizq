@@ -41,8 +41,8 @@ const DEFAULT_PRIORITY: u16 = 32_768;
 /// Default interval between heartbeat frames on idle take connections (milliseconds).
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 3_000;
 
-/// Default maximum number of jobs in the working set across all connections.
-pub const DEFAULT_GLOBAL_WORKING_LIMIT: u64 = 1024;
+/// Default maximum number of in-flight jobs across all connections.
+pub const DEFAULT_GLOBAL_IN_FLIGHT_LIMIT: u64 = 1024;
 
 // --- Take types ---
 
@@ -122,8 +122,9 @@ pub enum JobStatus {
     /// The job is in the priority queue ready to be worked.
     Ready,
 
-    /// The job is currently being processed by a worker.
-    Working,
+    /// The job has been delivered to a client and is in-flight.
+    #[serde(rename = "in_flight")]
+    InFlight,
 
     /// The job was successfully completed by a worker.
     Completed,
@@ -137,7 +138,7 @@ impl From<store::JobStatus> for JobStatus {
         match s {
             store::JobStatus::Scheduled => Self::Scheduled,
             store::JobStatus::Ready => Self::Ready,
-            store::JobStatus::Working => Self::Working,
+            store::JobStatus::InFlight => Self::InFlight,
             store::JobStatus::Completed => Self::Completed,
             store::JobStatus::Dead => Self::Dead,
         }
@@ -149,7 +150,7 @@ impl From<JobStatus> for store::JobStatus {
         match s {
             JobStatus::Scheduled => Self::Scheduled,
             JobStatus::Ready => Self::Ready,
-            JobStatus::Working => Self::Working,
+            JobStatus::InFlight => Self::InFlight,
             JobStatus::Completed => Self::Completed,
             JobStatus::Dead => Self::Dead,
         }
@@ -161,7 +162,7 @@ impl fmt::Display for JobStatus {
         match self {
             Self::Scheduled => f.write_str("scheduled"),
             Self::Ready => f.write_str("ready"),
-            Self::Working => f.write_str("working"),
+            Self::InFlight => f.write_str("in_flight"),
             Self::Completed => f.write_str("completed"),
             Self::Dead => f.write_str("dead"),
         }
@@ -175,7 +176,7 @@ impl FromStr for JobStatus {
         match s {
             "scheduled" => Ok(Self::Scheduled),
             "ready" => Ok(Self::Ready),
-            "working" => Ok(Self::Working),
+            "in_flight" => Ok(Self::InFlight),
             "completed" => Ok(Self::Completed),
             "dead" => Ok(Self::Dead),
             other => Err(format!("unknown status: {other}")),
@@ -187,8 +188,8 @@ impl FromStr for JobStatus {
 
 /// A set of values deserialized from a comma-delimited query parameter.
 ///
-/// For example, `?status=ready,working` deserializes into a
-/// `CommaSet<JobStatus>` containing `{Ready, Working}`.
+/// For example, `?status=ready,in_flight` deserializes into a
+/// `CommaSet<JobStatus>` containing `{Ready, InFlight}`.
 ///
 /// An absent or empty parameter deserializes as an empty set.
 #[derive(Debug, Clone)]
@@ -542,7 +543,7 @@ struct ListJobsParams {
     /// Maximum number of jobs to return (1–200, default 50).
     limit: Option<u16>,
 
-    /// Status filter, comma-delimited (e.g. "ready,working").
+    /// Status filter, comma-delimited (e.g. "ready,in_flight").
     #[serde(default)]
     status: CommaSet<JobStatus>,
 
@@ -708,9 +709,9 @@ pub struct AppState {
     /// Interval between heartbeat frames on idle take connections.
     pub heartbeat_interval_ms: Duration,
 
-    /// Maximum number of jobs in the working set across all connections.
+    /// Maximum number of in-flight jobs across all connections.
     /// 0 means no limit.
-    pub global_working_limit: u64,
+    pub global_in_flight_limit: u64,
 
     /// Current number of in-flight jobs across all connections.
     pub global_in_flight: AtomicU64,
@@ -1248,7 +1249,7 @@ async fn mark_completed(
             fmt,
             StatusCode::NOT_FOUND,
             &ErrorResponse {
-                error: "job not found in working set".into(),
+                error: "job not found in in-flight set".into(),
             },
         ),
         Err(e) => {
@@ -1357,7 +1358,7 @@ async fn report_failure(
             fmt,
             StatusCode::NOT_FOUND,
             &ErrorResponse {
-                error: "job not found in working set".into(),
+                error: "job not found in in-flight set".into(),
             },
         ),
         Err(e) => {
@@ -1703,7 +1704,7 @@ fn default_prefetch() -> usize {
 }
 
 /// Re-check each in-flight job against the store and remove any that are no
-/// longer in the working state (e.g. completed while we were lagged).
+/// longer in the in-flight state (e.g. completed while we were lagged).
 ///
 /// This is the recovery path for broadcast channel overflow. It's not a hot
 /// path — it only runs when we've missed events, which requires 1024+
@@ -1713,11 +1714,11 @@ async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashMap<String, u
     let now = (state.clock)();
     for id in in_flight.keys() {
         match state.store.get_job(now, id).await {
-            Ok(Some(job)) if job.status == store::JobStatus::Working as u8 => {
-                // Still working — keep tracking it.
+            Ok(Some(job)) if job.status == store::JobStatus::InFlight as u8 => {
+                // Still in-flight — keep tracking it.
             }
             _ => {
-                // Missing (completed/deleted) or no longer working.
+                // Missing (completed/deleted) or no longer in-flight.
                 gone.push(id.clone());
             }
         }
@@ -1785,14 +1786,14 @@ async fn take_jobs(
 
             // Maintain a set of in-flight job IDs. We need this because once we
             // remove a job from the queue and return it to the client, the job
-            // will forever stay in the working queue until the client acknowledges
+            // will forever stay in the in-flight queue until the client acknowledges
             // or fails the job. If the client disconnects without doing this, we
             // need to clean up any in-flight jobs by moving them back to the
             // queue.
             //
             // In the extremely rare case of a crash or shutdown before the client
             // finishes processing the job, recovery on server restart will move
-            // the job from the working set back into the queue.
+            // the job from the in-flight set back into the queue.
             let mut in_flight = HashMap::<String, u32>::new();
 
             // Pin the heartbeat timer outside the loop so it isn't reset
@@ -1820,9 +1821,9 @@ async fn take_jobs(
                 // taken the claim.
                 let can_take = !claim_token.load(Ordering::Relaxed)
                     && (prefetch == 0 || in_flight.len() < prefetch)
-                    && (state.global_working_limit == 0
+                    && (state.global_in_flight_limit == 0
                         || state.global_in_flight.load(Ordering::Relaxed)
-                            < state.global_working_limit);
+                            < state.global_in_flight_limit);
 
                 tokio::select! {
                     // Detect client disconnect without waiting for the
@@ -1872,11 +1873,11 @@ async fn take_jobs(
                                         1 // unlimited: permit is the only backpressure
                                     };
 
-                                    // Cap by global working limit.
-                                    let wanted = if state.global_working_limit > 0 {
+                                    // Cap by global in-flight limit.
+                                    let wanted = if state.global_in_flight_limit > 0 {
                                         let global_in_flight = state.global_in_flight.load(Ordering::Relaxed);
                                         wanted.min(
-                                            state.global_working_limit
+                                            state.global_in_flight_limit
                                                 .saturating_sub(global_in_flight) as usize,
                                         )
                                     } else {
@@ -1920,7 +1921,7 @@ async fn take_jobs(
                                                     }
                                                     Err(e) => {
                                                         tracing::error!(%e, "corrupt job data");
-                                                        // Skip this job — it's marked Working
+                                                        // Skip this job — it's marked InFlight
                                                         // in the store but we can't decode it.
                                                         // Don't track it in in_flight so the
                                                         // connection stays healthy.
@@ -1993,7 +1994,7 @@ async fn take_jobs(
                                     tracing::debug!(
                                         job_id = %id,
                                         reason = "completed",
-                                        "job removed from working set"
+                                        "job removed from in-flight set"
                                     );
                                     let _ = state
                                         .global_in_flight
@@ -2019,7 +2020,7 @@ async fn take_jobs(
                                     tracing::debug!(
                                         job_id = %id,
                                         reason = "failed",
-                                        "job removed from working set"
+                                        "job removed from in-flight set"
                                     );
                                     let _ = state
                                         .global_in_flight
@@ -2030,7 +2031,7 @@ async fn take_jobs(
                                         );
                                 }
                             }
-                            Ok(StoreEvent::JobWorking { .. }) => {}
+                            Ok(StoreEvent::JobInFlight { .. }) => {}
                             Ok(StoreEvent::JobScheduled { .. }) => {}
                             Ok(StoreEvent::IndexRebuilt) => {
                                 // Indexes just became available — mint
@@ -2130,7 +2131,7 @@ mod tests {
     /// Create a bare `AppState` with a mock clock for tests.
     ///
     /// Returns `(clock_handle, state)` so tests can read `now` from the
-    /// clock and mutate the state (e.g. custom backoff, working limit)
+    /// clock and mutate the state (e.g. custom backoff, in-flight limit)
     /// before wrapping in `Arc` and building the router.
     fn test_app_state() -> (Arc<AtomicU64>, AppState) {
         test_app_state_with_config(Default::default())
@@ -2148,7 +2149,7 @@ mod tests {
             license: License::Free,
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
-            global_working_limit: 0,
+            global_in_flight_limit: 0,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: clock_fn,
@@ -2794,7 +2795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_job_returns_working_job() {
+    async fn get_job_returns_in_flight_job() {
         let (state, app) = test_state_and_app();
 
         let req = json_request(
@@ -2806,7 +2807,7 @@ mod tests {
         let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let job_id = created["id"].as_str().unwrap();
 
-        // Take the job so it moves to working.
+        // Take the job so it moves to in-flight.
         state
             .store
             .take_next_job(crate::time::now_millis(), &HashSet::new())
@@ -2819,10 +2820,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["id"], job_id);
-        assert_eq!(body["status"], "working");
+        assert_eq!(body["status"], "in_flight");
         assert!(
             body["dequeued_at"].is_u64(),
-            "working job should have dequeued_at set"
+            "in-flight job should have dequeued_at set"
         );
     }
 
@@ -3154,7 +3155,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take the first job so it becomes working.
+        // Take the first job so it becomes in-flight.
         state
             .store
             .take_next_job(crate::time::now_millis(), &HashSet::new())
@@ -3171,13 +3172,13 @@ mod tests {
         assert_eq!(jobs[0]["status"], "ready");
         assert_eq!(jobs[0]["payload"], "b");
 
-        let req = empty_request("GET", "/jobs?status=working");
+        let req = empty_request("GET", "/jobs?status=in_flight");
         let res = app.oneshot(req).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let jobs = body["jobs"].as_array().unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0]["status"], "working");
+        assert_eq!(jobs[0]["status"], "in_flight");
         assert_eq!(jobs[0]["payload"], "a");
     }
 
@@ -3277,14 +3278,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Take the first job so it becomes working.
+        // Take the first job so it becomes in-flight.
         state
             .store
             .take_next_job(crate::time::now_millis(), &HashSet::new())
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs?status=ready,working");
+        let req = empty_request("GET", "/jobs?status=ready,in_flight");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
@@ -3328,7 +3329,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = empty_request("GET", "/jobs?status=ready,working&limit=2");
+        let req = empty_request("GET", "/jobs?status=ready,in_flight&limit=2");
         let res = app.clone().oneshot(req).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
@@ -3338,7 +3339,7 @@ mod tests {
         // The next URL should contain both statuses.
         assert!(next_url.contains("status="));
         assert!(next_url.contains("ready"));
-        assert!(next_url.contains("working"));
+        assert!(next_url.contains("in_flight"));
 
         let req = empty_request("GET", next_url);
         let res = app.oneshot(req).await.unwrap();
@@ -3504,7 +3505,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a so it becomes working.
+        // Take a so it becomes in-flight.
         state
             .store
             .take_next_job(crate::time::now_millis(), &HashSet::new())
@@ -3599,22 +3600,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a so it becomes working.
+        // Take a so it becomes in-flight.
         state
             .store
             .take_next_job(crate::time::now_millis(), &HashSet::new())
             .await
             .unwrap();
 
-        // Ready + working in emails + reports (excludes webhooks).
-        let req = empty_request("GET", "/jobs?queue=emails,reports&status=ready,working");
+        // Ready + in-flight in emails + reports (excludes webhooks).
+        let req = empty_request("GET", "/jobs?queue=emails,reports&status=ready,in_flight");
         let res = app.oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         let jobs = body["jobs"].as_array().unwrap();
         assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0]["payload"], "a"); // emails, working
+        assert_eq!(jobs[0]["payload"], "a"); // emails, in-flight
         assert_eq!(jobs[1]["payload"], "b"); // reports, ready
     }
 
@@ -3760,7 +3761,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take a so it becomes working.
+        // Take a so it becomes in-flight.
         state
             .store
             .take_next_job(crate::time::now_millis(), &HashSet::new())
@@ -3784,7 +3785,7 @@ mod tests {
     async fn success_returns_204() {
         let (state, app) = test_state_and_app();
 
-        // Enqueue and take a job so it's in the working set.
+        // Enqueue and take a job so it's in the in-flight set.
         let req = json_request(
             "POST",
             "/jobs",
@@ -3819,7 +3820,7 @@ mod tests {
     async fn success_returns_404_for_pending_job() {
         let (_, app) = test_state_and_app();
 
-        // Enqueue but don't take — job is pending, not working.
+        // Enqueue but don't take — job is pending, not in-flight.
         let req = json_request(
             "POST",
             "/jobs",
@@ -3873,7 +3874,7 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["queue"], "q1");
         assert_eq!(job["payload"], "first");
-        assert_eq!(job["status"], "working");
+        assert_eq!(job["status"], "in_flight");
         assert!(job["id"].is_string());
         assert!(
             job["dequeued_at"].is_u64(),
@@ -3886,7 +3887,7 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["queue"], "q2");
         assert_eq!(job["payload"], "second");
-        assert_eq!(job["status"], "working");
+        assert_eq!(job["status"], "in_flight");
         assert!(
             job["dequeued_at"].is_u64(),
             "taken job should have dequeued_at set"
@@ -3916,7 +3917,7 @@ mod tests {
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job["id"], enqueued.id);
         assert_eq!(job["payload"], "delayed");
-        assert_eq!(job["status"], "working");
+        assert_eq!(job["status"], "in_flight");
     }
 
     #[tokio::test]
@@ -3952,7 +3953,7 @@ mod tests {
         let json_str = data_line.strip_prefix("data:").unwrap().trim();
         let job: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(job["payload"], "sse-test");
-        assert_eq!(job["status"], "working");
+        assert_eq!(job["status"], "in_flight");
     }
 
     #[tokio::test]
@@ -3986,7 +3987,7 @@ mod tests {
 
         let job: serde_json::Value = rmp_serde::from_slice(&bytes[4..]).unwrap();
         assert_eq!(job["payload"], "mp-test");
-        assert_eq!(job["status"], "working");
+        assert_eq!(job["status"], "in_flight");
     }
 
     #[tokio::test]
@@ -4138,7 +4139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn take_respects_working_limit() {
+    async fn take_respects_in_flight_limit() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
@@ -4149,7 +4150,7 @@ mod tests {
             license: License::Free,
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
-            global_working_limit: 2,
+            global_in_flight_limit: 2,
             global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(crate::time::now_millis),
@@ -4187,7 +4188,7 @@ mod tests {
         let res = router.oneshot(req).await.unwrap();
         let mut body = res.into_body();
 
-        // Read 2 jobs — should succeed since working_limit is 2.
+        // Read 2 jobs — should succeed since in_flight_limit is 2.
         let bytes = next_body_bytes(&mut body).await;
         let job_a: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
@@ -4535,7 +4536,7 @@ mod tests {
         let state = Arc::new(state);
         let app = app(state.clone());
 
-        // Enqueue and take a job so it's in the working set.
+        // Enqueue and take a job so it's in the in-flight set.
         let req = json_request(
             "POST",
             "/jobs",
@@ -4617,7 +4618,7 @@ mod tests {
     async fn failure_returns_404_for_ready_job() {
         let (_, app) = test_state_and_app();
 
-        // Enqueue but don't take — job is ready, not working.
+        // Enqueue but don't take — job is ready, not in-flight.
         let req = json_request(
             "POST",
             "/jobs",
@@ -4707,7 +4708,7 @@ mod tests {
         let line = std::str::from_utf8(&bytes).unwrap().trim();
         let job: serde_json::Value = serde_json::from_str(line).unwrap();
         let job_id = job["id"].as_str().unwrap();
-        assert_eq!(job["status"], "working");
+        assert_eq!(job["status"], "in_flight");
         assert_eq!(job["attempts"], 0);
 
         // Report failure with retry_at in the past so we can promote
@@ -4742,7 +4743,7 @@ mod tests {
         let line = std::str::from_utf8(&bytes).unwrap().trim();
         let job2: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(job2["id"], job_id, "same job should be redelivered");
-        assert_eq!(job2["status"], "working");
+        assert_eq!(job2["status"], "in_flight");
         assert_eq!(job2["attempts"], 1, "attempts should be incremented");
     }
 
@@ -4810,7 +4811,7 @@ mod tests {
     async fn take_failure_frees_capacity_for_other_jobs() {
         let (clock, mut state) = test_app_state();
         let now = clock.load(Ordering::Relaxed);
-        state.global_working_limit = 1;
+        state.global_in_flight_limit = 1;
         let state = Arc::new(state);
         let router = app(state.clone());
 
@@ -4832,7 +4833,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Take with prefetch=2 but global_working_limit=1.
+        // Take with prefetch=2 but global_in_flight_limit=1.
         let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = router.clone().oneshot(req).await.unwrap();
         let mut body = res.into_body();
@@ -5263,7 +5264,7 @@ mod tests {
             ids.push(body["id"].as_str().unwrap().to_string());
         }
 
-        // Take all 3 so they're in the working set.
+        // Take all 3 so they're in the in-flight set.
         state
             .store
             .take_next_n_jobs(now, &HashSet::new(), 3)
@@ -5382,7 +5383,7 @@ mod tests {
             ids.push(body["id"].as_str().unwrap().to_string());
         }
 
-        // Bulk complete — should report all as not_found (they're pending, not working).
+        // Bulk complete — should report all as not_found (they're pending, not in-flight).
         let req = json_request("POST", "/jobs/success", &serde_json::json!({"ids": ids}));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);

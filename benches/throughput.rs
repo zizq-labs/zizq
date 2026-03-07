@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
-use zizq::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
+use zizq::http::{self, AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT};
 use zizq::store::Store;
 
 // ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
         license: zizq::license::License::Free,
         store: store.clone(),
         heartbeat_interval_ms: Duration::from_millis(200),
-        global_working_limit: DEFAULT_GLOBAL_WORKING_LIMIT,
+        global_in_flight_limit: DEFAULT_GLOBAL_IN_FLIGHT_LIMIT,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx.clone(),
         clock: Arc::new(zizq::time::now_millis),

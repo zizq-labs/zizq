@@ -13,7 +13,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http::{self, AppState, DEFAULT_GLOBAL_WORKING_LIMIT};
+use crate::http::{self, AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT};
 use crate::license::License;
 use crate::logging;
 use crate::store::{self, Store};
@@ -82,10 +82,10 @@ pub struct Args {
     #[arg(long = "heartbeat-interval", default_value = "3s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_HEARTBEAT_INTERVAL")]
     heartbeat_interval_ms: u64,
 
-    /// Maximum number of jobs in the working set across all connections.
+    /// Maximum number of in-flight jobs across all connections.
     /// 0 means no limit.
-    #[arg(long, default_value_t = DEFAULT_GLOBAL_WORKING_LIMIT, value_name = "NUMBER", env = "ZIZQ_GLOBAL_WORKING_LIMIT")]
-    global_working_limit: u64,
+    #[arg(short = 'l', long, default_value_t = DEFAULT_GLOBAL_IN_FLIGHT_LIMIT, value_name = "NUMBER", env = "ZIZQ_GLOBAL_IN_FLIGHT_LIMIT")]
+    global_in_flight_limit: u64,
 
     /// Default maximum retries before a failed job is killed.
     /// Jobs can override this at enqueue time with a per-job retry_limit.
@@ -178,7 +178,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
-    // Recover orphaned working jobs and rebuild the in-memory indexes
+    // Recover orphaned in-flight jobs and rebuild the in-memory indexes
     // asynchronously so that the server starts accepting connections
     // immediately. Workers wait (sending heartbeats) until the indexes
     // are ready; the TUI Ready panel shows empty until then.
@@ -187,7 +187,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         match store_for_rebuild.rebuild_indexes().await {
             Ok((recovered, ready, scheduled)) => {
                 if recovered > 0 {
-                    tracing::info!(count = recovered, "recovered orphaned working jobs");
+                    tracing::info!(count = recovered, "recovered orphaned in-flight jobs");
                 }
                 tracing::info!(ready, scheduled, "in-memory indexes rebuilt");
             }
@@ -210,7 +210,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         license,
         store,
         heartbeat_interval_ms: Duration::from_millis(args.heartbeat_interval_ms),
-        global_working_limit: args.global_working_limit,
+        global_in_flight_limit: args.global_in_flight_limit,
         global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx,
         clock: Arc::new(crate::time::now_millis),
