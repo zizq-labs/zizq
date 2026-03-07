@@ -120,6 +120,19 @@ module Zizq
       )
     end
 
+    # Signal the worker to shut down gracefully.
+    #
+    # Closes the dispatch queue and unblocks the main run loop so it can
+    # proceed through its shutdown sequence (drain workers, stop ack
+    # processor). Safe to call from any thread.
+    def shutdown #: () -> void
+      return if @shutdown
+
+      @shutdown = true
+      @dispatch_queue.close rescue nil
+      @shutdown_latch.close rescue nil
+    end
+
     # Start the worker.
     #
     # Spawns the desired number of worker threads and fibers, distributes jobs
@@ -152,7 +165,7 @@ module Zizq
       join_with_deadline(worker_threads)
 
       # Drain any pending acks/nacks after all workers have exited.
-      @ack_processor.stop(timeout: 10)
+      @ack_processor.stop(timeout: shutdown_timeout)
 
       logger.info { "Zizq worker stopped" }
     end
@@ -161,13 +174,7 @@ module Zizq
 
     def install_signal_handlers #: () -> void
       %w[INT TERM].each do |signal|
-        Signal.trap(signal) do
-          next if @shutdown
-
-          @shutdown = true
-          @dispatch_queue.close
-          @shutdown_latch.close
-        end
+        Signal.trap(signal) { shutdown }
       end
     end
 

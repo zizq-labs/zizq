@@ -19,5 +19,4 @@ Rake::TestTask.new(:test) do |t|
   t.test_files = FileList["test/**/test_*.rb"]
 end
 
-task test: :typecheck
-task default: :test
+task default: [:typecheck, :test]

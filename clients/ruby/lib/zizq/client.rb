@@ -48,7 +48,11 @@ module Zizq
 
     # Initialize a new instance of the client with the given base URL and
     # optional format options.
-    def initialize(url:, format: :msgpack) #: (url: String, ?format: Zizq::format) -> void
+    #
+    # @rbs url: String
+    # @rbs format: Zizq::format
+    # @rbs return: void
+    def initialize(url:, format: :msgpack)
       @url = url.chomp("/")
       @format = format
 
@@ -68,12 +72,17 @@ module Zizq
 
     # Close the underlying HTTP client and release connections.
     def close #: () -> void
-      @http.close
-
       if @io_thread&.alive?
         @io_queue&.close
         @io_thread&.join
       end
+
+      @http.close
+    rescue NoMethodError
+      # The async connection pool may hold references to tasks whose
+      # fibers were already reclaimed when their owning Sync reactor
+      # exited (e.g. the AckProcessor or producer thread). Stopping
+      # those dead tasks raises NoMethodError; safe to ignore.
     end
 
     # Enqueue a new job.
@@ -486,23 +495,18 @@ module Zizq
     # dispatches each call as a concurrent fiber via a barrier.
     def io_thread_run #: () -> void
       Sync do
-        http = Async::HTTP::Client.new(@endpoint)
         barrier = Async::Barrier.new
 
-        begin
-          while (item = @io_queue.pop)
-            block, result_queue = item
-            barrier.async do
-              result_queue.push([:ok, block.call(http)])
-            rescue => e
-              result_queue.push([:error, e])
-            end
+        while (item = @io_queue.pop)
+          block, result_queue = item
+          barrier.async do
+            result_queue.push([:ok, block.call(@http)])
+          rescue => e
+            result_queue.push([:error, e])
           end
-
-          barrier.wait
-        ensure
-          http.close
         end
+
+        barrier.wait
       end
     end
 

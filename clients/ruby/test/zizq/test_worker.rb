@@ -95,15 +95,14 @@ class TestWorker < Minitest::Test
       .to_return(status: 204)
 
     worker = Zizq::Worker.new(thread_count: 1, queues: [], prefetch: 1,
-                                 logger: Logger.new(File::NULL))
+                                 shutdown_timeout: 2, logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
 
     deadline = Time.now + 5
     sleep 0.05 while RecordingJob.results.empty? && Time.now < deadline
 
-    worker.instance_variable_set(:@shutdown, true)
-    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    worker.shutdown
     t.join(5)
 
     assert_equal 1, RecordingJob.results.size
@@ -142,15 +141,14 @@ class TestWorker < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     worker = Zizq::Worker.new(thread_count: 1, prefetch: 1,
-                                 logger: Logger.new(File::NULL))
+                                 shutdown_timeout: 2, logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
 
     deadline = Time.now + 5
     sleep 0.05 while FailingJob.fail_count == 0 && Time.now < deadline
 
-    worker.instance_variable_set(:@shutdown, true)
-    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    worker.shutdown
     t.join(5)
 
     assert_equal 1, FailingJob.fail_count
@@ -179,7 +177,7 @@ class TestWorker < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     worker = Zizq::Worker.new(thread_count: 1, prefetch: 1,
-                                 logger: Logger.new(File::NULL))
+                                 shutdown_timeout: 2, logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
 
@@ -196,8 +194,7 @@ class TestWorker < Minitest::Test
       end
     end
 
-    worker.instance_variable_set(:@shutdown, true)
-    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    worker.shutdown
     t.join(5)
 
     assert_requested(nack_stub, at_least_times: 1)
@@ -222,15 +219,14 @@ class TestWorker < Minitest::Test
 
     # 1 thread with 2 fibers exercises the Async code path
     worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
-                                 logger: Logger.new(File::NULL))
+                                 shutdown_timeout: 2, logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
 
     deadline = Time.now + 5
     sleep 0.05 while RecordingJob.results.empty? && Time.now < deadline
 
-    worker.instance_variable_set(:@shutdown, true)
-    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    worker.shutdown
     t.join(5)
 
     assert_equal 1, RecordingJob.results.size
@@ -264,15 +260,14 @@ class TestWorker < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
-                                 logger: Logger.new(File::NULL))
+                                 shutdown_timeout: 2, logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
 
     deadline = Time.now + 5
     sleep 0.05 while FailingJob.fail_count == 0 && Time.now < deadline
 
-    worker.instance_variable_set(:@shutdown, true)
-    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    worker.shutdown
     t.join(5)
 
     assert_equal 1, FailingJob.fail_count
@@ -302,15 +297,14 @@ class TestWorker < Minitest::Test
       .to_return(status: 204)
 
     worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,
-                                 logger: Logger.new(File::NULL))
+                                 shutdown_timeout: 2, logger: Logger.new(File::NULL))
 
     t = Thread.new { worker.run }
 
     deadline = Time.now + 5
     sleep 0.05 while RecordingJob.results.size < 2 && Time.now < deadline
 
-    worker.instance_variable_set(:@shutdown, true)
-    worker.instance_variable_get(:@dispatch_queue).close rescue nil
+    worker.shutdown
     t.join(5)
 
     # Both jobs were processed across the 2 fibers

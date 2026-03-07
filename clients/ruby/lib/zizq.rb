@@ -21,6 +21,8 @@ module Zizq
   autoload :Resources,      "zizq/resources"
   autoload :Worker,         "zizq/worker"
 
+  @client_mutex = Mutex.new
+
   class << self
     # Returns the client configuration.
     #
@@ -52,8 +54,15 @@ module Zizq
     # across calls, reducing TCP connection overhead.
     def client #: () -> Client
       @client ||= begin
-        configuration.validate!
-        Client.new(url: configuration.url, format: configuration.format)
+        @client_mutex.synchronize do
+          break @client if @client
+
+          configuration.validate!
+          @client = Client.new(
+            url: configuration.url,
+            format: configuration.format
+          )
+        end
       end
     end
 
