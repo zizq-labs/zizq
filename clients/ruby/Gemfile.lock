@@ -165,6 +165,7 @@ GEM
       unicode-emoji (~> 4.1)
     unicode-emoji (4.2.0)
     uri (1.1.1)
+    vernier (1.10.0)
     webmock (3.26.1)
       addressable (>= 2.8.0)
       crack (>= 0.3.2)
@@ -190,6 +191,7 @@ DEPENDENCIES
   rake (~> 13.0)
   rbs-inline (~> 0.10)
   steep (~> 1.9)
+  vernier (~> 1.0)
   webmock (~> 3.0)
   zizq!
 

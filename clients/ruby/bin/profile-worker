@@ -1,0 +1,147 @@
+#!/usr/bin/env ruby
+# Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
+# Licensed under the MIT License. See LICENSE file for details.
+
+# frozen_string_literal: true
+
+# Profile the worker using Vernier (wall-clock mode, all threads/fibers).
+#
+# All settings are controlled via environment variables — the same ones
+# accepted by zizq-worker, plus:
+#
+#   VERNIER_OUT         Output file (default: profile.vernier.json)
+#   VERNIER_INTERVAL    Sample interval in microseconds (default: 1000)
+#   VERNIER_TEXT        Set to 1 to print a text summary to stderr
+#
+# Example:
+#
+#   ZIZQ_THREADS=5 ZIZQ_FIBERS=5 bundle exec bin/profile-worker entrypoint.rb
+#
+
+require "vernier"
+require "set"
+require "zizq"
+
+# --- Worker settings (same env vars as zizq-worker) ---
+
+thread_count = Integer(ENV.fetch("ZIZQ_THREADS", Zizq::Worker::DEFAULT_THREADS))
+fiber_count = Integer(ENV.fetch("ZIZQ_FIBERS", Zizq::Worker::DEFAULT_FIBERS))
+prefetch = ENV.key?("ZIZQ_PREFETCH") ? Integer(ENV["ZIZQ_PREFETCH"]) : nil
+shutdown_timeout = Float(ENV.fetch("ZIZQ_SHUTDOWN_TIMEOUT", Zizq::Worker::DEFAULT_SHUTDOWN_TIMEOUT))
+retry_min_wait = Float(ENV.fetch("ZIZQ_RETRY_MIN_WAIT", Zizq::Worker::DEFAULT_RETRY_MIN_WAIT))
+retry_max_wait = Float(ENV.fetch("ZIZQ_RETRY_MAX_WAIT", Zizq::Worker::DEFAULT_RETRY_MAX_WAIT))
+retry_multiplier = Float(ENV.fetch("ZIZQ_RETRY_MULTIPLIER", Zizq::Worker::DEFAULT_RETRY_MULTIPLIER))
+
+queues = if ENV.key?("ZIZQ_QUEUES")
+  ENV["ZIZQ_QUEUES"].split(",").map(&:strip).reject(&:empty?)
+else
+  []
+end
+
+# --- Vernier settings ---
+
+out = ENV.fetch("VERNIER_OUT", "profile.vernier.json")
+interval = Integer(ENV.fetch("VERNIER_INTERVAL", 1000))
+text_output = ENV["VERNIER_TEXT"] == "1"
+
+# --- Load entrypoint ---
+
+entrypoint = ARGV[0]
+
+if entrypoint.nil?
+  warn "Usage: bundle exec bin/profile-worker <ENTRYPOINT>"
+  warn ""
+  warn "Example: ZIZQ_THREADS=5 bundle exec bin/profile-worker entrypoint.rb"
+  exit 1
+end
+
+unless File.file?(entrypoint)
+  warn "Error: entrypoint file not found: #{entrypoint}"
+  exit 1
+end
+
+require File.expand_path(entrypoint)
+
+# --- Run under profiler ---
+
+warn "Profiling worker (wall-clock, interval=#{interval}µs) → #{out}"
+warn "Send SIGINT/SIGTERM to stop and write the profile."
+
+Vernier.profile(out: out, interval: interval, allocation_sample_rate: 0) do
+  Zizq::Worker.run(
+    thread_count:,
+    fiber_count:,
+    prefetch:,
+    queues:,
+    shutdown_timeout:,
+    retry_min_wait:,
+    retry_max_wait:,
+    retry_multiplier:,
+  )
+end
+
+warn "Profile written to #{out}"
+warn "View with: https://profiler.firefox.com/ and load #{out}"
+
+if text_output
+  require "json"
+
+  data = JSON.parse(File.read(out))
+  data["threads"].each do |thread|
+    samples = thread["samples"]
+    next unless samples && samples["length"] > 0
+
+    stack_table = thread["stackTable"]
+    frame_table = thread["frameTable"]
+    func_table = thread["funcTable"]
+    strings = thread["stringArray"]
+
+    # Count self-time: how often each function is at the top of the stack.
+    self_counts = Hash.new(0)
+    total_weight = 0.0
+
+    samples["length"].times do |i|
+      stack_idx = samples["stack"][i]
+      weight = samples["weight"] ? samples["weight"][i] : 1
+      total_weight += weight
+
+      frame_idx = stack_table["frame"][stack_idx]
+      func_idx = frame_table["func"][frame_idx]
+      name = strings[func_table["name"][func_idx]]
+
+      self_counts[name] += weight
+    end
+
+    # Count total-time: how often each function appears anywhere in the stack.
+    total_counts = Hash.new(0)
+
+    samples["length"].times do |i|
+      stack_idx = samples["stack"][i]
+      weight = samples["weight"] ? samples["weight"][i] : 1
+      seen = Set.new
+
+      while stack_idx
+        frame_idx = stack_table["frame"][stack_idx]
+        func_idx = frame_table["func"][frame_idx]
+        name = strings[func_table["name"][func_idx]]
+
+        total_counts[name] += weight unless seen.include?(name)
+        seen << name
+
+        stack_idx = stack_table["prefix"][stack_idx]
+      end
+    end
+
+    sorted = self_counts.sort_by { |_, v| -v }
+
+    warn ""
+    warn "=== Thread: #{thread["name"]} (#{samples["length"]} samples) ==="
+    warn "%8s %6s  %8s %6s  %s" % ["SELF", "(%)", "TOTAL", "(%)", "FUNCTION"]
+    sorted.first(40).each do |name, self_w|
+      total_w = total_counts[name]
+      self_pct = (self_w / total_weight * 100).round(1)
+      total_pct = (total_w / total_weight * 100).round(1)
+      warn "%8.1f %5.1f%%  %8.1f %5.1f%%  %s" % [self_w, self_pct, total_w, total_pct, name]
+    end
+  end
+end
