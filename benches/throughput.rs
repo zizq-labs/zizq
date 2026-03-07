@@ -63,6 +63,8 @@ enum AckStrategy {
     Sequential,
     /// Fire ack without waiting; overlap with next job read via select!.
     Overlapped,
+    /// Accumulate IDs and flush one bulk POST per prefetch-window.
+    Bulk,
 }
 
 /// Fully describes how a benchmark talks to the server.
@@ -372,6 +374,11 @@ struct TakeJob {
     id: String,
 }
 
+#[derive(Serialize)]
+struct BulkAckBody {
+    ids: Vec<String>,
+}
+
 /// Format-aware stream reader that wraps a `reqwest::Response` and yields
 /// deserialized job objects. Handles both NDJSON (line-buffered text) and
 /// length-prefixed msgpack (binary).
@@ -575,6 +582,58 @@ async fn dequeue_worker(
                 if prev + 1 >= target {
                     let _ = done_tx.send(true);
                 }
+            }
+        }
+        AckStrategy::Bulk => {
+            let mut pending = Vec::new();
+            let ack_url = format!("{base_url}/jobs/success");
+
+            macro_rules! flush_pending {
+                ($ids:expr) => {{
+                    let ids: Vec<String> = $ids;
+                    let count = ids.len() as u64;
+                    let body = cfg.encode(&BulkAckBody { ids });
+                    let resp = client
+                        .post(&ack_url)
+                        .header("content-type", cfg.content_type())
+                        .body(body)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(
+                        resp.status() == 204 || resp.status() == 422,
+                        "bulk ack failed: {}",
+                        resp.status()
+                    );
+                    let _ = resp.bytes().await;
+                    let prev = acked.fetch_add(count, Ordering::Relaxed);
+                    if prev + count >= target {
+                        let _ = done_tx.send(true);
+                    }
+                }};
+            }
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = done_rx.changed() => break,
+                    // If we have a partial batch and the stream stalls (last
+                    // window < prefetch), flush early to unblock the server.
+                    _ = tokio::time::sleep(Duration::from_millis(5)), if !pending.is_empty() => {
+                        flush_pending!(std::mem::take(&mut pending));
+                    }
+                    job = stream.next_job() => {
+                        let Some(job) = job else { break };
+                        pending.push(job.id);
+                        if pending.len() >= prefetch as usize {
+                            flush_pending!(std::mem::take(&mut pending));
+                        }
+                    }
+                }
+            }
+            // Flush remaining.
+            if !pending.is_empty() {
+                flush_pending!(pending);
             }
         }
     }
@@ -903,6 +962,23 @@ fn bench_dequeue(c: &mut Criterion) {
             BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
             AckStrategy::Overlapped,
         ),
+        // Bulk ack — accumulate IDs and flush per prefetch-window.
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Bulk,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Bulk,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Bulk,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Bulk,
+        ),
     ];
 
     let mut group = c.benchmark_group(format!(
@@ -923,6 +999,7 @@ fn bench_dequeue(c: &mut Criterion) {
         let ack = match ack_strategy {
             AckStrategy::Sequential => "sequential",
             AckStrategy::Overlapped => "overlapped",
+            AckStrategy::Bulk => "bulk",
         };
         let label = format!("{proto} {fmt} {ack}");
 
@@ -993,6 +1070,23 @@ fn bench_pipeline(c: &mut Criterion) {
             BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
             AckStrategy::Overlapped,
         ),
+        // Bulk ack — accumulate IDs and flush per prefetch-window.
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Bulk,
+        ),
+        (
+            BenchConfig::new(Protocol::Http1, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Bulk,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::Json),
+            AckStrategy::Bulk,
+        ),
+        (
+            BenchConfig::new(Protocol::H2c, Persistence::KeepAlive, Format::MsgPack),
+            AckStrategy::Bulk,
+        ),
     ];
 
     let mut group = c.benchmark_group(format!(
@@ -1013,6 +1107,7 @@ fn bench_pipeline(c: &mut Criterion) {
         let ack = match ack_strategy {
             AckStrategy::Sequential => "sequential",
             AckStrategy::Overlapped => "overlapped",
+            AckStrategy::Bulk => "bulk",
         };
         let label = format!("{proto} {fmt} {ack}");
 
