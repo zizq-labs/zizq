@@ -296,6 +296,57 @@ class TestClient < Minitest::Test
     assert_raises(Zizq::NotFoundError) { @json_client.report_success("missing") }
   end
 
+  # --- report_success_bulk (bulk ack) ---
+
+  def test_report_success_bulk
+    stub_request(:post, "#{URL}/jobs/success")
+      .with(
+        body: JSON.generate({ ids: ["j1", "j2"] }),
+        headers: { "Content-Type" => "application/json", "Accept" => "application/json" }
+      )
+      .to_return(status: 204, body: "")
+
+    result = @json_client.report_success_bulk(["j1", "j2"])
+    assert_nil result
+  end
+
+  def test_report_success_bulk_422_accepted
+    stub_request(:post, "#{URL}/jobs/success")
+      .to_return(status: 422, body: JSON.generate({ "not_found" => ["j2"] }),
+                 headers: { "Content-Type" => "application/json" })
+
+    result = @json_client.report_success_bulk(["j1", "j2"])
+    assert_nil result
+  end
+
+  def test_report_success_bulk_500_raises
+    stub_request(:post, "#{URL}/jobs/success")
+      .to_return(status: 500, body: JSON.generate({ "error" => "internal" }),
+                 headers: { "Content-Type" => "application/json" })
+
+    assert_raises(Zizq::ServerError) { @json_client.report_success_bulk(["j1"]) }
+  end
+
+  def test_ack_bulk_alias
+    stub_request(:post, "#{URL}/jobs/success")
+      .to_return(status: 204, body: "")
+
+    result = @json_client.ack_bulk(["j1"])
+    assert_nil result
+  end
+
+  def test_report_success_bulk_msgpack
+    stub_request(:post, "#{URL}/jobs/success")
+      .with(
+        body: MessagePack.pack({ ids: ["j1", "j2"] }),
+        headers: { "Content-Type" => "application/msgpack", "Accept" => "application/msgpack" }
+      )
+      .to_return(status: 204, body: "")
+
+    result = @msgpack_client.report_success_bulk(["j1", "j2"])
+    assert_nil result
+  end
+
   # --- report_failure (nack) ---
 
   def test_report_failure

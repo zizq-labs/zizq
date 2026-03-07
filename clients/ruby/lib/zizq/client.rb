@@ -232,6 +232,31 @@ module Zizq
       nil
     end
 
+    # Bulk-mark jobs as successfully completed (bulk ack).
+    #
+    # See [`#report_success`] for full details of how acknowledgemen works.
+    #
+    # There are two ways in which the server can respond successfully:
+    #
+    # 1. 204 - No Content (All jobs acknowledged)
+    # 2. 422 - Unprocessible Entity (Some jobs were not found)
+    #
+    # Both of these statuses are in reality treated as success because missing
+    # jobs have either been previously acknowledged and purged, or moved to
+    # some other status that cannot be acknowledged.
+    #
+    # Other error response types will still raise.
+    #
+    # @rbs ids: Array[String]
+    # @rbs return: nil
+    def report_success_bulk(ids)
+      response = post("/jobs/success", { ids: ids })
+      return nil if response.status == 422
+      handle_response!(response, expected: 204)
+    end
+
+    alias ack_bulk report_success_bulk
+
     # Report a job failure (nack).
     #
     # Returns the updated job metadata.

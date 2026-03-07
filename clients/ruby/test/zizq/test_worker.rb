@@ -91,7 +91,7 @@ class TestWorker < Minitest::Test
           headers: { "Content-Type" => "application/x-ndjson" } }
       )
 
-    ack_stub = stub_request(:post, "#{URL}/jobs/j1/success")
+    ack_stub = stub_request(:post, "#{URL}/jobs/success")
       .to_return(status: 204)
 
     worker = Zizq::Worker.new(thread_count: 1, queues: [], prefetch: 1,
@@ -214,7 +214,7 @@ class TestWorker < Minitest::Test
           headers: { "Content-Type" => "application/x-ndjson" } }
       )
 
-    ack_stub = stub_request(:post, "#{URL}/jobs/j1/success")
+    ack_stub = stub_request(:post, "#{URL}/jobs/success")
       .to_return(status: 204)
 
     # 1 thread with 2 fibers exercises the Async code path
@@ -293,7 +293,7 @@ class TestWorker < Minitest::Test
           headers: { "Content-Type" => "application/x-ndjson" } }
       )
 
-    stub_request(:post, %r{#{URL}/jobs/j[12]/success})
+    stub_request(:post, "#{URL}/jobs/success")
       .to_return(status: 204)
 
     worker = Zizq::Worker.new(thread_count: 1, fiber_count: 2, prefetch: 2,

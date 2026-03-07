@@ -71,8 +71,25 @@ module Zizq
         barrier = Async::Barrier.new
 
         while (item = @queue.pop)
-          barrier.async do
-            process_item(item)
+          # Put the item into a batch.
+          batch = [item]
+
+          # Drain any additional ready items into the batch.
+          loop do
+            batch << @queue.pop(true) # non-blocking
+          rescue ThreadError
+            break
+          end
+
+          # Partition: acks go bulk, nacks go individually.
+          acks, nacks = batch.partition { |i| i.is_a?(Ack) }
+
+          unless acks.empty?
+            barrier.async { process_ack_batch(acks) }
+          end
+
+          nacks.each do |nack|
+            barrier.async { process_nack(nack) }
           end
         end
 
@@ -83,28 +100,35 @@ module Zizq
       @logger.debug { e.backtrace&.join("\n") }
     end
 
-    # Process a single ack/nack with inline retry logic.
-    def process_item(item) #: (Ack | Nack) -> void
+    def process_ack_batch(acks) #: (Array[Ack]) -> void
       backoff = @backoff.fresh
-
+      ids = acks.map(&:job_id)
       begin
-        case item
-        when Ack
-          @client.report_success(item.job_id)
-        when Nack
-          @client.report_failure(
-            item.job_id,
-            error: item.error,
-            error_type: item.error_type,
-            backtrace: item.backtrace
-          )
-        end
-      rescue NotFoundError
-        @logger.debug { "Ack/nack for #{item.job_id} returned 404 (already handled)" }
+        @client.report_success_bulk(ids)
       rescue ClientError => e
-        @logger.error { "Ack/nack for #{item.job_id} returned #{e.status} (dropping)" }
+        @logger.warn { "Bulk ack (#{ids.size} jobs) returned #{e.status} (dropping: #{e.message})" }
       rescue => e
-        @logger.warn { "Retrying ack/nack for #{item.job_id} in #{backoff.duration}s: #{e.message}" }
+        @logger.warn { "Retrying bulk ack (#{ids.size} jobs) in #{backoff.duration}s: #{e.message}" }
+        backoff.wait
+        retry
+      end
+    end
+
+    def process_nack(nack) #: (Nack) -> void
+      backoff = @backoff.fresh
+      begin
+        @client.report_failure(
+          nack.job_id,
+          error: nack.error,
+          error_type: nack.error_type,
+          backtrace: nack.backtrace
+        )
+      rescue NotFoundError
+        @logger.debug { "Nack for #{nack.job_id} returned 404 (already handled)" }
+      rescue ClientError => e
+        @logger.error { "Nack for #{nack.job_id} returned #{e.status} (dropping)" }
+      rescue => e
+        @logger.warn { "Retrying nack for #{nack.job_id} in #{backoff.duration}s: #{e.message}" }
         backoff.wait
         retry
       end

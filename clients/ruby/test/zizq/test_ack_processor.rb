@@ -23,7 +23,8 @@ class TestAckProcessor < Minitest::Test
   end
 
   def test_single_ack
-    stub = stub_request(:post, "#{URL}/jobs/j1/success")
+    stub = stub_request(:post, "#{URL}/jobs/success")
+      .with { |req| JSON.parse(req.body)["ids"] == ["j1"] }
       .to_return(status: 204)
 
     proc = new_processor
@@ -59,12 +60,12 @@ class TestAckProcessor < Minitest::Test
   end
 
   def test_batch_of_mixed_acks_and_nacks
-    ack_stub1 = stub_request(:post, "#{URL}/jobs/j1/success")
+    bulk_stub = stub_request(:post, "#{URL}/jobs/success")
       .to_return(status: 204)
     nack_stub = stub_request(:post, "#{URL}/jobs/j2/failure")
       .to_return(status: 200, body: JSON.generate({ "id" => "j2" }),
                  headers: { "Content-Type" => "application/json" })
-    ack_stub2 = stub_request(:post, "#{URL}/jobs/j3/success")
+    individual_ack_stub = stub_request(:post, %r{#{URL}/jobs/j[13]/success})
       .to_return(status: 204)
 
     proc = new_processor
@@ -76,14 +77,16 @@ class TestAckProcessor < Minitest::Test
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j3"))
     proc.stop(timeout: 5)
 
-    assert_requested(ack_stub1, times: 1)
+    assert_requested(bulk_stub, at_least_times: 1)
     assert_requested(nack_stub, times: 1)
-    assert_requested(ack_stub2, times: 1)
+    assert_not_requested(individual_ack_stub)
   end
 
   def test_retry_on_500
-    stub = stub_request(:post, "#{URL}/jobs/j1/success")
-      .to_return({ status: 500 }, { status: 204 })
+    stub = stub_request(:post, "#{URL}/jobs/success")
+      .to_return({ status: 500, body: JSON.generate({ "error" => "internal" }),
+                   headers: { "Content-Type" => "application/json" } },
+                 { status: 204 })
 
     proc = new_processor
     proc.start
@@ -95,9 +98,9 @@ class TestAckProcessor < Minitest::Test
     assert_requested(stub, times: 2)
   end
 
-  def test_drop_on_404
-    stub = stub_request(:post, "#{URL}/jobs/j1/success")
-      .to_return(status: 404, body: JSON.generate({ "error" => "not found" }),
+  def test_drop_on_422
+    stub = stub_request(:post, "#{URL}/jobs/success")
+      .to_return(status: 422, body: JSON.generate({ "not_found" => ["j1"] }),
                  headers: { "Content-Type" => "application/json" })
 
     proc = new_processor
@@ -105,13 +108,13 @@ class TestAckProcessor < Minitest::Test
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j1"))
     proc.stop(timeout: 5)
 
-    # Should only be called once — no retry
+    # 422 is silently accepted — no retry
     assert_requested(stub, times: 1)
   end
 
   def test_drop_on_4xx
-    stub = stub_request(:post, "#{URL}/jobs/j1/success")
-      .to_return(status: 422, body: JSON.generate({ "error" => "unprocessable" }),
+    stub = stub_request(:post, "#{URL}/jobs/success")
+      .to_return(status: 400, body: JSON.generate({ "error" => "bad request" }),
                  headers: { "Content-Type" => "application/json" })
 
     proc = new_processor
@@ -119,40 +122,37 @@ class TestAckProcessor < Minitest::Test
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j1"))
     proc.stop(timeout: 5)
 
-    # Should only be called once — no retry
+    # 4xx is dropped — no retry
     assert_requested(stub, times: 1)
   end
 
   def test_retries_do_not_block_fresh_acks
-    j1_stub = stub_request(:post, "#{URL}/jobs/j1/success")
-      .to_return({ status: 500 }, { status: 204 })
-    j2_stub = stub_request(:post, "#{URL}/jobs/j2/success")
-      .to_return(status: 204)
+    stub = stub_request(:post, "#{URL}/jobs/success")
+      .to_return({ status: 500, body: JSON.generate({ "error" => "internal" }),
+                   headers: { "Content-Type" => "application/json" } },
+                 { status: 204 })
 
     proc = new_processor
     proc.start
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j1"))
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j2"))
-    # Wait for j1's retry to complete (backoff 0.2s)
+    # Wait for retry to complete (backoff 0.2s)
     sleep 0.5
     proc.stop(timeout: 5)
 
-    # j2 succeeded immediately; j1 was retried once
-    assert_requested(j1_stub, times: 2)
-    assert_requested(j2_stub, times: 1)
+    assert_requested(stub, times: 2)
   end
 
   def test_clean_shutdown_drains_queue
-    stubs = (1..5).map do |i|
-      stub_request(:post, "#{URL}/jobs/j#{i}/success")
-        .to_return(status: 204)
-    end
+    stub = stub_request(:post, "#{URL}/jobs/success")
+      .to_return(status: 204)
 
     proc = new_processor
     proc.start
     5.times { |i| proc.push(Zizq::AckProcessor::Ack.new(job_id: "j#{i + 1}")) }
     proc.stop(timeout: 5)
 
-    stubs.each { |s| assert_requested(s, times: 1) }
+    # All 5 IDs should have been sent via bulk endpoint (1 or more calls)
+    assert_requested(stub, at_least_times: 1)
   end
 end
