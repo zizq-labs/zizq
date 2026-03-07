@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use dashmap::DashMap;
 
-use fjall::config::FilterPolicy;
+use fjall::config::{FilterPolicy, PinningPolicy};
 use fjall::{PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace, Slice};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -1457,6 +1457,11 @@ pub enum CommitMode {
 /// faster tombstone reclamation and tighter disk usage.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
+    /// Block cache capacity in bytes. Shared across all keyspaces.
+    /// Increase when the working set of filter + index + hot data blocks
+    /// exceeds the default. Recommended: 20–25 % of available memory.
+    pub cache_size: u64,
+
     /// Target size for SST files in the `data` keyspace (jobs, payloads, errors).
     /// The memtable is sized to match so flushes produce appropriately-sized
     /// L0 tables.
@@ -1498,6 +1503,9 @@ pub struct StorageConfig {
     pub enqueue_commit_mode: Option<CommitMode>,
 }
 
+/// Default block cache capacity (256 MiB).
+pub const DEFAULT_CACHE_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Default target size for data SST files (64 MiB).
 pub const DEFAULT_DATA_TABLE_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -1532,6 +1540,7 @@ pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            cache_size: DEFAULT_CACHE_SIZE,
             data_table_size: DEFAULT_DATA_TABLE_SIZE,
             index_table_size: DEFAULT_INDEX_TABLE_SIZE,
             journal_size: DEFAULT_JOURNAL_SIZE,
@@ -1557,6 +1566,7 @@ impl StorageConfig {
     ///
     /// | Variable                    | Field              |
     /// |-----------------------------|--------------------|
+    /// | `ZIZQ_CACHE_SIZE`         | `cache_size`       |
     /// | `ZIZQ_DATA_TABLE_SIZE`    | `data_table_size`  |
     /// | `ZIZQ_INDEX_TABLE_SIZE`   | `index_table_size` |
     /// | `ZIZQ_JOURNAL_SIZE`       | `journal_size`     |
@@ -1566,6 +1576,7 @@ impl StorageConfig {
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
         Ok(Self {
+            cache_size: env_parse("ZIZQ_CACHE_SIZE")?.unwrap_or(defaults.cache_size),
             data_table_size: env_parse("ZIZQ_DATA_TABLE_SIZE")?.unwrap_or(defaults.data_table_size),
             index_table_size: env_parse("ZIZQ_INDEX_TABLE_SIZE")?
                 .unwrap_or(defaults.index_table_size),
@@ -1642,6 +1653,7 @@ impl Store {
     ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let db = SingleWriterTxDatabase::builder(path)
+            .cache_size(config.cache_size)
             .manual_journal_persist(true)
             .max_journaling_size(config.journal_size)
             .open()?;
@@ -1666,12 +1678,15 @@ impl Store {
             fjall::KeyspaceCreateOptions::default()
                 .compaction_strategy(data_compaction.clone())
                 .max_memtable_size(config.data_table_size)
+                .filter_block_pinning_policy(PinningPolicy::all(true))
+                .index_block_pinning_policy(PinningPolicy::all(true))
         };
         let index_opts = || {
             fjall::KeyspaceCreateOptions::default()
                 .compaction_strategy(index_compaction.clone())
                 .max_memtable_size(config.index_table_size)
                 .filter_policy(FilterPolicy::disabled())
+                .index_block_pinning_policy(PinningPolicy::all(true))
         };
 
         let data = db.keyspace("data", &data_opts)?;
