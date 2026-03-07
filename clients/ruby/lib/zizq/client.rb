@@ -13,6 +13,7 @@ require "msgpack"
 require "json"
 require "stringio"
 require "uri"
+require "weakref"
 
 module Zizq
   # Low-level HTTP wrapper for the Zizq job queue server API.
@@ -61,28 +62,40 @@ module Zizq
         protocol: Async::HTTP::Protocol::HTTP2,
       )
 
-      @http = Async::HTTP::Client.new(@endpoint)
       @io_mutex = Mutex.new
       @io_thread = nil #: Thread?
       @io_queue = nil #: Thread::Queue?
+
+      # Each thread gets its own Async::HTTP::Client bound to its own
+      # reactor. We track them all so close can shut them down.
+      @http_clients = [] #: Array[Async::HTTP::Client]
+      @http_clients_mutex = Mutex.new
+      @http_key = :"zizq_http_#{object_id}"
 
       @content_type = CONTENT_TYPES.fetch(format)
       @stream_accept = STREAM_ACCEPT.fetch(format)
     end
 
-    # Close the underlying HTTP client and release connections.
+    # Close all thread-local HTTP clients and release connections.
     def close #: () -> void
       if @io_thread&.alive?
         @io_queue&.close
         @io_thread&.join
       end
 
-      @http.close
-    rescue NoMethodError
-      # The async connection pool may hold references to tasks whose
-      # fibers were already reclaimed when their owning Sync reactor
-      # exited (e.g. the AckProcessor or producer thread). Stopping
-      # those dead tasks raises NoMethodError; safe to ignore.
+      @http_clients_mutex.synchronize do
+        @http_clients.each do |ref|
+          ref.close
+        rescue WeakRef::RefError
+          # Client already GC'd (owning thread exited).
+        rescue NoMethodError
+          # The async connection pool may hold references to tasks whose
+          # fibers were already reclaimed when their owning Sync reactor
+          # exited. Stopping those dead tasks raises NoMethodError; safe
+          # to ignore.
+        end
+        @http_clients.clear
+      end
     end
 
     # Enqueue a new job.
@@ -305,7 +318,7 @@ module Zizq
       headers["worker-id"] = worker_id if worker_id
 
       Sync do
-        response = @http.get(path, headers)
+        response = http.get(path, headers)
 
         begin
           raise StreamError, "take jobs stream returned HTTP #{response.status}" unless response.status == 200
@@ -441,11 +454,12 @@ module Zizq
 
     # Dispatch a block to the appropriate execution context.
     #
-    # If already inside an Async reactor, yields @http directly.
-    # Otherwise, dispatches via the persistent background IO thread.
+    # If already inside an Async reactor (e.g. AckProcessor, producer),
+    # yields the calling thread's HTTP client directly. Otherwise,
+    # dispatches via the persistent background IO thread.
     def request(&block) #: () { (Async::HTTP::Client) -> RawResponse } -> RawResponse
       if Async::Task.current?
-        yield @http
+        yield http
       else
         sync_call(&block)
       end
@@ -500,13 +514,30 @@ module Zizq
         while (item = @io_queue.pop)
           block, result_queue = item
           barrier.async do
-            result_queue.push([:ok, block.call(@http)])
+            result_queue.push([:ok, block.call(http)])
           rescue => e
             result_queue.push([:error, e])
           end
         end
 
         barrier.wait
+      end
+    end
+
+    # Return the calling thread's HTTP client, creating one if needed.
+    # Uses thread_variable_get/set (not Thread.current[]) because the
+    # latter is fiber-local — each Async fiber would get its own client.
+    # The tracking array holds WeakRefs so clients from exited threads
+    # can be garbage-collected.
+    def http #: () -> Async::HTTP::Client
+      Thread.current.thread_variable_get(@http_key) || begin
+        client = Async::HTTP::Client.new(@endpoint)
+        @http_clients_mutex.synchronize do
+          @http_clients.reject! { |ref| !ref.weakref_alive? }
+          @http_clients << WeakRef.new(client)
+        end
+        Thread.current.thread_variable_set(@http_key, client)
+        client
       end
     end
 
