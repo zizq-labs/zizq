@@ -425,6 +425,18 @@ struct BulkEnqueueResponse {
     jobs: Vec<Job>,
 }
 
+/// Request shape for bulk job success.
+#[derive(Deserialize)]
+struct BulkSuccessRequest {
+    ids: Vec<String>,
+}
+
+/// Response shape for bulk success when some IDs were not found.
+#[derive(Serialize)]
+struct BulkSuccessNotFoundResponse {
+    not_found: Vec<String>,
+}
+
 /// Client-facing backoff configuration with human-readable field names.
 ///
 /// The store uses compact single-letter keys (`x`, `b`, `j`) for storage
@@ -980,6 +992,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/version", get(version))
         .route("/jobs", get(list_jobs).post(enqueue))
         .route("/jobs/bulk", post(bulk_enqueue))
+        .route("/jobs/success", post(bulk_mark_completed))
         .route("/jobs/take", get(take_jobs))
         .route("/jobs/{id}", get(get_job))
         .route("/jobs/{id}/success", post(mark_completed))
@@ -1240,6 +1253,56 @@ async fn mark_completed(
         ),
         Err(e) => {
             tracing::error!(%e, "mark_completed failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /jobs/success` — bulk mark jobs as completed.
+async fn bulk_mark_completed(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    NegotiatedBody(req): NegotiatedBody<BulkSuccessRequest>,
+) -> Response {
+    if req.ids.is_empty() {
+        return respond(
+            fmt,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: "ids must not be empty".into(),
+            },
+        );
+    }
+
+    let now = (state.clock)();
+    match state.store.mark_completed_bulk(now, &req.ids).await {
+        Ok(result) => {
+            if result.not_found.is_empty() {
+                tracing::debug!(count = result.completed.len(), "bulk success completed");
+                no_content()
+            } else {
+                tracing::debug!(
+                    completed = result.completed.len(),
+                    not_found = result.not_found.len(),
+                    "bulk success partially completed"
+                );
+                respond(
+                    fmt,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &BulkSuccessNotFoundResponse {
+                        not_found: result.not_found,
+                    },
+                )
+            }
+        }
+        Err(e) => {
+            tracing::error!(%e, "bulk mark_completed failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -5178,5 +5241,226 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0]["queue"], "q1");
         assert_eq!(jobs[1]["queue"], "q2");
+    }
+
+    // --- POST /jobs/success (bulk) tests ---
+
+    #[tokio::test]
+    async fn bulk_success_returns_204_when_all_found() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Enqueue 3 jobs.
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({"type": "test", "queue": "default", "payload": format!("j{i}")}),
+            );
+            let res = app.clone().oneshot(req).await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+
+        // Take all 3 so they're in the working set.
+        state
+            .store
+            .take_next_n_jobs(now, &HashSet::new(), 3)
+            .await
+            .unwrap();
+
+        // Bulk complete all 3.
+        let req = json_request("POST", "/jobs/success", &serde_json::json!({"ids": ids}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn bulk_success_returns_422_with_not_found() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Enqueue and take 2 jobs.
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({"type": "test", "queue": "default", "payload": format!("j{i}")}),
+            );
+            let res = app.clone().oneshot(req).await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+
+        state
+            .store
+            .take_next_n_jobs(now, &HashSet::new(), 2)
+            .await
+            .unwrap();
+
+        // Bulk complete with 1 valid + 1 bogus ID.
+        let req = json_request(
+            "POST",
+            "/jobs/success",
+            &serde_json::json!({"ids": [ids[0], "bogus_id"]}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let not_found = body["not_found"].as_array().unwrap();
+        assert_eq!(not_found.len(), 1);
+        assert_eq!(not_found[0], "bogus_id");
+    }
+
+    #[tokio::test]
+    async fn bulk_success_valid_jobs_committed_despite_not_found() {
+        // Use non-zero retention so the completed job remains visible via GET.
+        let mut config = store::StorageConfig::default();
+        config.default_completed_retention_ms = 3_600_000;
+        let (clock, state) = test_app_state_with_config(config);
+        let now = clock.load(Ordering::Relaxed);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        // Enqueue and take a job.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "default", "payload": "x"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let job_id = body["id"].as_str().unwrap().to_string();
+
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // Bulk complete with the valid job + a bogus one.
+        let req = json_request(
+            "POST",
+            "/jobs/success",
+            &serde_json::json!({"ids": [job_id, "bogus"]}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Verify the valid job is now Completed.
+        let req = empty_request("GET", &format!("/jobs/{job_id}"));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn bulk_success_returns_400_for_empty_ids() {
+        let req = json_request("POST", "/jobs/success", &serde_json::json!({"ids": []}));
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn bulk_success_returns_422_for_pending_jobs() {
+        let (_, app) = test_state_and_app();
+
+        // Enqueue 2 jobs but don't take them.
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({"type": "test", "queue": "default", "payload": format!("j{i}")}),
+            );
+            let res = app.clone().oneshot(req).await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+
+        // Bulk complete — should report all as not_found (they're pending, not working).
+        let req = json_request("POST", "/jobs/success", &serde_json::json!({"ids": ids}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let not_found = body["not_found"].as_array().unwrap();
+        assert_eq!(not_found.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_success_msgpack_round_trip() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Enqueue and take 2 jobs.
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({"type": "test", "queue": "default", "payload": format!("j{i}")}),
+            );
+            let res = app.clone().oneshot(req).await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+
+        state
+            .store
+            .take_next_n_jobs(now, &HashSet::new(), 2)
+            .await
+            .unwrap();
+
+        // Send bulk success via MsgPack.
+        #[derive(Serialize)]
+        struct MsgPackBulkSuccess {
+            ids: Vec<String>,
+        }
+
+        let body = rmp_serde::to_vec_named(&MsgPackBulkSuccess { ids: ids.clone() }).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs/success")
+            .header("content-type", "application/msgpack")
+            .body(Body::from(body))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn bulk_success_deduplicates_ids() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Enqueue and take 1 job.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({"type": "test", "queue": "default", "payload": "dup"}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let id = body["id"].as_str().unwrap().to_string();
+
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // Send the same ID twice — should succeed, not infinite-loop.
+        let req = json_request(
+            "POST",
+            "/jobs/success",
+            &serde_json::json!({"ids": [id, id]}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
     }
 }

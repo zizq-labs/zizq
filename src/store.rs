@@ -610,6 +610,14 @@ pub struct FailureOptions {
     pub kill: bool,
 }
 
+/// Result of a bulk completion operation.
+pub struct BulkCompleteResult {
+    /// IDs that were successfully marked as completed.
+    pub completed: Vec<String>,
+    /// IDs that were not found in the working set.
+    pub not_found: Vec<String>,
+}
+
 /// Events broadcast by the store when job state changes.
 ///
 /// Workers use these events to decide when to check for new work:
@@ -2313,6 +2321,186 @@ impl Store {
         }
 
         Ok(completed)
+    }
+
+    /// Mark multiple jobs as successfully completed in a single transaction.
+    ///
+    /// Jobs not found in the working set are collected in `not_found` but
+    /// do not prevent valid jobs from being committed. Returns a
+    /// `BulkCompleteResult` with both lists.
+    pub async fn mark_completed_bulk(
+        &self,
+        now: u64,
+        ids: &[String],
+    ) -> Result<BulkCompleteResult, StoreError> {
+        let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
+        let default_completed_retention_ms = self.default_completed_retention_ms;
+        let mut seen = HashSet::with_capacity(ids.len());
+        let ids: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
+        let event_tx = self.event_tx.clone();
+
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            /// A job that has been pre-read and prepared for completion.
+            struct Prepared {
+                id: String,
+                pre_bytes: Slice,
+                priority: u16,
+                /// `None` for zero-retention (will be deleted).
+                updated_bytes: Option<Slice>,
+                /// `Some` for zero-retention (will be deleted).
+                deletion: Option<JobDeletion>,
+                /// Index key updates for non-zero retention jobs.
+                index_keys: Option<RetentionKeys>,
+            }
+
+            /// Pre-computed index keys for a non-zero-retention completion.
+            struct RetentionKeys {
+                old_status: Vec<u8>,
+                new_status: Vec<u8>,
+                purge: Vec<u8>,
+            }
+
+            let mut not_found: Vec<String> = Vec::new();
+
+            loop {
+                // ---- outside tx: pre-read and prepare ----
+                let mut prepared: Vec<Prepared> = Vec::new();
+
+                for id in &ids {
+                    let job_key = make_job_key(id);
+                    let pre_bytes = match ks.data.get(&job_key)? {
+                        Some(bytes) => bytes,
+                        None => {
+                            not_found.push(id.clone());
+                            continue;
+                        }
+                    };
+
+                    let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+
+                    if job.status != JobStatus::Working as u8 {
+                        not_found.push(id.clone());
+                        continue;
+                    }
+
+                    let retention_ms = job
+                        .retention
+                        .as_ref()
+                        .and_then(|r| r.completed_ms)
+                        .unwrap_or(default_completed_retention_ms);
+
+                    if retention_ms == 0 {
+                        let del = prepare_job_deletion(&job, JobStatus::Working, &ks);
+                        prepared.push(Prepared {
+                            id: id.clone(),
+                            pre_bytes,
+                            priority: job.priority,
+                            updated_bytes: None,
+                            deletion: Some(del),
+                            index_keys: None,
+                        });
+                    } else {
+                        let purge_at = now + retention_ms;
+                        let old_status_key = make_status_key(JobStatus::Working, id);
+                        let new_status_key = make_status_key(JobStatus::Completed, id);
+                        let purge_key = make_purge_key(purge_at, id);
+
+                        job.status = JobStatus::Completed.into();
+                        job.purge_at = Some(purge_at);
+                        job.completed_at = Some(now);
+
+                        let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+                        prepared.push(Prepared {
+                            id: id.clone(),
+                            pre_bytes,
+                            priority: job.priority,
+                            updated_bytes: Some(updated_slice),
+                            deletion: None,
+                            index_keys: Some(RetentionKeys {
+                                old_status: old_status_key,
+                                new_status: new_status_key,
+                                purge: purge_key,
+                            }),
+                        });
+                    }
+                }
+
+                if prepared.is_empty() {
+                    return Ok((
+                        BulkCompleteResult {
+                            completed: Vec::new(),
+                            not_found,
+                        },
+                        None,
+                    ));
+                }
+
+                // ---- inside tx ----
+                let mut tx = ks.write_tx();
+                let mut cas_conflict_detected = false;
+
+                for p in &prepared {
+                    let job_key = make_job_key(&p.id);
+
+                    if let Some(ref del) = p.deletion {
+                        // Zero-retention: delete via CAS.
+                        let prev = tx.take(&ks.data, &job_key)?;
+                        if prev.as_deref() != Some(&*p.pre_bytes) {
+                            cas_conflict_detected = true;
+                            break;
+                        }
+                        apply_job_deletion(&mut tx, del, &ks);
+                    } else if let Some(ref updated) = p.updated_bytes {
+                        // Non-zero retention: update via CAS.
+                        let prev =
+                            tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
+                        if prev.as_deref() != Some(&*p.pre_bytes) {
+                            cas_conflict_detected = true;
+                            break;
+                        }
+                        let keys = p.index_keys.as_ref().unwrap();
+                        tx.remove(&ks.index, &keys.old_status);
+                        tx.insert(&ks.index, &keys.new_status, b"");
+                        tx.insert(&ks.index, &keys.purge, b"");
+                    }
+                }
+
+                if cas_conflict_detected {
+                    drop(tx);
+                    not_found.clear();
+                    continue; // Retry from pre-read.
+                }
+
+                let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+                // Update ready_index for all completed jobs.
+                for p in &prepared {
+                    ready_index.global.remove(&(p.priority, p.id.clone()));
+                }
+
+                let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
+
+                return Ok((
+                    BulkCompleteResult {
+                        completed,
+                        not_found,
+                    },
+                    Some(sync),
+                ));
+            }
+        })
+        .await?;
+
+        let bulk_result = await_sync(result).await?;
+
+        // Broadcast JobCompleted for each completed job.
+        for id in &bulk_result.completed {
+            let _ = event_tx.send(StoreEvent::JobCompleted { id: id.clone() });
+        }
+
+        Ok(bulk_result)
     }
 
     /// Record a job failure and either schedule a retry or kill the job
