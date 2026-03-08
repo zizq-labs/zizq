@@ -1394,11 +1394,15 @@ fn intersect_streams<'a>(
 /// if any ID is missing from the `data` keyspace (data corruption). Hydrates
 /// each job's payload from the same keyspace using the `P` tag prefix.
 ///
+/// Reads are performed through the provided `Readable` (typically a snapshot)
+/// to ensure consistency with the index scan that produced the IDs.
+///
 /// When `now` is `Some`, jobs with `purge_at <= now` are skipped (logically
 /// invisible before the reaper physically deletes them). The iterator
 /// continues scanning past expired jobs until `limit` entries are collected
 /// or the stream is exhausted.
 fn load_jobs_by_ids(
+    reader: &impl Readable,
     data_ks: &SingleWriterTxKeyspace,
     ids: impl Iterator<Item = Result<Vec<u8>, StoreError>>,
     source: &str,
@@ -1412,7 +1416,7 @@ fn load_jobs_by_ids(
             std::str::from_utf8(&id)
                 .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))?,
         );
-        let bytes = data_ks.get(&job_key)?.ok_or_else(|| {
+        let bytes = reader.get(data_ks, &job_key)?.ok_or_else(|| {
             StoreError::Corruption(format!(
                 "job in {source} but missing from data keyspace: {:?}",
                 String::from_utf8_lossy(&id),
@@ -1429,7 +1433,7 @@ fn load_jobs_by_ids(
 
         // Hydrate the payload from the data keyspace.
         let payload_key = make_payload_key(&job.id);
-        if let Some(payload_bytes) = data_ks.get(&payload_key)? {
+        if let Some(payload_bytes) = reader.get(data_ks, &payload_key)? {
             job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
         }
 
@@ -3016,7 +3020,8 @@ impl Store {
                 let first = iter.next().unwrap();
                 let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
 
-                rows = load_jobs_by_ids(&ks.data, combined, &source_desc, opts.now, fetch)?;
+                rows =
+                    load_jobs_by_ids(&snapshot, &ks.data, combined, &source_desc, opts.now, fetch)?;
             } else {
                 // No filter — scan the data keyspace for J-tagged keys.
                 // Range: [J, 0]..[J, 1] covers all job metadata entries.
