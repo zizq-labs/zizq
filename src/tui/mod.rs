@@ -64,7 +64,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut should_quit = false;
 
     loop {
-        // Process events until the next tick fires.
+        // Process events until the next tick fires, or a user input
+        // event arrives (user input triggers an immediate render).
         loop {
             tokio::select! {
                 biased;
@@ -72,8 +73,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 event = rx.recv() => {
                     match event {
                         Some(event) => {
+                            let immediate = event.is_user_input();
                             if app.handle_event(event) {
                                 should_quit = true;
+                                break;
+                            }
+                            if immediate {
                                 break;
                             }
                         }

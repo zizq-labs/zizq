@@ -14,6 +14,10 @@ use crate::admin::{AdminEvent, AdminJobSummary, JobChangeStatus};
 pub enum Event {
     /// User requested quit (e.g. pressed 'q').
     Quit,
+    /// Switch to the next tab.
+    NextTab,
+    /// Switch to the previous tab.
+    PrevTab,
     /// Server connection attempt in progress.
     ServerConnecting,
     /// Server connection established.
@@ -35,6 +39,13 @@ pub enum Event {
     ServerDisconnected,
 }
 
+impl Event {
+    /// Returns `true` for events triggered by user input (key presses).
+    pub fn is_user_input(&self) -> bool {
+        matches!(self, Event::Quit | Event::NextTab | Event::PrevTab)
+    }
+}
+
 /// Spawn a blocking thread that reads terminal input events and sends
 /// them to the event channel.
 pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
@@ -43,9 +54,20 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
 
         loop {
             if let Ok(CtEvent::Key(key)) = event::read() {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                    let _ = tx.blocking_send(Event::Quit);
-                    break;
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            let _ = tx.blocking_send(Event::Quit);
+                            break;
+                        }
+                        KeyCode::Char('l') => {
+                            let _ = tx.blocking_send(Event::NextTab);
+                        }
+                        KeyCode::Char('h') => {
+                            let _ = tx.blocking_send(Event::PrevTab);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }

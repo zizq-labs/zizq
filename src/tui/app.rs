@@ -7,6 +7,27 @@ use crate::admin::{AdminJobSummary, JobChangeStatus};
 
 use super::events::Event;
 
+/// Active tab in the TUI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Ready,
+    InFlight,
+}
+
+impl Tab {
+    const ALL: [Tab; 2] = [Tab::Ready, Tab::InFlight];
+
+    pub fn next(self) -> Tab {
+        let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Tab {
+        let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 /// Connection status to the admin API.
 pub enum ConnectionStatus {
     Connecting,
@@ -22,6 +43,7 @@ pub struct App {
     pub ready_jobs: Vec<AdminJobSummary>,
     pub in_flight_jobs: Vec<AdminJobSummary>,
     pub now_ms: u64,
+    pub active_tab: Tab,
 }
 
 impl App {
@@ -33,6 +55,7 @@ impl App {
             ready_jobs: Vec::new(),
             in_flight_jobs: Vec::new(),
             now_ms: 0,
+            active_tab: Tab::Ready,
         }
     }
 
@@ -42,6 +65,12 @@ impl App {
     pub fn handle_event(&mut self, event: Event) -> bool {
         match event {
             Event::Quit => return true,
+            Event::NextTab => {
+                self.active_tab = self.active_tab.next();
+            }
+            Event::PrevTab => {
+                self.active_tab = self.active_tab.prev();
+            }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;
             }
@@ -320,5 +349,43 @@ mod tests {
         });
 
         assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+    }
+
+    // ── Tab switching ───────────────────────────────────────────────
+
+    #[test]
+    fn default_tab_is_ready() {
+        let app = App::new();
+        assert_eq!(app.active_tab, Tab::Ready);
+    }
+
+    #[test]
+    fn next_tab_cycles_forward() {
+        let mut app = App::new();
+        app.handle_event(Event::NextTab);
+        assert_eq!(app.active_tab, Tab::InFlight);
+    }
+
+    #[test]
+    fn next_tab_wraps_around() {
+        let mut app = App::new();
+        app.handle_event(Event::NextTab);
+        app.handle_event(Event::NextTab);
+        assert_eq!(app.active_tab, Tab::Ready);
+    }
+
+    #[test]
+    fn prev_tab_cycles_backward() {
+        let mut app = App::new();
+        app.handle_event(Event::NextTab);
+        app.handle_event(Event::PrevTab);
+        assert_eq!(app.active_tab, Tab::Ready);
+    }
+
+    #[test]
+    fn prev_tab_wraps_around() {
+        let mut app = App::new();
+        app.handle_event(Event::PrevTab);
+        assert_eq!(app.active_tab, Tab::InFlight);
     }
 }

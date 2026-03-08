@@ -1,0 +1,16 @@
+---
+source: src/tui/ui.rs
+expression: "render_to_string(&app, 120, 12)"
+---
+┌Zizq 0.1.0────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ● Connected  v1.0.0  uptime: 2.0m                                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Ready   In-Flight
+                             ID   PRIORITY QUEUE                 TYPE                            DURATION       ATTEMPTS
+          job-emails-send_email          0 emails                send_email                      3.1s                  1
+             job-billing-charge          0 billing               charge                          2.5m                  3
+
+
+
+
+ h/l Switch tab  q Quit
