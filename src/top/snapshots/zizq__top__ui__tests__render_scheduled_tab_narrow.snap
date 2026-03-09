@@ -1,0 +1,16 @@
+---
+source: src/top/ui.rs
+expression: "render_to_string(&app, 80, 12)"
+---
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 2m
+  Queue: 2 in-flight, 2 ready
+
+  Depth[││││                                                           4 jobs]
+
+   In-Flight   Ready   Scheduled
+                         ID   PRIORITY QUEU          DUE   ATTEMPTS TYPE
+70a4ee89f2f09a1eb0af9d5ee80          0 defa        3m52s          0 send_reminde
+70a5ff9a03f0ab1fc0b0ae6ff90          0 repo           1h          1 generate_qua
+ ←/→ Switch tab  q Quit

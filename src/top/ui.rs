@@ -363,9 +363,9 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     Table::new(
         rows,
         [
-            Constraint::Fill(3),
+            Constraint::Length(27),
             Constraint::Length(10),
-            Constraint::Fill(2),
+            Constraint::Fill(1),
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Fill(3),
@@ -417,9 +417,9 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     Table::new(
         rows,
         [
-            Constraint::Fill(3),
+            Constraint::Length(27),
             Constraint::Length(10),
-            Constraint::Fill(2),
+            Constraint::Fill(1),
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Fill(3),
@@ -470,9 +470,9 @@ fn job_table_scheduled(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     Table::new(
         rows,
         [
-            Constraint::Fill(3),
+            Constraint::Length(27),
             Constraint::Length(10),
-            Constraint::Fill(2),
+            Constraint::Fill(1),
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Fill(3),
@@ -580,43 +580,6 @@ mod tests {
         }
     }
 
-    fn sample_ready_job(
-        queue: &str,
-        job_type: &str,
-        ready_at: u64,
-        attempts: u32,
-    ) -> AdminJobSummary {
-        AdminJobSummary {
-            id: format!("job-{queue}-{job_type}"),
-            queue: queue.to_string(),
-            job_type: job_type.to_string(),
-            priority: 0,
-            ready_at,
-            attempts,
-            dequeued_at: None,
-            failed_at: None,
-        }
-    }
-
-    fn sample_in_flight_job(
-        queue: &str,
-        job_type: &str,
-        dequeued_at: u64,
-        attempts: u32,
-        failed_at: Option<u64>,
-    ) -> AdminJobSummary {
-        AdminJobSummary {
-            id: format!("job-{queue}-{job_type}"),
-            queue: queue.to_string(),
-            job_type: job_type.to_string(),
-            priority: 0,
-            ready_at: dequeued_at.saturating_sub(1000),
-            attempts,
-            dequeued_at: Some(dequeued_at),
-            failed_at,
-        }
-    }
-
     #[test]
     fn render_connecting() {
         let app = new_app();
@@ -663,10 +626,31 @@ mod tests {
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
 
-    #[test]
-    fn render_ready_tab_with_jobs() {
+    fn realistic_job(
+        id: &str,
+        queue: &str,
+        job_type: &str,
+        priority: u16,
+        ready_at: u64,
+        attempts: u32,
+        dequeued_at: Option<u64>,
+        failed_at: Option<u64>,
+    ) -> AdminJobSummary {
+        AdminJobSummary {
+            id: id.to_string(),
+            queue: queue.to_string(),
+            job_type: job_type.to_string(),
+            priority,
+            ready_at,
+            attempts,
+            dequeued_at,
+            failed_at,
+        }
+    }
+
+    fn sample_app(active_tab: Tab) -> App {
         let now_ms = 1_700_000_000_000u64;
-        let app = App {
+        App {
             host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
@@ -674,83 +658,112 @@ mod tests {
             server_tier: Some(Tier::Pro),
             total_ready: 2,
             total_in_flight: 2,
-            total_scheduled: 0,
-            ready_jobs: vec![
-                sample_ready_job("emails", "send_email", now_ms - 5_200, 0),
-                sample_ready_job("reports", "gen_report", now_ms - 62_000, 2),
-            ],
-            in_flight_jobs: vec![
-                sample_in_flight_job("emails", "send_email", now_ms - 3_100, 1, None),
-                sample_in_flight_job(
-                    "billing",
-                    "charge",
-                    now_ms - 150_000,
-                    3,
-                    Some(now_ms - 60_000),
-                ),
-            ],
-            scheduled_jobs: Vec::new(),
-            now_ms,
-            active_tab: Tab::Ready,
-        };
-        insta::assert_snapshot!(render_to_string(&app, 120, 12));
-    }
-
-    #[test]
-    fn render_in_flight_tab_with_jobs() {
-        let now_ms = 1_700_000_000_000u64;
-        let app = App {
-            host: "127.0.0.1:8901".to_string(),
-            status: ConnectionStatus::Connected,
-            server_version: Some("1.0.0".to_string()),
-            server_uptime_ms: Some(120_000),
-            server_tier: Some(Tier::Pro),
-            total_ready: 2,
-            total_in_flight: 2,
-            total_scheduled: 0,
-            ready_jobs: vec![
-                sample_ready_job("emails", "send_email", now_ms - 5_200, 0),
-                sample_ready_job("reports", "gen_report", now_ms - 62_000, 2),
-            ],
-            in_flight_jobs: vec![
-                sample_in_flight_job("emails", "send_email", now_ms - 3_100, 1, None),
-                sample_in_flight_job(
-                    "billing",
-                    "charge",
-                    now_ms - 150_000,
-                    3,
-                    Some(now_ms - 60_000),
-                ),
-            ],
-            scheduled_jobs: Vec::new(),
-            now_ms,
-            active_tab: Tab::InFlight,
-        };
-        insta::assert_snapshot!(render_to_string(&app, 120, 12));
-    }
-
-    #[test]
-    fn render_scheduled_tab_with_jobs() {
-        let now_ms = 1_700_000_000_000u64;
-        let app = App {
-            host: "127.0.0.1:8901".to_string(),
-            status: ConnectionStatus::Connected,
-            server_version: Some("1.0.0".to_string()),
-            server_uptime_ms: Some(120_000),
-            server_tier: Some(Tier::Pro),
-            total_ready: 0,
-            total_in_flight: 0,
             total_scheduled: 2,
-            ready_jobs: Vec::new(),
-            in_flight_jobs: Vec::new(),
+            ready_jobs: vec![
+                realistic_job(
+                    "0195b70a3cc87a1f0890da08e8b3cc86",
+                    "default",
+                    "generate_annual_report_email",
+                    0,
+                    now_ms - 5_200,
+                    0,
+                    None,
+                    None,
+                ),
+                realistic_job(
+                    "0195b70a3dd47c2308a1fb09e9c4dd97",
+                    "default",
+                    "send_welcome_email",
+                    5,
+                    now_ms - 62_000,
+                    2,
+                    None,
+                    None,
+                ),
+            ],
+            in_flight_jobs: vec![
+                realistic_job(
+                    "0195b70a2bb46e1f07a0c908d7a2bb40",
+                    "default",
+                    "generate_annual_report_email",
+                    0,
+                    now_ms - 10_000,
+                    1,
+                    Some(now_ms - 3_100),
+                    None,
+                ),
+                realistic_job(
+                    "0195b70a1aa35d0e06b0b807c691aa30",
+                    "billing",
+                    "charge_subscription",
+                    0,
+                    now_ms - 200_000,
+                    3,
+                    Some(now_ms - 150_000),
+                    Some(now_ms - 60_000),
+                ),
+            ],
             scheduled_jobs: vec![
-                sample_ready_job("emails", "send_email", now_ms + 232_000, 0),
-                sample_ready_job("reports", "gen_report", now_ms + 3_600_000, 1),
+                realistic_job(
+                    "0195b70a4ee89f2f09a1eb0af9d5ee80",
+                    "default",
+                    "send_reminder_email",
+                    0,
+                    now_ms + 232_000,
+                    0,
+                    None,
+                    None,
+                ),
+                realistic_job(
+                    "0195b70a5ff9a03f0ab1fc0b0ae6ff90",
+                    "reports",
+                    "generate_quarterly_report",
+                    0,
+                    now_ms + 3_600_000,
+                    1,
+                    None,
+                    None,
+                ),
             ],
             now_ms,
-            active_tab: Tab::Scheduled,
-        };
-        insta::assert_snapshot!(render_to_string(&app, 120, 12));
+            active_tab,
+        }
+    }
+
+    #[test]
+    fn render_ready_tab_wide() {
+        let app = sample_app(Tab::Ready);
+        insta::assert_snapshot!(render_to_string(&app, 160, 12));
+    }
+
+    #[test]
+    fn render_ready_tab_narrow() {
+        let app = sample_app(Tab::Ready);
+        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+    }
+
+    #[test]
+    fn render_in_flight_tab_wide() {
+        let app = sample_app(Tab::InFlight);
+        insta::assert_snapshot!(render_to_string(&app, 160, 12));
+    }
+
+    #[test]
+    fn render_in_flight_tab_narrow() {
+        let app = sample_app(Tab::InFlight);
+        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+    }
+
+    #[test]
+    fn render_scheduled_tab_wide() {
+        let app = sample_app(Tab::Scheduled);
+        insta::assert_snapshot!(render_to_string(&app, 160, 12));
+    }
+
+    #[test]
+    fn render_scheduled_tab_narrow() {
+        let app = sample_app(Tab::Scheduled);
+        insta::assert_snapshot!(render_to_string(&app, 80, 12));
     }
 
     #[test]
@@ -827,12 +840,24 @@ mod tests {
             total_scheduled: 0,
             ready_jobs: Vec::new(),
             in_flight_jobs: vec![
-                sample_in_flight_job("emails", "send_email", now_ms - 3_100, 1, None),
-                sample_in_flight_job(
+                realistic_job(
+                    "0195b70a2bb46e1f07a0c908d7a2bb40",
+                    "default",
+                    "send_email",
+                    0,
+                    now_ms - 10_000,
+                    1,
+                    Some(now_ms - 3_100),
+                    None,
+                ),
+                realistic_job(
+                    "0195b70a1aa35d0e06b0b807c691aa30",
                     "billing",
                     "charge",
-                    now_ms - 150_000,
+                    0,
+                    now_ms - 200_000,
                     3,
+                    Some(now_ms - 150_000),
                     Some(now_ms - 60_000),
                 ),
             ],
