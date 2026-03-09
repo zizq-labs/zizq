@@ -1,5 +1,5 @@
 ---
-source: src/tui/ui.rs
+source: src/top/ui.rs
 expression: "render_to_string(&app, 60, 10)"
 ---
   Zizq 0.1.0
@@ -9,6 +9,6 @@ expression: "render_to_string(&app, 60, 10)"
 
 
 
-   Ready   In-Flight   Scheduled
-       ID   PRIORITY QUEUE        DELAY   ATTEMPTS TYPE
+   In-Flight   Ready   Scheduled
+       ID   PRIORITY QUEUE     DURATION   ATTEMPTS TYPE
  ←/→ Switch tab  q Quit

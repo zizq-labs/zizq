@@ -10,7 +10,7 @@
 //!
 //! Commands:
 //!   serve    Start the server (default)
-//!   tui      Launch the terminal UI dashboard (requires Pro license)
+//!   top      Launch the interactive terminal UI
 //!
 //! Options:
 //!  -k, --license-key <KEY>
@@ -32,12 +32,9 @@
 //! ZIZQ_SCHEDULER_BATCH_SIZE: Max scheduled jobs to promote per iteration
 //!                              (default: 200).
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
-use zizq::{
-    license::{Feature, License},
-    serve, tui,
-};
+use zizq::{license::License, serve, top};
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
@@ -66,8 +63,8 @@ enum Command {
     /// Start the server.
     Serve(serve::Args),
 
-    /// Launch the terminal UI dashboard (requires Pro license).
-    Tui(tui::Args),
+    /// Launch the interactive terminal UI.
+    Top(top::Args),
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
@@ -99,40 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
 
     match cli.command {
-        Some(Command::Tui(args)) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-
-            if let Err(msg) = license.require(now, Feature::Tui) {
-                // Capitalize the first letter of the error message.
-                let msg = {
-                    let mut chars = msg.chars();
-                    match chars.next() {
-                        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-                        None => msg,
-                    }
-                };
-
-                eprintln!("{msg}. See --license-key.");
-                eprintln!();
-
-                // Build the full command tree so global args are
-                // propagated into the subcommand help output.
-                let mut cmd = Cli::command();
-                cmd.build();
-                cmd.find_subcommand("tui")
-                    .unwrap()
-                    .clone()
-                    .name("zizq tui")
-                    .print_help()
-                    .ok();
-                std::process::exit(2);
-            }
-
-            tui::run(args).await
-        }
+        Some(Command::Top(args)) => top::run(args).await,
         Some(Command::Serve(args)) => serve::run(args, license).await,
         None => serve::run(serve::Args::parse_from(std::env::args()), license).await,
     }

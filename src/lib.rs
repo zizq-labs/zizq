@@ -15,4 +15,4 @@ pub mod scheduler;
 pub mod serve;
 pub mod store;
 pub mod time;
-pub mod tui;
+pub mod top;

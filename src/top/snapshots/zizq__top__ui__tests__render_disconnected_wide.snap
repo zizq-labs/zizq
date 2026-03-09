@@ -1,5 +1,5 @@
 ---
-source: src/tui/ui.rs
+source: src/top/ui.rs
 expression: "render_to_string(&app, 120, 8)"
 ---
   Zizq 0.1.0
@@ -8,5 +8,5 @@ expression: "render_to_string(&app, 120, 8)"
 
 
 
-   Ready   In-Flight   Scheduled
+   In-Flight   Ready   Scheduled
  ←/→ Switch tab  q Quit

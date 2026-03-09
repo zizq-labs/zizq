@@ -157,13 +157,14 @@ mod tests {
 
     #[test]
     fn parses_heartbeat() {
-        let json = r#"{"server":{"version":"1.0.0","uptime_ms":5000,"total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"heartbeat"}"#;
+        let json = r#"{"server":{"version":"1.0.0","uptime_ms":5000,"tier":"pro","total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"heartbeat"}"#;
         let event = parse_ws_message(json).unwrap();
 
         match event {
             Event::ServerHeartbeat { server } => {
                 assert_eq!(server.version, "1.0.0");
                 assert_eq!(server.uptime_ms, 5000);
+                assert_eq!(server.tier, "pro");
                 assert_eq!(server.total_ready, 0);
                 assert_eq!(server.total_in_flight, 0);
                 assert_eq!(server.total_scheduled, 0);
@@ -175,7 +176,7 @@ mod tests {
     #[test]
     fn parses_job_snapshot() {
         let json = r#"{
-            "server": {"version":"1.0.0","uptime_ms":5000,"total_ready":1,"total_in_flight":1,"total_scheduled":1},
+            "server": {"version":"1.0.0","uptime_ms":5000,"tier":"pro","total_ready":1,"total_in_flight":1,"total_scheduled":1},
             "event": "job_snapshot",
             "ready": [{"id":"r1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0}],
             "in_flight": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}],
@@ -208,7 +209,7 @@ mod tests {
     #[test]
     fn parses_job_changed_scheduled() {
         let json = r#"{
-            "server": {"version":"1.0.0","uptime_ms":5000,"total_ready":0,"total_in_flight":0,"total_scheduled":1},
+            "server": {"version":"1.0.0","uptime_ms":5000,"tier":"pro","total_ready":0,"total_in_flight":0,"total_scheduled":1},
             "event": "job_changed",
             "id": "s1",
             "status": "scheduled",
@@ -236,7 +237,7 @@ mod tests {
     #[test]
     fn parses_job_changed_with_job() {
         let json = r#"{
-            "server": {"version":"1.0.0","uptime_ms":5000,"total_ready":1,"total_in_flight":0,"total_scheduled":0},
+            "server": {"version":"1.0.0","uptime_ms":5000,"tier":"pro","total_ready":1,"total_in_flight":0,"total_scheduled":0},
             "event": "job_changed",
             "id": "j1",
             "status": "ready",
@@ -264,7 +265,7 @@ mod tests {
 
     #[test]
     fn parses_job_changed_without_job() {
-        let json = r#"{"server":{"version":"1.0.0","uptime_ms":5000,"total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"job_changed","id":"j1","status":"completed"}"#;
+        let json = r#"{"server":{"version":"1.0.0","uptime_ms":5000,"tier":"pro","total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"job_changed","id":"j1","status":"completed"}"#;
         let event = parse_ws_message(json).unwrap();
 
         match event {
@@ -290,7 +291,7 @@ mod tests {
 
     #[test]
     fn returns_none_for_unknown_event_type() {
-        let json = r#"{"server":{"version":"1.0.0","uptime_ms":0,"total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"unknown","data":123}"#;
+        let json = r#"{"server":{"version":"1.0.0","uptime_ms":0,"tier":"free","total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"unknown","data":123}"#;
         assert!(parse_ws_message(json).is_none());
     }
 }

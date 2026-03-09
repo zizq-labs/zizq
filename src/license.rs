@@ -23,13 +23,27 @@ const LICENSE_PUBLIC_KEY: Option<&str> = option_env!("ZIZQ_LICENSE_PUBLIC_KEY");
 /// Available license tiers, ordered by capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
+    Free,
     Pro,
     Enterprise,
+}
+
+impl Tier {
+    /// Parse a tier string (e.g. from the admin wire format).
+    pub fn parse(s: &str) -> Option<Tier> {
+        match s {
+            "free" => Some(Tier::Free),
+            "pro" => Some(Tier::Pro),
+            "enterprise" => Some(Tier::Enterprise),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Tier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Tier::Free => write!(f, "free"),
             Tier::Pro => write!(f, "pro"),
             Tier::Enterprise => write!(f, "enterprise"),
         }
@@ -42,8 +56,8 @@ impl std::fmt::Display for Tier {
 /// `min_tier()`, add a check in the relevant handler.
 #[derive(Debug, Clone, Copy)]
 pub enum Feature {
-    /// Terminal UI dashboard.
-    Tui,
+    /// Live queue detail in the `top` command (job lists by status).
+    TopLiveQueue,
     /// Example Pro feature for testing the gating machinery.
     ProExample,
     /// Example Enterprise feature for testing the gating machinery.
@@ -54,7 +68,7 @@ impl Feature {
     /// Minimum tier required for this feature.
     pub fn min_tier(self) -> Tier {
         match self {
-            Feature::Tui => Tier::Pro,
+            Feature::TopLiveQueue => Tier::Pro,
             Feature::ProExample => Tier::Pro,
             Feature::EnterpriseExample => Tier::Enterprise,
         }
@@ -64,7 +78,7 @@ impl Feature {
 impl std::fmt::Display for Feature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Feature::Tui => write!(f, "terminal UI"),
+            Feature::TopLiveQueue => write!(f, "live queue detail"),
             Feature::ProExample => write!(f, "pro example"),
             Feature::EnterpriseExample => write!(f, "enterprise example"),
         }
@@ -253,7 +267,16 @@ mod tests {
 
     #[test]
     fn tier_ordering() {
+        assert!(Tier::Free < Tier::Pro);
         assert!(Tier::Pro < Tier::Enterprise);
+    }
+
+    #[test]
+    fn tier_parse() {
+        assert_eq!(Tier::parse("free"), Some(Tier::Free));
+        assert_eq!(Tier::parse("pro"), Some(Tier::Pro));
+        assert_eq!(Tier::parse("enterprise"), Some(Tier::Enterprise));
+        assert_eq!(Tier::parse("unknown"), None);
     }
 
     #[test]

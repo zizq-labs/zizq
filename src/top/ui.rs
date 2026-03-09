@@ -141,8 +141,8 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // Tab bar.
     let tab_labels = [
-        (Tab::Ready, " Ready "),
         (Tab::InFlight, " In-Flight "),
+        (Tab::Ready, " Ready "),
         (Tab::Scheduled, " Scheduled "),
     ];
 
@@ -166,13 +166,55 @@ pub fn render(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[1]);
 
     // Content area — render only the active tab's table.
-    let table = match app.active_tab {
-        Tab::Ready => job_table_ready(&app.ready_jobs, app.now_ms),
-        Tab::InFlight => job_table_in_flight(&app.in_flight_jobs, app.now_ms),
-        Tab::Scheduled => job_table_scheduled(&app.scheduled_jobs, app.now_ms),
-    };
+    // In-flight is always available. Ready and Scheduled require Pro.
+    let tab_gated = connected
+        && app.active_tab != Tab::InFlight
+        && app
+            .server_tier
+            .is_none_or(|t| t < crate::license::Tier::Pro);
 
-    frame.render_widget(table, chunks[2]);
+    if tab_gated {
+        // Render the table header row, then the license message centered
+        // in the remaining space.
+        let table = match app.active_tab {
+            Tab::Ready => job_table_ready(&[], app.now_ms),
+            Tab::InFlight => unreachable!(),
+            Tab::Scheduled => job_table_scheduled(&[], app.now_ms),
+        };
+
+        let content_area = chunks[2];
+        let inner = Layout::vertical([
+            Constraint::Length(1), // table header row
+            Constraint::Min(0),    // license message
+        ])
+        .split(content_area);
+
+        frame.render_widget(table, inner[0]);
+
+        // Vertically center by padding top.
+        let msg_height = inner[1].height;
+        let pad_top = msg_height / 2;
+        let centered = Layout::vertical([
+            Constraint::Length(pad_top),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner[1]);
+
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "Live queue detail requires a pro license",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Center);
+        frame.render_widget(msg, centered[1]);
+    } else {
+        let table = match app.active_tab {
+            Tab::Ready => job_table_ready(&app.ready_jobs, app.now_ms),
+            Tab::InFlight => job_table_in_flight(&app.in_flight_jobs, app.now_ms),
+            Tab::Scheduled => job_table_scheduled(&app.scheduled_jobs, app.now_ms),
+        };
+        frame.render_widget(table, chunks[2]);
+    }
 
     // Help bar.
     let key_style = Style::default().fg(Color::White);
@@ -498,6 +540,7 @@ fn format_duration_ms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::license::Tier;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -525,6 +568,7 @@ mod tests {
             status: ConnectionStatus::Connecting,
             server_version: None,
             server_uptime_ms: None,
+            server_tier: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -532,7 +576,7 @@ mod tests {
             in_flight_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
             now_ms: 0,
-            active_tab: Tab::Ready,
+            active_tab: Tab::InFlight,
         }
     }
 
@@ -586,6 +630,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(65_000),
+            server_tier: Some(Tier::Pro),
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -593,7 +638,7 @@ mod tests {
             in_flight_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
             now_ms: 0,
-            active_tab: Tab::Ready,
+            active_tab: Tab::InFlight,
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -605,6 +650,7 @@ mod tests {
             status: ConnectionStatus::Disconnected,
             server_version: None,
             server_uptime_ms: None,
+            server_tier: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -612,7 +658,7 @@ mod tests {
             in_flight_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
             now_ms: 0,
-            active_tab: Tab::Ready,
+            active_tab: Tab::InFlight,
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -625,6 +671,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(120_000),
+            server_tier: Some(Tier::Pro),
             total_ready: 2,
             total_in_flight: 2,
             total_scheduled: 0,
@@ -657,6 +704,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(120_000),
+            server_tier: Some(Tier::Pro),
             total_ready: 2,
             total_in_flight: 2,
             total_scheduled: 0,
@@ -689,6 +737,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(120_000),
+            server_tier: Some(Tier::Pro),
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 2,
@@ -711,6 +760,7 @@ mod tests {
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(10_000),
+            server_tier: Some(Tier::Pro),
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -730,6 +780,7 @@ mod tests {
             status: ConnectionStatus::Disconnected,
             server_version: None,
             server_uptime_ms: None,
+            server_tier: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -737,9 +788,59 @@ mod tests {
             in_flight_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
             now_ms: 0,
-            active_tab: Tab::Ready,
+            active_tab: Tab::InFlight,
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));
+    }
+
+    #[test]
+    fn render_free_tier_license_message() {
+        let app = App {
+            host: "127.0.0.1:8901".to_string(),
+            status: ConnectionStatus::Connected,
+            server_version: Some("1.0.0".to_string()),
+            server_uptime_ms: Some(10_000),
+            server_tier: Some(Tier::Free),
+            total_ready: 5,
+            total_in_flight: 3,
+            total_scheduled: 2,
+            ready_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
+            scheduled_jobs: Vec::new(),
+            now_ms: 1_700_000_000_000,
+            active_tab: Tab::Ready,
+        };
+        insta::assert_snapshot!(render_to_string(&app, 80, 20));
+    }
+
+    #[test]
+    fn render_free_tier_in_flight_tab() {
+        let now_ms = 1_700_000_000_000u64;
+        let app = App {
+            host: "127.0.0.1:8901".to_string(),
+            status: ConnectionStatus::Connected,
+            server_version: Some("1.0.0".to_string()),
+            server_uptime_ms: Some(10_000),
+            server_tier: Some(Tier::Free),
+            total_ready: 5,
+            total_in_flight: 2,
+            total_scheduled: 0,
+            ready_jobs: Vec::new(),
+            in_flight_jobs: vec![
+                sample_in_flight_job("emails", "send_email", now_ms - 3_100, 1, None),
+                sample_in_flight_job(
+                    "billing",
+                    "charge",
+                    now_ms - 150_000,
+                    3,
+                    Some(now_ms - 60_000),
+                ),
+            ],
+            scheduled_jobs: Vec::new(),
+            now_ms,
+            active_tab: Tab::InFlight,
+        };
+        insta::assert_snapshot!(render_to_string(&app, 120, 12));
     }
 
     #[test]

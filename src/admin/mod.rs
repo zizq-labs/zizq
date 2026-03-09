@@ -24,6 +24,7 @@ use crate::store;
 pub struct ServerStatus {
     pub version: String,
     pub uptime_ms: u64,
+    pub tier: String,
     pub total_ready: usize,
     pub total_in_flight: usize,
     pub total_scheduled: usize,

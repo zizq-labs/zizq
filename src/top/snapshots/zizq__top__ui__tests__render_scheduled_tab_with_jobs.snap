@@ -1,5 +1,5 @@
 ---
-source: src/tui/ui.rs
+source: src/top/ui.rs
 expression: "render_to_string(&app, 120, 12)"
 ---
   Zizq 0.1.0
@@ -9,7 +9,7 @@ expression: "render_to_string(&app, 120, 12)"
 
   Depth[                                                                                                       0 jobs]
 
-   Ready   In-Flight   Scheduled
+   In-Flight   Ready   Scheduled
                              ID   PRIORITY QUEUE                          DUE   ATTEMPTS TYPE
           job-emails-send_email          0 emails                       3m52s          0 send_email
          job-reports-gen_report          0 reports                         1h          1 gen_report

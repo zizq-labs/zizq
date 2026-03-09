@@ -4,6 +4,7 @@
 //! TUI application state model.
 
 use crate::admin::{AdminJobSummary, JobChangeStatus, ServerStatus};
+use crate::license::Tier;
 
 use super::events::Event;
 
@@ -16,7 +17,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Ready, Tab::InFlight, Tab::Scheduled];
+    const ALL: [Tab; 3] = [Tab::InFlight, Tab::Ready, Tab::Scheduled];
 
     pub fn next(self) -> Tab {
         let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
@@ -42,6 +43,7 @@ pub struct App {
     pub status: ConnectionStatus,
     pub server_version: Option<String>,
     pub server_uptime_ms: Option<u64>,
+    pub server_tier: Option<Tier>,
     pub total_ready: usize,
     pub total_in_flight: usize,
     pub total_scheduled: usize,
@@ -59,6 +61,7 @@ impl App {
             status: ConnectionStatus::Connecting,
             server_version: None,
             server_uptime_ms: None,
+            server_tier: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -66,7 +69,7 @@ impl App {
             in_flight_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
             now_ms: 0,
-            active_tab: Tab::Ready,
+            active_tab: Tab::InFlight,
         }
     }
 
@@ -75,6 +78,7 @@ impl App {
         self.status = ConnectionStatus::Connected;
         self.server_version = Some(server.version);
         self.server_uptime_ms = Some(server.uptime_ms);
+        self.server_tier = Tier::parse(&server.tier);
         self.total_ready = server.total_ready;
         self.total_in_flight = server.total_in_flight;
         self.total_scheduled = server.total_scheduled;
@@ -180,6 +184,7 @@ impl App {
                 self.status = ConnectionStatus::Disconnected;
                 self.server_version = None;
                 self.server_uptime_ms = None;
+                self.server_tier = None;
                 self.total_ready = 0;
                 self.total_in_flight = 0;
                 self.total_scheduled = 0;
@@ -200,6 +205,7 @@ mod tests {
         crate::admin::ServerStatus {
             version: "1.0.0".to_string(),
             uptime_ms: 5000,
+            tier: "pro".to_string(),
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -429,16 +435,16 @@ mod tests {
     // ── Tab switching ───────────────────────────────────────────────
 
     #[test]
-    fn default_tab_is_ready() {
+    fn default_tab_is_in_flight() {
         let app = App::new("127.0.0.1:8901".into());
-        assert_eq!(app.active_tab, Tab::Ready);
+        assert_eq!(app.active_tab, Tab::InFlight);
     }
 
     #[test]
     fn next_tab_cycles_forward() {
         let mut app = App::new("127.0.0.1:8901".into());
         app.handle_event(Event::NextTab);
-        assert_eq!(app.active_tab, Tab::InFlight);
+        assert_eq!(app.active_tab, Tab::Ready);
     }
 
     #[test]
@@ -455,7 +461,7 @@ mod tests {
         app.handle_event(Event::NextTab);
         app.handle_event(Event::NextTab);
         app.handle_event(Event::NextTab);
-        assert_eq!(app.active_tab, Tab::Ready);
+        assert_eq!(app.active_tab, Tab::InFlight);
     }
 
     #[test]
@@ -463,7 +469,7 @@ mod tests {
         let mut app = App::new("127.0.0.1:8901".into());
         app.handle_event(Event::NextTab);
         app.handle_event(Event::PrevTab);
-        assert_eq!(app.active_tab, Tab::Ready);
+        assert_eq!(app.active_tab, Tab::InFlight);
     }
 
     #[test]

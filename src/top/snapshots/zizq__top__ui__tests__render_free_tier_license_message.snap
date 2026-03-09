@@ -1,0 +1,24 @@
+---
+source: src/top/ui.rs
+expression: "render_to_string(&app, 80, 20)"
+---
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 10s
+  Queue: 3 in-flight, 5 ready
+
+  Depth[││││││││                                                       8 jobs]
+
+   In-Flight   Ready   Scheduled
+              ID   PRIORITY QUEUE              DELAY   ATTEMPTS TYPE
+
+
+
+
+
+                    Live queue detail requires a pro license
+
+
+
+
+ ←/→ Switch tab  q Quit

@@ -123,6 +123,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 store,
                                 store_event,
                                 &mut conn,
+                                can_show_live_queue(&send_state),
                             ).await;
 
                             for event in events {
@@ -169,23 +170,42 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
 /// Build a `ServerStatus` snapshot from the current app state.
 fn server_status(state: &AppState) -> ServerStatus {
+    let tier = match state.license.tier() {
+        Some(tier) => tier.to_string(),
+        None => "free".to_string(),
+    };
     ServerStatus {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_ms: state.start_time.elapsed().as_millis() as u64,
+        tier,
         total_ready: state.store.ready_count(),
         total_in_flight: state.store.in_flight_count(),
         total_scheduled: state.store.scheduled_count(),
     }
 }
 
+/// Check whether the server license permits live queue detail.
+fn can_show_live_queue(state: &AppState) -> bool {
+    let now_ms = (state.clock)();
+    state
+        .license
+        .require(now_ms, crate::license::Feature::TopLiveQueue)
+        .is_ok()
+}
+
 /// Query each set: ready, in-flight, scheduled jobs, send a `JobSnapshot`, and
 /// return initial `ConnectionState`.
+///
+/// When the license does not permit live queue detail, job lists are empty —
+/// the header totals are still populated via `ServerStatus`.
 async fn send_initial_snapshot(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<ConnectionState, String> {
+    let live_queue = can_show_live_queue(state);
     let store = &state.store;
 
+    // In-flight data is always available (free tier).
     let mut in_flight_jobs = store
         .list_jobs(
             store::ListJobsOptions::new()
@@ -208,21 +228,29 @@ async fn send_initial_snapshot(
         .collect();
 
     // Capped windows of jobs in each state for the snapshot.
-    let capped_ready = store.list_ready_jobs(READY_CAP).await.unwrap_or_else(|e| {
-        tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
+    let capped_ready = if live_queue {
+        store.list_ready_jobs(READY_CAP).await.unwrap_or_else(|e| {
+            tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
+            Vec::new()
+        })
+    } else {
         Vec::new()
-    });
+    };
 
     let capped_in_flight: Vec<store::Job> =
         in_flight_jobs.into_iter().take(IN_FLIGHT_CAP).collect();
 
-    let capped_scheduled = store
-        .list_scheduled_jobs(SCHEDULED_CAP)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
-            Vec::new()
-        });
+    let capped_scheduled = if live_queue {
+        store
+            .list_scheduled_jobs(SCHEDULED_CAP)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
 
     // Collect keys for diffing logic.
     let prev_ready: Vec<(u16, String)> = capped_ready
@@ -275,16 +303,25 @@ async fn send_initial_snapshot(
 }
 
 /// Process a store event, returning zero or more `AdminEvent`s to send.
+///
+/// In-flight events are always emitted. Ready and scheduled diffs are
+/// only emitted when `live_queue` is true (Pro license or higher).
 async fn process_store_event(
     store: &store::Store,
     event: StoreEvent,
     conn: &mut ConnectionState,
+    live_queue: bool,
 ) -> Vec<AdminEvent> {
     match event {
         StoreEvent::JobCreated { .. } => {
-            let mut events = diff_ready(store, conn).await;
-            // A promotion removes from the scheduled window.
-            events.extend(diff_scheduled(store, conn).await);
+            let mut events = if live_queue {
+                diff_ready(store, conn).await
+            } else {
+                Vec::new()
+            };
+            if live_queue {
+                events.extend(diff_scheduled(store, conn).await);
+            }
             events
         }
         StoreEvent::JobInFlight { id } => {
@@ -297,7 +334,9 @@ async fn process_store_event(
             // Diff in-flight window (new entry may appear).
             events.extend(diff_in_flight(store, conn).await);
             // Diff ready window (job left ready, backfill may be needed).
-            events.extend(diff_ready(store, conn).await);
+            if live_queue {
+                events.extend(diff_ready(store, conn).await);
+            }
             events
         }
         StoreEvent::JobCompleted { id } => {
@@ -328,10 +367,22 @@ async fn process_store_event(
             events.extend(diff_in_flight(store, conn).await);
             events
         }
-        StoreEvent::JobScheduled { .. } => diff_scheduled(store, conn).await,
+        StoreEvent::JobScheduled { .. } => {
+            if live_queue {
+                diff_scheduled(store, conn).await
+            } else {
+                Vec::new()
+            }
+        }
         StoreEvent::IndexRebuilt => {
-            let mut events = diff_ready(store, conn).await;
-            events.extend(diff_scheduled(store, conn).await);
+            let mut events = if live_queue {
+                diff_ready(store, conn).await
+            } else {
+                Vec::new()
+            };
+            if live_queue {
+                events.extend(diff_scheduled(store, conn).await);
+            }
             events
         }
     }
@@ -548,14 +599,14 @@ mod tests {
 
     // ── Integration tests: snapshot + incremental events ────────────
 
-    fn test_state() -> Arc<AppState> {
+    fn test_state_with_license(license: License) -> Arc<AppState> {
         let (admin_events, _) = broadcast::channel(64);
         let (_, shutdown_rx) = watch::channel(());
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         Arc::new(AppState {
-            license: License::Free,
+            license,
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
             global_in_flight_limit: 0,
@@ -564,6 +615,23 @@ mod tests {
             admin_events,
             start_time: std::time::Instant::now(),
         })
+    }
+
+    fn test_state() -> Arc<AppState> {
+        test_state_with_license(pro_license())
+    }
+
+    fn free_state() -> Arc<AppState> {
+        test_state_with_license(License::Free)
+    }
+
+    fn pro_license() -> License {
+        License::Licensed {
+            licensee_id: "lic_test".into(),
+            licensee_name: "Test Org".into(),
+            tier: crate::license::Tier::Pro,
+            expires_at: u64::MAX,
+        }
     }
 
     /// Connect a WebSocket client to the admin endpoint and return the
@@ -620,6 +688,7 @@ mod tests {
             server["uptime_ms"].is_u64(),
             "server.uptime_ms should be a u64"
         );
+        assert!(server["tier"].is_string(), "server.tier should be a string");
         assert!(
             server["total_ready"].is_u64(),
             "server.total_ready should be a u64"
@@ -836,6 +905,7 @@ mod tests {
         let server = &snapshot["server"];
         assert_eq!(server["version"], env!("CARGO_PKG_VERSION"));
         assert!(server["uptime_ms"].as_u64().unwrap() < 5_000);
+        assert_eq!(server["tier"], "pro");
         assert_eq!(server["total_ready"], 2);
         assert_eq!(server["total_in_flight"], 1);
         assert_eq!(server["total_scheduled"], 2);
@@ -906,5 +976,127 @@ mod tests {
         }
         statuses.sort();
         assert_eq!(statuses, vec!["ready", "scheduled_removed"]);
+    }
+
+    #[tokio::test]
+    async fn free_tier_snapshot_has_empty_job_lists() {
+        let state = free_state();
+        let now = now_millis();
+
+        // Enqueue jobs in all states.
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("ready_type", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("ready_type2", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("sched_type", "q", serde_json::json!(null))
+                    .ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
+        let (_addr, mut rx) = connect(state).await;
+        let snapshot = next_json(&mut rx).await;
+
+        assert_eq!(snapshot["event"], "job_snapshot");
+        assert_server_status(&snapshot);
+        assert_eq!(snapshot["server"]["tier"], "free");
+        // Totals are still populated.
+        assert_eq!(snapshot["server"]["total_ready"], 1);
+        assert_eq!(snapshot["server"]["total_in_flight"], 1);
+        assert_eq!(snapshot["server"]["total_scheduled"], 1);
+        // In-flight is always available.
+        assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
+        // Ready and scheduled are gated.
+        assert_eq!(snapshot["ready"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["scheduled"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_tier_suppresses_ready_events() {
+        let state = free_state();
+        let now = now_millis();
+
+        let (_addr, mut rx) = connect(state.clone()).await;
+
+        // Consume initial empty snapshot.
+        let snapshot = next_json(&mut rx).await;
+        assert_eq!(snapshot["event"], "job_snapshot");
+
+        // Enqueue a job — on pro tier this would produce a "ready" event.
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        // Send a heartbeat so we can verify the next message is a
+        // heartbeat (not a job_changed event).
+        state.admin_events.send(AdminEvent::Heartbeat).unwrap();
+
+        let msg = next_json(&mut rx).await;
+        assert_eq!(
+            msg["event"], "heartbeat",
+            "free tier should not get ready job_changed events"
+        );
+        assert_eq!(msg["server"]["tier"], "free");
+    }
+
+    #[tokio::test]
+    async fn free_tier_streams_in_flight_events() {
+        let state = free_state();
+        let now = now_millis();
+
+        // Enqueue a job before connecting.
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let (_addr, mut rx) = connect(state.clone()).await;
+
+        // Consume snapshot.
+        let snapshot = next_json(&mut rx).await;
+        assert_eq!(snapshot["event"], "job_snapshot");
+
+        // Take the job — should produce in_flight event even on free tier.
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        // Collect events until we see the in_flight status.
+        let msg = next_json(&mut rx).await;
+        assert_eq!(msg["event"], "job_changed");
+        assert_eq!(msg["status"], "in_flight");
+        assert_eq!(msg["server"]["tier"], "free");
     }
 }
