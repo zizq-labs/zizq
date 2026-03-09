@@ -1,16 +1,20 @@
 // Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! WebSocket event stream for admin dashboard clients.
+//! WebSocket event stream (currently) for Terminal UI clients.
 //!
-//! Each `GET /events` request upgrades to a WebSocket connection,
-//! sends an initial `JobSnapshot`, then streams incremental
-//! `JobChanged` events driven by `StoreEvent` subscriptions.
+//! Each `GET /events` request upgrades to a WebSocket connection, sends an
+//! initial `JobSnapshot`, then streams incremental `JobChanged` events driven
+//! by `StoreEvent` subscriptions.
 //!
-//! Both Ready and In-Flight panes use a snapshot-diff strategy: the
-//! server holds a full ordered set of IDs and diffs a capped window
-//! (top N) against the previous window to produce add/remove events.
-//! Only genuinely new IDs trigger a `get_job` disk read.
+//! Each event is wrapped in a consistently shaped `AdminEvent` which provides
+//! some common server status info such as the total number of jobs in the
+//! queue and the uptime of the server.
+//!
+//! Each tab in the frontend app use a snapshot-diff strategy: the server holds
+//! a full ordered set of IDs and diffs a capped window (top N) against the
+//! previous window to produce add/remove events. Only genuinely new IDs
+//! trigger a `get_job` disk read.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -21,7 +25,7 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
-use super::{AdminEvent, AdminJobSummary, JobChangeStatus};
+use super::{AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, ServerStatus};
 use crate::http::AppState;
 use crate::store::{self, StoreEvent};
 use crate::time::now_millis;
@@ -31,6 +35,9 @@ const READY_CAP: usize = 200;
 
 /// Maximum number of in-flight jobs in the capped window.
 const IN_FLIGHT_CAP: usize = 200;
+
+/// Maximum number of scheduled jobs in the capped window.
+const SCHEDULED_CAP: usize = 200;
 
 /// Per-connection state tracking the previous capped windows.
 struct ConnectionState {
@@ -45,9 +52,12 @@ struct ConnectionState {
     /// Previous in-flight window: first `IN_FLIGHT_CAP` entries
     /// from `in_flight_ids`.
     prev_in_flight: Vec<(u64, String)>,
+
+    /// Previous scheduled window: sorted `(ready_at, id)` keys.
+    prev_scheduled: Vec<(u64, String)>,
 }
 
-/// WebSocket endpoint that streams admin events to dashboard clients.
+/// WebSocket endpoint that streams admin events to connected clients.
 pub async fn event_stream(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -61,11 +71,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
     // Spawn a task that handles sending events to the WebSocket.
-    let store = state.store.clone();
-
+    let send_state = state.clone();
     let send_task = tokio::spawn(async move {
+        let store = &send_state.store;
+
         // Query initial snapshot and build connection state.
-        let mut conn = match send_initial_snapshot(&store, &mut sender).await {
+        let mut conn = match send_initial_snapshot(&send_state, &mut sender).await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!(%e, "admin ws: initial snapshot failed");
@@ -78,8 +89,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 // Admin-specific events (currently just heartbeats).
                 event = admin_rx.recv() => {
                     match event {
-                        Ok(AdminEvent::Heartbeat { .. }) => {
-                            let json = match serde_json::to_string(&event.unwrap()) {
+                        Ok(AdminEvent::Heartbeat) => {
+                            let msg = AdminMessage {
+                                server: server_status(&send_state),
+                                event: AdminEvent::Heartbeat,
+                            };
+                            let json = match serde_json::to_string(&msg) {
                                 Ok(json) => json,
                                 Err(e) => {
                                     tracing::error!(%e, "admin ws: failed to serialize heartbeat");
@@ -105,13 +120,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     match event {
                         Ok(store_event) => {
                             let events = process_store_event(
-                                &store,
+                                store,
                                 store_event,
                                 &mut conn,
                             ).await;
 
                             for event in events {
-                                let json = match serde_json::to_string(&event) {
+                                let msg = AdminMessage {
+                                    server: server_status(&send_state),
+                                    event,
+                                };
+                                let json = match serde_json::to_string(&msg) {
                                     Ok(json) => json,
                                     Err(e) => {
                                         tracing::error!(%e, "admin ws: failed to serialize event");
@@ -127,7 +146,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             // Missed events — re-query full snapshot.
-                            match send_initial_snapshot(&store, &mut sender).await {
+                            match send_initial_snapshot(&send_state, &mut sender).await {
                                 Ok(new_conn) => conn = new_conn,
                                 Err(e) => {
                                     tracing::error!(%e, "admin ws: resync snapshot failed");
@@ -148,12 +167,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     send_task.abort();
 }
 
-/// Query ready + in-flight jobs, send a `JobSnapshot`, and return
-/// initial `ConnectionState`.
+/// Build a `ServerStatus` snapshot from the current app state.
+fn server_status(state: &AppState) -> ServerStatus {
+    use std::sync::atomic::Ordering;
+    ServerStatus {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_ms: state.start_time.elapsed().as_millis() as u64,
+        total_ready: state.store.ready_count(),
+        total_in_flight: state.global_in_flight.load(Ordering::Relaxed) as usize,
+        total_scheduled: state.store.scheduled_count(),
+    }
+}
+
+/// Query each set: ready, in-flight, scheduled jobs, send a `JobSnapshot`, and
+/// return initial `ConnectionState`.
 async fn send_initial_snapshot(
-    store: &store::Store,
+    state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<ConnectionState, String> {
+    let store = &state.store;
+
     let mut in_flight_jobs = store
         .list_jobs(
             store::ListJobsOptions::new()
@@ -184,6 +217,14 @@ async fn send_initial_snapshot(
     let capped_in_flight: Vec<store::Job> =
         in_flight_jobs.into_iter().take(IN_FLIGHT_CAP).collect();
 
+    let capped_scheduled = store
+        .list_scheduled_jobs(SCHEDULED_CAP)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
+            Vec::new()
+        });
+
     // Collect keys for diffing logic.
     let prev_ready: Vec<(u16, String)> = capped_ready
         .iter()
@@ -195,16 +236,28 @@ async fn send_initial_snapshot(
         .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
         .collect();
 
+    let prev_scheduled: Vec<(u64, String)> = capped_scheduled
+        .iter()
+        .map(|j| (j.ready_at, j.id.clone()))
+        .collect();
+
     // Prepare the windowed snapshot of jobs in each state to send to the client.
-    let snapshot = AdminEvent::JobSnapshot {
-        ready: capped_ready
-            .into_iter()
-            .map(AdminJobSummary::from)
-            .collect(),
-        in_flight: capped_in_flight
-            .into_iter()
-            .map(AdminJobSummary::from)
-            .collect(),
+    let snapshot = AdminMessage {
+        server: server_status(state),
+        event: AdminEvent::JobSnapshot {
+            ready: capped_ready
+                .into_iter()
+                .map(AdminJobSummary::from)
+                .collect(),
+            in_flight: capped_in_flight
+                .into_iter()
+                .map(AdminJobSummary::from)
+                .collect(),
+            scheduled: capped_scheduled
+                .into_iter()
+                .map(AdminJobSummary::from)
+                .collect(),
+        },
     };
 
     let json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
@@ -218,6 +271,7 @@ async fn send_initial_snapshot(
         prev_ready,
         in_flight_ids,
         prev_in_flight,
+        prev_scheduled,
     })
 }
 
@@ -228,7 +282,12 @@ async fn process_store_event(
     conn: &mut ConnectionState,
 ) -> Vec<AdminEvent> {
     match event {
-        StoreEvent::JobCreated { .. } => diff_ready(store, conn).await,
+        StoreEvent::JobCreated { .. } => {
+            let mut events = diff_ready(store, conn).await;
+            // A promotion removes from the scheduled window.
+            events.extend(diff_scheduled(store, conn).await);
+            events
+        }
         StoreEvent::JobInFlight { id } => {
             let mut events = Vec::new();
             // Insert into in-flight set.
@@ -270,8 +329,12 @@ async fn process_store_event(
             events.extend(diff_in_flight(store, conn).await);
             events
         }
-        StoreEvent::JobScheduled { .. } => Vec::new(),
-        StoreEvent::IndexRebuilt => diff_ready(store, conn).await,
+        StoreEvent::JobScheduled { .. } => diff_scheduled(store, conn).await,
+        StoreEvent::IndexRebuilt => {
+            let mut events = diff_ready(store, conn).await;
+            events.extend(diff_scheduled(store, conn).await);
+            events
+        }
     }
 }
 
@@ -339,6 +402,37 @@ async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec
     }
 
     conn.prev_in_flight = current;
+    events
+}
+
+/// Diff the scheduled window: scan top SCHEDULED_CAP IDs from the
+/// ScheduledIndex, compare against `prev_scheduled`, emit adds/removes.
+async fn diff_scheduled(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
+    let current = store.scan_scheduled_ids(SCHEDULED_CAP).await;
+    let (adds, removes) = diff_sorted(&current, &conn.prev_scheduled);
+    let mut events = Vec::with_capacity(adds.len() + removes.len());
+
+    // Emit removals first so the TUI frees space before inserts.
+    for (_ready_at, id) in removes {
+        events.push(AdminEvent::JobChanged {
+            id,
+            status: JobChangeStatus::ScheduledRemoved,
+            job: None,
+        });
+    }
+
+    // Emit additions — fetch metadata only for genuinely new IDs.
+    for (_ready_at, id) in adds {
+        if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
+            events.push(AdminEvent::JobChanged {
+                id,
+                status: JobChangeStatus::Scheduled,
+                job: Some(AdminJobSummary::from(job)),
+            });
+        }
+    }
+
+    conn.prev_scheduled = current;
     events
 }
 
@@ -471,6 +565,7 @@ mod tests {
             shutdown: shutdown_rx,
             clock: Arc::new(now_millis),
             admin_events,
+            start_time: std::time::Instant::now(),
         })
     }
 
@@ -516,8 +611,34 @@ mod tests {
         serde_json::from_str(&msg.into_text().unwrap()).unwrap()
     }
 
+    /// Assert that a message contains valid server status fields.
+    fn assert_server_status(msg: &serde_json::Value) {
+        let server = &msg["server"];
+        assert!(server.is_object(), "message should contain 'server' object");
+        assert!(
+            server["version"].is_string(),
+            "server.version should be a string"
+        );
+        assert!(
+            server["uptime_ms"].is_u64(),
+            "server.uptime_ms should be a u64"
+        );
+        assert!(
+            server["total_ready"].is_u64(),
+            "server.total_ready should be a u64"
+        );
+        assert!(
+            server["total_in_flight"].is_u64(),
+            "server.total_in_flight should be a u64"
+        );
+        assert!(
+            server["total_scheduled"].is_u64(),
+            "server.total_scheduled should be a u64"
+        );
+    }
+
     #[tokio::test]
-    async fn snapshot_contains_ready_and_in_flight_jobs() {
+    async fn snapshot_contains_all_job_states_and_server_status() {
         let state = test_state();
         let now = now_millis();
 
@@ -546,12 +667,24 @@ mod tests {
             .await
             .unwrap();
 
+        // Enqueue a scheduled job (ready in the future).
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("type_c", "q", serde_json::json!(null)).ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
         let (_addr, mut rx) = connect(state).await;
         let snapshot = next_json(&mut rx).await;
 
         assert_eq!(snapshot["event"], "job_snapshot");
+        assert_server_status(&snapshot);
         assert_eq!(snapshot["ready"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["scheduled"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -578,6 +711,7 @@ mod tests {
         let msg = next_json(&mut rx).await;
         assert_eq!(msg["event"], "job_changed");
         assert_eq!(msg["status"], "ready");
+        assert_server_status(&msg);
         assert!(msg["job"].is_object());
         assert_eq!(msg["job"]["queue"], "emails");
     }
@@ -617,6 +751,7 @@ mod tests {
             let msg = next_json(&mut rx).await;
             assert_eq!(msg["event"], "job_changed");
             assert_eq!(msg["id"], job.id);
+            assert_server_status(&msg);
             statuses.push(msg["status"].as_str().unwrap().to_string());
         }
         statuses.sort();
@@ -658,9 +793,124 @@ mod tests {
             let msg = next_json(&mut rx).await;
             assert_eq!(msg["event"], "job_changed");
             assert_eq!(msg["id"], job.id);
+            assert_server_status(&msg);
             statuses.push(msg["status"].as_str().unwrap().to_string());
         }
         statuses.sort();
         assert_eq!(statuses, vec!["completed", "in_flight_removed"]);
+    }
+
+    #[tokio::test]
+    async fn server_status_reflects_actual_counts() {
+        let state = test_state();
+        let now = now_millis();
+
+        // Enqueue 3 ready jobs.
+        for typ in ["a", "b", "c"] {
+            state
+                .store
+                .enqueue(now, EnqueueOptions::new(typ, "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+
+        // Take one so it becomes in-flight (3 ready -> 2 ready + 1 in-flight).
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+        state
+            .global_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Enqueue 2 scheduled jobs.
+        for typ in ["d", "e"] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new(typ, "q", serde_json::json!(null)).ready_at(now + 60_000),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (_addr, mut rx) = connect(state).await;
+        let snapshot = next_json(&mut rx).await;
+
+        let server = &snapshot["server"];
+        assert_eq!(server["version"], env!("CARGO_PKG_VERSION"));
+        assert!(server["uptime_ms"].as_u64().unwrap() < 5_000);
+        assert_eq!(server["total_ready"], 2);
+        assert_eq!(server["total_in_flight"], 1);
+        assert_eq!(server["total_scheduled"], 2);
+    }
+
+    #[tokio::test]
+    async fn enqueue_scheduled_job_sends_scheduled_event() {
+        let state = test_state();
+        let now = now_millis();
+
+        let (_addr, mut rx) = connect(state.clone()).await;
+
+        // Consume initial empty snapshot.
+        let snapshot = next_json(&mut rx).await;
+        assert_eq!(snapshot["event"], "job_snapshot");
+
+        // Enqueue a scheduled job (ready in the future).
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("send_email", "emails", serde_json::json!(null))
+                    .ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
+        let msg = next_json(&mut rx).await;
+        assert_eq!(msg["event"], "job_changed");
+        assert_eq!(msg["status"], "scheduled");
+        assert_server_status(&msg);
+        assert!(msg["job"].is_object());
+        assert_eq!(msg["job"]["queue"], "emails");
+    }
+
+    #[tokio::test]
+    async fn promote_scheduled_sends_ready_and_scheduled_removed() {
+        let state = test_state();
+        let now = now_millis();
+
+        // Enqueue a scheduled job before connecting.
+        let job = state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)).ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
+        let (_addr, mut rx) = connect(state.clone()).await;
+
+        // Consume snapshot (0 ready, 1 scheduled).
+        let snapshot = next_json(&mut rx).await;
+        assert_eq!(snapshot["ready"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["scheduled"].as_array().unwrap().len(), 1);
+
+        // Promote the job (simulates the scheduler firing).
+        state.store.promote_scheduled(&job).await.unwrap();
+
+        // Should get "ready" + "scheduled_removed" (order may vary).
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let msg = next_json(&mut rx).await;
+            assert_eq!(msg["event"], "job_changed");
+            assert_server_status(&msg);
+            statuses.push(msg["status"].as_str().unwrap().to_string());
+        }
+        statuses.sort();
+        assert_eq!(statuses, vec!["ready", "scheduled_removed"]);
     }
 }

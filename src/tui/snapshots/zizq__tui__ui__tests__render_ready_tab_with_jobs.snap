@@ -2,15 +2,15 @@
 source: src/tui/ui.rs
 expression: "render_to_string(&app, 120, 12)"
 ---
-┌Zizq 0.1.0────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ ● Connected  v1.0.0  uptime: 2.0m                                                                                    │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- Ready   In-Flight
-                             ID   PRIORITY QUEUE                 TYPE                            DELAY          ATTEMPTS
-          job-emails-send_email          0 emails                send_email                      5.2s                  0
-         job-reports-gen_report          0 reports               gen_report                      1.0m                  2
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 2m
+  Queue: 2 in-flight, 2 ready
 
+  Depth[││││                                                                                                   4 jobs]
 
-
-
- h/l Switch tab  q Quit
+   Ready   In-Flight   Scheduled
+                             ID   PRIORITY QUEUE                        DELAY   ATTEMPTS TYPE
+          job-emails-send_email          0 emails                          5s          0 send_email
+         job-reports-gen_report          0 reports                       1m2s          2 gen_report
+ ←/→ Switch tab  q Quit

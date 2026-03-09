@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use crate::admin::AdminJobSummary;
 
@@ -16,14 +16,14 @@ use super::app::{App, ConnectionStatus, Tab};
 /// Render the current application state to a terminal frame.
 pub fn render(app: &App, frame: &mut Frame) {
     let chunks = Layout::vertical([
-        Constraint::Length(3), // status bar
+        Constraint::Length(7), // header
         Constraint::Length(1), // tab bar
         Constraint::Min(0),    // content table
         Constraint::Length(1), // help bar
     ])
     .split(frame.area());
 
-    // Status bar.
+    // Header area (5 lines, no border).
     let (indicator, status_style) = match app.status {
         ConnectionStatus::Connected => (
             "Connected",
@@ -43,40 +43,114 @@ pub fn render(app: &App, frame: &mut Frame) {
         ),
     };
 
-    let mut status_spans = vec![
-        Span::raw(" "),
+    let bold_gray = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let cyan = Style::default().fg(Color::Cyan);
+    let connected = matches!(app.status, ConnectionStatus::Connected);
+
+    let version_line = Line::from(vec![
+        Span::raw("  "),
+        Span::raw(format!("Zizq {}", env!("CARGO_PKG_VERSION"))),
+    ]);
+
+    let status_text_style = match app.status {
+        ConnectionStatus::Connected => Style::default().fg(Color::LightGreen),
+        ConnectionStatus::Connecting => Style::default().fg(Color::LightYellow),
+        ConnectionStatus::Disconnected => Style::default().fg(Color::LightRed),
+    };
+    let status_line = Line::from(vec![
         Span::styled("\u{25cf} ", status_style),
-        Span::styled(indicator, status_style),
-    ];
+        Span::styled(indicator, status_text_style),
+        Span::raw(" "),
+        Span::styled(&*app.host, cyan),
+    ]);
 
-    if let Some(ref version) = app.server_version {
-        status_spans.push(Span::raw("  "));
-        status_spans.push(Span::raw(format!("v{version}")));
-    }
+    let server_info_line = if connected {
+        let version = app.server_version.as_deref().unwrap_or("?");
+        let uptime = app
+            .server_uptime_ms
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "?".to_string());
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Server version: ", cyan),
+            Span::styled(version.to_string(), bold_gray),
+            Span::styled(", Uptime: ", cyan),
+            Span::styled(uptime, bold_gray),
+        ])
+    } else {
+        Line::default()
+    };
 
-    if let Some(uptime_ms) = app.server_uptime_ms {
-        status_spans.push(Span::raw("  "));
-        status_spans.push(Span::raw(format!(
-            "uptime: {}",
-            format_duration_ms(uptime_ms)
-        )));
-    }
+    let totals_line = if connected {
+        let n_in_flight = app.total_in_flight;
+        let n_ready = app.total_ready;
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Queue: ", cyan),
+            Span::styled(
+                n_in_flight.to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " in-flight, ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                n_ready.to_string(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ready",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::default()
+    };
 
-    let status_bar = Paragraph::new(Line::from(status_spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Zizq {}", env!("CARGO_PKG_VERSION"))),
-    );
+    let depth_line = if connected {
+        render_depth_bar(
+            app.total_in_flight,
+            app.total_ready,
+            chunks[0].width as usize,
+        )
+    } else {
+        Line::default()
+    };
 
-    frame.render_widget(status_bar, chunks[0]);
+    let header = Paragraph::new(vec![
+        version_line,
+        status_line,
+        server_info_line,
+        totals_line,
+        Line::default(),
+        depth_line,
+        Line::default(),
+    ]);
+    frame.render_widget(header, chunks[0]);
 
     // Tab bar.
-    let tab_labels = [(Tab::Ready, " Ready "), (Tab::InFlight, " In-Flight ")];
+    let tab_labels = [
+        (Tab::Ready, " Ready "),
+        (Tab::InFlight, " In-Flight "),
+        (Tab::Scheduled, " Scheduled "),
+    ];
 
     let header_style = Style::default().fg(tab_fg()).bg(header_bg());
     let inactive_tab_style = Style::default().fg(tab_fg()).bg(Color::Blue);
 
     let mut tab_spans: Vec<Span> = Vec::new();
+    tab_spans.push(Span::raw("  "));
     for (i, (tab, label)) in tab_labels.iter().enumerate() {
         if i > 0 {
             tab_spans.push(Span::raw(" "));
@@ -95,6 +169,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let table = match app.active_tab {
         Tab::Ready => job_table_ready(&app.ready_jobs, app.now_ms),
         Tab::InFlight => job_table_in_flight(&app.in_flight_jobs, app.now_ms),
+        Tab::Scheduled => job_table_scheduled(&app.scheduled_jobs, app.now_ms),
     };
 
     frame.render_widget(table, chunks[2]);
@@ -103,12 +178,68 @@ pub fn render(app: &App, frame: &mut Frame) {
     let key_style = Style::default().fg(Color::White);
     let label_style = Style::default().fg(Color::Black).bg(Color::White);
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(" h/l ", key_style),
+        Span::styled(" \u{2190}/\u{2192} ", key_style),
         Span::styled("Switch tab", label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
     ]));
     frame.render_widget(help, chunks[3]);
+}
+
+/// Render the depth bar line: `  Depth[||||||||N Jobs]  `
+fn render_depth_bar(in_flight: usize, ready: usize, width: usize) -> Line<'static> {
+    let total = in_flight + ready;
+    let total_label = format!("{total} jobs");
+    let bold_white = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let cyan = Style::default().fg(Color::Cyan);
+
+    // Cap the bar at 120 columns (or terminal width if narrower).
+    let max_width = width.min(120);
+
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+
+    // "  Depth[" = 8 chars, "{N} jobs]  " = total_label.len() + 3
+    let overhead = 8 + total_label.len() + 3;
+    let bar_width = max_width.saturating_sub(overhead);
+
+    let (green_bars, blue_bars) = if total == 0 || bar_width == 0 {
+        (0, 0)
+    } else if total <= bar_width {
+        // One bar per job when total fits.
+        (in_flight, ready)
+    } else {
+        // Scale proportionally.
+        let green = ((in_flight as f64 / total as f64) * bar_width as f64).round() as usize;
+        (green, bar_width.saturating_sub(green))
+    };
+
+    // Pad so the label is right-aligned against "]".
+    let pad = bar_width.saturating_sub(green_bars + blue_bars);
+
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Depth", cyan),
+        Span::styled("[", bold_white),
+        Span::styled(
+            "\u{2502}".repeat(green_bars),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2502}".repeat(blue_bars),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(total_label, dim),
+        Span::styled("]  ", bold_white),
+    ])
 }
 
 /// Foreground color for tab labels and table header text.
@@ -121,15 +252,42 @@ const fn header_bg() -> Color {
     Color::Green
 }
 
+/// Style for ID and TYPE cells, based on attempt count.
+fn attempt_fg(attempts: u32) -> Style {
+    match attempts {
+        0 => Style::default(),
+        1 => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Red),
+    }
+}
+
+/// Style for ATTEMPTS cells (always bold), colored by attempt count.
+fn attempt_bold(attempts: u32) -> Style {
+    match attempts {
+        0 => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+        1 => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
+}
+
+/// Bold white style for PRIORITY cells.
+const fn priority_style() -> Style {
+    Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+}
+
 /// Build a table widget for the Ready pane.
 fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
         Cell::from("QUEUE"),
-        Cell::from("TYPE"),
-        Cell::from("DELAY"),
+        Cell::from(Line::from("DELAY").alignment(Alignment::Right)),
         Cell::from(Line::from("ATTEMPTS").alignment(Alignment::Right)),
+        Cell::from("TYPE"),
     ])
     .style(Style::default().fg(tab_fg()).bg(header_bg()))
     .bottom_margin(0);
@@ -137,13 +295,25 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
     let rows: Vec<Row> = jobs
         .iter()
         .map(|job| {
+            let fg = attempt_fg(job.attempts);
+            let att = attempt_bold(job.attempts);
             Row::new([
-                Cell::from(Line::from(job.id.as_str()).alignment(Alignment::Right)),
-                Cell::from(Line::from(job.priority.to_string()).alignment(Alignment::Right)),
+                Cell::from(
+                    Line::from(Span::styled(job.id.as_str(), fg)).alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(job.priority.to_string(), priority_style()))
+                        .alignment(Alignment::Right),
+                ),
                 Cell::from(job.queue.as_str()),
-                Cell::from(job.job_type.as_str()),
-                Cell::from(format_elapsed(job.ready_at, now_ms)),
-                Cell::from(Line::from(job.attempts.to_string()).alignment(Alignment::Right)),
+                Cell::from(
+                    Line::from(format_elapsed(job.ready_at, now_ms)).alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(job.attempts.to_string(), att))
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(Span::styled(job.job_type.as_str(), fg)),
             ])
         })
         .collect();
@@ -154,9 +324,9 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
             Constraint::Fill(3),
             Constraint::Length(10),
             Constraint::Fill(2),
-            Constraint::Fill(3),
             Constraint::Length(12),
             Constraint::Length(10),
+            Constraint::Fill(3),
         ],
     )
     .header(header)
@@ -168,9 +338,9 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
         Cell::from("QUEUE"),
-        Cell::from("TYPE"),
-        Cell::from("DURATION"),
+        Cell::from(Line::from("DURATION").alignment(Alignment::Right)),
         Cell::from(Line::from("ATTEMPTS").alignment(Alignment::Right)),
+        Cell::from("TYPE"),
     ])
     .style(Style::default().fg(tab_fg()).bg(header_bg()))
     .bottom_margin(0);
@@ -179,13 +349,25 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
         .iter()
         .map(|job| {
             let dequeued = job.dequeued_at.unwrap_or(0);
+            let fg = attempt_fg(job.attempts);
+            let att = attempt_bold(job.attempts);
             Row::new([
-                Cell::from(Line::from(job.id.as_str()).alignment(Alignment::Right)),
-                Cell::from(Line::from(job.priority.to_string()).alignment(Alignment::Right)),
+                Cell::from(
+                    Line::from(Span::styled(job.id.as_str(), fg)).alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(job.priority.to_string(), priority_style()))
+                        .alignment(Alignment::Right),
+                ),
                 Cell::from(job.queue.as_str()),
-                Cell::from(job.job_type.as_str()),
-                Cell::from(format_elapsed(dequeued, now_ms)),
-                Cell::from(Line::from(job.attempts.to_string()).alignment(Alignment::Right)),
+                Cell::from(
+                    Line::from(format_elapsed(dequeued, now_ms)).alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(job.attempts.to_string(), att))
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(Span::styled(job.job_type.as_str(), fg)),
             ])
         })
         .collect();
@@ -196,15 +378,81 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
             Constraint::Fill(3),
             Constraint::Length(10),
             Constraint::Fill(2),
-            Constraint::Fill(3),
             Constraint::Length(12),
             Constraint::Length(10),
+            Constraint::Fill(3),
         ],
     )
     .header(header)
 }
 
-/// Format elapsed time since a timestamp (e.g. "5.2s", "2.3m").
+/// Build a table widget for the Scheduled pane.
+fn job_table_scheduled(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
+    let header = Row::new([
+        Cell::from(Line::from("ID").alignment(Alignment::Right)),
+        Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
+        Cell::from("QUEUE"),
+        Cell::from(Line::from("DUE").alignment(Alignment::Right)),
+        Cell::from(Line::from("ATTEMPTS").alignment(Alignment::Right)),
+        Cell::from("TYPE"),
+    ])
+    .style(Style::default().fg(tab_fg()).bg(header_bg()))
+    .bottom_margin(0);
+
+    let rows: Vec<Row> = jobs
+        .iter()
+        .map(|job| {
+            let fg = attempt_fg(job.attempts);
+            let att = attempt_bold(job.attempts);
+            Row::new([
+                Cell::from(
+                    Line::from(Span::styled(job.id.as_str(), fg)).alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(job.priority.to_string(), priority_style()))
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(job.queue.as_str()),
+                Cell::from(
+                    Line::from(format_due(job.ready_at, now_ms)).alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(job.attempts.to_string(), att))
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(Span::styled(job.job_type.as_str(), fg)),
+            ])
+        })
+        .collect();
+
+    Table::new(
+        rows,
+        [
+            Constraint::Fill(3),
+            Constraint::Length(10),
+            Constraint::Fill(2),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Fill(3),
+        ],
+    )
+    .header(header)
+}
+
+/// Format time until a scheduled job is due, or how overdue it is.
+fn format_due(ready_at: u64, now_ms: u64) -> String {
+    if ready_at == 0 {
+        return "-".to_string();
+    }
+    if ready_at >= now_ms {
+        format_duration_ms(ready_at - now_ms)
+    } else {
+        let elapsed = format_duration_ms(now_ms - ready_at);
+        format!("{elapsed} ago")
+    }
+}
+
+/// Format elapsed time since a timestamp (e.g. "5s", "2m18s").
 fn format_elapsed(timestamp_ms: u64, now_ms: u64) -> String {
     if timestamp_ms == 0 {
         return "-".to_string();
@@ -213,18 +461,37 @@ fn format_elapsed(timestamp_ms: u64, now_ms: u64) -> String {
     format_duration_ms(diff_ms)
 }
 
-/// Format a duration in milliseconds as a human-readable string.
+/// Format a duration in milliseconds as a human-readable compound string.
 fn format_duration_ms(ms: u64) -> String {
     if ms < 1_000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
+        let s = ms / 1_000;
+        format!("{s}s")
     } else if ms < 3_600_000 {
-        format!("{:.1}m", ms as f64 / 60_000.0)
+        let m = ms / 60_000;
+        let s = (ms % 60_000) / 1_000;
+        if s > 0 {
+            format!("{m}m{s}s")
+        } else {
+            format!("{m}m")
+        }
     } else if ms < 86_400_000 {
-        format!("{:.1}h", ms as f64 / 3_600_000.0)
+        let h = ms / 3_600_000;
+        let m = (ms % 3_600_000) / 60_000;
+        if m > 0 {
+            format!("{h}h{m}m")
+        } else {
+            format!("{h}h")
+        }
     } else {
-        format!("{:.1}d", ms as f64 / 86_400_000.0)
+        let d = ms / 86_400_000;
+        let h = (ms % 86_400_000) / 3_600_000;
+        if h > 0 {
+            format!("{d}d{h}h")
+        } else {
+            format!("{d}d")
+        }
     }
 }
 
@@ -254,11 +521,16 @@ mod tests {
 
     fn new_app() -> App {
         App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connecting,
             server_version: None,
             server_uptime_ms: None,
+            total_ready: 0,
+            total_in_flight: 0,
+            total_scheduled: 0,
             ready_jobs: Vec::new(),
             in_flight_jobs: Vec::new(),
+            scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::Ready,
         }
@@ -310,11 +582,16 @@ mod tests {
     #[test]
     fn render_connected_with_server_info() {
         let app = App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(65_000),
+            total_ready: 0,
+            total_in_flight: 0,
+            total_scheduled: 0,
             ready_jobs: Vec::new(),
             in_flight_jobs: Vec::new(),
+            scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::Ready,
         };
@@ -324,11 +601,16 @@ mod tests {
     #[test]
     fn render_disconnected() {
         let app = App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Disconnected,
             server_version: None,
             server_uptime_ms: None,
+            total_ready: 0,
+            total_in_flight: 0,
+            total_scheduled: 0,
             ready_jobs: Vec::new(),
             in_flight_jobs: Vec::new(),
+            scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::Ready,
         };
@@ -339,9 +621,13 @@ mod tests {
     fn render_ready_tab_with_jobs() {
         let now_ms = 1_700_000_000_000u64;
         let app = App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(120_000),
+            total_ready: 2,
+            total_in_flight: 2,
+            total_scheduled: 0,
             ready_jobs: vec![
                 sample_ready_job("emails", "send_email", now_ms - 5_200, 0),
                 sample_ready_job("reports", "gen_report", now_ms - 62_000, 2),
@@ -356,6 +642,7 @@ mod tests {
                     Some(now_ms - 60_000),
                 ),
             ],
+            scheduled_jobs: Vec::new(),
             now_ms,
             active_tab: Tab::Ready,
         };
@@ -366,9 +653,13 @@ mod tests {
     fn render_in_flight_tab_with_jobs() {
         let now_ms = 1_700_000_000_000u64;
         let app = App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(120_000),
+            total_ready: 2,
+            total_in_flight: 2,
+            total_scheduled: 0,
             ready_jobs: vec![
                 sample_ready_job("emails", "send_email", now_ms - 5_200, 0),
                 sample_ready_job("reports", "gen_report", now_ms - 62_000, 2),
@@ -383,6 +674,7 @@ mod tests {
                     Some(now_ms - 60_000),
                 ),
             ],
+            scheduled_jobs: Vec::new(),
             now_ms,
             active_tab: Tab::InFlight,
         };
@@ -390,13 +682,41 @@ mod tests {
     }
 
     #[test]
+    fn render_scheduled_tab_with_jobs() {
+        let now_ms = 1_700_000_000_000u64;
+        let app = App {
+            host: "127.0.0.1:8901".to_string(),
+            status: ConnectionStatus::Connected,
+            server_version: Some("1.0.0".to_string()),
+            server_uptime_ms: Some(120_000),
+            total_ready: 0,
+            total_in_flight: 0,
+            total_scheduled: 2,
+            ready_jobs: Vec::new(),
+            in_flight_jobs: Vec::new(),
+            scheduled_jobs: vec![
+                sample_ready_job("emails", "send_email", now_ms + 232_000, 0),
+                sample_ready_job("reports", "gen_report", now_ms + 3_600_000, 1),
+            ],
+            now_ms,
+            active_tab: Tab::Scheduled,
+        };
+        insta::assert_snapshot!(render_to_string(&app, 120, 12));
+    }
+
+    #[test]
     fn render_empty_ready_tab() {
         let app = App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(10_000),
+            total_ready: 0,
+            total_in_flight: 0,
+            total_scheduled: 0,
             ready_jobs: Vec::new(),
             in_flight_jobs: Vec::new(),
+            scheduled_jobs: Vec::new(),
             now_ms: 1_700_000_000_000,
             active_tab: Tab::Ready,
         };
@@ -406,11 +726,16 @@ mod tests {
     #[test]
     fn render_disconnected_wide() {
         let app = App {
+            host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Disconnected,
             server_version: None,
             server_uptime_ms: None,
+            total_ready: 0,
+            total_in_flight: 0,
+            total_scheduled: 0,
             ready_jobs: Vec::new(),
             in_flight_jobs: Vec::new(),
+            scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::Ready,
         };
@@ -421,9 +746,9 @@ mod tests {
     fn format_elapsed_examples() {
         let now = 10_000_000u64;
         assert_eq!(format_elapsed(now - 500, now), "500ms");
-        assert_eq!(format_elapsed(now - 5_200, now), "5.2s");
-        assert_eq!(format_elapsed(now - 138_000, now), "2.3m");
-        assert_eq!(format_elapsed(now - 3_960_000, now), "1.1h");
+        assert_eq!(format_elapsed(now - 5_200, now), "5s");
+        assert_eq!(format_elapsed(now - 138_000, now), "2m18s");
+        assert_eq!(format_elapsed(now - 3_960_000, now), "1h6m");
         assert_eq!(format_elapsed(0, now), "-");
     }
 
@@ -432,13 +757,26 @@ mod tests {
         assert_eq!(format_duration_ms(0), "0ms");
         assert_eq!(format_duration_ms(500), "500ms");
         assert_eq!(format_duration_ms(999), "999ms");
-        assert_eq!(format_duration_ms(1_000), "1.0s");
-        assert_eq!(format_duration_ms(5_200), "5.2s");
-        assert_eq!(format_duration_ms(60_000), "1.0m");
-        assert_eq!(format_duration_ms(138_000), "2.3m");
-        assert_eq!(format_duration_ms(3_600_000), "1.0h");
-        assert_eq!(format_duration_ms(3_960_000), "1.1h");
-        assert_eq!(format_duration_ms(86_400_000), "1.0d");
-        assert_eq!(format_duration_ms(190_800_000), "2.2d");
+        assert_eq!(format_duration_ms(1_000), "1s");
+        assert_eq!(format_duration_ms(5_200), "5s");
+        assert_eq!(format_duration_ms(60_000), "1m");
+        assert_eq!(format_duration_ms(138_000), "2m18s");
+        assert_eq!(format_duration_ms(3_600_000), "1h");
+        assert_eq!(format_duration_ms(3_960_000), "1h6m");
+        assert_eq!(format_duration_ms(86_400_000), "1d");
+        assert_eq!(format_duration_ms(190_800_000), "2d5h");
+    }
+
+    #[test]
+    fn format_due_examples() {
+        let now = 10_000_000u64;
+        // Future: shows remaining time.
+        assert_eq!(format_due(now + 232_000, now), "3m52s");
+        assert_eq!(format_due(now + 5_000, now), "5s");
+        // Overdue: shows elapsed with "ago" suffix.
+        assert_eq!(format_due(now - 60_000, now), "1m ago");
+        assert_eq!(format_due(now - 500, now), "500ms ago");
+        // Zero timestamp.
+        assert_eq!(format_due(0, now), "-");
     }
 }

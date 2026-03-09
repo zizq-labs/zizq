@@ -2,13 +2,13 @@
 source: src/tui/ui.rs
 expression: "render_to_string(&app, 60, 10)"
 ---
-┌Zizq 0.1.0────────────────────────────────────────────────┐
-│ ● Disconnected                                           │
-└──────────────────────────────────────────────────────────┘
- Ready   In-Flight
-       ID   PRIORITY QUEUE TYPE      DELAY          ATTEMPTS
+  Zizq 0.1.0
+● Disconnected 127.0.0.1:8901
 
 
 
 
- h/l Switch tab  q Quit
+
+   Ready   In-Flight   Scheduled
+       ID   PRIORITY QUEUE        DELAY   ATTEMPTS TYPE
+ ←/→ Switch tab  q Quit

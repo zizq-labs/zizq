@@ -14,7 +14,6 @@ use std::io;
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -43,7 +42,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -52,10 +51,21 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn terminal input reader (blocking, runs in a thread).
     events::read_terminal_events(tx.clone());
 
+    let host = reqwest::Url::parse(&args.url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?.to_string();
+            match u.port() {
+                Some(port) => Some(format!("{host}:{port}")),
+                None => Some(host),
+            }
+        })
+        .unwrap_or_else(|| args.url.clone());
+
     // Spawn WebSocket connection manager (async).
     events::manage_ws_connection(tx, args.url);
 
-    let mut app = App::new();
+    let mut app = App::new(host);
 
     // Main event loop — process events as they arrive, redraw on tick.
     let mut tick = tokio::time::interval(Duration::from_millis(args.refresh_rate));
@@ -110,11 +120,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Restore terminal.
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     Ok(())

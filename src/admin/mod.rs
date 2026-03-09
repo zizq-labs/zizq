@@ -19,17 +19,36 @@ use serde::{Deserialize, Serialize};
 use crate::http::AppState;
 use crate::store;
 
+/// Server-wide status sent with every admin message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub version: String,
+    pub uptime_ms: u64,
+    pub total_ready: usize,
+    pub total_in_flight: usize,
+    pub total_scheduled: usize,
+}
+
+/// Wrapper that pairs a `ServerStatus` snapshot with an `AdminEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminMessage {
+    pub server: ServerStatus,
+    #[serde(flatten)]
+    pub event: AdminEvent,
+}
+
 /// Events broadcast to admin dashboard clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AdminEvent {
-    /// Periodic heartbeat with server metadata.
-    Heartbeat { version: String, uptime_ms: u64 },
+    /// Periodic heartbeat (server metadata is in the `ServerStatus` wrapper).
+    Heartbeat,
 
-    /// Snapshot of ready and in-flight job queues.
+    /// Snapshot of ready, in-flight, and scheduled job queues.
     JobSnapshot {
         ready: Vec<AdminJobSummary>,
         in_flight: Vec<AdminJobSummary>,
+        scheduled: Vec<AdminJobSummary>,
     },
 
     /// Incremental change to a single job's status.
@@ -49,6 +68,8 @@ pub enum JobChangeStatus {
     ReadyRemoved,
     InFlight,
     InFlightRemoved,
+    Scheduled,
+    ScheduledRemoved,
     Completed,
     Dead,
 }
@@ -120,6 +141,7 @@ mod tests {
             shutdown: shutdown_rx,
             clock: Arc::new(now_millis),
             admin_events: admin_events.clone(),
+            start_time: std::time::Instant::now(),
         });
         (admin_events, state)
     }
@@ -157,12 +179,7 @@ mod tests {
         // Consume the initial job_snapshot.
         consume_initial_snapshot(&mut ws_rx).await;
 
-        admin_events
-            .send(AdminEvent::Heartbeat {
-                version: "1.0.0".to_string(),
-                uptime_ms: 5000,
-            })
-            .unwrap();
+        admin_events.send(AdminEvent::Heartbeat).unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(2), ws_rx.next())
             .await
@@ -174,8 +191,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(parsed["event"], "heartbeat");
-        assert_eq!(parsed["version"], "1.0.0");
-        assert_eq!(parsed["uptime_ms"], 5000);
+        assert!(parsed["server"]["version"].is_string());
+        assert!(parsed["server"]["uptime_ms"].is_number());
     }
 
     #[tokio::test]
@@ -194,16 +211,11 @@ mod tests {
         // Consume the initial job_snapshot.
         consume_initial_snapshot(&mut ws_rx).await;
 
-        for i in 1..=3 {
-            admin_events
-                .send(AdminEvent::Heartbeat {
-                    version: "1.0.0".to_string(),
-                    uptime_ms: i * 1000,
-                })
-                .unwrap();
+        for _ in 1..=3 {
+            admin_events.send(AdminEvent::Heartbeat).unwrap();
         }
 
-        for i in 1..=3 {
+        for _ in 1..=3 {
             let msg = tokio::time::timeout(Duration::from_secs(2), ws_rx.next())
                 .await
                 .expect("timed out")
@@ -212,7 +224,8 @@ mod tests {
 
             let parsed: serde_json::Value =
                 serde_json::from_str(&msg.into_text().unwrap()).unwrap();
-            assert_eq!(parsed["uptime_ms"], i * 1000);
+            assert_eq!(parsed["event"], "heartbeat");
+            assert!(parsed["server"]["uptime_ms"].is_number());
         }
     }
 
@@ -233,12 +246,7 @@ mod tests {
         consume_initial_snapshot(&mut ws_rx).await;
 
         // Verify connection works.
-        admin_events
-            .send(AdminEvent::Heartbeat {
-                version: "1.0.0".to_string(),
-                uptime_ms: 1000,
-            })
-            .unwrap();
+        admin_events.send(AdminEvent::Heartbeat).unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(2), ws_rx.next())
             .await
@@ -252,9 +260,6 @@ mod tests {
 
         // Server should not panic — sending into the closed connection
         // just silently fails.
-        let _ = admin_events.send(AdminEvent::Heartbeat {
-            version: "1.0.0".to_string(),
-            uptime_ms: 2000,
-        });
+        let _ = admin_events.send(AdminEvent::Heartbeat);
     }
 }

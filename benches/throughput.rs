@@ -190,6 +190,7 @@ async fn start_server() -> (String, JoinHandle<()>) {
         shutdown: shutdown_rx.clone(),
         clock: Arc::new(zizq::time::now_millis),
         admin_events,
+        start_time: std::time::Instant::now(),
     });
 
     // Spawn the background scheduler.

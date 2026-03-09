@@ -215,6 +215,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         shutdown: shutdown_rx,
         clock: Arc::new(crate::time::now_millis),
         admin_events: admin_events_tx,
+        start_time: std::time::Instant::now(),
     });
 
     // Start the background scheduler that promotes scheduled jobs to Ready
@@ -246,7 +247,6 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         // Start the admin heartbeat producer.
         let admin_events = state.admin_events.clone();
         let admin_shutdown = state.shutdown.clone();
-        let start_time = std::time::Instant::now();
 
         tokio::spawn(async move {
             let mut shutdown = admin_shutdown;
@@ -254,10 +254,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                        let _ = admin_events.send(crate::admin::AdminEvent::Heartbeat {
-                            version: env!("CARGO_PKG_VERSION").to_string(),
-                            uptime_ms: start_time.elapsed().as_millis() as u64,
-                        });
+                        let _ = admin_events.send(crate::admin::AdminEvent::Heartbeat);
                     }
                     _ = shutdown.changed() => break,
                 }

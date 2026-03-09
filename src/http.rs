@@ -727,6 +727,9 @@ pub struct AppState {
 
     /// Broadcast channel for admin dashboard events (heartbeats, etc.).
     pub admin_events: broadcast::Sender<crate::admin::AdminEvent>,
+
+    /// Server start time, used to compute uptime for admin heartbeats.
+    pub start_time: std::time::Instant,
 }
 
 // --- Content negotiation ---
@@ -2154,6 +2157,7 @@ mod tests {
             shutdown: shutdown_rx,
             clock: clock_fn,
             admin_events,
+            start_time: std::time::Instant::now(),
         };
         (clock, state)
     }
@@ -4155,6 +4159,7 @@ mod tests {
             shutdown: shutdown_rx,
             clock: Arc::new(crate::time::now_millis),
             admin_events,
+            start_time: std::time::Instant::now(),
         });
         let router = app(state.clone());
 

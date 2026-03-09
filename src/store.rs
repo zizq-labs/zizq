@@ -2745,6 +2745,16 @@ impl Store {
         self.event_tx.subscribe()
     }
 
+    /// Total number of ready jobs across all queues.
+    pub fn ready_count(&self) -> usize {
+        self.ready_index.global.len()
+    }
+
+    /// Total number of scheduled jobs.
+    pub fn scheduled_count(&self) -> usize {
+        self.scheduled_index.entries.len()
+    }
+
     /// Atomically move a in-flight job back to the priority queue.
     ///
     /// Looks up the job from the `jobs` keyspace to reconstruct its
@@ -3206,6 +3216,63 @@ impl Store {
                 }
                 let (priority, job_id) = entry.key();
                 ids.push((*priority, job_id.clone()));
+            }
+            ids
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// List scheduled jobs in chronological order from the in-memory index.
+    ///
+    /// Iterates the `ScheduledIndex` SkipSet and hydrates job metadata from
+    /// the `jobs` keyspace. Skips jobs whose metadata is missing. Does NOT
+    /// hydrate payloads.
+    pub async fn list_scheduled_jobs(&self, limit: usize) -> Result<Vec<Job>, StoreError> {
+        if !self.index_ready.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+
+        let scheduled_index = self.scheduled_index.clone();
+        let ks = self.ks.clone();
+
+        task::spawn_blocking(move || {
+            let mut jobs = Vec::with_capacity(limit);
+            for entry in scheduled_index.entries.iter() {
+                if jobs.len() >= limit {
+                    break;
+                }
+                let (_ready_at, job_id) = entry.value();
+                let job_key = make_job_key(job_id);
+                if let Some(bytes) = ks.data.get(&job_key)? {
+                    let job: Job = rmp_serde::from_slice(&bytes)?;
+                    jobs.push(job);
+                }
+            }
+            Ok(jobs)
+        })
+        .await?
+    }
+
+    /// Scan the in-memory ScheduledIndex and return up to `limit` keys.
+    ///
+    /// Returns `Vec<(ready_at, job_id)>` in chronological order — zero disk I/O.
+    /// Used by the admin event handler to diff capped scheduled windows.
+    pub async fn scan_scheduled_ids(&self, limit: usize) -> Vec<(u64, String)> {
+        if !self.index_ready.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+
+        let scheduled_index = self.scheduled_index.clone();
+
+        task::spawn_blocking(move || {
+            let mut ids = Vec::with_capacity(limit);
+            for entry in scheduled_index.entries.iter() {
+                if ids.len() >= limit {
+                    break;
+                }
+                let (ready_at, job_id) = entry.value();
+                ids.push((*ready_at, job_id.clone()));
             }
             ids
         })
@@ -8056,6 +8123,207 @@ mod tests {
 
         let jobs = store.list_ready_jobs(10).await.unwrap();
         assert_eq!(jobs.len(), 1);
+    }
+
+    // --- list_scheduled_jobs tests ---
+
+    #[tokio::test]
+    async fn list_scheduled_jobs_returns_chronological_order() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue jobs at different ready_at times.
+        let late = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 30_000),
+            )
+            .await
+            .unwrap();
+        let early = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 10_000),
+            )
+            .await
+            .unwrap();
+        let mid = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 20_000),
+            )
+            .await
+            .unwrap();
+
+        let jobs = store.list_scheduled_jobs(10).await.unwrap();
+        let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec![early.id, mid.id, late.id]);
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_jobs_respects_limit() {
+        let store = test_store();
+        let now = now_millis();
+
+        for i in 0..5 {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(null))
+                        .ready_at(now + (i + 1) * 10_000),
+                )
+                .await
+                .unwrap();
+        }
+
+        let jobs = store.list_scheduled_jobs(3).await.unwrap();
+        assert_eq!(jobs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_jobs_empty_store() {
+        let store = test_store();
+        let jobs = store.list_scheduled_jobs(10).await.unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_jobs_excludes_ready() {
+        let store = test_store();
+        let now = now_millis();
+
+        // One ready job.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        // One scheduled job.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
+        let jobs = store.list_scheduled_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+    }
+
+    // --- ready_count / scheduled_count tests ---
+
+    #[tokio::test]
+    async fn ready_count_tracks_enqueue_and_take() {
+        let store = test_store();
+        let now = now_millis();
+
+        assert_eq!(store.ready_count(), 0);
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.ready_count(), 2);
+
+        // Taking a job should decrement the ready count.
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+        assert_eq!(store.ready_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn ready_count_excludes_scheduled() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.ready_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_count_tracks_enqueue_and_promote() {
+        let store = test_store();
+        let now = now_millis();
+
+        assert_eq!(store.scheduled_count(), 0);
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 120_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.scheduled_count(), 2);
+
+        // Promoting a scheduled job should decrement the scheduled count.
+        store.promote_scheduled(&job).await.unwrap();
+        assert_eq!(store.scheduled_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_count_excludes_ready() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null))
+                    .ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.scheduled_count(), 1);
     }
 
     // --- enqueue_bulk tests ---

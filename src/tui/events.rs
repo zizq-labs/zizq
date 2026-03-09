@@ -8,7 +8,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::admin::{AdminEvent, AdminJobSummary, JobChangeStatus};
+use crate::admin::{AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, ServerStatus};
 
 /// Unified event type for the TUI event loop.
 pub enum Event {
@@ -23,14 +23,17 @@ pub enum Event {
     /// Server connection established.
     ServerConnected,
     /// Heartbeat received from server.
-    ServerHeartbeat { version: String, uptime_ms: u64 },
-    /// Snapshot of ready and in-flight job queues.
+    ServerHeartbeat { server: ServerStatus },
+    /// Snapshot of ready, in-flight, and scheduled job queues.
     ServerJobSnapshot {
+        server: ServerStatus,
         ready: Vec<AdminJobSummary>,
         in_flight: Vec<AdminJobSummary>,
+        scheduled: Vec<AdminJobSummary>,
     },
     /// Incremental change to a single job's status.
     ServerJobChanged {
+        server: ServerStatus,
         id: String,
         status: JobChangeStatus,
         job: Option<AdminJobSummary>,
@@ -60,10 +63,10 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                             let _ = tx.blocking_send(Event::Quit);
                             break;
                         }
-                        KeyCode::Char('l') => {
+                        KeyCode::Right => {
                             let _ = tx.blocking_send(Event::NextTab);
                         }
-                        KeyCode::Char('h') => {
+                        KeyCode::Left => {
                             let _ = tx.blocking_send(Event::PrevTab);
                         }
                         _ => {}
@@ -125,18 +128,26 @@ async fn connect_ws(
 
 /// Parse a WebSocket JSON text message into a TUI Event.
 fn parse_ws_message(text: &str) -> Option<Event> {
-    let admin_event: AdminEvent = serde_json::from_str(text).ok()?;
+    let msg: AdminMessage = serde_json::from_str(text).ok()?;
 
-    match admin_event {
-        AdminEvent::Heartbeat { version, uptime_ms } => {
-            Some(Event::ServerHeartbeat { version, uptime_ms })
-        }
-        AdminEvent::JobSnapshot { ready, in_flight } => {
-            Some(Event::ServerJobSnapshot { ready, in_flight })
-        }
-        AdminEvent::JobChanged { id, status, job } => {
-            Some(Event::ServerJobChanged { id, status, job })
-        }
+    match msg.event {
+        AdminEvent::Heartbeat => Some(Event::ServerHeartbeat { server: msg.server }),
+        AdminEvent::JobSnapshot {
+            ready,
+            in_flight,
+            scheduled,
+        } => Some(Event::ServerJobSnapshot {
+            server: msg.server,
+            ready,
+            in_flight,
+            scheduled,
+        }),
+        AdminEvent::JobChanged { id, status, job } => Some(Event::ServerJobChanged {
+            server: msg.server,
+            id,
+            status,
+            job,
+        }),
     }
 }
 
@@ -146,13 +157,16 @@ mod tests {
 
     #[test]
     fn parses_heartbeat() {
-        let json = r#"{"event":"heartbeat","version":"1.0.0","uptime_ms":5000}"#;
+        let json = r#"{"server":{"version":"1.0.0","uptime_ms":5000,"total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"heartbeat"}"#;
         let event = parse_ws_message(json).unwrap();
 
         match event {
-            Event::ServerHeartbeat { version, uptime_ms } => {
-                assert_eq!(version, "1.0.0");
-                assert_eq!(uptime_ms, 5000);
+            Event::ServerHeartbeat { server } => {
+                assert_eq!(server.version, "1.0.0");
+                assert_eq!(server.uptime_ms, 5000);
+                assert_eq!(server.total_ready, 0);
+                assert_eq!(server.total_in_flight, 0);
+                assert_eq!(server.total_scheduled, 0);
             }
             _ => panic!("expected ServerHeartbeat"),
         }
@@ -161,26 +175,68 @@ mod tests {
     #[test]
     fn parses_job_snapshot() {
         let json = r#"{
+            "server": {"version":"1.0.0","uptime_ms":5000,"total_ready":1,"total_in_flight":1,"total_scheduled":1},
             "event": "job_snapshot",
             "ready": [{"id":"r1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0}],
-            "in_flight": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}]
+            "in_flight": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}],
+            "scheduled": [{"id":"s1","queue":"q","job_type":"t","priority":0,"ready_at":5000,"attempts":0}]
         }"#;
         let event = parse_ws_message(json).unwrap();
 
         match event {
-            Event::ServerJobSnapshot { ready, in_flight } => {
+            Event::ServerJobSnapshot {
+                server,
+                ready,
+                in_flight,
+                scheduled,
+            } => {
+                assert_eq!(server.version, "1.0.0");
+                assert_eq!(server.total_ready, 1);
+                assert_eq!(server.total_in_flight, 1);
+                assert_eq!(server.total_scheduled, 1);
                 assert_eq!(ready.len(), 1);
                 assert_eq!(ready[0].id, "r1");
                 assert_eq!(in_flight.len(), 1);
                 assert_eq!(in_flight[0].id, "w1");
+                assert_eq!(scheduled.len(), 1);
+                assert_eq!(scheduled[0].id, "s1");
             }
             _ => panic!("expected ServerJobSnapshot"),
         }
     }
 
     #[test]
+    fn parses_job_changed_scheduled() {
+        let json = r#"{
+            "server": {"version":"1.0.0","uptime_ms":5000,"total_ready":0,"total_in_flight":0,"total_scheduled":1},
+            "event": "job_changed",
+            "id": "s1",
+            "status": "scheduled",
+            "job": {"id":"s1","queue":"q","job_type":"t","priority":0,"ready_at":5000,"attempts":0}
+        }"#;
+        let event = parse_ws_message(json).unwrap();
+
+        match event {
+            Event::ServerJobChanged {
+                server,
+                id,
+                status,
+                job,
+            } => {
+                assert_eq!(server.version, "1.0.0");
+                assert_eq!(server.total_scheduled, 1);
+                assert_eq!(id, "s1");
+                assert_eq!(status, JobChangeStatus::Scheduled);
+                assert!(job.is_some());
+            }
+            _ => panic!("expected ServerJobChanged"),
+        }
+    }
+
+    #[test]
     fn parses_job_changed_with_job() {
         let json = r#"{
+            "server": {"version":"1.0.0","uptime_ms":5000,"total_ready":1,"total_in_flight":0,"total_scheduled":0},
             "event": "job_changed",
             "id": "j1",
             "status": "ready",
@@ -189,7 +245,14 @@ mod tests {
         let event = parse_ws_message(json).unwrap();
 
         match event {
-            Event::ServerJobChanged { id, status, job } => {
+            Event::ServerJobChanged {
+                server,
+                id,
+                status,
+                job,
+            } => {
+                assert_eq!(server.version, "1.0.0");
+                assert_eq!(server.total_ready, 1);
                 assert_eq!(id, "j1");
                 assert_eq!(status, JobChangeStatus::Ready);
                 let job = job.unwrap();
@@ -201,11 +264,17 @@ mod tests {
 
     #[test]
     fn parses_job_changed_without_job() {
-        let json = r#"{"event":"job_changed","id":"j1","status":"completed"}"#;
+        let json = r#"{"server":{"version":"1.0.0","uptime_ms":5000,"total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"job_changed","id":"j1","status":"completed"}"#;
         let event = parse_ws_message(json).unwrap();
 
         match event {
-            Event::ServerJobChanged { id, status, job } => {
+            Event::ServerJobChanged {
+                server,
+                id,
+                status,
+                job,
+            } => {
+                assert_eq!(server.version, "1.0.0");
                 assert_eq!(id, "j1");
                 assert_eq!(status, JobChangeStatus::Completed);
                 assert!(job.is_none());
@@ -221,7 +290,7 @@ mod tests {
 
     #[test]
     fn returns_none_for_unknown_event_type() {
-        let json = r#"{"event":"unknown","data":123}"#;
+        let json = r#"{"server":{"version":"1.0.0","uptime_ms":0,"total_ready":0,"total_in_flight":0,"total_scheduled":0},"event":"unknown","data":123}"#;
         assert!(parse_ws_message(json).is_none());
     }
 }

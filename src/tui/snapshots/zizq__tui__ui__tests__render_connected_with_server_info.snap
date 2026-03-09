@@ -2,13 +2,13 @@
 source: src/tui/ui.rs
 expression: "render_to_string(&app, 60, 10)"
 ---
-┌Zizq 0.1.0────────────────────────────────────────────────┐
-│ ● Connected  v1.0.0  uptime: 1.1m                        │
-└──────────────────────────────────────────────────────────┘
- Ready   In-Flight
-       ID   PRIORITY QUEUE TYPE      DELAY          ATTEMPTS
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 1m5s
+  Queue: 0 in-flight, 0 ready
 
+  Depth[                                           0 jobs]
 
-
-
- h/l Switch tab  q Quit
+   Ready   In-Flight   Scheduled
+       ID   PRIORITY QUEUE        DELAY   ATTEMPTS TYPE
+ ←/→ Switch tab  q Quit
