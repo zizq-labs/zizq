@@ -18,6 +18,10 @@ pub enum Event {
     NextTab,
     /// Switch to the previous tab.
     PrevTab,
+    /// Scroll the table view left.
+    ScrollLeft,
+    /// Scroll the table view right.
+    ScrollRight,
     /// Server connection attempt in progress.
     ServerConnecting,
     /// Server connection established.
@@ -45,7 +49,10 @@ pub enum Event {
 impl Event {
     /// Returns `true` for events triggered by user input (key presses).
     pub fn is_user_input(&self) -> bool {
-        matches!(self, Event::Quit | Event::NextTab | Event::PrevTab)
+        matches!(
+            self,
+            Event::Quit | Event::NextTab | Event::PrevTab | Event::ScrollLeft | Event::ScrollRight
+        )
     }
 }
 
@@ -63,11 +70,17 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                             let _ = tx.blocking_send(Event::Quit);
                             break;
                         }
-                        KeyCode::Right => {
+                        KeyCode::Char('n') => {
                             let _ = tx.blocking_send(Event::NextTab);
                         }
-                        KeyCode::Left => {
+                        KeyCode::Char('p') => {
                             let _ = tx.blocking_send(Event::PrevTab);
+                        }
+                        KeyCode::Right => {
+                            let _ = tx.blocking_send(Event::ScrollRight);
+                        }
+                        KeyCode::Left => {
+                            let _ = tx.blocking_send(Event::ScrollLeft);
                         }
                         _ => {}
                     }

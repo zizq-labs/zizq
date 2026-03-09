@@ -10,7 +10,7 @@ expression: "render_to_string(&app, 80, 12)"
   Depth[││││                                                           4 jobs]
 
    In-Flight   Ready   Scheduled
-                         ID   PRIORITY QUEU     DURATION   ATTEMPTS TYPE
-70a2bb46e1f07a0c908d7a2bb40          0 defa           3s          1 generate_ann
-70a1aa35d0e06b0b807c691aa30          0 bill        2m30s          3 charge_subsc
- ←/→ Switch tab  q Quit
+                         ID   PRIORITY QUEUE              DURATION   ATTEMPTS TY
+70a2bb46e1f07a0c908d7a2bb40          0 default                  3s          1 ge
+70a1aa35d0e06b0b807c691aa30          0 billing               2m30s          3 ch
+ n/p Switch tab  ←/→ Scroll  q Quit

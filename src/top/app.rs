@@ -24,6 +24,10 @@ impl Tab {
         Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 
+    pub fn idx(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap()
+    }
+
     pub fn prev(self) -> Tab {
         let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
         Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
@@ -31,6 +35,7 @@ impl Tab {
 }
 
 /// Connection status to the admin API.
+#[derive(Clone)]
 pub enum ConnectionStatus {
     Connecting,
     Connected,
@@ -38,6 +43,7 @@ pub enum ConnectionStatus {
 }
 
 /// Top-level application state for the TUI.
+#[derive(Clone)]
 pub struct App {
     pub host: String,
     pub status: ConnectionStatus,
@@ -52,6 +58,7 @@ pub struct App {
     pub scheduled_jobs: Vec<AdminJobSummary>,
     pub now_ms: u64,
     pub active_tab: Tab,
+    pub h_scroll: [u16; 3],
 }
 
 impl App {
@@ -70,6 +77,7 @@ impl App {
             scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::InFlight,
+            h_scroll: [0; 3],
         }
     }
 
@@ -95,6 +103,14 @@ impl App {
             }
             Event::PrevTab => {
                 self.active_tab = self.active_tab.prev();
+            }
+            Event::ScrollLeft => {
+                let i = self.active_tab.idx();
+                self.h_scroll[i] = self.h_scroll[i].saturating_sub(4);
+            }
+            Event::ScrollRight => {
+                let i = self.active_tab.idx();
+                self.h_scroll[i] = self.h_scroll[i].saturating_add(4);
             }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;

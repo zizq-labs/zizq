@@ -4,17 +4,28 @@
 //! Ratatui rendering for the TUI dashboard.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Widget};
 
 use crate::admin::AdminJobSummary;
 
 use super::app::{App, ConnectionStatus, Tab};
 
 /// Render the current application state to a terminal frame.
-pub fn render(app: &App, frame: &mut Frame) {
+pub fn render(app: &mut App, frame: &mut Frame) {
+    // Clamp horizontal scroll so it never exceeds what the current
+    // viewport actually needs. This prevents accumulating scroll
+    // offset while the viewport is wide enough not to scroll, which
+    // would cause a confusing jump when the window is later resized
+    // smaller.
+    let viewport_width = frame.area().width;
+    let max_scroll = MIN_TABLE_WIDTH.saturating_sub(viewport_width);
+    for s in &mut app.h_scroll {
+        *s = (*s).min(max_scroll);
+    }
     let chunks = Layout::vertical([
         Constraint::Length(7), // header
         Constraint::Length(1), // tab bar
@@ -167,6 +178,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // Content area — render only the active tab's table.
     // In-flight is always available. Ready and Scheduled require Pro.
+    let content_area = chunks[2];
     let tab_gated = connected
         && app.active_tab != Tab::InFlight
         && app
@@ -182,7 +194,6 @@ pub fn render(app: &App, frame: &mut Frame) {
             Tab::Scheduled => job_table_scheduled(&[], app.now_ms),
         };
 
-        let content_area = chunks[2];
         let inner = Layout::vertical([
             Constraint::Length(1), // table header row
             Constraint::Min(0),    // license message
@@ -213,19 +224,68 @@ pub fn render(app: &App, frame: &mut Frame) {
             Tab::InFlight => job_table_in_flight(&app.in_flight_jobs, app.now_ms),
             Tab::Scheduled => job_table_scheduled(&app.scheduled_jobs, app.now_ms),
         };
-        frame.render_widget(table, chunks[2]);
+        let tab_scroll = app.h_scroll[app.active_tab.idx()];
+        render_scrollable(frame, table, content_area, tab_scroll);
     }
 
     // Help bar.
     let key_style = Style::default().fg(Color::White);
     let label_style = Style::default().fg(Color::Black).bg(Color::White);
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(" \u{2190}/\u{2192} ", key_style),
+        Span::styled(" n/p ", key_style),
         Span::styled("Switch tab", label_style),
+        Span::styled("  \u{2190}/\u{2192} ", key_style),
+        Span::styled("Scroll", label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
     ]));
     frame.render_widget(help, chunks[3]);
+}
+
+/// Minimum width for the table content area. When the viewport is narrower,
+/// the table renders at this width and the visible portion is determined by
+/// the horizontal scroll offset.
+const MIN_TABLE_WIDTH: u16 = 120;
+
+/// Render a widget into `area`, applying horizontal scrolling when the area
+/// is narrower than [`MIN_TABLE_WIDTH`].
+fn render_scrollable(frame: &mut Frame, widget: impl Widget, area: Rect, h_scroll: u16) {
+    let virtual_width = area.width.max(MIN_TABLE_WIDTH);
+
+    if virtual_width == area.width {
+        // No scrolling needed — render directly.
+        frame.render_widget(widget, area);
+        return;
+    }
+
+    // Clamp scroll so we don't scroll past the end.
+    let max_scroll = virtual_width - area.width;
+    let scroll = h_scroll.min(max_scroll);
+
+    // Render the widget into a temporary off-screen buffer.
+    let virtual_area = Rect {
+        x: 0,
+        y: 0,
+        width: virtual_width,
+        height: area.height,
+    };
+    let mut vbuf = Buffer::empty(virtual_area);
+    widget.render(virtual_area, &mut vbuf);
+
+    // Copy the visible slice into the frame buffer.
+    let fbuf = frame.buffer_mut();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let src_x = x + scroll;
+            let dst_x = area.x + x;
+            let dst_y = area.y + y;
+            if src_x < virtual_width && dst_x < fbuf.area.width && dst_y < fbuf.area.height {
+                let cell = &vbuf[(src_x, y)];
+                fbuf[(dst_x, dst_y)].set_symbol(cell.symbol());
+                fbuf[(dst_x, dst_y)].set_style(cell.style());
+            }
+        }
+    }
 }
 
 /// Render the depth bar line: `  Depth[||||||||N Jobs]  `
@@ -547,9 +607,10 @@ mod tests {
     /// Render the app state to a fixed-size terminal and return the
     /// buffer contents as a string suitable for snapshot comparison.
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
+        let mut app = app.clone();
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        let frame = terminal.draw(|f| render(app, f)).unwrap();
+        let frame = terminal.draw(|f| render(&mut app, f)).unwrap();
         let buf = &frame.buffer;
         let mut lines = Vec::new();
         for y in 0..buf.area.height {
@@ -577,6 +638,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::InFlight,
+            h_scroll: [0; 3],
         }
     }
 
@@ -602,6 +664,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::InFlight,
+            h_scroll: [0; 3],
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -622,6 +685,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::InFlight,
+            h_scroll: [0; 3],
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -727,6 +791,7 @@ mod tests {
             ],
             now_ms,
             active_tab,
+            h_scroll: [0; 3],
         }
     }
 
@@ -751,6 +816,20 @@ mod tests {
     #[test]
     fn render_in_flight_tab_narrow() {
         let app = sample_app(Tab::InFlight);
+        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+    }
+
+    #[test]
+    fn render_in_flight_tab_narrow_scrolled() {
+        let mut app = sample_app(Tab::InFlight);
+        app.h_scroll[Tab::InFlight.idx()] = 20;
+        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+    }
+
+    #[test]
+    fn render_in_flight_tab_narrow_scrolled_max() {
+        let mut app = sample_app(Tab::InFlight);
+        app.h_scroll[Tab::InFlight.idx()] = 40;
         insta::assert_snapshot!(render_to_string(&app, 80, 12));
     }
 
@@ -782,6 +861,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms: 1_700_000_000_000,
             active_tab: Tab::Ready,
+            h_scroll: [0; 3],
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -802,6 +882,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms: 0,
             active_tab: Tab::InFlight,
+            h_scroll: [0; 3],
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -822,6 +903,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms: 1_700_000_000_000,
             active_tab: Tab::Ready,
+            h_scroll: [0; 3],
         };
         insta::assert_snapshot!(render_to_string(&app, 80, 20));
     }
@@ -864,6 +946,7 @@ mod tests {
             scheduled_jobs: Vec::new(),
             now_ms,
             active_tab: Tab::InFlight,
+            h_scroll: [0; 3],
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 12));
     }

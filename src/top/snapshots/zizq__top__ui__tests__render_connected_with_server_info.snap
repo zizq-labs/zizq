@@ -10,5 +10,5 @@ expression: "render_to_string(&app, 60, 10)"
   Depth[                                           0 jobs]
 
    In-Flight   Ready   Scheduled
-                       ID   PRIORITY    DURATION   ATTEMPTS
- ←/→ Switch tab  q Quit
+                         ID   PRIORITY QUEUE              DU
+ n/p Switch tab  ←/→ Scroll  q Quit

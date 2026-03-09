@@ -10,7 +10,7 @@ expression: "render_to_string(&app, 80, 12)"
   Depth[││││                                                           4 jobs]
 
    In-Flight   Ready   Scheduled
-                         ID   PRIORITY QUEUE                 DELAY   ATTEMPTS TY
-70a3cc87a1f0890da08e8b3cc86          0 default                  5s          0 ge
-70a3dd47c2308a1fb09e9c4dd97          5 default                1m2s          2 se
+UEUE              DURATION   ATTEMPTS TYPE
+efault                  3s          1 generate_annual_report_email
+illing               2m30s          3 charge_subscription
  n/p Switch tab  ←/→ Scroll  q Quit

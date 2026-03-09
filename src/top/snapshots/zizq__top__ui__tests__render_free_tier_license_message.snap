@@ -21,4 +21,4 @@ expression: "render_to_string(&app, 80, 20)"
 
 
 
- ←/→ Switch tab  q Quit
+ n/p Switch tab  ←/→ Scroll  q Quit
