@@ -76,6 +76,18 @@ class TestClient < Minitest::Test
     @json_client.enqueue(type: "Job", queue: "q", payload: {}, ready_at: 9999.0)
   end
 
+  def test_enqueue_with_time_ready_at
+    now = Time.now
+    ready_at = now + 60
+
+    stub_request(:post, "#{URL}/jobs")
+      .with { |req| JSON.parse(req.body)["ready_at"] == (ready_at.to_f * 1000).to_i }
+      .to_return(status: 201, body: JSON.generate({ "id" => "x" }),
+                 headers: { "Content-Type" => "application/json" })
+
+    @json_client.enqueue(type: "Job", queue: "q", payload: {}, ready_at: ready_at)
+  end
+
   def test_enqueue_400_raises_client_error
     stub_request(:post, "#{URL}/jobs")
       .to_return(status: 400, body: JSON.generate({ "error" => "queue is required" }),

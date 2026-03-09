@@ -10,6 +10,7 @@ class SendEmailJob
   include Zizq::Job
 
   zizq_queue "emails"
+  zizq_priority 20
 
   attr_reader :received_user_id, :received_template
 
@@ -133,7 +134,7 @@ class TestJob < Minitest::Test
   def test_enqueue_options_defaults
     opts = SendEmailJob.zizq_enqueue_options(42)
     assert_equal "emails", opts.queue
-    assert_nil opts.priority
+    assert_equal 20, opts.priority
     assert_nil opts.delay
     assert_nil opts.retry_limit
   end
@@ -253,6 +254,21 @@ class TestJob < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     Zizq.enqueue(SendEmailJob, 42) { |o| o.priority = 100 }
+  end
+
+  def test_enqueue_with_ready_at_via_block
+    now = Time.now
+    expected_ready_at = ((now.to_f + 60) * 1000).to_i
+
+    stub_request(:post, "#{URL}/jobs")
+      .with { |req|
+        body = JSON.parse(req.body)
+        body["ready_at"] == expected_ready_at
+      }
+      .to_return(status: 201, body: JSON.generate({ "id" => "x" }),
+                 headers: { "Content-Type" => "application/json" })
+
+    Zizq.enqueue(SendEmailJob, 42) { |o| o.ready_at = now + 60 }
   end
 
   def test_enqueue_with_delay_via_block

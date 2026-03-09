@@ -119,7 +119,7 @@ module Zizq
       body = { type:, queue:, payload: } #: Hash[Symbol, untyped]
       body[:priority] = priority if priority
       # ready_at is fractional seconds in Ruby; the server expects ms.
-      body[:ready_at] = (ready_at * 1000).to_i if ready_at
+      body[:ready_at] = (ready_at.to_f * 1000).to_i if ready_at
       body[:retry_limit] = retry_limit if retry_limit
       body[:backoff] = backoff if backoff
       body[:retention] = retention if retention
@@ -144,7 +144,7 @@ module Zizq
         wire = { type: j[:type], queue: j[:queue], payload: j[:payload] } #: Hash[Symbol, untyped]
         wire[:priority] = j[:priority] if j[:priority]
         # ready_at is fractional seconds in Ruby; the server expects ms.
-        wire[:ready_at] = (j[:ready_at] * 1000).to_i if j[:ready_at]
+        wire[:ready_at] = (j[:ready_at].to_f * 1000).to_i if j[:ready_at]
         wire[:retry_limit] = j[:retry_limit] if j[:retry_limit]
         wire[:backoff] = j[:backoff] if j[:backoff]
         wire[:retention] = j[:retention] if j[:retention]

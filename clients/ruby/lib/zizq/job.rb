@@ -45,6 +45,20 @@ module Zizq
         end
       end
 
+      # Declare the default priority for this job class.
+      #
+      # If not called, defaults to the default priority on the Zizq server.
+      # Jobs enqueued for this class will use the specified priority unless
+      # explicitly overridden during [`Zizq::enqueue`] or by overriding
+      # `::zizq_enqueue_options` on the job class.
+      def zizq_priority(priority = nil) #: (?Integer?) -> Integer?
+        if priority
+          @zizq_priority = priority
+        else
+          @zizq_priority
+        end
+      end
+
       # Declare the default retry limit for this job class.
       #
       # The job may fail up to the number of times specified by the retry limit
@@ -166,6 +180,7 @@ module Zizq
       def zizq_enqueue_options(*args, **kwargs) #: (*untyped, **untyped) -> EnqueueOptions
         EnqueueOptions.new(
           queue:       zizq_queue,
+          priority:    zizq_priority,
           retry_limit: zizq_retry_limit,
           backoff:     zizq_backoff,
           retention:   zizq_retention
