@@ -904,6 +904,13 @@ pub struct Store {
     /// return empty results while `false`.
     index_ready: Arc<AtomicBool>,
 
+    /// Current number of in-flight jobs across all connections.
+    ///
+    /// Incremented when jobs are taken (`take_next_n_jobs`), decremented
+    /// when jobs complete, fail, or are requeued. Used by the HTTP layer
+    /// to enforce `global_in_flight_limit` without hitting disk.
+    in_flight_count: Arc<AtomicU64>,
+
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
@@ -1732,6 +1739,7 @@ impl Store {
             default_retry_limit: config.default_retry_limit,
             default_backoff: config.default_backoff,
             index_ready: Arc::new(AtomicBool::new(true)),
+            in_flight_count: Arc::new(AtomicU64::new(0)),
             event_tx,
         })
     }
@@ -2212,7 +2220,11 @@ impl Store {
 
         let jobs = await_sync(result).await?;
 
-        // Broadcast JobInFlight for each taken job.
+        // Update the in-flight counter and broadcast events.
+        if !jobs.is_empty() {
+            self.in_flight_count
+                .fetch_add(jobs.len() as u64, Ordering::Relaxed);
+        }
         for job in &jobs {
             let _ = self
                 .event_tx
@@ -2319,6 +2331,11 @@ impl Store {
         let completed = await_sync(result).await?;
 
         if completed {
+            let _ = self
+                .in_flight_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
             let _ = self
                 .event_tx
                 .send(StoreEvent::JobCompleted { id: id_for_event });
@@ -2498,6 +2515,14 @@ impl Store {
         .await?;
 
         let bulk_result = await_sync(result).await?;
+
+        if !bulk_result.completed.is_empty() {
+            let _ = self
+                .in_flight_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(bulk_result.completed.len() as u64))
+                });
+        }
 
         // Broadcast JobCompleted for each completed job.
         for id in &bulk_result.completed {
@@ -2684,6 +2709,12 @@ impl Store {
 
         // Emit events outside spawn_blocking due to &self.event_tx.
         if let Some(ref job) = result {
+            let _ = self
+                .in_flight_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
+
             // Always emit JobFailed first so workers prune their
             // in-flight set before any downstream events arrive.
             //
@@ -2748,6 +2779,11 @@ impl Store {
     /// Total number of ready jobs across all queues.
     pub fn ready_count(&self) -> usize {
         self.ready_index.global.len()
+    }
+
+    /// Total number of in-flight jobs across all connections.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight_count.load(Ordering::Relaxed) as usize
     }
 
     /// Total number of scheduled jobs.
@@ -2822,6 +2858,11 @@ impl Store {
         .await?;
 
         if let Some(queue) = await_sync(result).await? {
+            let _ = self
+                .in_flight_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
             let _ = self.event_tx.send(StoreEvent::JobCreated {
                 id: event_id,
                 queue,
@@ -8324,6 +8365,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.scheduled_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_flight_count_tracks_take_and_complete() {
+        let store = test_store();
+        let now = now_millis();
+
+        assert_eq!(store.in_flight_count(), 0);
+
+        // Enqueue two jobs and take both.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+        assert_eq!(store.in_flight_count(), 2);
+
+        // Completing a job should decrement.
+        store.mark_completed(now, &job.id).await.unwrap();
+        assert_eq!(store.in_flight_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_flight_count_tracks_failure_and_requeue() {
+        let store = test_store();
+        let now = now_millis();
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+        assert_eq!(store.in_flight_count(), 1);
+
+        // Failing a job should decrement.
+        store
+            .record_failure(now, &job.id, test_failure_opts())
+            .await
+            .unwrap();
+        assert_eq!(store.in_flight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_count_tracks_requeue() {
+        let store = test_store();
+        let now = now_millis();
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+        assert_eq!(store.in_flight_count(), 1);
+
+        // Requeuing should decrement.
+        store.requeue(&job.id).await.unwrap();
+        assert_eq!(store.in_flight_count(), 0);
     }
 
     // --- enqueue_bulk tests ---

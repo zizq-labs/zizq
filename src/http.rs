@@ -12,7 +12,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::license::License;
@@ -712,9 +712,6 @@ pub struct AppState {
     /// Maximum number of in-flight jobs across all connections.
     /// 0 means no limit.
     pub global_in_flight_limit: u64,
-
-    /// Current number of in-flight jobs across all connections.
-    pub global_in_flight: AtomicU64,
 
     /// Cloneable receiver for graceful shutdown signaling.
     pub shutdown: watch::Receiver<()>,
@@ -1729,11 +1726,6 @@ async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashMap<String, u
     for id in &gone {
         in_flight.remove(id);
         tracing::debug!(job_id = %id, "reconciled: job no longer in-flight");
-        let _ = state
-            .global_in_flight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
     }
 }
 
@@ -1825,8 +1817,7 @@ async fn take_jobs(
                 let can_take = !claim_token.load(Ordering::Relaxed)
                     && (prefetch == 0 || in_flight.len() < prefetch)
                     && (state.global_in_flight_limit == 0
-                        || state.global_in_flight.load(Ordering::Relaxed)
-                            < state.global_in_flight_limit);
+                        || (state.store.in_flight_count() as u64) < state.global_in_flight_limit);
 
                 tokio::select! {
                     // Detect client disconnect without waiting for the
@@ -1878,10 +1869,10 @@ async fn take_jobs(
 
                                     // Cap by global in-flight limit.
                                     let wanted = if state.global_in_flight_limit > 0 {
-                                        let global_in_flight = state.global_in_flight.load(Ordering::Relaxed);
+                                        let in_flight = state.store.in_flight_count() as u64;
                                         wanted.min(
                                             state.global_in_flight_limit
-                                                .saturating_sub(global_in_flight) as usize,
+                                                .saturating_sub(in_flight) as usize,
                                         )
                                     } else {
                                         wanted
@@ -1909,7 +1900,6 @@ async fn take_jobs(
                                                 match Job::try_from(store_job) {
                                                     Ok(job) => {
                                                         in_flight.insert(job.id.clone(), job.attempts);
-                                                        state.global_in_flight.fetch_add(1, Ordering::Relaxed);
                                                         tracing::debug!(
                                                             job_id = %job.id,
                                                             job_type = %job.job_type,
@@ -1999,13 +1989,6 @@ async fn take_jobs(
                                         reason = "completed",
                                         "job removed from in-flight set"
                                     );
-                                    let _ = state
-                                        .global_in_flight
-                                        .fetch_update(
-                                            Ordering::Relaxed,
-                                            Ordering::Relaxed,
-                                            |v| Some(v.saturating_sub(1)),
-                                        );
                                 }
                             }
                             Ok(StoreEvent::JobFailed {
@@ -2025,13 +2008,6 @@ async fn take_jobs(
                                         reason = "failed",
                                         "job removed from in-flight set"
                                     );
-                                    let _ = state
-                                        .global_in_flight
-                                        .fetch_update(
-                                            Ordering::Relaxed,
-                                            Ordering::Relaxed,
-                                            |v| Some(v.saturating_sub(1)),
-                                        );
                                 }
                             }
                             Ok(StoreEvent::JobInFlight { .. }) => {}
@@ -2080,14 +2056,6 @@ async fn take_jobs(
             }
 
             tracing::debug!(in_flight = in_flight_count, "worker disconnected");
-
-            // Bulk decrement the global in-flight count.
-            let _ =
-                state
-                    .global_in_flight
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(in_flight.len() as u64))
-                    });
         },
         span,
     ));
@@ -2153,7 +2121,6 @@ mod tests {
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_in_flight_limit: 0,
-            global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: clock_fn,
             admin_events,
@@ -4155,7 +4122,6 @@ mod tests {
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_in_flight_limit: 2,
-            global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(crate::time::now_millis),
             admin_events,
@@ -4199,7 +4165,7 @@ mod tests {
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
         let _ = next_body_bytes(&mut body).await;
 
-        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 2);
+        assert_eq!(state.store.in_flight_count(), 2);
 
         // Ack the first job to free a slot.
         state
@@ -4392,7 +4358,7 @@ mod tests {
         let mut body = res.into_body();
 
         let _ = next_body_bytes(&mut body).await;
-        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(state.store.in_flight_count(), 1);
 
         // Disconnect.
         drop(body);
@@ -4400,7 +4366,7 @@ mod tests {
         // Give the spawned task time to detect disconnect.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(state.store.in_flight_count(), 0);
     }
 
     #[tokio::test]
@@ -4732,7 +4698,7 @@ mod tests {
 
         // The in-flight counter should be back to 0.
         assert_eq!(
-            state.global_in_flight.load(Ordering::Relaxed),
+            state.store.in_flight_count(),
             0,
             "global_in_flight should be 0 after failure prunes in-flight"
         );
@@ -4848,7 +4814,7 @@ mod tests {
         let job_a: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
         let job_a_id = job_a["id"].as_str().unwrap();
-        assert_eq!(state.global_in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(state.store.in_flight_count(), 1);
 
         // Fail the first job (kill it so it doesn't go back to the queue).
         let req = json_request(

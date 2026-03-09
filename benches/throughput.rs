@@ -186,7 +186,6 @@ async fn start_server() -> (String, JoinHandle<()>) {
         store: store.clone(),
         heartbeat_interval_ms: Duration::from_millis(200),
         global_in_flight_limit: DEFAULT_GLOBAL_IN_FLIGHT_LIMIT,
-        global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx.clone(),
         clock: Arc::new(zizq::time::now_millis),
         admin_events,

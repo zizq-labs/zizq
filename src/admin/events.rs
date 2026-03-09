@@ -169,12 +169,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
 /// Build a `ServerStatus` snapshot from the current app state.
 fn server_status(state: &AppState) -> ServerStatus {
-    use std::sync::atomic::Ordering;
     ServerStatus {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_ms: state.start_time.elapsed().as_millis() as u64,
         total_ready: state.store.ready_count(),
-        total_in_flight: state.global_in_flight.load(Ordering::Relaxed) as usize,
+        total_in_flight: state.store.in_flight_count(),
         total_scheduled: state.store.scheduled_count(),
     }
 }
@@ -481,7 +480,6 @@ fn diff_sorted<K: Ord + Clone>(
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     use futures_util::StreamExt;
@@ -561,7 +559,6 @@ mod tests {
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
             global_in_flight_limit: 0,
-            global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(now_millis),
             admin_events,
@@ -820,9 +817,6 @@ mod tests {
             .take_next_job(now, &HashSet::new())
             .await
             .unwrap();
-        state
-            .global_in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Enqueue 2 scheduled jobs.
         for typ in ["d", "e"] {

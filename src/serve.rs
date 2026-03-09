@@ -6,7 +6,6 @@
 //! Parses CLI arguments, initializes the database, and starts the HTTP server.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use clap::Parser;
@@ -211,7 +210,6 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         store,
         heartbeat_interval_ms: Duration::from_millis(args.heartbeat_interval_ms),
         global_in_flight_limit: args.global_in_flight_limit,
-        global_in_flight: AtomicU64::new(0),
         shutdown: shutdown_rx,
         clock: Arc::new(crate::time::now_millis),
         admin_events: admin_events_tx,

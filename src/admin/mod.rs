@@ -114,7 +114,6 @@ pub fn app(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     use futures_util::{SinkExt, StreamExt};
@@ -137,7 +136,6 @@ mod tests {
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
             global_in_flight_limit: 0,
-            global_in_flight: AtomicU64::new(0),
             shutdown: shutdown_rx,
             clock: Arc::new(now_millis),
             admin_events: admin_events.clone(),
