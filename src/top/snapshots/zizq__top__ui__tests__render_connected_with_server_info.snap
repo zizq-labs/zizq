@@ -5,7 +5,7 @@ expression: "render_to_string(&app, 60, 10)"
   Zizq 0.1.0
 ● Connected 127.0.0.1:8901
   Server version: 1.0.0, Uptime: 1m5s
-  Queue: 0 in-flight, 0 ready
+  Queue: 0 in-flight, 0 ready, 0 scheduled
 
   Depth[                                           0 jobs]
 

@@ -97,13 +97,14 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let totals_line = if connected {
         let n_in_flight = app.total_in_flight;
         let n_ready = app.total_ready;
+        let n_scheduled = app.total_scheduled;
         Line::from(vec![
             Span::raw("  "),
             Span::styled("Queue: ", cyan),
             Span::styled(
                 n_in_flight.to_string(),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -119,7 +120,19 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " ready",
+                " ready, ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                n_scheduled.to_string(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " scheduled",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
@@ -133,6 +146,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         render_depth_bar(
             app.total_in_flight,
             app.total_ready,
+            app.total_scheduled,
             chunks[0].width as usize,
         )
     } else {
@@ -289,8 +303,13 @@ fn render_scrollable(frame: &mut Frame, widget: impl Widget, area: Rect, h_scrol
 }
 
 /// Render the depth bar line: `  Depth[||||||||N Jobs]  `
-fn render_depth_bar(in_flight: usize, ready: usize, width: usize) -> Line<'static> {
-    let total = in_flight + ready;
+fn render_depth_bar(
+    in_flight: usize,
+    ready: usize,
+    scheduled: usize,
+    width: usize,
+) -> Line<'static> {
+    let total = in_flight + ready + scheduled;
     let total_label = format!("{total} jobs");
     let bold_white = Style::default()
         .fg(Color::White)
@@ -308,34 +327,42 @@ fn render_depth_bar(in_flight: usize, ready: usize, width: usize) -> Line<'stati
     let overhead = 8 + total_label.len() + 3;
     let bar_width = max_width.saturating_sub(overhead);
 
-    let (green_bars, blue_bars) = if total == 0 || bar_width == 0 {
-        (0, 0)
+    let (if_bars, ready_bars, sched_bars) = if total == 0 || bar_width == 0 {
+        (0, 0, 0)
     } else if total <= bar_width {
         // One bar per job when total fits.
-        (in_flight, ready)
+        (in_flight, ready, scheduled)
     } else {
         // Scale proportionally.
-        let green = ((in_flight as f64 / total as f64) * bar_width as f64).round() as usize;
-        (green, bar_width.saturating_sub(green))
+        let if_b = ((in_flight as f64 / total as f64) * bar_width as f64).round() as usize;
+        let ready_b = ((ready as f64 / total as f64) * bar_width as f64).round() as usize;
+        let sched_b = bar_width.saturating_sub(if_b + ready_b);
+        (if_b, ready_b, sched_b)
     };
 
     // Pad so the label is right-aligned against "]".
-    let pad = bar_width.saturating_sub(green_bars + blue_bars);
+    let pad = bar_width.saturating_sub(if_bars + ready_bars + sched_bars);
 
     Line::from(vec![
         Span::raw("  "),
         Span::styled("Depth", cyan),
         Span::styled("[", bold_white),
         Span::styled(
-            "\u{2502}".repeat(green_bars),
+            "\u{2502}".repeat(if_bars),
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "\u{2502}".repeat(blue_bars),
+            "\u{2502}".repeat(ready_bars),
             Style::default()
                 .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2502}".repeat(sched_bars),
+            Style::default()
+                .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" ".repeat(pad)),

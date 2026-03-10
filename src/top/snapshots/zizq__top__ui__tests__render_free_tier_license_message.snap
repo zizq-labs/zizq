@@ -5,9 +5,9 @@ expression: "render_to_string(&app, 80, 20)"
   Zizq 0.1.0
 ● Connected 127.0.0.1:8901
   Server version: 1.0.0, Uptime: 10s
-  Queue: 3 in-flight, 5 ready
+  Queue: 3 in-flight, 5 ready, 2 scheduled
 
-  Depth[││││││││                                                       8 jobs]
+  Depth[││││││││││                                                    10 jobs]
 
    In-Flight   Ready   Scheduled
                          ID   PRIORITY QUEU        DELAY   ATTEMPTS TYPE

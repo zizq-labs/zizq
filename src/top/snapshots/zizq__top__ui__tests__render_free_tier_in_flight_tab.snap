@@ -5,7 +5,7 @@ expression: "render_to_string(&app, 120, 12)"
   Zizq 0.1.0
 ● Connected 127.0.0.1:8901
   Server version: 1.0.0, Uptime: 10s
-  Queue: 2 in-flight, 5 ready
+  Queue: 2 in-flight, 5 ready, 0 scheduled
 
   Depth[│││││││                                                                                                7 jobs]
 
