@@ -654,6 +654,9 @@ fn format_elapsed(timestamp_ms: u64, now_ms: u64) -> String {
         return "-".to_string();
     }
     let diff_ms = now_ms.saturating_sub(timestamp_ms);
+    if diff_ms < 1_000 {
+        return "< 1s".to_string();
+    }
     format_duration_ms(diff_ms)
 }
 
@@ -1072,7 +1075,7 @@ mod tests {
     #[test]
     fn format_elapsed_examples() {
         let now = 10_000_000u64;
-        assert_eq!(format_elapsed(now - 500, now), "500ms");
+        assert_eq!(format_elapsed(now - 500, now), "< 1s");
         assert_eq!(format_elapsed(now - 5_200, now), "5s");
         assert_eq!(format_elapsed(now - 138_000, now), "2m18s");
         assert_eq!(format_elapsed(now - 3_960_000, now), "1h6m");
