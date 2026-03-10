@@ -142,15 +142,18 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Line::default()
     };
 
-    let depth_line = if connected {
+    let depth_lines = if connected {
+        let ls = &app.list_states[app.active_tab.idx()];
         render_depth_bar(
             app.total_in_flight,
             app.total_ready,
             app.total_scheduled,
             chunks[0].width as usize,
+            app.active_tab,
+            ls.cursor,
         )
     } else {
-        Line::default()
+        [Line::default(), Line::default(), Line::default()]
     };
 
     let header = Paragraph::new(vec![
@@ -158,9 +161,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         status_line,
         server_info_line,
         totals_line,
-        Line::default(),
-        depth_line,
-        Line::default(),
+        depth_lines[0].clone(),
+        depth_lines[1].clone(),
+        depth_lines[2].clone(),
     ]);
     frame.render_widget(header, chunks[0]);
 
@@ -339,13 +342,17 @@ fn render_scrollable(frame: &mut Frame, widget: impl Widget, area: Rect, h_scrol
     }
 }
 
-/// Render the depth bar line: `  Depth[||||||||N Jobs]  `
+/// Render the depth bar with cursor markers above and below.
+///
+/// Returns `[marker_above, depth_bar, marker_below]`.
 fn render_depth_bar(
     in_flight: usize,
     ready: usize,
     scheduled: usize,
     width: usize,
-) -> Line<'static> {
+    active_tab: Tab,
+    cursor: usize,
+) -> [Line<'static>; 3] {
     let total = in_flight + ready + scheduled;
     let total_label = format!("{total} jobs");
     let bold_white = Style::default()
@@ -361,7 +368,8 @@ fn render_depth_bar(
         .add_modifier(Modifier::BOLD);
 
     // "  Depth[" = 8 chars, "{N} jobs]  " = total_label.len() + 3
-    let overhead = 8 + total_label.len() + 3;
+    let prefix_len = 8;
+    let overhead = prefix_len + total_label.len() + 3;
     let bar_width = max_width.saturating_sub(overhead);
 
     let (if_bars, ready_bars, sched_bars) = if total == 0 || bar_width == 0 {
@@ -380,7 +388,7 @@ fn render_depth_bar(
     // Pad so the label is right-aligned against "]".
     let pad = bar_width.saturating_sub(if_bars + ready_bars + sched_bars);
 
-    Line::from(vec![
+    let depth_line = Line::from(vec![
         Span::raw("  "),
         Span::styled("Depth", cyan),
         Span::styled("[", bold_white),
@@ -405,7 +413,53 @@ fn render_depth_bar(
         Span::raw(" ".repeat(pad)),
         Span::styled(total_label, dim),
         Span::styled("]  ", bold_white),
-    ])
+    ]);
+
+    // Compute cursor marker position within the bar.
+    let (section_total, section_bars, section_start) = match active_tab {
+        Tab::InFlight => (in_flight, if_bars, 0),
+        Tab::Ready => (ready, ready_bars, if_bars),
+        Tab::Scheduled => (scheduled, sched_bars, if_bars + ready_bars),
+    };
+
+    let marker_color = match active_tab {
+        Tab::InFlight => Color::LightYellow,
+        Tab::Ready => Color::Blue,
+        Tab::Scheduled => Color::Magenta,
+    };
+
+    let marker_lines = if section_total == 0 {
+        // No jobs in this section — no marker.
+        [Line::default(), Line::default()]
+    } else {
+        let pos_in_section = if section_bars == 0 {
+            // Section is invisible; place at boundary.
+            0
+        } else if total <= bar_width {
+            // 1:1 mode — cursor maps directly.
+            cursor.min(section_bars.saturating_sub(1))
+        } else {
+            // Ratio mode — proportional position.
+            let frac = cursor as f64 / section_total as f64;
+            (frac * section_bars as f64)
+                .round()
+                .min(section_bars.saturating_sub(1) as f64) as usize
+        };
+
+        let col = prefix_len + section_start + pos_in_section;
+        let marker_style = Style::default().fg(marker_color);
+
+        let make_marker = |ch: &'static str| -> Line<'static> {
+            Line::from(vec![
+                Span::raw(" ".repeat(col)),
+                Span::styled(ch, marker_style),
+            ])
+        };
+
+        [make_marker("\u{25bc}"), make_marker("\u{25b2}")]
+    };
+
+    [marker_lines[0].clone(), depth_line, marker_lines[1].clone()]
 }
 
 /// Foreground color for tab labels and table header text.

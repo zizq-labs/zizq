@@ -6,9 +6,9 @@ expression: "render_to_string(&app, 160, 12)"
 ● Connected 127.0.0.1:8901
   Server version: 1.0.0, Uptime: 2m
   Queue: 2 in-flight, 2 ready, 2 scheduled
-
+            ▼
   Depth[││││││                                                                                                 6 jobs]
-
+            ▲
    In-Flight   Ready   Scheduled
                          ID   PRIORITY QUEUE                             DUE   ATTEMPTS TYPE
 70a4ee89f2f09a1eb0af9d5ee80          0 default                         3m52s          0 send_reminder_email
