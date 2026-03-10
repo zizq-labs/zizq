@@ -28,6 +28,10 @@ pub enum Event {
     ScrollUp,
     /// Scroll the cursor down one row.
     ScrollDown,
+    /// Scroll the cursor up one page.
+    PageUp,
+    /// Scroll the cursor down one page.
+    PageDown,
     /// Server connection attempt in progress.
     ServerConnecting,
     /// Server connection established.
@@ -63,7 +67,10 @@ impl Event {
 
     /// Returns `true` for events that should trigger a deferred (batched) render.
     pub fn is_scroll(&self) -> bool {
-        matches!(self, Event::ScrollUp | Event::ScrollDown)
+        matches!(
+            self,
+            Event::ScrollUp | Event::ScrollDown | Event::PageUp | Event::PageDown
+        )
     }
 }
 
@@ -98,6 +105,12 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             let _ = tx.blocking_send(Event::ScrollDown);
+                        }
+                        KeyCode::PageUp => {
+                            let _ = tx.blocking_send(Event::PageUp);
+                        }
+                        KeyCode::PageDown => {
+                            let _ = tx.blocking_send(Event::PageDown);
                         }
                         _ => {}
                     }

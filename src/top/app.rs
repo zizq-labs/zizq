@@ -257,6 +257,12 @@ impl App {
             Event::ScrollDown => {
                 self.scroll_down();
             }
+            Event::PageUp => {
+                self.page_up();
+            }
+            Event::PageDown => {
+                self.page_down();
+            }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;
             }
@@ -430,6 +436,36 @@ impl App {
             ls.cursor += 1;
         }
         if self.viewport_height > 0 && ls.cursor >= ls.scroll_pos + self.viewport_height {
+            ls.scroll_pos = ls.cursor - self.viewport_height + 1;
+        }
+        ls.follow_bottom = ls.cursor == total - 1;
+        self.maybe_prefetch();
+    }
+
+    fn page_up(&mut self) {
+        let total = self.active_total();
+        if total == 0 || self.viewport_height == 0 {
+            return;
+        }
+        let ls = &mut self.list_states[self.active_tab.idx()];
+        let jump = self.viewport_height.saturating_sub(1).max(1);
+        ls.cursor = ls.cursor.saturating_sub(jump);
+        if ls.cursor < ls.scroll_pos {
+            ls.scroll_pos = ls.cursor;
+        }
+        ls.follow_bottom = false;
+        self.maybe_prefetch();
+    }
+
+    fn page_down(&mut self) {
+        let total = self.active_total();
+        if total == 0 || self.viewport_height == 0 {
+            return;
+        }
+        let ls = &mut self.list_states[self.active_tab.idx()];
+        let jump = self.viewport_height.saturating_sub(1).max(1);
+        ls.cursor = (ls.cursor + jump).min(total - 1);
+        if ls.cursor >= ls.scroll_pos + self.viewport_height {
             ls.scroll_pos = ls.cursor - self.viewport_height + 1;
         }
         ls.follow_bottom = ls.cursor == total - 1;
