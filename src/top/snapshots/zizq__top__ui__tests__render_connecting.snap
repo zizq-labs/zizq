@@ -11,4 +11,4 @@ expression: "render_to_string(&app, 60, 10)"
 
    In-Flight   Ready   Scheduled
                          ID   PRIORITY QUEUE              DU
- n/p Switch tab  ←/→ Scroll  q Quit
+ n/p Tabs  ←↑→↓ Scroll  q Quit

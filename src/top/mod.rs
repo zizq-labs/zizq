@@ -48,6 +48,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, mut rx) = mpsc::channel::<Event>(64);
 
+    // Channel for outbound WS messages from App to the WS task.
+    let (ws_out_tx, ws_out_rx) = mpsc::channel::<String>(64);
+
     // Spawn terminal input reader (blocking, runs in a thread).
     events::read_terminal_events(tx.clone());
 
@@ -62,10 +65,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or_else(|| args.url.clone());
 
-    // Spawn WebSocket connection manager (async).
-    events::manage_ws_connection(tx, args.url);
+    // Spawn WebSocket connection manager (async, bidirectional).
+    events::manage_ws_connection(tx, ws_out_rx, args.url);
 
     let mut app = App::new(host);
+    app.set_ws_tx(ws_out_tx);
 
     // Main event loop — process events as they arrive, redraw on tick.
     let mut tick = tokio::time::interval(Duration::from_millis(args.refresh_rate));
@@ -73,23 +77,35 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut should_quit = false;
 
+    // Short delay for batching rapid scroll events before rendering.
+    let scroll_debounce = Duration::from_millis(16);
+
     loop {
         // Process events until the next tick fires, or a user input
         // event arrives (user input triggers an immediate render).
+        // Scroll events set a short debounce instead of rendering
+        // immediately, so holding an arrow key batches updates.
+        let mut scroll_dirty = false;
+
         loop {
             tokio::select! {
                 biased;
                 _ = tick.tick() => break,
+                _ = tokio::time::sleep(scroll_debounce), if scroll_dirty => break,
                 event = rx.recv() => {
                     match event {
                         Some(event) => {
                             let immediate = event.is_user_input();
+                            let scroll = event.is_scroll();
                             if app.handle_event(event) {
                                 should_quit = true;
                                 break;
                             }
                             if immediate {
                                 break;
+                            }
+                            if scroll {
+                                scroll_dirty = true;
                             }
                         }
                         None => { should_quit = true; break; }

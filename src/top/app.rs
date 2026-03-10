@@ -3,10 +3,12 @@
 
 //! TUI application state model.
 
-use crate::admin::{AdminJobSummary, JobChangeStatus, ServerStatus};
+use tokio::sync::mpsc;
+
+use crate::admin::{AdminJobSummary, JobChangeStatus, JobWindow, ServerStatus};
 use crate::license::Tier;
 
-use super::events::Event;
+use super::events::{self, Event};
 
 /// Active tab in the TUI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +34,14 @@ impl Tab {
         let idx = Self::ALL.iter().position(|&t| t == self).unwrap();
         Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
     }
+
+    fn list_name(self) -> crate::admin::ListName {
+        match self {
+            Tab::Ready => crate::admin::ListName::Ready,
+            Tab::InFlight => crate::admin::ListName::InFlight,
+            Tab::Scheduled => crate::admin::ListName::Scheduled,
+        }
+    }
 }
 
 /// Connection status to the admin API.
@@ -42,8 +52,34 @@ pub enum ConnectionStatus {
     Disconnected,
 }
 
-/// Top-level application state for the TUI.
+/// Per-list scroll and buffering state.
 #[derive(Clone)]
+pub struct ListState {
+    /// Selected row index in the full (server-side) list.
+    pub cursor: usize,
+    /// First visible row in the viewport.
+    pub scroll_pos: usize,
+    /// Offset of buffered data from server.
+    pub buffer_offset: usize,
+    /// Whether the cursor should follow the bottom of the list.
+    pub follow_bottom: bool,
+    /// Last subscribe (offset, limit) sent — used to avoid duplicate requests.
+    last_subscribe: Option<(usize, usize)>,
+}
+
+impl Default for ListState {
+    fn default() -> Self {
+        Self {
+            cursor: 0,
+            scroll_pos: 0,
+            buffer_offset: 0,
+            follow_bottom: false,
+            last_subscribe: None,
+        }
+    }
+}
+
+/// Top-level application state for the TUI.
 pub struct App {
     pub host: String,
     pub status: ConnectionStatus,
@@ -59,6 +95,33 @@ pub struct App {
     pub now_ms: u64,
     pub active_tab: Tab,
     pub h_scroll: [u16; 3],
+    pub list_states: [ListState; 3],
+    pub viewport_height: usize,
+    pub ws_tx: Option<mpsc::Sender<String>>,
+}
+
+impl Clone for App {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            status: self.status.clone(),
+            server_version: self.server_version.clone(),
+            server_uptime_ms: self.server_uptime_ms,
+            server_tier: self.server_tier,
+            total_ready: self.total_ready,
+            total_in_flight: self.total_in_flight,
+            total_scheduled: self.total_scheduled,
+            ready_jobs: self.ready_jobs.clone(),
+            in_flight_jobs: self.in_flight_jobs.clone(),
+            scheduled_jobs: self.scheduled_jobs.clone(),
+            now_ms: self.now_ms,
+            active_tab: self.active_tab,
+            h_scroll: self.h_scroll,
+            list_states: self.list_states.clone(),
+            viewport_height: self.viewport_height,
+            ws_tx: self.ws_tx.clone(),
+        }
+    }
 }
 
 impl App {
@@ -78,6 +141,82 @@ impl App {
             now_ms: 0,
             active_tab: Tab::InFlight,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
+        }
+    }
+
+    pub fn set_ws_tx(&mut self, tx: mpsc::Sender<String>) {
+        self.ws_tx = Some(tx);
+    }
+
+    /// Get the total count for the active tab.
+    fn active_total(&self) -> usize {
+        match self.active_tab {
+            Tab::Ready => self.total_ready,
+            Tab::InFlight => self.total_in_flight,
+            Tab::Scheduled => self.total_scheduled,
+        }
+    }
+
+    /// Send a subscribe message over WebSocket.
+    fn send_subscribe(&self, tab: Tab, offset: usize, limit: usize) {
+        if let Some(tx) = &self.ws_tx {
+            let msg = events::subscribe_message(tab.list_name(), offset, limit);
+            let _ = tx.try_send(msg);
+        }
+    }
+
+    /// Re-subscribe all tabs with a window sized to the current viewport.
+    /// Called when the terminal is resized.
+    pub fn resubscribe_all(&mut self) {
+        let vh = self.viewport_height;
+        if vh == 0 {
+            return;
+        }
+        let limit = vh * 3;
+        for tab in [Tab::InFlight, Tab::Ready, Tab::Scheduled] {
+            let ls = &mut self.list_states[tab.idx()];
+            let offset = ls.cursor.saturating_sub(limit / 2);
+            ls.last_subscribe = Some((offset, limit));
+            if let Some(tx) = &self.ws_tx {
+                let msg = events::subscribe_message(tab.list_name(), offset, limit);
+                let _ = tx.try_send(msg);
+            }
+        }
+    }
+
+    /// Check if prefetch is needed and send subscribe if so.
+    /// Deduplicates: won't re-send the same (offset, limit) for the same tab.
+    fn maybe_prefetch(&mut self) {
+        let vh = self.viewport_height;
+        if vh == 0 {
+            return;
+        }
+        let tab = self.active_tab;
+        let ls = &self.list_states[tab.idx()];
+        let buffer_size = match tab {
+            Tab::Ready => self.ready_jobs.len(),
+            Tab::InFlight => self.in_flight_jobs.len(),
+            Tab::Scheduled => self.scheduled_jobs.len(),
+        };
+        let buffer_end = ls.buffer_offset + buffer_size;
+
+        // Prefetch when cursor is within one viewport of buffer edges.
+        let near_top = ls.cursor < ls.buffer_offset + vh;
+        let near_bottom = ls.cursor + vh >= buffer_end;
+
+        if (near_top && ls.buffer_offset > 0) || (near_bottom && buffer_end < self.active_total()) {
+            let new_limit = vh * 3;
+            let new_offset = ls.cursor.saturating_sub(new_limit / 2);
+            let key = (new_offset, new_limit);
+
+            if self.list_states[tab.idx()].last_subscribe == Some(key) {
+                return;
+            }
+            self.list_states[tab.idx()].last_subscribe = Some(key);
+            self.send_subscribe(tab, new_offset, new_limit);
         }
     }
 
@@ -112,6 +251,12 @@ impl App {
                 let i = self.active_tab.idx();
                 self.h_scroll[i] = self.h_scroll[i].saturating_add(4);
             }
+            Event::ScrollUp => {
+                self.scroll_up();
+            }
+            Event::ScrollDown => {
+                self.scroll_down();
+            }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;
             }
@@ -120,6 +265,7 @@ impl App {
             }
             Event::ServerHeartbeat { server } => {
                 self.apply_server_status(server);
+                self.apply_follow_bottom();
             }
             Event::ServerJobSnapshot {
                 server,
@@ -128,9 +274,10 @@ impl App {
                 scheduled,
             } => {
                 self.apply_server_status(server);
-                self.ready_jobs = ready;
-                self.in_flight_jobs = in_flight;
-                self.scheduled_jobs = scheduled;
+                self.apply_job_window(Tab::Ready, ready);
+                self.apply_job_window(Tab::InFlight, in_flight);
+                self.apply_job_window(Tab::Scheduled, scheduled);
+                self.apply_follow_bottom();
             }
             Event::ServerJobChanged {
                 server,
@@ -143,12 +290,9 @@ impl App {
                     JobChangeStatus::Ready => {
                         if let Some(job) = job {
                             let key = (job.priority, &job.id);
-                            // Determine where in the list the job should sit.
                             let pos = self
                                 .ready_jobs
                                 .partition_point(|j| (j.priority, &j.id) < key);
-                            // Insert the element at this position (unless it would
-                            // be a duplicate).
                             if self.ready_jobs.get(pos).is_none_or(|j| j.id != id) {
                                 self.ready_jobs.insert(pos, job);
                             }
@@ -158,12 +302,9 @@ impl App {
                         self.ready_jobs.retain(|j| j.id != id);
                         if let Some(job) = job {
                             let dequeued = job.dequeued_at.unwrap_or(0);
-                            // Determine where in the list the job should sit.
                             let pos = self
                                 .in_flight_jobs
                                 .partition_point(|j| j.dequeued_at.unwrap_or(0) < dequeued);
-                            // Insert the element at this position (unless it would
-                            // be a duplicate).
                             if self.in_flight_jobs.get(pos).is_none_or(|j| j.id != id) {
                                 self.in_flight_jobs.insert(pos, job);
                             }
@@ -195,6 +336,7 @@ impl App {
                         self.scheduled_jobs.retain(|j| j.id != id);
                     }
                 }
+                self.apply_follow_bottom();
             }
             Event::ServerDisconnected => {
                 self.status = ConnectionStatus::Disconnected;
@@ -207,9 +349,91 @@ impl App {
                 self.ready_jobs.clear();
                 self.in_flight_jobs.clear();
                 self.scheduled_jobs.clear();
+                self.list_states = Default::default();
             }
         }
         false
+    }
+
+    /// Apply a JobWindow snapshot to the corresponding list.
+    fn apply_job_window(&mut self, tab: Tab, window: JobWindow) {
+        let ls = &mut self.list_states[tab.idx()];
+        ls.buffer_offset = window.offset;
+        ls.last_subscribe = None; // Allow new prefetch after data arrives.
+        match tab {
+            Tab::Ready => self.ready_jobs = window.items,
+            Tab::InFlight => self.in_flight_jobs = window.items,
+            Tab::Scheduled => self.scheduled_jobs = window.items,
+        }
+    }
+
+    /// Clamp cursor/scroll positions and apply follow-bottom tracking.
+    fn apply_follow_bottom(&mut self) {
+        for tab in [Tab::InFlight, Tab::Ready, Tab::Scheduled] {
+            let total = match tab {
+                Tab::Ready => self.total_ready,
+                Tab::InFlight => self.total_in_flight,
+                Tab::Scheduled => self.total_scheduled,
+            };
+            let ls = &mut self.list_states[tab.idx()];
+
+            if total == 0 {
+                ls.cursor = 0;
+                ls.scroll_pos = 0;
+                continue;
+            }
+
+            // Follow-bottom: stick cursor to end.
+            if ls.follow_bottom {
+                ls.cursor = total - 1;
+            }
+
+            // Clamp cursor if total shrunk below it.
+            if ls.cursor >= total {
+                ls.cursor = total - 1;
+            }
+
+            // Clamp scroll_pos so cursor stays visible.
+            if self.viewport_height > 0 {
+                if ls.cursor < ls.scroll_pos {
+                    ls.scroll_pos = ls.cursor;
+                } else if ls.cursor >= ls.scroll_pos + self.viewport_height {
+                    ls.scroll_pos = ls.cursor - self.viewport_height + 1;
+                }
+            }
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        let total = self.active_total();
+        if total == 0 {
+            return;
+        }
+        let ls = &mut self.list_states[self.active_tab.idx()];
+        if ls.cursor > 0 {
+            ls.cursor -= 1;
+        }
+        if ls.cursor < ls.scroll_pos {
+            ls.scroll_pos = ls.cursor;
+        }
+        ls.follow_bottom = false;
+        self.maybe_prefetch();
+    }
+
+    fn scroll_down(&mut self) {
+        let total = self.active_total();
+        if total == 0 {
+            return;
+        }
+        let ls = &mut self.list_states[self.active_tab.idx()];
+        if ls.cursor < total - 1 {
+            ls.cursor += 1;
+        }
+        if self.viewport_height > 0 && ls.cursor >= ls.scroll_pos + self.viewport_height {
+            ls.scroll_pos = ls.cursor - self.viewport_height + 1;
+        }
+        ls.follow_bottom = ls.cursor == total - 1;
+        self.maybe_prefetch();
     }
 }
 
@@ -313,9 +537,18 @@ mod tests {
 
         app.handle_event(Event::ServerJobSnapshot {
             server: default_server(),
-            ready: vec![job("r1", 0, None)],
-            in_flight: vec![job("w1", 0, Some(100))],
-            scheduled: vec![job("s1", 0, None)],
+            ready: JobWindow {
+                offset: 0,
+                items: vec![job("r1", 0, None)],
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![job("w1", 0, Some(100))],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![job("s1", 0, None)],
+            },
         });
 
         assert_eq!(ids(&app.ready_jobs), vec!["r1"]);

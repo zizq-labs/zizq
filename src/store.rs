@@ -3212,7 +3212,11 @@ impl Store {
     /// the `jobs` keyspace. Skips jobs whose metadata is missing (claimed
     /// between index scan and disk read — next snapshot corrects). Does
     /// NOT hydrate payloads.
-    pub async fn list_ready_jobs(&self, limit: usize) -> Result<Vec<Job>, StoreError> {
+    pub async fn list_ready_jobs(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Job>, StoreError> {
         if !self.index_ready.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
@@ -3222,7 +3226,7 @@ impl Store {
 
         task::spawn_blocking(move || {
             let mut jobs = Vec::with_capacity(limit);
-            for entry in ready_index.global.iter() {
+            for entry in ready_index.global.iter().skip(offset) {
                 if jobs.len() >= limit {
                     break;
                 }
@@ -3242,7 +3246,7 @@ impl Store {
     ///
     /// Returns `Vec<(priority, job_id)>` in priority order — zero disk I/O.
     /// Used by the admin event handler to diff capped ready windows.
-    pub async fn scan_ready_ids(&self, limit: usize) -> Vec<(u16, String)> {
+    pub async fn scan_ready_ids(&self, offset: usize, limit: usize) -> Vec<(u16, String)> {
         if !self.index_ready.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -3251,7 +3255,7 @@ impl Store {
 
         task::spawn_blocking(move || {
             let mut ids = Vec::with_capacity(limit);
-            for entry in ready_index.global.iter() {
+            for entry in ready_index.global.iter().skip(offset) {
                 if ids.len() >= limit {
                     break;
                 }
@@ -3269,7 +3273,11 @@ impl Store {
     /// Iterates the `ScheduledIndex` SkipSet and hydrates job metadata from
     /// the `jobs` keyspace. Skips jobs whose metadata is missing. Does NOT
     /// hydrate payloads.
-    pub async fn list_scheduled_jobs(&self, limit: usize) -> Result<Vec<Job>, StoreError> {
+    pub async fn list_scheduled_jobs(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Job>, StoreError> {
         if !self.index_ready.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
@@ -3279,7 +3287,7 @@ impl Store {
 
         task::spawn_blocking(move || {
             let mut jobs = Vec::with_capacity(limit);
-            for entry in scheduled_index.entries.iter() {
+            for entry in scheduled_index.entries.iter().skip(offset) {
                 if jobs.len() >= limit {
                     break;
                 }
@@ -3299,7 +3307,7 @@ impl Store {
     ///
     /// Returns `Vec<(ready_at, job_id)>` in chronological order — zero disk I/O.
     /// Used by the admin event handler to diff capped scheduled windows.
-    pub async fn scan_scheduled_ids(&self, limit: usize) -> Vec<(u64, String)> {
+    pub async fn scan_scheduled_ids(&self, offset: usize, limit: usize) -> Vec<(u64, String)> {
         if !self.index_ready.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -3308,7 +3316,7 @@ impl Store {
 
         task::spawn_blocking(move || {
             let mut ids = Vec::with_capacity(limit);
-            for entry in scheduled_index.entries.iter() {
+            for entry in scheduled_index.entries.iter().skip(offset) {
                 if ids.len() >= limit {
                     break;
                 }
@@ -8108,7 +8116,7 @@ mod tests {
             .await
             .unwrap();
 
-        let jobs = store.list_ready_jobs(10).await.unwrap();
+        let jobs = store.list_ready_jobs(0, 10).await.unwrap();
         let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
         assert_eq!(ids, vec![high.id, mid.id, low.id]);
     }
@@ -8128,14 +8136,14 @@ mod tests {
                 .unwrap();
         }
 
-        let jobs = store.list_ready_jobs(3).await.unwrap();
+        let jobs = store.list_ready_jobs(0, 3).await.unwrap();
         assert_eq!(jobs.len(), 3);
     }
 
     #[tokio::test]
     async fn list_ready_jobs_empty_store() {
         let store = test_store();
-        let jobs = store.list_ready_jobs(10).await.unwrap();
+        let jobs = store.list_ready_jobs(0, 10).await.unwrap();
         assert!(jobs.is_empty());
     }
 
@@ -8162,7 +8170,7 @@ mod tests {
         // Take one job — it moves to InFlight.
         store.take_next_job(now, &HashSet::new()).await.unwrap();
 
-        let jobs = store.list_ready_jobs(10).await.unwrap();
+        let jobs = store.list_ready_jobs(0, 10).await.unwrap();
         assert_eq!(jobs.len(), 1);
     }
 
@@ -8199,7 +8207,7 @@ mod tests {
             .await
             .unwrap();
 
-        let jobs = store.list_scheduled_jobs(10).await.unwrap();
+        let jobs = store.list_scheduled_jobs(0, 10).await.unwrap();
         let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
         assert_eq!(ids, vec![early.id, mid.id, late.id]);
     }
@@ -8220,14 +8228,14 @@ mod tests {
                 .unwrap();
         }
 
-        let jobs = store.list_scheduled_jobs(3).await.unwrap();
+        let jobs = store.list_scheduled_jobs(0, 3).await.unwrap();
         assert_eq!(jobs.len(), 3);
     }
 
     #[tokio::test]
     async fn list_scheduled_jobs_empty_store() {
         let store = test_store();
-        let jobs = store.list_scheduled_jobs(10).await.unwrap();
+        let jobs = store.list_scheduled_jobs(0, 10).await.unwrap();
         assert!(jobs.is_empty());
     }
 
@@ -8255,7 +8263,7 @@ mod tests {
             .await
             .unwrap();
 
-        let jobs = store.list_scheduled_jobs(10).await.unwrap();
+        let jobs = store.list_scheduled_jobs(0, 10).await.unwrap();
         assert_eq!(jobs.len(), 1);
     }
 

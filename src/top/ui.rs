@@ -193,6 +193,16 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Content area — render only the active tab's table.
     // In-flight is always available. Ready and Scheduled require Pro.
     let content_area = chunks[2];
+
+    // Store the viewport height (minus 1 for the header row) so
+    // scroll logic can reference it. If it changed (terminal resize),
+    // re-subscribe with an updated window size.
+    let table_body_height = content_area.height.saturating_sub(1) as usize;
+    if table_body_height != app.viewport_height {
+        app.viewport_height = table_body_height;
+        app.resubscribe_all();
+    }
+
     let tab_gated = connected
         && app.active_tab != Tab::InFlight
         && app
@@ -203,9 +213,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         // Render the table header row, then the license message centered
         // in the remaining space.
         let table = match app.active_tab {
-            Tab::Ready => job_table_ready(&[], app.now_ms),
+            Tab::Ready => job_table_ready(&[], app.now_ms, None),
             Tab::InFlight => unreachable!(),
-            Tab::Scheduled => job_table_scheduled(&[], app.now_ms),
+            Tab::Scheduled => job_table_scheduled(&[], app.now_ms, None),
         };
 
         let inner = Layout::vertical([
@@ -233,10 +243,34 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         .alignment(Alignment::Center);
         frame.render_widget(msg, centered[1]);
     } else {
+        let ls = &app.list_states[app.active_tab.idx()];
+        let jobs = match app.active_tab {
+            Tab::Ready => &app.ready_jobs,
+            Tab::InFlight => &app.in_flight_jobs,
+            Tab::Scheduled => &app.scheduled_jobs,
+        };
+
+        // Extract the visible slice from the buffer.
+        let visible_start = ls.scroll_pos.saturating_sub(ls.buffer_offset);
+        let visible_end = (visible_start + table_body_height).min(jobs.len());
+        let visible = if visible_start < jobs.len() {
+            &jobs[visible_start..visible_end]
+        } else {
+            &[]
+        };
+
+        // Determine which row in the visible slice is the cursor.
+        let cursor_in_view =
+            if ls.cursor >= ls.scroll_pos && ls.cursor < ls.scroll_pos + table_body_height {
+                Some(ls.cursor - ls.scroll_pos)
+            } else {
+                None
+            };
+
         let table = match app.active_tab {
-            Tab::Ready => job_table_ready(&app.ready_jobs, app.now_ms),
-            Tab::InFlight => job_table_in_flight(&app.in_flight_jobs, app.now_ms),
-            Tab::Scheduled => job_table_scheduled(&app.scheduled_jobs, app.now_ms),
+            Tab::Ready => job_table_ready(visible, app.now_ms, cursor_in_view),
+            Tab::InFlight => job_table_in_flight(visible, app.now_ms, cursor_in_view),
+            Tab::Scheduled => job_table_scheduled(visible, app.now_ms, cursor_in_view),
         };
         let tab_scroll = app.h_scroll[app.active_tab.idx()];
         render_scrollable(frame, table, content_area, tab_scroll);
@@ -244,11 +278,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     // Help bar.
     let key_style = Style::default().fg(Color::White);
-    let label_style = Style::default().fg(Color::Black).bg(Color::White);
+    let label_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
     let help = Paragraph::new(Line::from(vec![
         Span::styled(" n/p ", key_style),
-        Span::styled("Switch tab", label_style),
-        Span::styled("  \u{2190}/\u{2192} ", key_style),
+        Span::styled("Tabs", label_style),
+        Span::styled("  \u{2190}\u{2191}\u{2192}\u{2193} ", key_style),
         Span::styled("Scroll", label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
@@ -260,6 +294,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 /// the table renders at this width and the visible portion is determined by
 /// the horizontal scroll offset.
 const MIN_TABLE_WIDTH: u16 = 120;
+
+/// Style for the cursor-highlighted row.
+const CURSOR_STYLE: Style = Style::new().fg(Color::Black).bg(Color::LightCyan);
 
 /// Render a widget into `area`, applying horizontal scrolling when the area
 /// is narrower than [`MIN_TABLE_WIDTH`].
@@ -382,7 +419,10 @@ const fn header_bg() -> Color {
 }
 
 /// Style for ID and TYPE cells, based on attempt count.
-fn attempt_fg(attempts: u32) -> Style {
+fn attempt_fg(attempts: u32, highlighted: bool) -> Style {
+    if highlighted {
+        return CURSOR_STYLE;
+    }
     match attempts {
         0 => Style::default(),
         1 => Style::default().fg(Color::Yellow),
@@ -391,7 +431,10 @@ fn attempt_fg(attempts: u32) -> Style {
 }
 
 /// Style for ATTEMPTS cells (always bold), colored by attempt count.
-fn attempt_bold(attempts: u32) -> Style {
+fn attempt_bold(attempts: u32, highlighted: bool) -> Style {
+    if highlighted {
+        return CURSOR_STYLE;
+    }
     match attempts {
         0 => Style::default()
             .fg(Color::DarkGray)
@@ -403,13 +446,16 @@ fn attempt_bold(attempts: u32) -> Style {
     }
 }
 
-/// Bold white style for PRIORITY cells.
-const fn priority_style() -> Style {
+/// Bold style for PRIORITY cells.
+fn priority_style(highlighted: bool) -> Style {
+    if highlighted {
+        return CURSOR_STYLE;
+    }
     Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
 }
 
 /// Build a table widget for the Ready pane.
-fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
+fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64, cursor_row: Option<usize>) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
@@ -423,15 +469,17 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
 
     let rows: Vec<Row> = jobs
         .iter()
-        .map(|job| {
-            let fg = attempt_fg(job.attempts);
-            let att = attempt_bold(job.attempts);
-            Row::new([
+        .enumerate()
+        .map(|(i, job)| {
+            let hl = cursor_row == Some(i);
+            let fg = attempt_fg(job.attempts, hl);
+            let att = attempt_bold(job.attempts, hl);
+            let row = Row::new([
                 Cell::from(
                     Line::from(Span::styled(job.id.as_str(), fg)).alignment(Alignment::Right),
                 ),
                 Cell::from(
-                    Line::from(Span::styled(job.priority.to_string(), priority_style()))
+                    Line::from(Span::styled(job.priority.to_string(), priority_style(hl)))
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(job.queue.as_str()),
@@ -443,7 +491,8 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(Span::styled(job.job_type.as_str(), fg)),
-            ])
+            ]);
+            if hl { row.style(CURSOR_STYLE) } else { row }
         })
         .collect();
 
@@ -462,7 +511,11 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
 }
 
 /// Build a table widget for the In-Flight pane.
-fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
+fn job_table_in_flight(
+    jobs: &[AdminJobSummary],
+    now_ms: u64,
+    cursor_row: Option<usize>,
+) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
@@ -476,16 +529,18 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
 
     let rows: Vec<Row> = jobs
         .iter()
-        .map(|job| {
+        .enumerate()
+        .map(|(i, job)| {
+            let hl = cursor_row == Some(i);
             let dequeued = job.dequeued_at.unwrap_or(0);
-            let fg = attempt_fg(job.attempts);
-            let att = attempt_bold(job.attempts);
-            Row::new([
+            let fg = attempt_fg(job.attempts, hl);
+            let att = attempt_bold(job.attempts, hl);
+            let row = Row::new([
                 Cell::from(
                     Line::from(Span::styled(job.id.as_str(), fg)).alignment(Alignment::Right),
                 ),
                 Cell::from(
-                    Line::from(Span::styled(job.priority.to_string(), priority_style()))
+                    Line::from(Span::styled(job.priority.to_string(), priority_style(hl)))
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(job.queue.as_str()),
@@ -497,7 +552,8 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(Span::styled(job.job_type.as_str(), fg)),
-            ])
+            ]);
+            if hl { row.style(CURSOR_STYLE) } else { row }
         })
         .collect();
 
@@ -516,7 +572,11 @@ fn job_table_in_flight(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
 }
 
 /// Build a table widget for the Scheduled pane.
-fn job_table_scheduled(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
+fn job_table_scheduled(
+    jobs: &[AdminJobSummary],
+    now_ms: u64,
+    cursor_row: Option<usize>,
+) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
@@ -530,15 +590,17 @@ fn job_table_scheduled(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
 
     let rows: Vec<Row> = jobs
         .iter()
-        .map(|job| {
-            let fg = attempt_fg(job.attempts);
-            let att = attempt_bold(job.attempts);
-            Row::new([
+        .enumerate()
+        .map(|(i, job)| {
+            let hl = cursor_row == Some(i);
+            let fg = attempt_fg(job.attempts, hl);
+            let att = attempt_bold(job.attempts, hl);
+            let row = Row::new([
                 Cell::from(
                     Line::from(Span::styled(job.id.as_str(), fg)).alignment(Alignment::Right),
                 ),
                 Cell::from(
-                    Line::from(Span::styled(job.priority.to_string(), priority_style()))
+                    Line::from(Span::styled(job.priority.to_string(), priority_style(hl)))
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(job.queue.as_str()),
@@ -550,7 +612,8 @@ fn job_table_scheduled(jobs: &[AdminJobSummary], now_ms: u64) -> Table<'_> {
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(Span::styled(job.job_type.as_str(), fg)),
-            ])
+            ]);
+            if hl { row.style(CURSOR_STYLE) } else { row }
         })
         .collect();
 
@@ -573,10 +636,14 @@ fn format_due(ready_at: u64, now_ms: u64) -> String {
     if ready_at == 0 {
         return "-".to_string();
     }
+    let diff = ready_at.abs_diff(now_ms);
+    if diff < 1_000 {
+        return "< 1s".to_string();
+    }
     if ready_at >= now_ms {
-        format_duration_ms(ready_at - now_ms)
+        format_duration_ms(diff)
     } else {
-        let elapsed = format_duration_ms(now_ms - ready_at);
+        let elapsed = format_duration_ms(diff);
         format!("{elapsed} ago")
     }
 }
@@ -666,6 +733,9 @@ mod tests {
             now_ms: 0,
             active_tab: Tab::InFlight,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         }
     }
 
@@ -692,6 +762,9 @@ mod tests {
             now_ms: 0,
             active_tab: Tab::InFlight,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -713,6 +786,9 @@ mod tests {
             now_ms: 0,
             active_tab: Tab::InFlight,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         };
         insta::assert_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -819,6 +895,9 @@ mod tests {
             now_ms,
             active_tab,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         }
     }
 
@@ -889,6 +968,9 @@ mod tests {
             now_ms: 1_700_000_000_000,
             active_tab: Tab::Ready,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -910,6 +992,9 @@ mod tests {
             now_ms: 0,
             active_tab: Tab::InFlight,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -931,6 +1016,9 @@ mod tests {
             now_ms: 1_700_000_000_000,
             active_tab: Tab::Ready,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         };
         insta::assert_snapshot!(render_to_string(&app, 80, 20));
     }
@@ -974,6 +1062,9 @@ mod tests {
             now_ms,
             active_tab: Tab::InFlight,
             h_scroll: [0; 3],
+            list_states: Default::default(),
+            viewport_height: 0,
+            ws_tx: None,
         };
         insta::assert_snapshot!(render_to_string(&app, 120, 12));
     }
@@ -1011,7 +1102,9 @@ mod tests {
         assert_eq!(format_due(now + 5_000, now), "5s");
         // Overdue: shows elapsed with "ago" suffix.
         assert_eq!(format_due(now - 60_000, now), "1m ago");
-        assert_eq!(format_due(now - 500, now), "500ms ago");
+        assert_eq!(format_due(now - 500, now), "< 1s");
+        // Sub-second future rounds to "< 1s".
+        assert_eq!(format_due(now + 500, now), "< 1s");
         // Zero timestamp.
         assert_eq!(format_due(0, now), "-");
     }

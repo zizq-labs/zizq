@@ -13,4 +13,4 @@ expression: "render_to_string(&app, 80, 12)"
      ID   PRIORITY QUEUE              DURATION   ATTEMPTS TYPE
 7a2bb40          0 default                  3s          1 generate_annual_report
 691aa30          0 billing               2m30s          3 charge_subscription
- n/p Switch tab  ←/→ Scroll  q Quit
+ n/p Tabs  ←↑→↓ Scroll  q Quit

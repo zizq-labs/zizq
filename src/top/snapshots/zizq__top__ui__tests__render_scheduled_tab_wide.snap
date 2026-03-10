@@ -13,4 +13,4 @@ expression: "render_to_string(&app, 160, 12)"
                          ID   PRIORITY QUEUE                             DUE   ATTEMPTS TYPE
 70a4ee89f2f09a1eb0af9d5ee80          0 default                         3m52s          0 send_reminder_email
 70a5ff9a03f0ab1fc0b0ae6ff90          0 reports                            1h          1 generate_quarterly_report
- n/p Switch tab  ←/→ Scroll  q Quit
+ n/p Tabs  ←↑→↓ Scroll  q Quit

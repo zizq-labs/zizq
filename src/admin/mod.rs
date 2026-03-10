@@ -47,9 +47,9 @@ pub enum AdminEvent {
 
     /// Snapshot of ready, in-flight, and scheduled job queues.
     JobSnapshot {
-        ready: Vec<AdminJobSummary>,
-        in_flight: Vec<AdminJobSummary>,
-        scheduled: Vec<AdminJobSummary>,
+        ready: JobWindow,
+        in_flight: JobWindow,
+        scheduled: JobWindow,
     },
 
     /// Incremental change to a single job's status.
@@ -59,6 +59,33 @@ pub enum AdminEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         job: Option<AdminJobSummary>,
     },
+}
+
+/// A windowed slice of jobs with offset metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobWindow {
+    pub offset: usize,
+    pub items: Vec<AdminJobSummary>,
+}
+
+/// Client-to-server message for controlling subscriptions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMessage {
+    Subscribe {
+        list: ListName,
+        offset: usize,
+        limit: usize,
+    },
+}
+
+/// Which job list a subscription targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListName {
+    Ready,
+    InFlight,
+    Scheduled,
 }
 
 /// The kind of change that occurred for a job.

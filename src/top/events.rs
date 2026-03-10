@@ -8,7 +8,9 @@
 
 use tokio::sync::mpsc;
 
-use crate::admin::{AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, ServerStatus};
+use crate::admin::{
+    AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, JobWindow, ServerStatus,
+};
 
 /// Unified event type for the TUI event loop.
 pub enum Event {
@@ -22,6 +24,10 @@ pub enum Event {
     ScrollLeft,
     /// Scroll the table view right.
     ScrollRight,
+    /// Scroll the cursor up one row.
+    ScrollUp,
+    /// Scroll the cursor down one row.
+    ScrollDown,
     /// Server connection attempt in progress.
     ServerConnecting,
     /// Server connection established.
@@ -31,9 +37,9 @@ pub enum Event {
     /// Snapshot of ready, in-flight, and scheduled job queues.
     ServerJobSnapshot {
         server: ServerStatus,
-        ready: Vec<AdminJobSummary>,
-        in_flight: Vec<AdminJobSummary>,
-        scheduled: Vec<AdminJobSummary>,
+        ready: JobWindow,
+        in_flight: JobWindow,
+        scheduled: JobWindow,
     },
     /// Incremental change to a single job's status.
     ServerJobChanged {
@@ -47,12 +53,17 @@ pub enum Event {
 }
 
 impl Event {
-    /// Returns `true` for events triggered by user input (key presses).
+    /// Returns `true` for events that should trigger an immediate render.
     pub fn is_user_input(&self) -> bool {
         matches!(
             self,
             Event::Quit | Event::NextTab | Event::PrevTab | Event::ScrollLeft | Event::ScrollRight
         )
+    }
+
+    /// Returns `true` for events that should trigger a deferred (batched) render.
+    pub fn is_scroll(&self) -> bool {
+        matches!(self, Event::ScrollUp | Event::ScrollDown)
     }
 }
 
@@ -82,6 +93,12 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                         KeyCode::Left => {
                             let _ = tx.blocking_send(Event::ScrollLeft);
                         }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let _ = tx.blocking_send(Event::ScrollUp);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let _ = tx.blocking_send(Event::ScrollDown);
+                        }
                         _ => {}
                     }
                 }
@@ -92,7 +109,11 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
 
 /// Spawn an async task that manages the WebSocket connection,
 /// automatically reconnecting on failure.
-pub fn manage_ws_connection(tx: mpsc::Sender<Event>, base_url: String) {
+pub fn manage_ws_connection(
+    tx: mpsc::Sender<Event>,
+    mut ws_out_rx: mpsc::Receiver<String>,
+    base_url: String,
+) {
     tokio::spawn(async move {
         let url = format!("{base_url}/events");
 
@@ -102,7 +123,7 @@ pub fn manage_ws_connection(tx: mpsc::Sender<Event>, base_url: String) {
             // Error is intentionally ignored — the UI shows "Connecting"
             // status until a connection succeeds, so the retry loop
             // handles failures gracefully without console output.
-            let _ = connect_ws(&url, &tx).await;
+            let _ = connect_ws(&url, &tx, &mut ws_out_rx).await;
 
             let _ = tx.send(Event::ServerDisconnected).await;
 
@@ -116,8 +137,9 @@ pub fn manage_ws_connection(tx: mpsc::Sender<Event>, base_url: String) {
 async fn connect_ws(
     url: &str,
     tx: &mpsc::Sender<Event>,
+    ws_out_rx: &mut mpsc::Receiver<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use reqwest_websocket::{Message, RequestBuilderExt};
 
     let response = reqwest::Client::new().get(url).upgrade().send().await?;
@@ -125,18 +147,32 @@ async fn connect_ws(
 
     let _ = tx.send(Event::ServerConnected).await;
 
-    while let Some(msg) = websocket.next().await {
-        let msg = msg?;
-        if let Message::Text(text) = msg {
-            if let Some(event) = parse_ws_message(&text) {
-                if tx.send(event).await.is_err() {
-                    return Ok(());
+    loop {
+        tokio::select! {
+            msg = websocket.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(event) = parse_ws_message(&text) {
+                            if tx.send(event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {} // ignore binary/ping/pong
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
+                }
+            }
+            outbound = ws_out_rx.recv() => {
+                match outbound {
+                    Some(msg) => {
+                        websocket.send(Message::Text(msg)).await?;
+                    }
+                    None => return Ok(()),
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Parse a WebSocket JSON text message into a TUI Event.
@@ -162,6 +198,16 @@ fn parse_ws_message(text: &str) -> Option<Event> {
             job,
         }),
     }
+}
+
+/// Serialize a subscribe message for sending over WebSocket.
+pub fn subscribe_message(list: crate::admin::ListName, offset: usize, limit: usize) -> String {
+    serde_json::to_string(&crate::admin::ClientMessage::Subscribe {
+        list,
+        offset,
+        limit,
+    })
+    .expect("ClientMessage serialization cannot fail")
 }
 
 #[cfg(test)]
@@ -191,9 +237,9 @@ mod tests {
         let json = r#"{
             "server": {"version":"1.0.0","uptime_ms":5000,"tier":"pro","total_ready":1,"total_in_flight":1,"total_scheduled":1},
             "event": "job_snapshot",
-            "ready": [{"id":"r1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0}],
-            "in_flight": [{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}],
-            "scheduled": [{"id":"s1","queue":"q","job_type":"t","priority":0,"ready_at":5000,"attempts":0}]
+            "ready": {"offset":0,"items":[{"id":"r1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0}]},
+            "in_flight": {"offset":0,"items":[{"id":"w1","queue":"q","job_type":"t","priority":0,"ready_at":1000,"attempts":0,"dequeued_at":2000}]},
+            "scheduled": {"offset":0,"items":[{"id":"s1","queue":"q","job_type":"t","priority":0,"ready_at":5000,"attempts":0}]}
         }"#;
         let event = parse_ws_message(json).unwrap();
 
@@ -208,12 +254,12 @@ mod tests {
                 assert_eq!(server.total_ready, 1);
                 assert_eq!(server.total_in_flight, 1);
                 assert_eq!(server.total_scheduled, 1);
-                assert_eq!(ready.len(), 1);
-                assert_eq!(ready[0].id, "r1");
-                assert_eq!(in_flight.len(), 1);
-                assert_eq!(in_flight[0].id, "w1");
-                assert_eq!(scheduled.len(), 1);
-                assert_eq!(scheduled[0].id, "s1");
+                assert_eq!(ready.items.len(), 1);
+                assert_eq!(ready.items[0].id, "r1");
+                assert_eq!(in_flight.items.len(), 1);
+                assert_eq!(in_flight.items[0].id, "w1");
+                assert_eq!(scheduled.items.len(), 1);
+                assert_eq!(scheduled.items[0].id, "s1");
             }
             _ => panic!("expected ServerJobSnapshot"),
         }

@@ -25,19 +25,32 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
-use super::{AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, ServerStatus};
+use super::{
+    AdminEvent, AdminJobSummary, AdminMessage, ClientMessage, JobChangeStatus, JobWindow, ListName,
+    ServerStatus,
+};
 use crate::http::AppState;
 use crate::store::{self, StoreEvent};
 use crate::time::now_millis;
 
-/// Maximum number of ready jobs in the capped window.
-const READY_CAP: usize = 200;
+/// Default subscription window size.
+const DEFAULT_LIMIT: usize = 200;
 
-/// Maximum number of in-flight jobs in the capped window.
-const IN_FLIGHT_CAP: usize = 200;
+/// Per-list subscription parameters.
+#[derive(Clone)]
+struct Subscription {
+    offset: usize,
+    limit: usize,
+}
 
-/// Maximum number of scheduled jobs in the capped window.
-const SCHEDULED_CAP: usize = 200;
+impl Default for Subscription {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
 
 /// Per-connection state tracking the previous capped windows.
 struct ConnectionState {
@@ -49,12 +62,16 @@ struct ConnectionState {
     /// remove on `JobCompleted`/`JobFailed`.
     in_flight_ids: BTreeSet<(u64, String)>,
 
-    /// Previous in-flight window: first `IN_FLIGHT_CAP` entries
-    /// from `in_flight_ids`.
+    /// Previous in-flight window entries from `in_flight_ids`.
     prev_in_flight: Vec<(u64, String)>,
 
     /// Previous scheduled window: sorted `(ready_at, id)` keys.
     prev_scheduled: Vec<(u64, String)>,
+
+    /// Per-list subscription state.
+    ready_sub: Subscription,
+    in_flight_sub: Subscription,
+    scheduled_sub: Subscription,
 }
 
 /// WebSocket endpoint that streams admin events to connected clients.
@@ -69,6 +86,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut admin_rx = state.admin_events.subscribe();
     let mut store_rx = state.store.subscribe();
     let (mut sender, mut receiver) = socket.split();
+
+    // Channel for client messages from the read loop to the send task.
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<ClientMessage>(16);
 
     // Spawn a task that handles sending events to the WebSocket.
     let send_state = state.clone();
@@ -86,6 +106,24 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
         loop {
             tokio::select! {
+                // Client subscribe messages.
+                client_msg = client_rx.recv() => {
+                    match client_msg {
+                        Some(ClientMessage::Subscribe { list, offset, limit }) => {
+                            handle_subscribe(
+                                &send_state,
+                                store,
+                                &mut conn,
+                                &mut sender,
+                                list,
+                                offset,
+                                limit,
+                            )
+                            .await;
+                        }
+                        None => break,
+                    }
+                }
                 // Admin-specific events (currently just heartbeats).
                 event = admin_rx.recv() => {
                     match event {
@@ -162,8 +200,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     });
 
-    // Read loop — detect client disconnect.
-    while let Some(Ok(_msg)) = receiver.next().await {}
+    // Read loop — parse client messages and forward to send task.
+    while let Some(Ok(msg)) = receiver.next().await {
+        if let Message::Text(text) = msg {
+            if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                if client_tx.send(client_msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 
     send_task.abort();
 }
@@ -202,6 +248,20 @@ async fn send_initial_snapshot(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<ConnectionState, String> {
+    let ready_sub = Subscription::default();
+    let in_flight_sub = Subscription::default();
+    let scheduled_sub = Subscription::default();
+
+    send_snapshot_with_subs(state, sender, ready_sub, in_flight_sub, scheduled_sub).await
+}
+
+async fn send_snapshot_with_subs(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    ready_sub: Subscription,
+    in_flight_sub: Subscription,
+    scheduled_sub: Subscription,
+) -> Result<ConnectionState, String> {
     let live_queue = can_show_live_queue(state);
     let store = &state.store;
 
@@ -227,22 +287,28 @@ async fn send_initial_snapshot(
         .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
         .collect();
 
-    // Capped windows of jobs in each state for the snapshot.
+    // Windowed slices of jobs in each state for the snapshot.
     let capped_ready = if live_queue {
-        store.list_ready_jobs(READY_CAP).await.unwrap_or_else(|e| {
-            tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
-            Vec::new()
-        })
+        store
+            .list_ready_jobs(ready_sub.offset, ready_sub.limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
+                Vec::new()
+            })
     } else {
         Vec::new()
     };
 
-    let capped_in_flight: Vec<store::Job> =
-        in_flight_jobs.into_iter().take(IN_FLIGHT_CAP).collect();
+    let capped_in_flight: Vec<store::Job> = in_flight_jobs
+        .into_iter()
+        .skip(in_flight_sub.offset)
+        .take(in_flight_sub.limit)
+        .collect();
 
     let capped_scheduled = if live_queue {
         store
-            .list_scheduled_jobs(SCHEDULED_CAP)
+            .list_scheduled_jobs(scheduled_sub.offset, scheduled_sub.limit)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
@@ -272,18 +338,27 @@ async fn send_initial_snapshot(
     let snapshot = AdminMessage {
         server: server_status(state),
         event: AdminEvent::JobSnapshot {
-            ready: capped_ready
-                .into_iter()
-                .map(AdminJobSummary::from)
-                .collect(),
-            in_flight: capped_in_flight
-                .into_iter()
-                .map(AdminJobSummary::from)
-                .collect(),
-            scheduled: capped_scheduled
-                .into_iter()
-                .map(AdminJobSummary::from)
-                .collect(),
+            ready: JobWindow {
+                offset: ready_sub.offset,
+                items: capped_ready
+                    .into_iter()
+                    .map(AdminJobSummary::from)
+                    .collect(),
+            },
+            in_flight: JobWindow {
+                offset: in_flight_sub.offset,
+                items: capped_in_flight
+                    .into_iter()
+                    .map(AdminJobSummary::from)
+                    .collect(),
+            },
+            scheduled: JobWindow {
+                offset: scheduled_sub.offset,
+                items: capped_scheduled
+                    .into_iter()
+                    .map(AdminJobSummary::from)
+                    .collect(),
+            },
         },
     };
 
@@ -299,6 +374,9 @@ async fn send_initial_snapshot(
         in_flight_ids,
         prev_in_flight,
         prev_scheduled,
+        ready_sub,
+        in_flight_sub,
+        scheduled_sub,
     })
 }
 
@@ -388,10 +466,119 @@ async fn process_store_event(
     }
 }
 
-/// Diff the ready window: scan top READY_CAP IDs from the ReadyIndex,
-/// compare against `prev_ready`, emit adds/removes.
+/// Handle a subscribe message: update subscription, reset diff state, re-send snapshot.
+async fn handle_subscribe(
+    state: &AppState,
+    store: &store::Store,
+    conn: &mut ConnectionState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    list: ListName,
+    offset: usize,
+    limit: usize,
+) {
+    let sub = Subscription { offset, limit };
+    match list {
+        ListName::Ready => {
+            conn.ready_sub = sub;
+            conn.prev_ready.clear();
+        }
+        ListName::InFlight => {
+            conn.in_flight_sub = sub;
+            conn.prev_in_flight.clear();
+        }
+        ListName::Scheduled => {
+            conn.scheduled_sub = sub;
+            conn.prev_scheduled.clear();
+        }
+    }
+
+    // Re-send a full snapshot at the new window.
+    let live_queue = can_show_live_queue(state);
+
+    let ready_window = if live_queue {
+        let jobs = store
+            .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
+            .await
+            .unwrap_or_default();
+        let keys: Vec<(u16, String)> = jobs.iter().map(|j| (j.priority, j.id.clone())).collect();
+        conn.prev_ready = keys;
+        JobWindow {
+            offset: conn.ready_sub.offset,
+            items: jobs.into_iter().map(AdminJobSummary::from).collect(),
+        }
+    } else {
+        conn.prev_ready.clear();
+        JobWindow {
+            offset: conn.ready_sub.offset,
+            items: Vec::new(),
+        }
+    };
+
+    let in_flight_items: Vec<store::Job> = {
+        let mut jobs = Vec::new();
+        for (_dequeued_at, id) in conn
+            .in_flight_ids
+            .iter()
+            .skip(conn.in_flight_sub.offset)
+            .take(conn.in_flight_sub.limit)
+        {
+            if let Ok(Some(job)) = store.get_job(now_millis(), id).await {
+                jobs.push(job);
+            }
+        }
+        jobs
+    };
+    conn.prev_in_flight = in_flight_items
+        .iter()
+        .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
+        .collect();
+    let in_flight_window = JobWindow {
+        offset: conn.in_flight_sub.offset,
+        items: in_flight_items
+            .into_iter()
+            .map(AdminJobSummary::from)
+            .collect(),
+    };
+
+    let scheduled_window = if live_queue {
+        let jobs = store
+            .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
+            .await
+            .unwrap_or_default();
+        let keys: Vec<(u64, String)> = jobs.iter().map(|j| (j.ready_at, j.id.clone())).collect();
+        conn.prev_scheduled = keys;
+        JobWindow {
+            offset: conn.scheduled_sub.offset,
+            items: jobs.into_iter().map(AdminJobSummary::from).collect(),
+        }
+    } else {
+        conn.prev_scheduled.clear();
+        JobWindow {
+            offset: conn.scheduled_sub.offset,
+            items: Vec::new(),
+        }
+    };
+
+    let snapshot = AdminMessage {
+        server: server_status(state),
+        event: AdminEvent::JobSnapshot {
+            ready: ready_window,
+            in_flight: in_flight_window,
+            scheduled: scheduled_window,
+        },
+    };
+
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        let _ = sender.send(Message::Text(json.into())).await;
+    }
+}
+
+/// Diff the ready window: scan IDs from the ReadyIndex using subscription
+/// offset/limit, compare against `prev_ready`, emit adds/removes.
 async fn diff_ready(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current = store.scan_ready_ids(READY_CAP).await;
+    let current = store
+        .scan_ready_ids(conn.ready_sub.offset, conn.ready_sub.limit)
+        .await;
     let (adds, removes) = diff_sorted(&current, &conn.prev_ready);
     let mut events = Vec::with_capacity(adds.len() + removes.len());
 
@@ -419,13 +606,14 @@ async fn diff_ready(store: &store::Store, conn: &mut ConnectionState) -> Vec<Adm
     events
 }
 
-/// Diff the in-flight window: take first IN_FLIGHT_CAP entries from
-/// `in_flight_ids`, compare against `prev_in_flight`, emit adds/removes.
+/// Diff the in-flight window: take entries from `in_flight_ids` using
+/// subscription offset/limit, compare against `prev_in_flight`, emit adds/removes.
 async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
     let current: Vec<(u64, String)> = conn
         .in_flight_ids
         .iter()
-        .take(IN_FLIGHT_CAP)
+        .skip(conn.in_flight_sub.offset)
+        .take(conn.in_flight_sub.limit)
         .cloned()
         .collect();
     let (adds, removes) = diff_sorted(&current, &conn.prev_in_flight);
@@ -455,10 +643,12 @@ async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec
     events
 }
 
-/// Diff the scheduled window: scan top SCHEDULED_CAP IDs from the
-/// ScheduledIndex, compare against `prev_scheduled`, emit adds/removes.
+/// Diff the scheduled window: scan IDs from the ScheduledIndex using
+/// subscription offset/limit, compare against `prev_scheduled`, emit adds/removes.
 async fn diff_scheduled(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current = store.scan_scheduled_ids(SCHEDULED_CAP).await;
+    let current = store
+        .scan_scheduled_ids(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
+        .await;
     let (adds, removes) = diff_sorted(&current, &conn.prev_scheduled);
     let mut events = Vec::with_capacity(adds.len() + removes.len());
 
@@ -748,9 +938,9 @@ mod tests {
 
         assert_eq!(snapshot["event"], "job_snapshot");
         assert_server_status(&snapshot);
-        assert_eq!(snapshot["ready"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["scheduled"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["in_flight"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["scheduled"]["items"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -801,7 +991,7 @@ mod tests {
 
         // Consume snapshot (has 1 ready, 0 in-flight).
         let snapshot = next_json(&mut rx).await;
-        assert_eq!(snapshot["ready"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 1);
 
         // Take the job — triggers JobInFlight.
         state
@@ -848,7 +1038,7 @@ mod tests {
 
         // Consume snapshot (0 ready, 1 in-flight).
         let snapshot = next_json(&mut rx).await;
-        assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["in_flight"]["items"].as_array().unwrap().len(), 1);
 
         // Complete the job.
         state.store.mark_completed(now, &job.id).await.unwrap();
@@ -960,8 +1150,8 @@ mod tests {
 
         // Consume snapshot (0 ready, 1 scheduled).
         let snapshot = next_json(&mut rx).await;
-        assert_eq!(snapshot["ready"].as_array().unwrap().len(), 0);
-        assert_eq!(snapshot["scheduled"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["scheduled"]["items"].as_array().unwrap().len(), 1);
 
         // Promote the job (simulates the scheduler firing).
         state.store.promote_scheduled(&job).await.unwrap();
@@ -1026,10 +1216,10 @@ mod tests {
         assert_eq!(snapshot["server"]["total_in_flight"], 1);
         assert_eq!(snapshot["server"]["total_scheduled"], 1);
         // In-flight is always available.
-        assert_eq!(snapshot["in_flight"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["in_flight"]["items"].as_array().unwrap().len(), 1);
         // Ready and scheduled are gated.
-        assert_eq!(snapshot["ready"].as_array().unwrap().len(), 0);
-        assert_eq!(snapshot["scheduled"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["scheduled"]["items"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
