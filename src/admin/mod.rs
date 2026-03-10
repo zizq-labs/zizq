@@ -28,6 +28,9 @@ pub struct ServerStatus {
     pub total_ready: usize,
     pub total_in_flight: usize,
     pub total_scheduled: usize,
+    /// When present, the server caps each subscription list to this many items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_limit: Option<usize>,
 }
 
 /// Wrapper that pairs a `ServerStatus` snapshot with an `AdminEvent`.

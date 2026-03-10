@@ -194,58 +194,35 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[1]);
 
     // Content area — render only the active tab's table.
-    // In-flight is always available. Ready and Scheduled require Pro.
     let content_area = chunks[2];
+
+    let subscription_limit = if connected {
+        app.subscription_limit
+    } else {
+        None
+    };
+
+    let (table_area, msg_area) = if subscription_limit.is_some() {
+        let split = Layout::vertical([
+            Constraint::Min(0),    // table
+            Constraint::Length(4), // blank line + 2-line message + blank line
+        ])
+        .split(content_area);
+        (split[0], Some(split[1]))
+    } else {
+        (content_area, None)
+    };
 
     // Store the viewport height (minus 1 for the header row) so
     // scroll logic can reference it. If it changed (terminal resize),
     // re-subscribe with an updated window size.
-    let table_body_height = content_area.height.saturating_sub(1) as usize;
+    let table_body_height = table_area.height.saturating_sub(1) as usize;
     if table_body_height != app.viewport_height {
         app.viewport_height = table_body_height;
         app.resubscribe_all();
     }
 
-    let tab_gated = connected
-        && app.active_tab != Tab::InFlight
-        && app
-            .server_tier
-            .is_none_or(|t| t < crate::license::Tier::Pro);
-
-    if tab_gated {
-        // Render the table header row, then the license message centered
-        // in the remaining space.
-        let table = match app.active_tab {
-            Tab::Ready => job_table_ready(&[], app.now_ms, None),
-            Tab::InFlight => unreachable!(),
-            Tab::Scheduled => job_table_scheduled(&[], app.now_ms, None),
-        };
-
-        let inner = Layout::vertical([
-            Constraint::Length(1), // table header row
-            Constraint::Min(0),    // license message
-        ])
-        .split(content_area);
-
-        frame.render_widget(table, inner[0]);
-
-        // Vertically center by padding top.
-        let msg_height = inner[1].height;
-        let pad_top = msg_height / 2;
-        let centered = Layout::vertical([
-            Constraint::Length(pad_top),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner[1]);
-
-        let msg = Paragraph::new(Line::from(Span::styled(
-            "Live queue detail requires a pro license",
-            Style::default().fg(Color::DarkGray),
-        )))
-        .alignment(Alignment::Center);
-        frame.render_widget(msg, centered[1]);
-    } else {
+    {
         let ls = &app.list_states[app.active_tab.idx()];
         let jobs = match app.active_tab {
             Tab::Ready => &app.ready_jobs,
@@ -276,7 +253,19 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             Tab::Scheduled => job_table_scheduled(visible, app.now_ms, cursor_in_view),
         };
         let tab_scroll = app.h_scroll[app.active_tab.idx()];
-        render_scrollable(frame, table, content_area, tab_scroll);
+        render_scrollable(frame, table, table_area, tab_scroll);
+    }
+
+    if let Some(cap) = subscription_limit {
+        let msg = Paragraph::new(vec![
+            Line::default(),
+            Line::from(format!("The free tier is capped to {cap} jobs.")),
+            Line::from("Upgrade to a pro license to see everything."),
+            Line::default(),
+        ])
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+        frame.render_widget(msg, msg_area.unwrap());
     }
 
     // Help bar.
@@ -781,6 +770,7 @@ mod tests {
             server_version: None,
             server_uptime_ms: None,
             server_tier: None,
+            subscription_limit: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -810,6 +800,7 @@ mod tests {
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(65_000),
             server_tier: Some(Tier::Pro),
+            subscription_limit: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -834,6 +825,7 @@ mod tests {
             server_version: None,
             server_uptime_ms: None,
             server_tier: None,
+            subscription_limit: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -880,6 +872,7 @@ mod tests {
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(120_000),
             server_tier: Some(Tier::Pro),
+            subscription_limit: None,
             total_ready: 2,
             total_in_flight: 2,
             total_scheduled: 2,
@@ -1016,6 +1009,7 @@ mod tests {
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(10_000),
             server_tier: Some(Tier::Pro),
+            subscription_limit: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -1040,6 +1034,7 @@ mod tests {
             server_version: None,
             server_uptime_ms: None,
             server_tier: None,
+            subscription_limit: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -1057,20 +1052,43 @@ mod tests {
     }
 
     #[test]
-    fn render_free_tier_license_message() {
+    fn render_free_tier_ready_tab_with_cap_message() {
+        let now_ms = 1_700_000_000_000u64;
         let app = App {
             host: "127.0.0.1:8901".to_string(),
             status: ConnectionStatus::Connected,
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(10_000),
             server_tier: Some(Tier::Free),
-            total_ready: 5,
+            subscription_limit: Some(10),
+            total_ready: 50,
             total_in_flight: 3,
             total_scheduled: 2,
-            ready_jobs: Vec::new(),
+            ready_jobs: vec![
+                realistic_job(
+                    "0195b70a3cc87a1f0890da08e8b3cc86",
+                    "default",
+                    "send_email",
+                    0,
+                    now_ms - 5_200,
+                    0,
+                    None,
+                    None,
+                ),
+                realistic_job(
+                    "0195b70a3dd47c2308a1fb09e9c4dd97",
+                    "default",
+                    "charge",
+                    5,
+                    now_ms - 62_000,
+                    2,
+                    None,
+                    None,
+                ),
+            ],
             in_flight_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
-            now_ms: 1_700_000_000_000,
+            now_ms,
             active_tab: Tab::Ready,
             h_scroll: [0; 3],
             list_states: Default::default(),
@@ -1081,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn render_free_tier_in_flight_tab() {
+    fn render_free_tier_in_flight_tab_with_cap_message() {
         let now_ms = 1_700_000_000_000u64;
         let app = App {
             host: "127.0.0.1:8901".to_string(),
@@ -1089,6 +1107,7 @@ mod tests {
             server_version: Some("1.0.0".to_string()),
             server_uptime_ms: Some(10_000),
             server_tier: Some(Tier::Free),
+            subscription_limit: Some(10),
             total_ready: 5,
             total_in_flight: 2,
             total_scheduled: 0,

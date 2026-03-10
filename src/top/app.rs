@@ -86,6 +86,7 @@ pub struct App {
     pub server_version: Option<String>,
     pub server_uptime_ms: Option<u64>,
     pub server_tier: Option<Tier>,
+    pub subscription_limit: Option<usize>,
     pub total_ready: usize,
     pub total_in_flight: usize,
     pub total_scheduled: usize,
@@ -108,6 +109,7 @@ impl Clone for App {
             server_version: self.server_version.clone(),
             server_uptime_ms: self.server_uptime_ms,
             server_tier: self.server_tier,
+            subscription_limit: self.subscription_limit,
             total_ready: self.total_ready,
             total_in_flight: self.total_in_flight,
             total_scheduled: self.total_scheduled,
@@ -132,6 +134,7 @@ impl App {
             server_version: None,
             server_uptime_ms: None,
             server_tier: None,
+            subscription_limit: None,
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
@@ -160,6 +163,15 @@ impl App {
         }
     }
 
+    /// Effective total for scroll clamping — capped when server sets a limit.
+    fn effective_total(&self) -> usize {
+        let total = self.active_total();
+        match self.subscription_limit {
+            Some(cap) => total.min(cap),
+            None => total,
+        }
+    }
+
     /// Send a subscribe message over WebSocket.
     fn send_subscribe(&self, tab: Tab, offset: usize, limit: usize) {
         if let Some(tx) = &self.ws_tx {
@@ -171,6 +183,9 @@ impl App {
     /// Re-subscribe all tabs with a window sized to the current viewport.
     /// Called when the terminal is resized.
     pub fn resubscribe_all(&mut self) {
+        if self.subscription_limit.is_some() {
+            return;
+        }
         let vh = self.viewport_height;
         if vh == 0 {
             return;
@@ -190,6 +205,9 @@ impl App {
     /// Check if prefetch is needed and send subscribe if so.
     /// Deduplicates: won't re-send the same (offset, limit) for the same tab.
     fn maybe_prefetch(&mut self) {
+        if self.subscription_limit.is_some() {
+            return;
+        }
         let vh = self.viewport_height;
         if vh == 0 {
             return;
@@ -226,6 +244,7 @@ impl App {
         self.server_version = Some(server.version);
         self.server_uptime_ms = Some(server.uptime_ms);
         self.server_tier = Tier::parse(&server.tier);
+        self.subscription_limit = server.subscription_limit;
         self.total_ready = server.total_ready;
         self.total_in_flight = server.total_in_flight;
         self.total_scheduled = server.total_scheduled;
@@ -349,6 +368,7 @@ impl App {
                 self.server_version = None;
                 self.server_uptime_ms = None;
                 self.server_tier = None;
+                self.subscription_limit = None;
                 self.total_ready = 0;
                 self.total_in_flight = 0;
                 self.total_scheduled = 0;
@@ -375,11 +395,16 @@ impl App {
 
     /// Clamp cursor/scroll positions and apply follow-bottom tracking.
     fn apply_follow_bottom(&mut self) {
+        let cap = self.subscription_limit;
         for tab in [Tab::InFlight, Tab::Ready, Tab::Scheduled] {
-            let total = match tab {
+            let raw_total = match tab {
                 Tab::Ready => self.total_ready,
                 Tab::InFlight => self.total_in_flight,
                 Tab::Scheduled => self.total_scheduled,
+            };
+            let total = match cap {
+                Some(c) => raw_total.min(c),
+                None => raw_total,
             };
             let ls = &mut self.list_states[tab.idx()];
 
@@ -411,7 +436,7 @@ impl App {
     }
 
     fn scroll_up(&mut self) {
-        let total = self.active_total();
+        let total = self.effective_total();
         if total == 0 {
             return;
         }
@@ -427,7 +452,7 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
-        let total = self.active_total();
+        let total = self.effective_total();
         if total == 0 {
             return;
         }
@@ -443,7 +468,7 @@ impl App {
     }
 
     fn page_up(&mut self) {
-        let total = self.active_total();
+        let total = self.effective_total();
         if total == 0 || self.viewport_height == 0 {
             return;
         }
@@ -458,7 +483,7 @@ impl App {
     }
 
     fn page_down(&mut self) {
-        let total = self.active_total();
+        let total = self.effective_total();
         if total == 0 || self.viewport_height == 0 {
             return;
         }
@@ -485,6 +510,7 @@ mod tests {
             total_ready: 0,
             total_in_flight: 0,
             total_scheduled: 0,
+            subscription_limit: None,
         }
     }
 

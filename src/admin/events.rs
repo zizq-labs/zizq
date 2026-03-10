@@ -36,6 +36,9 @@ use crate::time::now_millis;
 /// Default subscription window size.
 const DEFAULT_LIMIT: usize = 200;
 
+/// Maximum subscription window for free-tier connections.
+const FREE_TIER_CAP: usize = 10;
+
 /// Per-list subscription parameters.
 #[derive(Clone)]
 struct Subscription {
@@ -161,7 +164,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 store,
                                 store_event,
                                 &mut conn,
-                                can_show_live_queue(&send_state),
                             ).await;
 
                             for event in events {
@@ -220,6 +222,11 @@ fn server_status(state: &AppState) -> ServerStatus {
         Some(tier) => tier.to_string(),
         None => "free".to_string(),
     };
+    let subscription_limit = if can_show_live_queue(state) {
+        None
+    } else {
+        Some(FREE_TIER_CAP)
+    };
     ServerStatus {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_ms: state.start_time.elapsed().as_millis() as u64,
@@ -227,6 +234,7 @@ fn server_status(state: &AppState) -> ServerStatus {
         total_ready: state.store.ready_count(),
         total_in_flight: state.store.in_flight_count(),
         total_scheduled: state.store.scheduled_count(),
+        subscription_limit,
     }
 }
 
@@ -248,11 +256,19 @@ async fn send_initial_snapshot(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<ConnectionState, String> {
-    let ready_sub = Subscription::default();
-    let in_flight_sub = Subscription::default();
-    let scheduled_sub = Subscription::default();
+    let live_queue = can_show_live_queue(state);
+    let make_sub = || {
+        if live_queue {
+            Subscription::default()
+        } else {
+            Subscription {
+                offset: 0,
+                limit: FREE_TIER_CAP,
+            }
+        }
+    };
 
-    send_snapshot_with_subs(state, sender, ready_sub, in_flight_sub, scheduled_sub).await
+    send_snapshot_with_subs(state, sender, make_sub(), make_sub(), make_sub()).await
 }
 
 async fn send_snapshot_with_subs(
@@ -262,7 +278,6 @@ async fn send_snapshot_with_subs(
     in_flight_sub: Subscription,
     scheduled_sub: Subscription,
 ) -> Result<ConnectionState, String> {
-    let live_queue = can_show_live_queue(state);
     let store = &state.store;
 
     // In-flight data is always available (free tier).
@@ -288,17 +303,13 @@ async fn send_snapshot_with_subs(
         .collect();
 
     // Windowed slices of jobs in each state for the snapshot.
-    let capped_ready = if live_queue {
-        store
-            .list_ready_jobs(ready_sub.offset, ready_sub.limit)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
-                Vec::new()
-            })
-    } else {
-        Vec::new()
-    };
+    let capped_ready = store
+        .list_ready_jobs(ready_sub.offset, ready_sub.limit)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
+            Vec::new()
+        });
 
     let capped_in_flight: Vec<store::Job> = in_flight_jobs
         .into_iter()
@@ -306,17 +317,13 @@ async fn send_snapshot_with_subs(
         .take(in_flight_sub.limit)
         .collect();
 
-    let capped_scheduled = if live_queue {
-        store
-            .list_scheduled_jobs(scheduled_sub.offset, scheduled_sub.limit)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
-                Vec::new()
-            })
-    } else {
-        Vec::new()
-    };
+    let capped_scheduled = store
+        .list_scheduled_jobs(scheduled_sub.offset, scheduled_sub.limit)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
+            Vec::new()
+        });
 
     // Collect keys for diffing logic.
     let prev_ready: Vec<(u16, String)> = capped_ready
@@ -388,18 +395,11 @@ async fn process_store_event(
     store: &store::Store,
     event: StoreEvent,
     conn: &mut ConnectionState,
-    live_queue: bool,
 ) -> Vec<AdminEvent> {
     match event {
         StoreEvent::JobCreated { .. } => {
-            let mut events = if live_queue {
-                diff_ready(store, conn).await
-            } else {
-                Vec::new()
-            };
-            if live_queue {
-                events.extend(diff_scheduled(store, conn).await);
-            }
+            let mut events = diff_ready(store, conn).await;
+            events.extend(diff_scheduled(store, conn).await);
             events
         }
         StoreEvent::JobInFlight { id } => {
@@ -412,9 +412,7 @@ async fn process_store_event(
             // Diff in-flight window (new entry may appear).
             events.extend(diff_in_flight(store, conn).await);
             // Diff ready window (job left ready, backfill may be needed).
-            if live_queue {
-                events.extend(diff_ready(store, conn).await);
-            }
+            events.extend(diff_ready(store, conn).await);
             events
         }
         StoreEvent::JobCompleted { id } => {
@@ -445,22 +443,10 @@ async fn process_store_event(
             events.extend(diff_in_flight(store, conn).await);
             events
         }
-        StoreEvent::JobScheduled { .. } => {
-            if live_queue {
-                diff_scheduled(store, conn).await
-            } else {
-                Vec::new()
-            }
-        }
+        StoreEvent::JobScheduled { .. } => diff_scheduled(store, conn).await,
         StoreEvent::IndexRebuilt => {
-            let mut events = if live_queue {
-                diff_ready(store, conn).await
-            } else {
-                Vec::new()
-            };
-            if live_queue {
-                events.extend(diff_scheduled(store, conn).await);
-            }
+            let mut events = diff_ready(store, conn).await;
+            events.extend(diff_scheduled(store, conn).await);
             events
         }
     }
@@ -476,7 +462,14 @@ async fn handle_subscribe(
     offset: usize,
     limit: usize,
 ) {
-    let sub = Subscription { offset, limit };
+    let sub = if can_show_live_queue(state) {
+        Subscription { offset, limit }
+    } else {
+        Subscription {
+            offset: 0,
+            limit: FREE_TIER_CAP,
+        }
+    };
     match list {
         ListName::Ready => {
             conn.ready_sub = sub;
@@ -493,9 +486,7 @@ async fn handle_subscribe(
     }
 
     // Re-send a full snapshot at the new window.
-    let live_queue = can_show_live_queue(state);
-
-    let ready_window = if live_queue {
+    let ready_window = {
         let jobs = store
             .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
             .await
@@ -505,12 +496,6 @@ async fn handle_subscribe(
         JobWindow {
             offset: conn.ready_sub.offset,
             items: jobs.into_iter().map(AdminJobSummary::from).collect(),
-        }
-    } else {
-        conn.prev_ready.clear();
-        JobWindow {
-            offset: conn.ready_sub.offset,
-            items: Vec::new(),
         }
     };
 
@@ -540,7 +525,7 @@ async fn handle_subscribe(
             .collect(),
     };
 
-    let scheduled_window = if live_queue {
+    let scheduled_window = {
         let jobs = store
             .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
             .await
@@ -550,12 +535,6 @@ async fn handle_subscribe(
         JobWindow {
             offset: conn.scheduled_sub.offset,
             items: jobs.into_iter().map(AdminJobSummary::from).collect(),
-        }
-    } else {
-        conn.prev_scheduled.clear();
-        JobWindow {
-            offset: conn.scheduled_sub.offset,
-            items: Vec::new(),
         }
     };
 
@@ -1096,6 +1075,10 @@ mod tests {
         assert_eq!(server["version"], env!("CARGO_PKG_VERSION"));
         assert!(server["uptime_ms"].as_u64().unwrap() < 5_000);
         assert_eq!(server["tier"], "pro");
+        assert!(
+            server["subscription_limit"].is_null(),
+            "pro tier should not have subscription_limit"
+        );
         assert_eq!(server["total_ready"], 2);
         assert_eq!(server["total_in_flight"], 1);
         assert_eq!(server["total_scheduled"], 2);
@@ -1169,7 +1152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn free_tier_snapshot_has_empty_job_lists() {
+    async fn free_tier_snapshot_has_capped_job_lists() {
         let state = free_state();
         let now = now_millis();
 
@@ -1211,29 +1194,29 @@ mod tests {
         assert_eq!(snapshot["event"], "job_snapshot");
         assert_server_status(&snapshot);
         assert_eq!(snapshot["server"]["tier"], "free");
+        assert_eq!(snapshot["server"]["subscription_limit"], FREE_TIER_CAP);
         // Totals are still populated.
         assert_eq!(snapshot["server"]["total_ready"], 1);
         assert_eq!(snapshot["server"]["total_in_flight"], 1);
         assert_eq!(snapshot["server"]["total_scheduled"], 1);
-        // In-flight is always available.
+        // All lists are now populated (capped to FREE_TIER_CAP).
         assert_eq!(snapshot["in_flight"]["items"].as_array().unwrap().len(), 1);
-        // Ready and scheduled are gated.
-        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 0);
-        assert_eq!(snapshot["scheduled"]["items"].as_array().unwrap().len(), 0);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["scheduled"]["items"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn free_tier_suppresses_ready_events() {
+    async fn free_tier_streams_ready_events_within_cap() {
         let state = free_state();
         let now = now_millis();
 
         let (_addr, mut rx) = connect(state.clone()).await;
 
-        // Consume initial empty snapshot.
+        // Consume initial snapshot.
         let snapshot = next_json(&mut rx).await;
         assert_eq!(snapshot["event"], "job_snapshot");
 
-        // Enqueue a job — on pro tier this would produce a "ready" event.
+        // Enqueue a job — free tier now receives ready events within the cap.
         state
             .store
             .enqueue(
@@ -1243,15 +1226,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Send a heartbeat so we can verify the next message is a
-        // heartbeat (not a job_changed event).
-        state.admin_events.send(AdminEvent::Heartbeat).unwrap();
-
         let msg = next_json(&mut rx).await;
-        assert_eq!(
-            msg["event"], "heartbeat",
-            "free tier should not get ready job_changed events"
-        );
+        assert_eq!(msg["event"], "job_changed");
+        assert_eq!(msg["status"], "ready");
         assert_eq!(msg["server"]["tier"], "free");
     }
 
