@@ -3585,126 +3585,92 @@ impl Store {
 
     /// Recover state after startup.
     ///
-    /// Three-phase recovery that must run before accepting requests:
+    /// Move orphaned in-flight jobs back to Ready.
     ///
-    /// 1. InFlight -> Ready: If the server crashed while jobs were being
-    ///    processed, those jobs are stuck in the `InFlight` state with no
-    ///    client handling them. This phase scans the status index and
-    ///    atomically moves them back to `Ready`.
-    ///
-    /// 2. Rebuild ready index: The in-memory skip list is empty after
-    ///    opening the database. This phase scans the status index for all
-    ///    `Ready` jobs (including any just recovered above) and populates
-    ///    the index so `take_next_job` can find them.
-    ///
-    /// 3. Rebuild scheduled index: The in-memory SkipSet is empty after
-    ///    opening the database. This phase scans the status index for all
-    ///    `Scheduled` jobs and populates the chronological index so the
-    ///    scheduler can find them.
-    ///
-    /// This method must be called before any subscribers exist (no events are
-    /// fired for recovered jobs).
-    ///
-    /// Returns `(recovered, ready_indexed, scheduled_indexed)` — the number
-    /// of orphaned in-flight jobs moved back to Ready, the total number of
-    /// Ready jobs in the index, and the total number of Scheduled jobs in
-    /// the index.
+    /// Must complete before accepting API requests to avoid races
+    /// with concurrent job completions. The job scan and status
+    /// transitions run synchronously; only the durable commit is
+    /// awaited.
+    pub async fn recover_in_flight(&self) -> Result<usize, StoreError> {
+        let (count, rx) = self.recover_in_flight_jobs()?;
+        if let Some(rx) = rx {
+            await_sync(Ok(((), Some(rx)))).await?;
+        }
+        Ok(count)
+    }
+
     /// Rebuild all in-memory indexes asynchronously.
     ///
-    /// Sets `index_ready` to `false` while rebuilding. Scheduled-index
-    /// rebuild runs concurrently with in-flight-job recovery (disjoint status
-    /// ranges). The ready-index rebuild waits for recovery so its snapshot
-    /// includes the InFlight→Ready transitions. Emits `IndexRebuilt` when
-    /// all three complete.
-    pub async fn rebuild_indexes(&self) -> Result<(usize, usize, usize), StoreError> {
+    /// Sets `index_ready` to `false` while rebuilding and emits
+    /// `IndexRebuilt` when complete. Workers wait on `index_ready`
+    /// before taking jobs.
+    pub async fn rebuild_indexes(&self) -> Result<(usize, usize), StoreError> {
         self.index_ready.store(false, Ordering::Release);
 
-        // Scheduled-index rebuild can run alongside in-flight-job recovery
-        // since they scan disjoint status ranges.
-        let (recovered, scheduled) = tokio::try_join!(
-            self.recover_in_flight_jobs(),
-            self.rebuild_scheduled_index(),
-        )?;
-
-        // Ready-index rebuild must wait for recovery so its snapshot
-        // includes the InFlight→Ready transitions.
-        let ready = self.rebuild_ready_index().await?;
+        let (ready, scheduled) =
+            tokio::try_join!(self.rebuild_ready_index(), self.rebuild_scheduled_index(),)?;
 
         self.index_ready.store(true, Ordering::Release);
         let _ = self.event_tx.send(StoreEvent::IndexRebuilt);
-        Ok((recovered, ready, scheduled))
-    }
-
-    /// Recover orphaned in-flight jobs and rebuild indexes.
-    ///
-    /// Convenience wrapper around `rebuild_indexes()` so that tests and
-    /// callers that used `recover()` keep working unchanged.
-    pub async fn recover(&self) -> Result<(usize, usize, usize), StoreError> {
-        self.rebuild_indexes().await
+        Ok((ready, scheduled))
     }
 
     /// Move orphaned in-flight jobs back to Ready in the LSM indexes.
     ///
-    /// Does not touch the in-memory ready index — that's handled by
-    /// `rebuild_ready_index`, which runs immediately after.
-    async fn recover_in_flight_jobs(&self) -> Result<usize, StoreError> {
-        let ks = self.ks.clone();
+    /// Runs synchronously so it completes before any API requests are
+    /// accepted. Does not touch the in-memory ready index — that's
+    /// handled by `rebuild_ready_index`, which runs immediately after.
+    fn recover_in_flight_jobs(
+        &self,
+    ) -> Result<(usize, Option<tokio::sync::oneshot::Receiver<SyncResult>>), StoreError> {
+        let ks = &self.ks;
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Scan the status index for all InFlight jobs.
-            // InFlight = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
-            let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8, 0];
-            let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8 + 1, 0];
-            let range = (Bound::Included(start), Bound::Excluded(end));
+        // Scan the status index for all InFlight jobs.
+        // InFlight = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
+        let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8, 0];
+        let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8 + 1, 0];
+        let range = (Bound::Included(start), Bound::Excluded(end));
 
-            // Collect IDs first — we can't hold an iterator across the write tx.
-            let snapshot = ks.db.read_tx();
-            let in_flight_ids: Vec<String> = snapshot
-                .range::<Vec<u8>, _>(&ks.index, range)
-                .map(|entry| {
-                    let (key, _) = entry.into_inner()?;
-                    // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
-                    String::from_utf8(key[4..].to_vec()).map_err(|e| {
-                        StoreError::Corruption(format!("job ID is not valid UTF-8: {e}"))
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-            drop(snapshot);
+        // Collect IDs via a read snapshot first — the write tx type
+        // does not support range scans.
+        let snapshot = ks.db.read_tx();
+        let in_flight_ids: Vec<String> = snapshot
+            .range::<Vec<u8>, _>(&ks.index, range)
+            .map(|entry| {
+                let (key, _) = entry.into_inner()?;
+                // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
+                String::from_utf8(key[4..].to_vec())
+                    .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+        drop(snapshot);
 
-            if in_flight_ids.is_empty() {
-                return Ok((0, None));
-            }
+        if in_flight_ids.is_empty() {
+            return Ok((0, None));
+        }
 
-            // Recovery runs at startup before concurrent access, so we
-            // can safely read and write in place inside the tx.
-            let count = in_flight_ids.len();
-            let mut tx = ks.write_tx();
+        let count = in_flight_ids.len();
+        let mut tx = ks.write_tx();
 
-            for id in &in_flight_ids {
-                let job_key = make_job_key(id);
-                let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
-                    StoreError::Corruption(format!(
-                        "in-flight job missing from data keyspace: {id:?}"
-                    ))
-                })?;
-                let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+        for id in &in_flight_ids {
+            let job_key = make_job_key(id);
+            let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
+                StoreError::Corruption(format!("in-flight job missing from data keyspace: {id:?}"))
+            })?;
+            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                let old_status_key = make_status_key(JobStatus::InFlight, id);
-                let new_status_key = make_status_key(JobStatus::Ready, id);
-                job.status = JobStatus::Ready.into();
-                let updated_bytes = rmp_serde::to_vec_named(&job)?;
+            let old_status_key = make_status_key(JobStatus::InFlight, id);
+            let new_status_key = make_status_key(JobStatus::Ready, id);
+            job.status = JobStatus::Ready.into();
+            let updated_bytes = rmp_serde::to_vec_named(&job)?;
 
-                tx.insert(&ks.data, &job_key, &updated_bytes);
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-            }
+            tx.insert(&ks.data, &job_key, &updated_bytes);
+            tx.remove(&ks.index, &old_status_key);
+            tx.insert(&ks.index, &new_status_key, b"");
+        }
 
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
-            Ok((count, Some(sync)))
-        })
-        .await?;
-
-        Ok(await_sync(result).await?)
+        let sync = ks.commit(tx, ks.default_commit_mode)?;
+        Ok((count, Some(sync)))
     }
 
     /// Populate the in-memory ready index from the `jobs_by_status` index.
@@ -7229,7 +7195,8 @@ mod tests {
         );
 
         // Recover should move it back to Ready and rebuild the index.
-        let (recovered, indexed, _scheduled) = store.recover().await.unwrap();
+        let recovered = store.recover_in_flight().await.unwrap();
+        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 1);
         assert_eq!(indexed, 1);
 
@@ -7255,7 +7222,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (recovered, indexed, _scheduled) = store.recover().await.unwrap();
+        let recovered = store.recover_in_flight().await.unwrap();
+        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 0);
         // The already-ready job should be indexed.
         assert_eq!(indexed, 1);
@@ -7294,7 +7262,8 @@ mod tests {
             .unwrap();
 
         // Recover both.
-        let (recovered, indexed, _scheduled) = store.recover().await.unwrap();
+        let recovered = store.recover_in_flight().await.unwrap();
+        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 2);
         assert_eq!(indexed, 2);
 
@@ -7341,7 +7310,8 @@ mod tests {
             .unwrap();
 
         // Recover should find no in-flight jobs, but index the ready one.
-        let (recovered, indexed, _scheduled) = store.recover().await.unwrap();
+        let recovered = store.recover_in_flight().await.unwrap();
+        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 0);
         assert_eq!(indexed, 1);
 

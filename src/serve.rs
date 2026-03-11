@@ -177,21 +177,30 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
-    // Recover orphaned in-flight jobs and rebuild the in-memory indexes
-    // asynchronously so that the server starts accepting connections
-    // immediately. Workers wait (sending heartbeats) until the indexes
-    // are ready; the TUI Ready panel shows empty until then.
+    // Recover orphaned in-flight jobs synchronously before accepting
+    // requests — this avoids races with concurrent job completions.
+    match store.recover_in_flight().await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::info!(count = recovered, "recovered orphaned in-flight jobs");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "in-flight recovery failed");
+            return Err(e.into());
+        }
+    }
+
+    // Rebuild in-memory indexes asynchronously. Workers wait (sending
+    // heartbeats) until the indexes are ready; the TUI Ready panel
+    // shows empty until then.
     let store_for_rebuild = store.clone();
     tokio::spawn(async move {
         match store_for_rebuild.rebuild_indexes().await {
-            Ok((recovered, ready, scheduled)) => {
-                if recovered > 0 {
-                    tracing::info!(count = recovered, "recovered orphaned in-flight jobs");
-                }
+            Ok((ready, scheduled)) => {
                 tracing::info!(ready, scheduled, "in-memory indexes rebuilt");
             }
             Err(e) => {
-                tracing::error!(error = %e, "recovery failed");
+                tracing::error!(error = %e, "index rebuild failed");
                 std::process::abort();
             }
         }
