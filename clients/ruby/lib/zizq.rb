@@ -18,6 +18,7 @@ module Zizq
   autoload :Client,         "zizq/client"
   autoload :EnqueueOptions, "zizq/enqueue_options"
   autoload :Job,            "zizq/job"
+  autoload :Lifecycle,      "zizq/lifecycle"
   autoload :Resources,      "zizq/resources"
   autoload :Worker,         "zizq/worker"
 

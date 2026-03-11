@@ -107,9 +107,8 @@ module Zizq
       )
       @worker_id_proc = worker_id
       @logger = logger || Zizq.configuration.logger
-      @shutdown = false
+      @lifecycle = Lifecycle.new
       @dispatch_queue = Thread::Queue.new
-      @shutdown_latch = Thread::Queue.new
 
       Zizq.configuration.validate!
       @ack_processor = AckProcessor.new(
@@ -120,17 +119,13 @@ module Zizq
       )
     end
 
-    # Signal the worker to shut down gracefully.
+    # Signal the worker to begin shutting down gracefully.
     #
-    # Closes the dispatch queue and unblocks the main run loop so it can
-    # proceed through its shutdown sequence (drain workers, stop ack
-    # processor). Safe to call from any thread.
+    # Transitions the lifecycle to :draining and closes the dispatch queue
+    # so workers finish their current jobs and exit.
     def shutdown #: () -> void
-      return if @shutdown
-
-      @shutdown = true
+      @lifecycle.drain!
       @dispatch_queue.close rescue nil
-      @shutdown_latch.close rescue nil
     end
 
     # Start the worker.
@@ -140,7 +135,15 @@ module Zizq
     def run #: () -> void
       install_signal_handlers
 
-      logger.info { "Zizq worker starting: #{thread_count} threads, #{fiber_count} fibers, prefetch=#{prefetch}" }
+      logger.info do
+        format(
+          "Zizq worker starting: %d threads, %d fibers, prefetch=%d",
+          thread_count,
+          fiber_count,
+          prefetch,
+        )
+      end
+
       logger.info { "Queues: #{queues.empty? ? '(all)' : queues.join(', ')}" }
 
       # Everything runs in the background initially.
@@ -148,24 +151,33 @@ module Zizq
       worker_threads = start_worker_threads
       producer_thread = start_producer_thread
 
-      # Block until shutdown is signaled or the producer exits unexpectedly.
-      # The latch is closed by the signal handler or the producer's ensure
-      # block — pop returns nil in either case, waking the main thread.
-      @shutdown_latch.pop
-      logger.info { "Shutting down. Waiting up to #{shutdown_timeout}s for workers to finish..." }
+      # Block until the lifecycle leaves :running (shutdown or crash).
+      @lifecycle.wait_while_running
 
-      # The producer has no work to drain — kill it immediately. It may
-      # be blocked in a streaming HTTP read that neither Thread#raise nor
-      # Thread#kill can interrupt (the exception is deferred until the
-      # next GVL checkpoint, which won't happen until data arrives on the
-      # socket). Give it a brief moment to exit cleanly, then force-kill.
-      producer_thread.kill unless producer_thread.join(1)
+      logger.info do
+        format(
+          "Shutting down. Waiting up to %.2fs for workers to finish...",
+          shutdown_timeout,
+        )
+      end
 
-      # Workers get the full shutdown timeout to drain remaining jobs.
+      # Workers drain remaining jobs from the closed dispatch queue.
+      # The producer stays connected so in-flight jobs aren't requeued
+      # by the server while workers are still finishing them.
       join_with_deadline(worker_threads)
 
-      # Drain any pending acks/nacks after all workers have exited.
+      # Drain pending acks/nacks while the connection is still open.
       @ack_processor.stop(timeout: shutdown_timeout)
+
+      # Signal the producer that draining is complete. If it's waiting
+      # inside take_jobs on the ClosedQueueError path, this wakes it
+      # and it breaks out cleanly. If it's blocked on an IO read (no
+      # job arrived since drain), we fall back to Thread#kill.
+      @lifecycle.stop!
+      unless producer_thread.join(shutdown_timeout)
+        logger.warn { "Producer did not exit cleanly, killing" }
+        producer_thread.kill
+      end
 
       logger.info { "Zizq worker stopped" }
     end
@@ -182,7 +194,9 @@ module Zizq
       Thread.new do
         Thread.current.name = "zizq-producer"
 
-        until @shutdown
+        logger.info { "Zizq producer thread started" }
+
+        while @lifecycle.running?
           begin
             client = Zizq.client
             logger.info { "Connecting to #{client.url}..." }
@@ -194,40 +208,57 @@ module Zizq
                 logger.info { "Connected. Listening for jobs." }
                 @backoff.reset
               }
-            ) do |job_hash|
+            ) do |job|
               begin
-                logger.debug { "Received #{job_hash.type} (#{job_hash.id}), dispatch queue: #{@dispatch_queue.size}" }
-                @dispatch_queue.push(job_hash)
+                logger.debug do
+                  format(
+                    "Received %s (%s), dispatch queue: %d",
+                    job.type,
+                    job.id,
+                    @dispatch_queue.size
+                  )
+                end
+
+                @dispatch_queue.push(job)
               rescue ClosedQueueError
-                # Shutdown in progress — stop consuming from stream.
-                # Exiting the block causes the HTTP connection to close,
-                # and the server will requeue any unacknowledged jobs.
+                # Shutdown in progress. Stay connected so in-flight jobs
+                # aren't requeued while workers and acks drain.
+                @lifecycle.wait_until_stopped
                 break
               end
             end
 
             # Stream ended normally — reset backoff for next reconnect.
             @backoff.reset
-          rescue Zizq::ConnectionError, Zizq::StreamError => e
-            break if @shutdown
+          rescue Zizq::ConnectionError, Zizq::StreamError => error
+            break unless @lifecycle.running?
 
-            logger.warn { "#{e.message}. Reconnecting in #{@backoff.duration}s..." }
+            logger.warn do
+              format(
+                "%s: %s. Reconnecting in %.2fs...",
+                error.class,
+                error.message,
+                @backoff.duration,
+              )
+            end
+
             @backoff.wait
-          rescue => e
-            break if @shutdown
+          rescue => error
+            break unless @lifecycle.running?
 
-            logger.error { "Error: #{e.class}: #{e.message}" }
-            logger.debug { e.backtrace&.join("\n") }
+            logger.error { "Error: #{error.class}: #{error.message}" }
+            logger.debug { error.backtrace&.join("\n") }
             @backoff.wait
           end
         end
 
         # Ensure queue is closed so workers can drain and exit
         @dispatch_queue.close rescue nil
-        logger.info { "Stopped" }
+        logger.info { "Zizq producer thread stopped" }
       ensure
-        # Wake the main thread whether we exited due to shutdown or a crash.
-        @shutdown_latch.close rescue nil
+        # Wake the main thread if the producer crashes during normal
+        # operation (before a shutdown signal).
+        @lifecycle.drain!
       end
     end
 
@@ -251,6 +282,10 @@ module Zizq
     # and dispatches them to the correct job class until the queue is closed
     # and drained.
     def run_loop(thread_idx, fiber_idx) #: (Integer, Integer) -> void
+      logger.info do
+        format("Worker %d:%d started", thread_idx, fiber_idx)
+      end
+
       wid = resolve_worker_id(thread_idx, fiber_idx)
 
       loop do
@@ -259,6 +294,10 @@ module Zizq
         break if job.nil?
 
         dispatch(job, wid)
+      end
+
+      logger.info do
+        format("Worker %d:%d stopped", thread_idx, fiber_idx)
       end
     end
 
@@ -275,63 +314,85 @@ module Zizq
       end
     end
 
-    # Process a single job: resolve and validate the job class, instantiate,
-    # set job metadata, deserialize payload, call perform, then report success
-    # or failure.
+    # Process a single job.
     #
-    # The outer rescue Exception catches anything the inner rescue misses,
-    # including non-StandardError exceptions and errors from malformed job
-    # hashes. This keeps the worker thread alive regardless of what happens
-    # during dispatch.
+    # Resolves the job class and validates it, instantiates it, sets job
+    # metadata, deserializes the payload, calls #perform, then reports success
+    # or failure.
     def dispatch(job, worker_id) #: (Resources::Job, String?) -> void
-      job_type = job.type
-      job_id = job.id
-
-      logger.debug { "Processing #{job_type} (#{job_id})" }
+      job_id, job_type = job.id, job.type
 
       # Resolve the job class from the type string and validate that it
-      # includes Zizq::Job. Object.const_get naturally triggers
-      # Zeitwerk/autoload if configured.
+      # includes Zizq::Job. Any autoloading will naturally occur.
       job_class = begin
         Object.const_get(job_type)
-      rescue NameError => e
-        logger.error { "Unknown job type '#{job_type}' (#{job_id}): #{e.message}" }
-        push_nack(job_id, e)
+      rescue NameError => error
+        logger.error { "Job #{job_type} (#{job_id}) not found: #{error.message}" }
+        push_nack(job_id, error)
         return
       end
 
       unless job_class.is_a?(Class) && job_class.include?(Zizq::Job)
-        logger.error { "#{job_type} (#{job_id}) does not include Zizq::Job" }
+        logger.error { "Job #{job_type} (#{job_id}) does not include Zizq::Job" }
         push_nack(job_id, RuntimeError.new("#{job_type} does not include Zizq::Job"))
         return
       end
 
-      # After the runtime guard above, we know job_class includes Zizq::Job.
+      # We've manually type checked this.
       zizq_job_class = job_class #: Zizq::job_class
 
       job_instance = zizq_job_class.new
       job_instance.set_zizq_job(job)
 
       begin
-        args, kwargs = zizq_job_class.zizq_deserialize(
-          job.payload || { "args" => [], "kwargs" => {} }
-        )
+        start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        job_instance.perform(*args, **kwargs)
-        elapsed_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(1)
+        begin
+          args, kwargs = zizq_job_class.zizq_deserialize(
+            job.payload || { "args" => [], "kwargs" => {} }
+          )
 
-        push_ack(job_id)
+          job_instance.perform(*args, **kwargs)
+        ensure
+          finish_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          elapsed_time = finish_time - start_time
+        end
+      rescue Exception => error
+        raise if !@lifecycle.running? && error.is_a?(Async::Stop)
 
-        logger.debug { "Completed #{job_type} (#{job_id}) in #{elapsed_ms}ms" }
-      rescue Exception => e # Intentionally rescuing all Exceptions here
-        logger.error { "#{job_type} (#{job_id}) failed: #{e.class}: #{e.message}" }
-        push_nack(job_id, e)
+        logger.error do
+          format(
+            "Job %s (%s) failed in %.4fs: %s: %s",
+            job_type,
+            job_id,
+            elapsed_time,
+            error.class,
+            error.message
+          )
+        end
+
+        push_nack(job_id, error)
+        return
       end
-    rescue Exception => e
-      # Last resort in the case of something truly unexpected.
-      logger.error { "Dispatch error (#{job_id || 'unknown'}): #{e.class}: #{e.message}" }
-      push_nack(job_id, e) if job_id
+
+      push_ack(job_id)
+
+      logger.debug do
+        format(
+          "Job %s (%s) completed in %.4fs",
+          job_type,
+          job_id,
+          elapsed_time
+        )
+      end
+    rescue Async::Stop, ClosedQueueError
+      # In the case jobs take too long to terminate, they are force killed
+      # which produces errors as they attempt to ack/nack etc.
+      #
+      # This means those jobs terminate without finishing their work but the
+      # Zizq backend automatically returns them to the queue when the client
+      # disconnects, so they'll be received by another worker when one connects.
+      logger.debug { "Job #{job_type} (#{job_id}) interrupted during shutdown" }
     end
 
     # @rbs job_id: String
@@ -367,9 +428,8 @@ module Zizq
 
       threads.each do |t|
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        if remaining > 0 && t.join(remaining)
-          next # Thread finished cleanly
-        end
+        next if remaining > 0 && t.join(remaining)
+        next unless t.alive?
 
         logger.warn { "Shutdown timeout reached. Killing thread #{t.name}" }
         t.kill
