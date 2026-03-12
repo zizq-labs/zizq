@@ -54,8 +54,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         ),
     };
 
-    let bold_gray = Style::default()
-        .fg(Color::Gray)
+    let bold_dark_gray = Style::default()
+        .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
     let cyan = Style::default().fg(Color::Cyan);
     let connected = matches!(app.status, ConnectionStatus::Connected);
@@ -86,9 +86,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Line::from(vec![
             Span::raw("  "),
             Span::styled("Server version: ", cyan),
-            Span::styled(version.to_string(), bold_gray),
+            Span::styled(version.to_string(), bold_dark_gray),
             Span::styled(", Uptime: ", cyan),
-            Span::styled(uptime, bold_gray),
+            Span::styled(uptime, bold_dark_gray),
         ])
     } else {
         Line::default()
@@ -259,7 +259,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Some(cap) = subscription_limit {
         let msg = Paragraph::new(vec![
             Line::default(),
-            Line::from(format!("The free tier is capped to {cap} jobs.")),
+            Line::from(format!("Display is currently capped at {cap} jobs.")),
             Line::from("Upgrade to a pro license to see everything."),
             Line::default(),
         ])
@@ -269,7 +269,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
 
     // Help bar.
-    let key_style = Style::default().fg(Color::White);
+    let key_style = Style::default();
     let label_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
     let help = Paragraph::new(Line::from(vec![
         Span::styled(" n/p ", key_style),
@@ -344,9 +344,7 @@ fn render_depth_bar(
 ) -> [Line<'static>; 3] {
     let total = in_flight + ready + scheduled;
     let total_label = format!("{total} jobs");
-    let bold_white = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    let bold_default = Style::default().add_modifier(Modifier::BOLD);
     let cyan = Style::default().fg(Color::Cyan);
 
     // Cap the bar at 120 columns (or terminal width if narrower).
@@ -380,7 +378,7 @@ fn render_depth_bar(
     let depth_line = Line::from(vec![
         Span::raw("  "),
         Span::styled("Depth", cyan),
-        Span::styled("[", bold_white),
+        Span::styled("[", bold_default),
         Span::styled(
             "\u{2502}".repeat(if_bars),
             Style::default()
@@ -401,7 +399,7 @@ fn render_depth_bar(
         ),
         Span::raw(" ".repeat(pad)),
         Span::styled(total_label, dim),
-        Span::styled("]  ", bold_white),
+        Span::styled("]  ", bold_default),
     ]);
 
     // Compute cursor marker position within the bar.
@@ -494,7 +492,7 @@ fn priority_style(highlighted: bool) -> Style {
     if highlighted {
         return CURSOR_STYLE;
     }
-    Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+    Style::new().add_modifier(Modifier::BOLD)
 }
 
 /// Build a table widget for the Ready pane.
