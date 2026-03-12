@@ -4,7 +4,12 @@
 //! Zizq CLI `serve` command entry point.
 //!
 //! Parses CLI arguments, initializes the database, and starts the HTTP server.
+//!
+//! ```text
+//! Usage: zizq serve [OPTIONS]
+//! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,12 +49,19 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Parse a human-readable byte size string (e.g. "100MB", "1GiB") into bytes.
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    s.parse::<bytesize::ByteSize>()
+        .map(|b| b.as_u64())
+        .map_err(|e| e.to_string())
+}
+
 /// Arguments for the `serve` subcommand.
 #[derive(Parser)]
 pub struct Args {
-    /// Log output format.
-    #[arg(long, default_value = "pretty", value_name = "FORMAT")]
-    log_format: logging::LogFormat,
+    /// Log output format (auto-detected if not set: TTY → pretty, non-TTY/file → compact).
+    #[arg(long, value_name = "FORMAT", env = "ZIZQ_LOG_FORMAT")]
+    log_format: Option<logging::LogFormat>,
 
     /// Log level for zizq.
     #[arg(
@@ -59,6 +71,36 @@ pub struct Args {
         env = "ZIZQ_LOG_LEVEL"
     )]
     log_level: logging::LogLevel,
+
+    /// Write logs to rotated files in {root_dir}/log/ instead of stdout.
+    #[arg(long, default_value_t = false, env = "ZIZQ_LOG_TO_DISK")]
+    log_to_disk: bool,
+
+    /// Custom directory for log files (implies --log-to-disk).
+    #[arg(long, value_name = "PATH", env = "ZIZQ_LOG_DIR")]
+    log_dir: Option<String>,
+
+    /// Time-based log rotation frequency.
+    #[arg(
+        long,
+        default_value = "daily",
+        value_name = "FREQUENCY",
+        env = "ZIZQ_LOG_ROTATION"
+    )]
+    log_rotation: logging::LogRotation,
+
+    /// Maximum size per log file before rotation (e.g. 100MB, 1GiB).
+    #[arg(long, default_value = "100MB", value_name = "SIZE", value_parser = parse_byte_size, env = "ZIZQ_LOG_MAX_SIZE")]
+    log_max_size: u64,
+
+    /// Maximum number of rotated log files to retain.
+    #[arg(
+        long,
+        default_value_t = 10,
+        value_name = "NUMBER",
+        env = "ZIZQ_LOG_MAX_FILES"
+    )]
+    log_max_files: usize,
 
     /// Root directory for all server data and configuration.
     #[arg(
@@ -155,12 +197,38 @@ pub struct Args {
 
 /// Initializes the database and starts the HTTP server.
 pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error::Error>> {
-    logging::init(&args.log_format, &args.log_level);
-    log_license(&license);
+    // Log the application name to stderr so it's obviously something is running.
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    if is_tty {
+        eprintln!("Zizq {}", env!("CARGO_PKG_VERSION"));
+    }
 
     // Make sure the root dir exists.
     let root = std::path::Path::new(&args.root_dir);
     std::fs::create_dir_all(root)?;
+
+    // Resolve the effective log directory.
+    let log_dir = if let Some(ref dir) = args.log_dir {
+        Some(PathBuf::from(dir))
+    } else if args.log_to_disk {
+        Some(root.join("log"))
+    } else {
+        None
+    };
+
+    if let Some(ref dir) = log_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let _log_guard = logging::init(logging::LogConfig {
+        format: args.log_format.as_ref(),
+        level: &args.log_level,
+        log_dir: log_dir.as_deref(),
+        rotation: &args.log_rotation,
+        max_size: args.log_max_size,
+        max_files: args.log_max_files,
+    });
+    log_license(&license);
 
     // Init/open the store (within the root dir).
     let mut storage_config = crate::store::StorageConfig::from_env()?;
@@ -273,7 +341,9 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         let admin_listener = TcpListener::bind(admin_addr).await?;
         tracing::info!(addr = %admin_addr, "admin API listening");
 
-        eprintln!("Accepting admin connections on {admin_addr}");
+        if is_tty {
+            eprintln!("Listening on {admin_addr} (admin)");
+        }
 
         let admin_state = state.clone();
         let admin_shutdown = state.shutdown.clone();
@@ -293,9 +363,11 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     // Set up the TCP socket for incoming connections.
     let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "listening");
+    tracing::info!(%addr, "primary API listening");
 
-    eprintln!("Accepting connections on {addr}");
+    if is_tty {
+        eprintln!("Listening on {addr} (primary)");
+    }
 
     // Start the server with graceful shutdown. Signal the watch channel
     // first so spawned take tasks break out of their loops, allowing

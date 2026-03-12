@@ -17,20 +17,6 @@
 //!  -h, --help
 //!  -V, --version
 //! ```
-//!
-//! The following environment variables are also supported:
-//!
-//! ZIZQ_ROOT_DIR:             Same as --root-dir, specifies where Zizq stores data
-//! ZIZQ_HOST:                 Same as --host, specifies the address to bind to
-//! ZIZQ_PORT:                 Same as --port, specifies the port to listen on
-//! ZIZQ_LOG_LEVEL:            Same as --log-level, specifies how verbose logs are
-//! ZIZQ_LOG_FILTER:           EnvFilter string for the tracing crate (overrides
-//!                              --log-level). This is useful when debugging
-//!                              dependencies.
-//! ZIZQ_LICENSE_KEY:          Same as --license-key, Ed25519-signed JWT for paid
-//!                              features. Prefix with @ to read from a file.
-//! ZIZQ_SCHEDULER_BATCH_SIZE: Max scheduled jobs to promote per iteration
-//!                              (default: 200).
 
 use clap::{Parser, Subcommand};
 
@@ -91,9 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => License::Free,
     };
-
-    eprintln!("Zizq {}", env!("CARGO_PKG_VERSION"));
-    eprintln!();
 
     match cli.command {
         Some(Command::Top(args)) => top::run(args).await,

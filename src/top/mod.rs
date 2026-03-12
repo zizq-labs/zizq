@@ -3,8 +3,12 @@
 
 //! Terminal UI dashboard for Zizq.
 //!
-//! Connects to the admin API via WebSocket and renders a live
-//! dashboard using ratatui. Requires a Pro license.
+//! Parses CLI arguments, connects to the admin API via WebSocket, and renders
+//! a live view of queue activity. Display limits apply without a pro license.
+//!
+//! ```text
+//! Usage: zizq top [OPTIONS]
+//! ```
 
 pub mod app;
 pub mod events;
