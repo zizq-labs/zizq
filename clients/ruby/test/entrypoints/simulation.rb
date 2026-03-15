@@ -49,8 +49,8 @@ end
 JOB_CHOICES = [
   *([SendEmailJob] * 40),
   *([FulfillOrderJob] * 10),
-  *([ProcessVideoJob] * 3),
-  *([GenerateReportJob] * 2),
+  *([ProcessVideoJob] * 4),
+  *([GenerateReportJob] * 1),
   *([ClearNotesJob] * 1),
 ]
 
@@ -79,11 +79,11 @@ ERROR_PROBABILITY = {
 }
 
 JOB_LATENCY = {
-  SendEmailJob => (0.1..1.0),
-  FulfillOrderJob => (2.0..5.0),
-  ProcessVideoJob => (10.0..60.0),
-  GenerateReportJob => (120.0..180.00),
-  ClearNotesJob => (10.0..30.0),
+  SendEmailJob => (0.1..0.5),
+  FulfillOrderJob => (0.4..2.0),
+  ProcessVideoJob => (1.0..5.0),
+  GenerateReportJob => (4.0..20.0),
+  ClearNotesJob => (4.0..20.0),
 }
 
 def enqueue_random_job(z)
@@ -103,7 +103,12 @@ def process_for(job_class)
     raise 'Simulated error'
   end
 
-  enqueue_random_job(Zizq)
+  # Enqueue between 0 and 2 jobs, with 1 being most likely.
+  Zizq.enqueue_bulk do |b|
+    [0, 1, 1, 2].sample.times do
+      enqueue_random_job(b)
+    end
+  end
 end
 
 job_count = Integer(ENV.fetch("JOB_COUNT", 5_000))
