@@ -1,7 +1,7 @@
 [book]
-title = "Zizq API Documentation"
+title = "API Reference"
 authors = ["Chris Corbyn"]
-description = "HTTP API reference for the Zizq job queue server"
+description = "HTTP API reference Zizq — The lightweight job queue server"
 language = "en"
 src = "src"
 
@@ -11,3 +11,8 @@ build-dir = "../target/docs"
 [output.html]
 site-url = "/docs/api/"
 additional-css = ["src/zizq_docs.css"]
+default-theme = "light"
+preferred-dark-theme = "light"
+
+[output.html.print]
+enable = false
