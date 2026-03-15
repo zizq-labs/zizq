@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="./images/Zizq.png" width="256" height="128" alt="Zizq" title="Zizq Logo">
+    <img src="./images/Zizq.png" height="128" alt="Zizq" title="Zizq Logo">
 </p>
 
 Zizq is a fast and lightweight self-contained job queue. Download a single
