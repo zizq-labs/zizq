@@ -1,6 +1,6 @@
-<p align="center">
-    <img src="./images/Zizq.png" height="128" alt="Zizq" title="Zizq Logo">
-</p>
+# Zizq
+
+## Job Queue
 
 Zizq is a fast and lightweight self-contained job queue. Download a single
 binary, start the server then enqueue and process jobs in your preferred
