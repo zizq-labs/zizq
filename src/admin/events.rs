@@ -29,7 +29,7 @@ use super::{
     AdminEvent, AdminJobSummary, AdminMessage, ClientMessage, JobChangeStatus, JobWindow, ListName,
     ServerStatus,
 };
-use crate::http::AppState;
+use crate::state::AppState;
 use crate::store::{self, StoreEvent};
 use crate::time::now_millis;
 
@@ -706,8 +706,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{broadcast, watch};
 
-    use crate::http::AppState;
     use crate::license::License;
+    use crate::state::AppState;
     use crate::store::{EnqueueOptions, Store};
     use crate::time::now_millis;
 

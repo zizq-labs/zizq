@@ -16,7 +16,7 @@ use axum::Router;
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 
-use crate::http::AppState;
+use crate::state::AppState;
 use crate::store;
 
 /// Server-wide status sent with every admin message.
@@ -151,8 +151,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{broadcast, watch};
 
-    use crate::http::AppState;
     use crate::license::License;
+    use crate::state::AppState;
     use crate::store::Store;
     use crate::time::now_millis;
 

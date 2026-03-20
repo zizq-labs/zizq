@@ -13,10 +13,8 @@ use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use crate::license::License;
-use crate::store::{self, ListErrorsOptions, ListJobsOptions, ScanDirection, Store, StoreEvent};
+use crate::store::{self, ListErrorsOptions, ListJobsOptions, ScanDirection, StoreEvent};
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -28,21 +26,17 @@ use axum::response::Response;
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+
+use crate::state::AppState;
 
 /// Default priority for jobs that don't specify one.
 ///
 /// Sits in the middle of the u16 range so there is equal room for higher
 /// and lower priority work.
 const DEFAULT_PRIORITY: u16 = 32_768;
-
-/// Default interval between heartbeat frames on idle take connections (milliseconds).
-pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 3_000;
-
-/// Default maximum number of in-flight jobs across all connections.
-pub const DEFAULT_GLOBAL_IN_FLIGHT_LIMIT: u64 = 1024;
 
 // --- Take types ---
 
@@ -696,37 +690,6 @@ struct ListErrorsPages {
 
     /// URL for the previous page, or null if this is the first page.
     prev: Option<String>,
-}
-
-/// Shared server state, passed to all request handlers.
-pub struct AppState {
-    /// Validated license determining which paid features are available.
-    pub license: License,
-
-    /// Persistent store for job queue operations.
-    pub store: Store,
-
-    /// Interval between heartbeat frames on idle take connections.
-    pub heartbeat_interval_ms: Duration,
-
-    /// Maximum number of in-flight jobs across all connections.
-    /// 0 means no limit.
-    pub global_in_flight_limit: u64,
-
-    /// Cloneable receiver for graceful shutdown signaling.
-    pub shutdown: watch::Receiver<()>,
-
-    /// Clock function for the current time in milliseconds since Unix epoch.
-    ///
-    /// In production, this is `time::now_millis`; tests can inject a
-    /// custom clock for deterministic timestamps.
-    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-
-    /// Broadcast channel for admin dashboard events (heartbeats, etc.).
-    pub admin_events: broadcast::Sender<crate::admin::AdminEvent>,
-
-    /// Server start time, used to compute uptime for admin heartbeats.
-    pub start_time: std::time::Instant,
 }
 
 // --- Content negotiation ---
@@ -2136,10 +2099,14 @@ async fn not_found(AcceptFormat(fmt): AcceptFormat) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::EnqueueOptions;
+    use crate::license::License;
+    use crate::state::DEFAULT_HEARTBEAT_INTERVAL_MS;
+    use crate::store::{EnqueueOptions, Store};
     use axum::body::Body;
     use http_body_util::BodyExt;
     use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+    use tokio::sync::watch;
     use tower::util::ServiceExt;
 
     /// Build a controllable clock backed by an `AtomicU64`.

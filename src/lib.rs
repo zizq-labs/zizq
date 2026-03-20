@@ -13,6 +13,7 @@ pub mod logging;
 pub mod reaper;
 pub mod scheduler;
 pub mod serve;
+pub mod state;
 pub mod store;
 pub mod time;
 pub mod tls;

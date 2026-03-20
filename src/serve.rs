@@ -17,9 +17,10 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http::{self, AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT};
+use crate::http;
 use crate::license::{Feature, License};
 use crate::logging;
+use crate::state::{AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT};
 use crate::store::{self, Store};
 use crate::tls;
 
