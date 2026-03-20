@@ -15,6 +15,18 @@
 require 'zizq'
 require 'async'
 
+Zizq.configure do |c|
+  c.url = ENV['ZIZQ_URL'] if ENV['ZIZQ_URL']
+
+  if ENV['ZIZQ_CA']
+    c.tls = {
+      ca: ENV['ZIZQ_CA'],
+      client_cert: ENV['ZIZQ_CLIENT_CERT'],
+      client_key: ENV['ZIZQ_CLIENT_KEY'],
+    }
+  end
+end
+
 class SimulationBaseJob
   include Zizq::Job
 

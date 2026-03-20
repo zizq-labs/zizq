@@ -16,6 +16,9 @@ module Zizq
   # Retention configuration expressed in fractional seconds.
   type retention = { ?completed: Float, ?dead: Float }
 
+  # TLS options for connecting over HTTPS. Values are PEM strings or file paths.
+  type tls_options = { ?ca: String, ?client_cert: String, ?client_key: String }
+
   # Structural type for a class that includes Zizq::Job.
   #
   # When a class includes Zizq::Job, the `included` callback extends

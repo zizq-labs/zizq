@@ -42,7 +42,7 @@ module Async
     end
 
     class Endpoint
-      def self.parse: (String, ?protocol: untyped) -> Endpoint
+      def self.parse: (String, **untyped) -> Endpoint
     end
 
     module Protocol

@@ -52,14 +52,18 @@ module Zizq
     #
     # @rbs url: String
     # @rbs format: Zizq::format
+    # @rbs ssl_context: OpenSSL::SSL::SSLContext?
     # @rbs return: void
-    def initialize(url:, format: :msgpack)
+    def initialize(url:, format: :msgpack, ssl_context: nil)
       @url = url.chomp("/")
       @format = format
 
+      endpoint_options = { protocol: Async::HTTP::Protocol::HTTP2 } #: Hash[Symbol, untyped]
+      endpoint_options[:ssl_context] = ssl_context if ssl_context
+
       @endpoint = Async::HTTP::Endpoint.parse(
         @url,
-        protocol: Async::HTTP::Protocol::HTTP2,
+        **endpoint_options,
       )
 
       @io_mutex = Mutex.new

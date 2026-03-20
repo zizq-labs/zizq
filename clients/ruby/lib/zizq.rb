@@ -61,7 +61,8 @@ module Zizq
           configuration.validate!
           @client = Client.new(
             url: configuration.url,
-            format: configuration.format
+            format: configuration.format,
+            ssl_context: configuration.ssl_context
           )
         end
       end

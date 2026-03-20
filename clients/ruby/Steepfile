@@ -6,6 +6,7 @@ target :lib do
 
   library "logger"
   library "json"
+  library "openssl"
 
   configure_code_diagnostics do |hash|
     # External gems without RBS declarations — covered by sig/external.rbs stubs.
