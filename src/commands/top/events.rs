@@ -126,6 +126,7 @@ pub fn manage_ws_connection(
     tx: mpsc::Sender<Event>,
     mut ws_out_rx: mpsc::Receiver<String>,
     base_url: String,
+    http_client: reqwest::Client,
 ) {
     tokio::spawn(async move {
         let url = format!("{base_url}/events");
@@ -136,7 +137,7 @@ pub fn manage_ws_connection(
             // Error is intentionally ignored — the UI shows "Connecting"
             // status until a connection succeeds, so the retry loop
             // handles failures gracefully without console output.
-            let _ = connect_ws(&url, &tx, &mut ws_out_rx).await;
+            let _ = connect_ws(&url, &tx, &mut ws_out_rx, &http_client).await;
 
             let _ = tx.send(Event::ServerDisconnected).await;
 
@@ -151,11 +152,12 @@ async fn connect_ws(
     url: &str,
     tx: &mpsc::Sender<Event>,
     ws_out_rx: &mut mpsc::Receiver<String>,
+    http_client: &reqwest::Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
     use reqwest_websocket::{Message, RequestBuilderExt};
 
-    let response = reqwest::Client::new().get(url).upgrade().send().await?;
+    let response = http_client.get(url).upgrade().send().await?;
     let mut websocket = response.into_websocket().await?;
 
     let _ = tx.send(Event::ServerConnected).await;

@@ -56,6 +56,9 @@ pub fn build_server_config(
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
+    let provider: Arc<rustls::crypto::CryptoProvider> =
+        Arc::new(rustls::crypto::ring::default_provider());
+
     let builder = if let Some(ca_path) = client_ca_path {
         let ca_certs = load_certs(ca_path)?;
         let mut root_store = rustls::RootCertStore::empty();
@@ -64,12 +67,21 @@ pub fn build_server_config(
                 .add(cert)
                 .map_err(|e| format!("invalid CA certificate: {e}"))?;
         }
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| format!("failed to build client verifier: {e}"))?;
-        ServerConfig::builder().with_client_cert_verifier(verifier)
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            Arc::clone(&provider),
+        )
+        .build()
+        .map_err(|e| format!("failed to build client verifier: {e}"))?;
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("failed to set TLS protocol versions: {e}"))?
+            .with_client_cert_verifier(verifier)
     } else {
-        ServerConfig::builder().with_no_client_auth()
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("failed to set TLS protocol versions: {e}"))?
+            .with_no_client_auth()
     };
 
     let mut config = builder

@@ -190,6 +190,22 @@ pub struct Args {
     #[arg(long, default_value_t = false, env = "ZIZQ_NO_ADMIN")]
     no_admin: bool,
 
+    /// Path to a PEM-encoded TLS certificate chain for the admin API.
+    /// Must be used together with --admin-tls-key.
+    #[arg(long, value_name = "PATH", env = "ZIZQ_ADMIN_TLS_CERT")]
+    admin_tls_cert: Option<String>,
+
+    /// Path to a PEM-encoded TLS private key for the admin API.
+    /// Must be used together with --admin-tls-cert.
+    #[arg(long, value_name = "PATH", env = "ZIZQ_ADMIN_TLS_KEY")]
+    admin_tls_key: Option<String>,
+
+    /// Path to PEM-encoded CA certificate(s) for mTLS client verification on
+    /// the admin API. Requires --admin-tls-cert and --admin-tls-key.
+    /// Requires a Pro license.
+    #[arg(long, value_name = "PATH", env = "ZIZQ_ADMIN_TLS_CLIENT_CA")]
+    admin_tls_client_ca: Option<String>,
+
     /// Path to a PEM-encoded TLS certificate chain for the primary API.
     /// Must be used together with --tls-key.
     #[arg(long, value_name = "PATH", env = "ZIZQ_TLS_CERT")]
@@ -260,6 +276,23 @@ pub async fn run(
         license
             .require(now_ms, Feature::MutualTls)
             .map_err(|e| format!("cannot enable mTLS: {e}"))?;
+    }
+
+    // Validate admin TLS argument combinations.
+    match (&args.admin_tls_cert, &args.admin_tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--admin-tls-cert and --admin-tls-key must be provided together".into());
+        }
+        _ => {}
+    }
+    if args.admin_tls_client_ca.is_some() && args.admin_tls_cert.is_none() {
+        return Err("--admin-tls-client-ca requires --admin-tls-cert and --admin-tls-key".into());
+    }
+    if args.admin_tls_client_ca.is_some() {
+        let now_ms = (crate::time::now_millis)();
+        license
+            .require(now_ms, Feature::MutualTls)
+            .map_err(|e| format!("cannot enable admin mTLS: {e}"))?;
     }
 
     // Init/open the store (within the root dir).
@@ -370,23 +403,51 @@ pub async fn run(
 
         let admin_addr: std::net::SocketAddr =
             format!("{}:{}", args.admin_host, args.admin_port).parse()?;
-        let admin_listener = TcpListener::bind(admin_addr).await?;
-        tracing::info!(addr = %admin_addr, "admin API listening");
+        let admin_tcp = TcpListener::bind(admin_addr).await?;
+
+        let admin_scheme = if args.admin_tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        tracing::info!(addr = %admin_addr, scheme = %admin_scheme, "admin API listening");
 
         if is_tty {
-            eprintln!("Listening on {admin_addr} (admin)");
+            eprintln!("Listening on {admin_scheme}://{admin_addr} (admin)");
         }
 
         let admin_state = state.clone();
         let admin_shutdown = state.shutdown.clone();
+        let admin_app = crate::admin::app(admin_state);
+        let admin_tls_config = match (&args.admin_tls_cert, &args.admin_tls_key) {
+            (Some(cert), Some(key)) => Some(tls::build_server_config(
+                cert.as_ref(),
+                key.as_ref(),
+                args.admin_tls_client_ca
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )?),
+            _ => None,
+        };
+
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(admin_listener, crate::admin::app(admin_state))
-                .with_graceful_shutdown(async move {
-                    let mut rx = admin_shutdown;
-                    let _ = rx.changed().await;
-                })
-                .await
-            {
+            let shutdown = async move {
+                let mut rx = admin_shutdown;
+                let _ = rx.changed().await;
+            };
+
+            let result = if let Some(config) = admin_tls_config {
+                let listener = tls::TlsListener::new(admin_tcp, config);
+                axum::serve(listener, admin_app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            } else {
+                axum::serve(admin_tcp, admin_app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            };
+
+            if let Err(e) = result {
                 tracing::error!(error = %e, "admin API listener failed");
             }
         });
