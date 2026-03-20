@@ -20,7 +20,7 @@ module Zizq
     Ack = Data.define(:job_id)
 
     # Immutable value object representing a job failure.
-    Nack = Data.define(:job_id, :error, :error_type, :backtrace)
+    Nack = Data.define(:job_id, :message, :error_type, :backtrace)
 
     # @rbs client: Client
     # @rbs capacity: Integer
@@ -119,7 +119,7 @@ module Zizq
       begin
         @client.report_failure(
           nack.job_id,
-          error: nack.error,
+          message: nack.message,
           error_type: nack.error_type,
           backtrace: nack.backtrace
         )

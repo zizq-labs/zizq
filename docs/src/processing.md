@@ -247,7 +247,7 @@ this job according to the backoff policy.
         </tr>
         <tr>
             <td>
-                <div><code>error</code> <em>required</em></div>
+                <div><code>message</code> <em>required</em></div>
                 <div><pre>string</pre></div>
             </td>
             <td>
@@ -484,7 +484,7 @@ date: Sat, 14 Mar 2026 05:10:09 GMT
 ```shell
 http POST http://127.0.0.1:7890/jobs/03fr82s4q2jktvg5p1acpeqfe/failure <<'JSON'
 {
-    "error": "Something went wrong",
+    "message": "Something went wrong",
     "error_type": "RuntimeError"
 }
 JSON

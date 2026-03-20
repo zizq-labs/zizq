@@ -67,14 +67,14 @@ module Zizq
 
       # Report this job as failed.
       #
-      # @rbs error: String
+      # @rbs message: String
       # @rbs error_type: String?
       # @rbs backtrace: String?
       # @rbs retry_at: Float?
       # @rbs kill: bool
       # @rbs return: Job
-      def fail!(error:, error_type: nil, backtrace: nil, retry_at: nil, kill: false)
-        @client.report_failure(id, error:, error_type:, backtrace:, retry_at:, kill:)
+      def fail!(message:, error_type: nil, backtrace: nil, retry_at: nil, kill: false)
+        @client.report_failure(id, message:, error_type:, backtrace:, retry_at:, kill:)
       end
     end
   end

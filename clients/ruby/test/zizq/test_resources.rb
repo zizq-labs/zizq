@@ -125,7 +125,7 @@ class TestResources < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     job = Zizq::Resources::Job.new(@client, { "id" => "j1" })
-    result = job.fail!(error: "oops")
+    result = job.fail!(message: "oops")
 
     assert_instance_of Zizq::Resources::Job, result
     assert_equal "scheduled", result.status

@@ -277,14 +277,14 @@ module Zizq
     # it can quickly detect and handle disconnected clients.
     #
     # @rbs id: String
-    # @rbs error: String
+    # @rbs message: String
     # @rbs error_type: String?
     # @rbs backtrace: String?
     # @rbs retry_at: Float?
     # @rbs kill: bool
     # @rbs return: Resources::Job
-    def report_failure(id, error:, error_type: nil, backtrace: nil, retry_at: nil, kill: false)
-      body = { error: } #: Hash[Symbol, untyped]
+    def report_failure(id, message:, error_type: nil, backtrace: nil, retry_at: nil, kill: false)
+      body = { message: } #: Hash[Symbol, untyped]
       body[:error_type] = error_type if error_type
       body[:backtrace] = backtrace if backtrace
       # retry_at is fractional seconds in Ruby; the server expects ms.

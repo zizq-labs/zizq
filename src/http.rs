@@ -512,7 +512,7 @@ impl From<store::RetentionConfig> for RetentionConfig {
 #[derive(Deserialize)]
 struct FailureRequest {
     /// Error message describing what went wrong.
-    error: String,
+    message: String,
 
     /// Optional error class, e.g. "TimeoutError" or "ConnectionRefused".
     error_type: Option<String>,
@@ -1330,7 +1330,7 @@ async fn report_failure(
     NegotiatedBody(failure_req): NegotiatedBody<FailureRequest>,
 ) -> Response {
     let opts = store::FailureOptions {
-        error: failure_req.error,
+        message: failure_req.message,
         error_type: failure_req.error_type,
         backtrace: failure_req.backtrace,
         retry_at: failure_req.retry_at,
@@ -2631,7 +2631,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "oops"}),
+            &serde_json::json!({"message": "oops"}),
         );
         let res = router.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -2654,7 +2654,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "oops again"}),
+            &serde_json::json!({"message": "oops again"}),
         );
         let res = router.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -2701,7 +2701,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "timeout"}),
+            &serde_json::json!({"message": "timeout"}),
         );
         let res = router.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -4527,7 +4527,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "connection timeout"}),
+            &serde_json::json!({"message": "connection timeout"}),
         );
         let res = app.oneshot(req).await.unwrap();
 
@@ -4563,7 +4563,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "fatal", "kill": true}),
+            &serde_json::json!({"message": "fatal", "kill": true}),
         );
         let res = app.oneshot(req).await.unwrap();
 
@@ -4578,7 +4578,7 @@ mod tests {
         let req = json_request(
             "POST",
             "/jobs/nonexistent/failure",
-            &serde_json::json!({"error": "oops"}),
+            &serde_json::json!({"message": "oops"}),
         );
         let res = test_app().oneshot(req).await.unwrap();
 
@@ -4602,7 +4602,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "oops"}),
+            &serde_json::json!({"message": "oops"}),
         );
         let res = app.oneshot(req).await.unwrap();
 
@@ -4634,7 +4634,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "oops"}),
+            &serde_json::json!({"message": "oops"}),
         );
         let res = app.oneshot(req).await.unwrap();
 
@@ -4687,7 +4687,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "boom", "retry_at": 1}),
+            &serde_json::json!({"message": "boom", "retry_at": 1}),
         );
         let fail_res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(fail_res.status(), StatusCode::OK);
@@ -4758,7 +4758,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
-            &serde_json::json!({"error": "timeout"}),
+            &serde_json::json!({"message": "timeout"}),
         );
         let res = router.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -4820,7 +4820,7 @@ mod tests {
         let req = json_request(
             "POST",
             &format!("/jobs/{job_a_id}/failure"),
-            &serde_json::json!({"error": "fatal", "kill": true}),
+            &serde_json::json!({"message": "fatal", "kill": true}),
         );
         let fail_res = router.oneshot(req).await.unwrap();
         assert_eq!(fail_res.status(), StatusCode::OK);
@@ -4882,7 +4882,7 @@ mod tests {
 
         // Fail the job.
         let opts = store::FailureOptions {
-            error: "boom".into(),
+            message: "boom".into(),
             error_type: Some("RuntimeError".into()),
             backtrace: None,
             retry_at: None,
@@ -4929,7 +4929,7 @@ mod tests {
 
         // Fail, promote, retake, fail again to get 2 error records.
         let fail_opts = || store::FailureOptions {
-            error: "err".into(),
+            message: "err".into(),
             error_type: None,
             backtrace: None,
             retry_at: None,

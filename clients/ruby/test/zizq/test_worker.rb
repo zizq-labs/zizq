@@ -133,8 +133,8 @@ class TestWorker < Minitest::Test
     nack_stub = stub_request(:post, "#{URL}/jobs/j1/failure")
       .with { |req|
         body = JSON.parse(req.body)
-        body["error"].include?("RuntimeError") &&
-          body["error"].include?("boom") &&
+        body["message"].include?("RuntimeError") &&
+          body["message"].include?("boom") &&
           body["error_type"] == "RuntimeError"
       }
       .to_return(status: 200, body: JSON.generate({ "id" => "j1", "status" => "scheduled" }),
@@ -253,8 +253,8 @@ class TestWorker < Minitest::Test
     nack_stub = stub_request(:post, "#{URL}/jobs/j1/failure")
       .with { |req|
         body = JSON.parse(req.body)
-        body["error"].include?("RuntimeError") &&
-          body["error"].include?("boom")
+        body["message"].include?("RuntimeError") &&
+          body["message"].include?("boom")
       }
       .to_return(status: 200, body: JSON.generate({ "id" => "j1", "status" => "scheduled" }),
                  headers: { "Content-Type" => "application/json" })

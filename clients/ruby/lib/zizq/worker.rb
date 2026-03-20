@@ -407,7 +407,7 @@ module Zizq
     def push_nack(job_id, error)
       @ack_processor.push(AckProcessor::Nack.new(
         job_id:     job_id,
-        error:      "#{error.class}: #{error.message}",
+        message:    "#{error.class}: #{error.message}",
         error_type: error.class.name,
         backtrace:  error.backtrace&.join("\n")
       ))

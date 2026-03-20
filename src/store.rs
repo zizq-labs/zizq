@@ -592,7 +592,7 @@ impl EnqueueOptions {
 /// Options for recording a job failure.
 pub struct FailureOptions {
     /// Error message from the worker.
-    pub error: String,
+    pub message: String,
 
     /// Error class, e.g. "TimeoutError".
     pub error_type: Option<String>,
@@ -2563,7 +2563,7 @@ impl Store {
             // be cloned on each iteration.
             let kill = opts.kill;
             let retry_at = opts.retry_at;
-            let error_message = opts.error;
+            let error_message = opts.message;
             let error_type_opt = opts.error_type;
             let error_backtrace = opts.backtrace;
 
@@ -7337,7 +7337,7 @@ mod tests {
     /// Build a FailureOptions with sensible defaults for testing.
     fn test_failure_opts() -> FailureOptions {
         FailureOptions {
-            error: "something broke".into(),
+            message: "something broke".into(),
             error_type: None,
             backtrace: None,
             retry_at: None,
@@ -7566,7 +7566,7 @@ mod tests {
         let job = enqueue_and_take(&store).await;
 
         let mut opts = test_failure_opts();
-        opts.error = "connection timeout".into();
+        opts.message = "connection timeout".into();
         opts.error_type = Some("TimeoutError".into());
         opts.backtrace = Some("at line 42".into());
 
@@ -7850,7 +7850,7 @@ mod tests {
     /// assertion clarity.
     async fn fail_and_retake(store: &Store, job_id: &str, error_msg: &str) -> Job {
         let mut opts = test_failure_opts();
-        opts.error = error_msg.into();
+        opts.message = error_msg.into();
         store
             .record_failure(now_millis(), job_id, opts)
             .await
@@ -7896,7 +7896,7 @@ mod tests {
         // Fail twice to produce two error records (attempts 1, 2).
         let retaken = fail_and_retake(&store, &job.id, "error one").await;
         let mut opts = test_failure_opts();
-        opts.error = "error two".into();
+        opts.message = "error two".into();
         store
             .record_failure(now_millis(), &retaken.id, opts)
             .await
@@ -7919,7 +7919,7 @@ mod tests {
 
         let retaken = fail_and_retake(&store, &job.id, "error one").await;
         let mut opts = test_failure_opts();
-        opts.error = "error two".into();
+        opts.message = "error two".into();
         store
             .record_failure(now_millis(), &retaken.id, opts)
             .await
@@ -7945,7 +7945,7 @@ mod tests {
         let retaken = fail_and_retake(&store, &job.id, "error one").await;
         let retaken = fail_and_retake(&store, &retaken.id, "error two").await;
         let mut opts = test_failure_opts();
-        opts.error = "error three".into();
+        opts.message = "error three".into();
         store
             .record_failure(now_millis(), &retaken.id, opts)
             .await
@@ -7977,7 +7977,7 @@ mod tests {
 
         let retaken = fail_and_retake(&store, &job.id, "error one").await;
         let mut opts = test_failure_opts();
-        opts.error = "error two".into();
+        opts.message = "error two".into();
         store
             .record_failure(now_millis(), &retaken.id, opts)
             .await
@@ -8001,7 +8001,7 @@ mod tests {
 
         let retaken = fail_and_retake(&store, &job.id, "first").await;
         let mut opts = test_failure_opts();
-        opts.error = "second".into();
+        opts.message = "second".into();
         store
             .record_failure(now_millis(), &retaken.id, opts)
             .await

@@ -39,7 +39,7 @@ class TestAckProcessor < Minitest::Test
     stub = stub_request(:post, "#{URL}/jobs/j1/failure")
       .with { |req|
         body = JSON.parse(req.body)
-        body["error"] == "RuntimeError: boom" &&
+        body["message"] == "RuntimeError: boom" &&
           body["error_type"] == "RuntimeError" &&
           body["backtrace"] == "line1\nline2"
       }
@@ -50,7 +50,7 @@ class TestAckProcessor < Minitest::Test
     proc.start
     proc.push(Zizq::AckProcessor::Nack.new(
       job_id: "j1",
-      error: "RuntimeError: boom",
+      message: "RuntimeError: boom",
       error_type: "RuntimeError",
       backtrace: "line1\nline2"
     ))
@@ -72,7 +72,7 @@ class TestAckProcessor < Minitest::Test
     proc.start
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j1"))
     proc.push(Zizq::AckProcessor::Nack.new(
-      job_id: "j2", error: "err", error_type: "E", backtrace: nil
+      job_id: "j2", message: "err", error_type: "E", backtrace: nil
     ))
     proc.push(Zizq::AckProcessor::Ack.new(job_id: "j3"))
     proc.stop(timeout: 5)

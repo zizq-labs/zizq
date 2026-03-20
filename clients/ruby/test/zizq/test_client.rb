@@ -367,7 +367,7 @@ class TestClient < Minitest::Test
     stub_request(:post, "#{URL}/jobs/job1/failure")
       .with { |req|
         body = JSON.parse(req.body)
-        body["error"] == "RuntimeError: boom" &&
+        body["message"] == "RuntimeError: boom" &&
           body["error_type"] == "RuntimeError" &&
           body["backtrace"] == "line1\nline2"
       }
@@ -375,7 +375,7 @@ class TestClient < Minitest::Test
                  headers: { "Content-Type" => "application/json" })
 
     result = @json_client.report_failure("job1",
-                                         error: "RuntimeError: boom",
+                                         message: "RuntimeError: boom",
                                          error_type: "RuntimeError",
                                          backtrace: "line1\nline2")
     assert_instance_of Zizq::Resources::Job, result
@@ -389,7 +389,7 @@ class TestClient < Minitest::Test
       .to_return(status: 200, body: JSON.generate({ "id" => "job1", "status" => "dead" }),
                  headers: { "Content-Type" => "application/json" })
 
-    result = @json_client.report_failure("job1", error: "fatal", kill: true)
+    result = @json_client.report_failure("job1", message: "fatal", kill: true)
     assert_equal "dead", result.status
   end
 
@@ -398,7 +398,7 @@ class TestClient < Minitest::Test
       .to_return(status: 200, body: JSON.generate({ "id" => "job1" }),
                  headers: { "Content-Type" => "application/json" })
 
-    @json_client.nack("job1", error: "oops")
+    @json_client.nack("job1", message: "oops")
   end
 
   # --- error handling ---
