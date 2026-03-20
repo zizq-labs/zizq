@@ -13,4 +13,4 @@ expression: "render_to_string(&app, 80, 12)"
 UEUE              DURATION   ATTEMPTS TYPE
 efault                  3s          1 generate_annual_report_email
 illing               2m30s          3 charge_subscription
- n/p Tabs  ←↑→↓ Scroll  q Quit
+ Tab Change Tab  q Quit

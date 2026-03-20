@@ -21,4 +21,4 @@ expression: "render_to_string(&app, 80, 20)"
                      Display is currently capped at 10 jobs.
                    Upgrade to a pro license to see everything.
 
- n/p Tabs  ←↑→↓ Scroll  q Quit
+ Tab Change Tab  q Quit

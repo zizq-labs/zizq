@@ -272,10 +272,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let key_style = Style::default();
     let label_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(" n/p ", key_style),
-        Span::styled("Tabs", label_style),
-        Span::styled("  \u{2190}\u{2191}\u{2192}\u{2193} ", key_style),
-        Span::styled("Scroll", label_style),
+        Span::styled(" Tab ", key_style),
+        Span::styled("Change Tab", label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
     ]));

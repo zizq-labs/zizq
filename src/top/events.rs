@@ -88,10 +88,10 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                             let _ = tx.blocking_send(Event::Quit);
                             break;
                         }
-                        KeyCode::Char('n') => {
+                        KeyCode::Tab => {
                             let _ = tx.blocking_send(Event::NextTab);
                         }
-                        KeyCode::Char('p') => {
+                        KeyCode::BackTab => {
                             let _ = tx.blocking_send(Event::PrevTab);
                         }
                         KeyCode::Right => {

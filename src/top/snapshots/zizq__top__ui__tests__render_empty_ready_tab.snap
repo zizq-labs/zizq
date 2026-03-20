@@ -9,4 +9,4 @@ expression: "render_to_string(&app, 120, 8)"
 
   Depth[                                                                                                       0 jobs]
    In-Flight   Ready   Scheduled
- n/p Tabs  ←↑→↓ Scroll  q Quit
+ Tab Change Tab  q Quit
