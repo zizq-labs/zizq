@@ -21,7 +21,8 @@
 
 use clap::{Parser, Subcommand};
 
-use zizq::{license::License, serve, tls_cmd, top};
+use zizq::commands::{serve, tls, top};
+use zizq::license::License;
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
@@ -64,7 +65,7 @@ enum Command {
     Top(top::Args),
 
     /// Generate TLS certificates for use with `zizq serve'.
-    Tls(tls_cmd::Args),
+    Tls(tls::Args),
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
@@ -102,7 +103,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(Command::Top(args)) => top::run(args).await,
         Some(Command::Serve(args)) => serve::run(args, &cli.root_dir, license).await,
-        Some(Command::Tls(args)) => tls_cmd::run(args, &cli.root_dir).await,
+        Some(Command::Tls(args)) => tls::run(args, &cli.root_dir).await,
         None => {
             serve::run(
                 serve::Args::parse_from(std::env::args()),

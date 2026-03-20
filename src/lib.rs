@@ -7,15 +7,13 @@
 //! integration tests without duplicating the module tree.
 
 pub mod admin;
+pub mod commands;
 pub mod http;
 pub mod license;
 pub mod logging;
 pub mod reaper;
 pub mod scheduler;
-pub mod serve;
 pub mod state;
 pub mod store;
 pub mod time;
 pub mod tls;
-pub mod tls_cmd;
-pub mod top;

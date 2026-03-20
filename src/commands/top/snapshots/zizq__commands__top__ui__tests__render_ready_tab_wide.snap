@@ -1,5 +1,5 @@
 ---
-source: src/top/ui.rs
+source: src/commands/top/ui.rs
 expression: "render_to_string(&app, 160, 12)"
 ---
   Zizq 0.1.0

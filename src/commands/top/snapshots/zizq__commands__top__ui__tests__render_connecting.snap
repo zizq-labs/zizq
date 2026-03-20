@@ -1,9 +1,9 @@
 ---
-source: src/top/ui.rs
+source: src/commands/top/ui.rs
 expression: "render_to_string(&app, 60, 10)"
 ---
   Zizq 0.1.0
-● Disconnected 127.0.0.1:8901
+● Connecting... 127.0.0.1:8901
 
 
 
