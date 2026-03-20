@@ -13,6 +13,7 @@
 //!   top      Launch the interactive terminal UI
 //!
 //! Options:
+//!      --root-dir <PATH>
 //!  -k, --license-key <KEY>
 //!  -h, --help
 //!  -V, --version
@@ -20,12 +21,22 @@
 
 use clap::{Parser, Subcommand};
 
-use zizq::{license::License, serve, top};
+use zizq::{license::License, serve, tls_cmd, top};
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
 #[command(name = "zizq", version, about = "A self-contained job queue server")]
 struct Cli {
+    /// Root directory for all server data and configuration.
+    #[arg(
+        long,
+        default_value = "./zizq-root",
+        value_name = "PATH",
+        env = "ZIZQ_ROOT_DIR",
+        global = true
+    )]
+    root_dir: String,
+
     /// License key string or filename for access to paid features.
     /// The format is an Ed25519 signed JWT.
     /// Prefixing with @ reads from a file (e.g. @/etc/zizq/license.jwt).
@@ -51,6 +62,9 @@ enum Command {
 
     /// Launch the interactive terminal UI.
     Top(top::Args),
+
+    /// Generate TLS certificates for use with `zizq serve'.
+    Tls(tls_cmd::Args),
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
@@ -65,7 +79,14 @@ fn resolve_license_key(value: &str) -> Result<String, Box<dyn std::error::Error>
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Load the software license if present so it can be provided to each
@@ -80,7 +101,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Command::Top(args)) => top::run(args).await,
-        Some(Command::Serve(args)) => serve::run(args, license).await,
-        None => serve::run(serve::Args::parse_from(std::env::args()), license).await,
+        Some(Command::Serve(args)) => serve::run(args, &cli.root_dir, license).await,
+        Some(Command::Tls(args)) => tls_cmd::run(args, &cli.root_dir).await,
+        None => {
+            serve::run(
+                serve::Args::parse_from(std::env::args()),
+                &cli.root_dir,
+                license,
+            )
+            .await
+        }
     }
 }

@@ -16,4 +16,5 @@ pub mod serve;
 pub mod store;
 pub mod time;
 pub mod tls;
+pub mod tls_cmd;
 pub mod top;

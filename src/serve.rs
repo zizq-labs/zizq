@@ -103,15 +103,6 @@ pub struct Args {
     )]
     log_max_files: usize,
 
-    /// Root directory for all server data and configuration.
-    #[arg(
-        long,
-        default_value = "./zizq-root",
-        value_name = "PATH",
-        env = "ZIZQ_ROOT_DIR"
-    )]
-    root_dir: String,
-
     /// Address to bind the HTTP server to.
     #[arg(long, default_value = "127.0.0.1", env = "ZIZQ_HOST")]
     host: String,
@@ -212,7 +203,11 @@ pub struct Args {
 }
 
 /// Initializes the database and starts the HTTP server.
-pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    args: Args,
+    root_dir: &str,
+    license: License,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Log the application name to stderr so it's obviously something is running.
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     if is_tty {
@@ -220,7 +215,7 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
     }
 
     // Make sure the root dir exists.
-    let root = std::path::Path::new(&args.root_dir);
+    let root = std::path::Path::new(root_dir);
     std::fs::create_dir_all(root)?;
 
     // Resolve the effective log directory.
