@@ -17,9 +17,6 @@ use crate::store::Store;
 /// Default number of expired jobs to fetch per iteration.
 pub const DEFAULT_BATCH_SIZE: usize = 1_000;
 
-/// Default interval between reaper scans (milliseconds).
-pub const DEFAULT_CHECK_INTERVAL_MS: u64 = 30_000;
-
 /// Run the reaper loop until the shutdown signal is received.
 ///
 /// Each iteration fetches a batch of expired jobs and purges them one at a

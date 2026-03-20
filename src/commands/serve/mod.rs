@@ -17,12 +17,15 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::http;
+mod http;
+mod reaper;
+mod scheduler;
+mod tls;
+
 use crate::license::{Feature, License};
 use crate::logging;
 use crate::state::{AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT};
 use crate::store::{self, Store};
-use crate::tls;
 
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";
@@ -328,8 +331,8 @@ pub async fn run(
     let scheduler_batch_size = std::env::var("ZIZQ_SCHEDULER_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(crate::scheduler::DEFAULT_BATCH_SIZE);
-    tokio::spawn(crate::scheduler::run(
+        .unwrap_or(scheduler::DEFAULT_BATCH_SIZE);
+    tokio::spawn(scheduler::run(
         state.store.clone(),
         crate::time::now_millis,
         scheduler_batch_size,
@@ -338,10 +341,10 @@ pub async fn run(
 
     // Start the background reaper that purges expired completed/dead jobs.
     let reaper_shutdown = state.shutdown.clone();
-    tokio::spawn(crate::reaper::run(
+    tokio::spawn(reaper::run(
         state.store.clone(),
         crate::time::now_millis,
-        crate::reaper::DEFAULT_BATCH_SIZE,
+        reaper::DEFAULT_BATCH_SIZE,
         Duration::from_millis(args.reaper_check_interval_ms),
         reaper_shutdown,
     ));
