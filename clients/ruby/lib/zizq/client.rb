@@ -183,6 +183,17 @@ module Zizq
       Resources::JobPage.new(self, data)
     end
 
+    # Get a single error record by job ID and attempt number.
+    #
+    # @rbs id: String
+    # @rbs attempt: Integer
+    # @rbs return: Resources::ErrorRecord
+    def get_error(id, attempt:)
+      response = get("/jobs/#{id}/errors/#{attempt}")
+      data = handle_response!(response, expected: 200)
+      Resources::ErrorRecord.new(self, data)
+    end
+
     # List error records for a job.
     #
     # @rbs id: String

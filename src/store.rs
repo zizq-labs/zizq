@@ -3329,6 +3329,32 @@ impl Store {
         .unwrap_or_default()
     }
 
+    /// Get a single error record by job ID and attempt number.
+    ///
+    /// Returns `None` if the job or attempt doesn't exist.
+    pub async fn get_error(
+        &self,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<Option<ErrorRecord>, StoreError> {
+        let ks = self.ks.clone();
+        let job_id = job_id.to_string();
+
+        task::spawn_blocking(move || {
+            let key = make_error_key(&job_id, attempt);
+            match ks.data.get(&key)? {
+                Some(bytes) => {
+                    let mut record: ErrorRecord = rmp_serde::from_slice(&bytes)?;
+                    record.attempt = attempt;
+                    Ok(Some(record))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .unwrap()
+    }
+
     /// List error records for a job with cursor-based pagination.
     ///
     /// Returns a page of `ErrorRecord`s plus `next` / `prev` cursors for

@@ -234,6 +234,24 @@ class TestClient < Minitest::Test
     assert_equal 1, result.jobs.size
   end
 
+  # --- get_error ---
+
+  def test_get_error
+    response = { "attempt" => 2, "message" => "timeout",
+                 "error_type" => "Timeout::Error", "backtrace" => nil,
+                 "dequeued_at" => 1000, "failed_at" => 2000 }
+
+    stub_request(:get, "#{URL}/jobs/j1/errors/2")
+      .to_return(status: 200, body: JSON.generate(response),
+                 headers: { "Content-Type" => "application/json" })
+
+    result = @json_client.get_error("j1", attempt: 2)
+    assert_instance_of Zizq::Resources::ErrorRecord, result
+    assert_equal 2, result.attempt
+    assert_equal "timeout", result.message
+    assert_equal "Timeout::Error", result.error_type
+  end
+
   # --- list_errors ---
 
   def test_list_errors

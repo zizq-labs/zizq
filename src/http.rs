@@ -999,6 +999,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/success", post(mark_completed))
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
+        .route("/jobs/{id}/errors/{attempt}", get(get_error))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
@@ -1667,6 +1668,59 @@ async fn list_errors(
         }
         Err(e) => {
             tracing::error!(%e, "list_errors failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `GET /jobs/{id}/errors/{attempt}` — get a single error record.
+async fn get_error(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((id, attempt)): Path<(String, u32)>,
+) -> Response {
+    // Verify the job exists.
+    let now = (state.clock)();
+    match state.store.get_job(now, &id).await {
+        Ok(None) => {
+            return respond(
+                fmt,
+                StatusCode::NOT_FOUND,
+                &ErrorResponse {
+                    error: "job not found".into(),
+                },
+            );
+        }
+        Err(e) => {
+            tracing::error!(%e, "get_error: get_job failed");
+            return respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            );
+        }
+        Ok(Some(_)) => {}
+    }
+
+    match state.store.get_error(&id, attempt).await {
+        Ok(Some(record)) => respond(fmt, StatusCode::OK, &ErrorRecord::from(record)),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: "error record not found".into(),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "get_error failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4987,6 +5041,85 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["error"], "job not found");
+    }
+
+    // --- get_error tests ---
+
+    #[tokio::test]
+    async fn get_error_returns_single_error_record() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+
+        let job = state
+            .store
+            .enqueue(
+                now,
+                store::EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+        state
+            .store
+            .record_failure(
+                now,
+                &job.id,
+                store::FailureOptions {
+                    message: "boom".into(),
+                    error_type: Some("RuntimeError".into()),
+                    backtrace: None,
+                    retry_at: None,
+                    kill: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{}/errors/1", job.id));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["attempt"], 1);
+        assert_eq!(body["message"], "boom");
+        assert_eq!(body["error_type"], "RuntimeError");
+    }
+
+    #[tokio::test]
+    async fn get_error_returns_404_for_unknown_job() {
+        let app = test_app();
+        let req = empty_request("GET", "/jobs/nonexistent/errors/1");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["error"], "job not found");
+    }
+
+    #[tokio::test]
+    async fn get_error_returns_404_for_missing_attempt() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+
+        let job = state
+            .store
+            .enqueue(
+                now,
+                store::EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", &format!("/jobs/{}/errors/1", job.id));
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["error"], "error record not found");
     }
 
     // --- Bulk enqueue tests ---

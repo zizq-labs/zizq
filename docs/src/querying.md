@@ -208,7 +208,7 @@ Retrieve a paginated list of errors for a known job in order of attempt.
 > Zizq uses cursor-based pagination. Pages are enumerated by following the
 > links in the response data
 
-### Parameters { #get-jobs-list-parameters }
+### Parameters { #get-job-errors-list-parameters }
 
 <table>
     <thead>
@@ -229,6 +229,8 @@ Retrieve a paginated list of errors for a known job in order of attempt.
         </tr>
     </tbody>
 </table>
+
+### Responses { #get-jobs-errors-list-response }
 
 #### `200` OK
 
@@ -357,5 +359,123 @@ When given invalid input parameters.
 #### `404` Not Found
 
 When the specified job does not exist.
+
+{{#include ./error-response.md}}
+
+## `GET /jobs/{id}/errors/{attempt}` { #get-job-error }
+
+Retrieve a specific error for a known job and attempt.
+
+### Parameters { #get-job-error-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job for which to retrieve errors.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>attempt</code> <em>path</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The attempt number of the job that failed.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #get-job-error-response }
+
+#### `200` OK
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>attempt</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The attempt number of the job that failed.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>message</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The error message sent by the client when the job failed.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>error_type</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The error type sent by the client when the job failed.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>backtrace</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The backtrace associated with the error, if specified by the
+                client.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>dequeued_at</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The timestamp at which the failing job was dequeued by the
+                worker.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>failed_at</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The timestamp at which the job failed.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `400` Bad Request
+
+When given invalid input parameters.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+When the specified job or error does not exist.
 
 {{#include ./error-response.md}}
