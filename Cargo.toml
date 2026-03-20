@@ -33,6 +33,9 @@ reqwest-websocket = "0.4"
 rolling-file = "0.2"
 bytesize = "2"
 tracing-appender = "0.2"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
@@ -46,6 +49,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
 rand = "0.8"
 insta = "1"
+rcgen = "0.14.7"
 
 [[bench]]
 name = "throughput"

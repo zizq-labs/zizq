@@ -18,9 +18,10 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::http::{self, AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT};
-use crate::license::License;
+use crate::license::{Feature, License};
 use crate::logging;
 use crate::store::{self, Store};
+use crate::tls;
 
 /// Location of the internal database within the root directory.
 const DATABASE_DIR: &str = "data";
@@ -193,6 +194,21 @@ pub struct Args {
     /// Disable the admin API listener.
     #[arg(long, default_value_t = false, env = "ZIZQ_NO_ADMIN")]
     no_admin: bool,
+
+    /// Path to a PEM-encoded TLS certificate chain for the primary API.
+    /// Must be used together with --tls-key.
+    #[arg(long, value_name = "PATH", env = "ZIZQ_TLS_CERT")]
+    tls_cert: Option<String>,
+
+    /// Path to a PEM-encoded TLS private key for the primary API.
+    /// Must be used together with --tls-cert.
+    #[arg(long, value_name = "PATH", env = "ZIZQ_TLS_KEY")]
+    tls_key: Option<String>,
+
+    /// Path to PEM-encoded CA certificate(s) for mTLS client verification.
+    /// Requires --tls-cert and --tls-key. Requires a Pro license.
+    #[arg(long, value_name = "PATH", env = "ZIZQ_TLS_CLIENT_CA")]
+    tls_client_ca: Option<String>,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -229,6 +245,23 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
         max_files: args.log_max_files,
     });
     log_license(&license);
+
+    // Validate TLS argument combinations.
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--tls-cert and --tls-key must be provided together".into());
+        }
+        _ => {}
+    }
+    if args.tls_client_ca.is_some() && args.tls_cert.is_none() {
+        return Err("--tls-client-ca requires --tls-cert and --tls-key".into());
+    }
+    if args.tls_client_ca.is_some() {
+        let now_ms = (crate::time::now_millis)();
+        license
+            .require(now_ms, Feature::MutualTls)
+            .map_err(|e| format!("cannot enable mTLS: {e}"))?;
+    }
 
     // Init/open the store (within the root dir).
     let mut storage_config = crate::store::StorageConfig::from_env()?;
@@ -362,22 +395,43 @@ pub async fn run(args: Args, license: License) -> Result<(), Box<dyn std::error:
 
     // Set up the TCP socket for incoming connections.
     let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "primary API listening");
+    let tcp_listener = TcpListener::bind(addr).await?;
+
+    let scheme = if args.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    tracing::info!(%addr, %scheme, "primary API listening");
 
     if is_tty {
-        eprintln!("Listening on {addr} (primary)");
+        eprintln!("Listening on {scheme}://{addr} (primary)");
     }
 
     // Start the server with graceful shutdown. Signal the watch channel
     // first so spawned take tasks break out of their loops, allowing
     // their connections to close.
-    axum::serve(listener, http::app(state))
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = shutdown_tx.send(());
-        })
-        .await?;
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        let config = tls::build_server_config(
+            cert.as_ref(),
+            key.as_ref(),
+            args.tls_client_ca.as_deref().map(std::path::Path::new),
+        )?;
+        let listener = tls::TlsListener::new(tcp_listener, config);
+        axum::serve(listener, http::app(state))
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                let _ = shutdown_tx.send(());
+            })
+            .await?;
+    } else {
+        axum::serve(tcp_listener, http::app(state))
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                let _ = shutdown_tx.send(());
+            })
+            .await?;
+    }
 
     eprintln!("Server stopped.");
     Ok(())

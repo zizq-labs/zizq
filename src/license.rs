@@ -62,6 +62,8 @@ pub enum Feature {
     ProExample,
     /// Example Enterprise feature for testing the gating machinery.
     EnterpriseExample,
+    /// Mutual TLS (mTLS) client certificate verification.
+    MutualTls,
 }
 
 impl Feature {
@@ -71,6 +73,7 @@ impl Feature {
             Feature::TopLiveQueue => Tier::Pro,
             Feature::ProExample => Tier::Pro,
             Feature::EnterpriseExample => Tier::Enterprise,
+            Feature::MutualTls => Tier::Pro,
         }
     }
 }
@@ -81,6 +84,7 @@ impl std::fmt::Display for Feature {
             Feature::TopLiveQueue => write!(f, "live queue detail"),
             Feature::ProExample => write!(f, "pro example"),
             Feature::EnterpriseExample => write!(f, "enterprise example"),
+            Feature::MutualTls => write!(f, "mutual TLS"),
         }
     }
 }
@@ -508,5 +512,25 @@ mod tests {
             err.contains("expired"),
             "expected expired in error, got: {err}"
         );
+    }
+
+    #[test]
+    fn require_free_rejects_mutual_tls() {
+        let err = License::Free.require(0, Feature::MutualTls).unwrap_err();
+        assert!(err.contains("pro"), "expected pro in error, got: {err}");
+    }
+
+    #[test]
+    fn require_pro_allows_mutual_tls() {
+        let lic = licensed(Tier::Pro, 2_000_000);
+        lic.require(secs_to_ms(1_000_000), Feature::MutualTls)
+            .expect("pro license should allow mutual TLS");
+    }
+
+    #[test]
+    fn require_enterprise_allows_mutual_tls() {
+        let lic = licensed(Tier::Enterprise, 2_000_000);
+        lic.require(secs_to_ms(1_000_000), Feature::MutualTls)
+            .expect("enterprise license should allow mutual TLS");
     }
 }
