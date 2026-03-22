@@ -305,12 +305,44 @@ pub struct Job {
     /// When the job was completed (milliseconds since Unix epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
+
+    /// Unique key for deduplication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_key: Option<String>,
+
+    /// Uniqueness scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_while: Option<String>,
+
+    /// Whether this job was returned as a duplicate of an existing job.
+    /// Only present on enqueue responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
 }
 
 impl TryFrom<store::Job> for Job {
     type Error = store::StoreError;
 
     fn try_from(job: store::Job) -> Result<Self, Self::Error> {
+        Self::from_store_job(job, None)
+    }
+}
+
+impl Job {
+    fn try_from_result(result: store::EnqueueResult) -> Result<Self, store::StoreError> {
+        let is_duplicate = result.is_duplicate();
+        let job = result.into_job();
+        Self::from_store_job(job, Some(is_duplicate))
+    }
+
+    fn from_store_job(job: store::Job, duplicate: Option<bool>) -> Result<Self, store::StoreError> {
+        let unique_while = job.unique.as_ref().map(|uc| match uc.scope {
+            0 => "queued".to_string(),
+            1 => "active".to_string(),
+            2 => "exists".to_string(),
+            _ => "queued".to_string(),
+        });
+
         let status = store::JobStatus::try_from(job.status).map_err(|v| {
             store::StoreError::Corruption(format!(
                 "job {} has unrecognized status byte: {v}",
@@ -334,6 +366,9 @@ impl TryFrom<store::Job> for Job {
             retention: job.retention.map(Into::into),
             purge_at: job.purge_at,
             completed_at: job.completed_at,
+            unique_key: job.unique.map(|uc| uc.key),
+            unique_while,
+            duplicate,
         })
     }
 }
@@ -406,6 +441,14 @@ struct EnqueueRequest {
     /// Per-job retention configuration override. When omitted, the server
     /// default applies.
     retention: Option<RetentionConfig>,
+
+    /// Unique key for deduplication. When present, the store checks for an
+    /// existing job with the same key before inserting.
+    unique_key: Option<String>,
+
+    /// Uniqueness scope: "queued" (default), "active", or "exists".
+    /// Only valid when `unique_key` is present.
+    unique_while: Option<String>,
 }
 
 /// Request shape for bulk job enqueue.
@@ -418,6 +461,18 @@ struct BulkEnqueueRequest {
 #[derive(Serialize)]
 struct BulkEnqueueResponse {
     jobs: Vec<Job>,
+}
+
+/// Parse a unique_while string into the store enum.
+fn parse_unique_while(s: &str) -> Result<store::UniqueWhile, String> {
+    match s {
+        "queued" => Ok(store::UniqueWhile::Queued),
+        "active" => Ok(store::UniqueWhile::Active),
+        "exists" => Ok(store::UniqueWhile::Exists),
+        other => Err(format!(
+            "invalid unique_while: {other:?} (expected \"queued\", \"active\", or \"exists\")"
+        )),
+    }
 }
 
 /// Request shape for bulk job success.
@@ -1050,6 +1105,28 @@ async fn enqueue(
         return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
     }
 
+    // Validate uniqueness fields.
+    if enqueue_req.unique_while.is_some() && enqueue_req.unique_key.is_none() {
+        return respond(
+            fmt,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: "unique_while requires unique_key".into(),
+            },
+        );
+    }
+
+    // License check for unique jobs.
+    if enqueue_req.unique_key.is_some() {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .require(now_ms, crate::license::Feature::UniqueJobs)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
     let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
 
     let mut opts =
@@ -1068,10 +1145,31 @@ async fn enqueue(
     if let Some(retention) = enqueue_req.retention {
         opts = opts.retention(retention.into());
     }
+    if let Some(unique_key) = enqueue_req.unique_key {
+        opts = opts.unique_key(unique_key);
+    }
+    if let Some(ref unique_while) = enqueue_req.unique_while {
+        match parse_unique_while(unique_while) {
+            Ok(scope) => opts = opts.unique_while(scope),
+            Err(msg) => {
+                return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
+            }
+        }
+    }
 
     let now = (state.clock)();
-    match state.store.enqueue(now, opts).await.and_then(Job::try_from) {
+    match state
+        .store
+        .enqueue(now, opts)
+        .await
+        .and_then(Job::try_from_result)
+    {
         Ok(mut job) => {
+            let status_code = if job.duplicate == Some(true) {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
             tracing::debug!(
                 job_id = %job.id,
                 job_type = %job.job_type,
@@ -1079,12 +1177,13 @@ async fn enqueue(
                 priority = job.priority,
                 status = %job.status,
                 ready_at = job.ready_at,
+                duplicate = job.duplicate.unwrap_or(false),
                 "job enqueued"
             );
             // Drop the payload from the response — the enqueue confirmation
             // returns metadata only.
             job.payload = None;
-            respond(fmt, StatusCode::CREATED, &job)
+            respond(fmt, status_code, &job)
         }
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
@@ -1106,6 +1205,7 @@ async fn bulk_enqueue(
     NegotiatedBody(req): NegotiatedBody<BulkEnqueueRequest>,
 ) -> Response {
     // Validate all jobs up front.
+    let mut has_unique = false;
     for (i, job) in req.jobs.iter().enumerate() {
         if let Err(msg) = validate_name("type", &job.job_type) {
             return respond(
@@ -1124,6 +1224,40 @@ async fn bulk_enqueue(
                     error: format!("jobs[{i}]: {msg}"),
                 },
             );
+        }
+        if job.unique_while.is_some() && job.unique_key.is_none() {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("jobs[{i}]: unique_while requires unique_key"),
+                },
+            );
+        }
+        if let Some(ref uw) = job.unique_while {
+            if let Err(msg) = parse_unique_while(uw) {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("jobs[{i}]: {msg}"),
+                    },
+                );
+            }
+        }
+        if job.unique_key.is_some() {
+            has_unique = true;
+        }
+    }
+
+    // License check for unique jobs (once for the whole batch).
+    if has_unique {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .require(now_ms, crate::license::Feature::UniqueJobs)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
         }
     }
 
@@ -1152,25 +1286,39 @@ async fn bulk_enqueue(
             if let Some(retention) = enqueue_req.retention {
                 opts = opts.retention(retention.into());
             }
+            if let Some(unique_key) = enqueue_req.unique_key {
+                opts = opts.unique_key(unique_key);
+            }
+            if let Some(unique_while) = enqueue_req.unique_while {
+                // Already validated above.
+                opts = opts.unique_while(parse_unique_while(&unique_while).unwrap());
+            }
             opts
         })
         .collect();
 
     let now = (state.clock)();
     match state.store.enqueue_bulk(now, opts).await {
-        Ok(store_jobs) => {
-            let jobs: Result<Vec<Job>, store::StoreError> = store_jobs
+        Ok(store_results) => {
+            let all_duplicates =
+                !store_results.is_empty() && store_results.iter().all(|r| r.is_duplicate());
+            let jobs: Result<Vec<Job>, store::StoreError> = store_results
                 .into_iter()
-                .map(|sj| {
-                    let mut job = Job::try_from(sj)?;
+                .map(|r| {
+                    let mut job = Job::try_from_result(r)?;
                     job.payload = None;
                     Ok(job)
                 })
                 .collect();
             match jobs {
                 Ok(jobs) => {
+                    let status_code = if all_duplicates {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::CREATED
+                    };
                     tracing::debug!(count = jobs.len(), "bulk enqueue succeeded");
-                    respond(fmt, StatusCode::CREATED, &BulkEnqueueResponse { jobs })
+                    respond(fmt, status_code, &BulkEnqueueResponse { jobs })
                 }
                 Err(e) => {
                     tracing::error!(%e, "bulk enqueue job conversion failed");
@@ -3047,7 +3195,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         state
             .store
             .enqueue(
@@ -3902,7 +4051,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("delayed")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let bytes = next_body_bytes(&mut body).await;
         let line = std::str::from_utf8(&bytes).unwrap().trim();
@@ -4029,7 +4179,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("requeue-me")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Use prefetch=2 so the task attempts to reserve a second slot
         // after sending the first job. When the body is dropped, the
@@ -4077,7 +4228,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("acked")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let job_b = state
             .store
             .enqueue(
@@ -4085,7 +4237,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("unacked")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let req = empty_request("GET", "/jobs/take?prefetch=2");
         let res = app.oneshot(req).await.unwrap();
@@ -4868,7 +5021,8 @@ mod tests {
                 store::EnqueueOptions::new("test", "q", serde_json::json!("x")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let req = empty_request("GET", &format!("/jobs/{}/errors", job.id));
         let res = app.oneshot(req).await.unwrap();
@@ -5024,7 +5178,8 @@ mod tests {
                 store::EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         state
             .store
             .take_next_job(now, &HashSet::new())
@@ -5079,7 +5234,8 @@ mod tests {
                 store::EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let req = empty_request("GET", &format!("/jobs/{}/errors/1", job.id));
         let res = app.oneshot(req).await.unwrap();
@@ -5534,5 +5690,164 @@ mod tests {
         );
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    // --- Unique jobs ---
+
+    fn pro_app() -> Router {
+        let (_, mut state) = test_app_state();
+        state.license = License::Licensed {
+            licensee_id: "test".into(),
+            licensee_name: "Test".into(),
+            tier: crate::license::Tier::Pro,
+            expires_at: u64::MAX,
+        };
+        app(Arc::new(state))
+    }
+
+    #[tokio::test]
+    async fn unique_enqueue_returns_201_for_new_job() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "task", "queue": "q", "payload": {},
+                "unique_key": "k1"
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["duplicate"], false);
+        assert_eq!(body["unique_key"], "k1");
+        assert_eq!(body["unique_while"], "queued");
+    }
+
+    #[tokio::test]
+    async fn unique_enqueue_returns_200_for_duplicate() {
+        let app = pro_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "task", "queue": "q", "payload": {},
+                "unique_key": "k1"
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let first: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "task", "queue": "q", "payload": {},
+                "unique_key": "k1"
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["duplicate"], true);
+        assert_eq!(body["id"], first["id"]);
+    }
+
+    #[tokio::test]
+    async fn unique_enqueue_returns_403_on_free_tier() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "task", "queue": "q", "payload": {},
+                "unique_key": "k1"
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("pro license"),
+            "error should mention pro license, got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_while_without_key_returns_400() {
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "task", "queue": "q", "payload": {},
+                "unique_while": "active"
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unique_bulk_returns_200_when_all_duplicates() {
+        let app = pro_app();
+
+        // First: create a job.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({
+                "type": "task", "queue": "q", "payload": {},
+                "unique_key": "k1"
+            }),
+        );
+        app.clone().oneshot(req).await.unwrap();
+
+        // Bulk: all duplicates of the same key.
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "task", "queue": "q", "payload": {}, "unique_key": "k1"},
+                    {"type": "task", "queue": "q", "payload": {}, "unique_key": "k1"},
+                ]
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert!(jobs[0]["duplicate"].as_bool().unwrap());
+        assert!(jobs[1]["duplicate"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unique_bulk_returns_201_when_mixed() {
+        let app = pro_app();
+
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    {"type": "task", "queue": "q", "payload": {}, "unique_key": "k1"},
+                    {"type": "task", "queue": "q", "payload": {}, "unique_key": "k1"},
+                    {"type": "task", "queue": "q", "payload": {}, "unique_key": "k2"},
+                ]
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert!(!jobs[0]["duplicate"].as_bool().unwrap());
+        assert!(jobs[1]["duplicate"].as_bool().unwrap());
+        assert!(!jobs[2]["duplicate"].as_bool().unwrap());
     }
 }

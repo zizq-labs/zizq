@@ -64,6 +64,8 @@ pub enum Feature {
     EnterpriseExample,
     /// Mutual TLS (mTLS) client certificate verification.
     MutualTls,
+    /// Unique job deduplication at enqueue time.
+    UniqueJobs,
 }
 
 impl Feature {
@@ -74,6 +76,7 @@ impl Feature {
             Feature::ProExample => Tier::Pro,
             Feature::EnterpriseExample => Tier::Enterprise,
             Feature::MutualTls => Tier::Pro,
+            Feature::UniqueJobs => Tier::Pro,
         }
     }
 }
@@ -85,6 +88,7 @@ impl std::fmt::Display for Feature {
             Feature::ProExample => write!(f, "pro example"),
             Feature::EnterpriseExample => write!(f, "enterprise example"),
             Feature::MutualTls => write!(f, "mutual TLS"),
+            Feature::UniqueJobs => write!(f, "unique jobs"),
         }
     }
 }

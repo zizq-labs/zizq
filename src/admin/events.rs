@@ -964,7 +964,8 @@ mod tests {
                 EnqueueOptions::new("task", "q", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let (_addr, mut rx) = connect(state.clone()).await;
 
@@ -1006,7 +1007,8 @@ mod tests {
                 EnqueueOptions::new("task", "q", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         state
             .store
             .take_next_job(now, &HashSet::new())
@@ -1127,7 +1129,8 @@ mod tests {
                 EnqueueOptions::new("task", "q", serde_json::json!(null)).ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let (_addr, mut rx) = connect(state.clone()).await;
 

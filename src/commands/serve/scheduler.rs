@@ -205,7 +205,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 1_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Advance the clock past the job's ready_at and let the scheduler
         // timer fire.
@@ -240,7 +241,8 @@ mod tests {
                     EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
             ids.push(job.id);
         }
 
@@ -274,7 +276,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(t + 10_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Advance partway — not past the job's ready_at.
         clock.store(t + 5_000, Ordering::Relaxed);
@@ -306,7 +309,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("late")).ready_at(t + 10_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Now enqueue a job due in 2s — should reset the timer.
         let early = store
@@ -315,7 +319,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("early")).ready_at(t + 2_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Advance past the early job's ready_at but not the late one.
         clock.store(t + 2_001, Ordering::Relaxed);
@@ -356,7 +361,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("early")).ready_at(t + 2_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Enqueue a job due in 10s — must NOT push the timer forward.
         let late = store
@@ -365,7 +371,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("late")).ready_at(t + 10_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Advance past the early job only.
         clock.store(t + 2_001, Ordering::Relaxed);
@@ -404,7 +411,8 @@ mod tests {
                     EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(t + 1_000),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
             ids.push(job.id);
         }
 

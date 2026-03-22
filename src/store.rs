@@ -137,6 +137,59 @@ impl TryFrom<u8> for JobStatus {
     }
 }
 
+/// Uniqueness scope — which job statuses constitute a conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UniqueWhile {
+    Queued = 0,
+    Active = 1,
+    Exists = 2,
+}
+
+impl TryFrom<u8> for UniqueWhile {
+    type Error = u8;
+    fn try_from(value: u8) -> Result<Self, u8> {
+        match value {
+            0 => Ok(UniqueWhile::Queued),
+            1 => Ok(UniqueWhile::Active),
+            2 => Ok(UniqueWhile::Exists),
+            other => Err(other),
+        }
+    }
+}
+
+impl UniqueWhile {
+    fn conflicts_with(self, status: JobStatus) -> bool {
+        match self {
+            UniqueWhile::Queued => matches!(status, JobStatus::Scheduled | JobStatus::Ready),
+            UniqueWhile::Active => matches!(
+                status,
+                JobStatus::Scheduled | JobStatus::Ready | JobStatus::InFlight
+            ),
+            UniqueWhile::Exists => true,
+        }
+    }
+}
+
+/// A uniqueness constraint on a job, stored as a nested object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniqueConstraint {
+    /// The unique key string.
+    #[serde(rename = "k")]
+    pub key: String,
+
+    /// The scope as a u8 (converts to `UniqueWhile`).
+    #[serde(rename = "w")]
+    pub scope: u8,
+}
+
+impl UniqueConstraint {
+    /// The parsed uniqueness scope.
+    pub fn unique_while(&self) -> UniqueWhile {
+        UniqueWhile::try_from(self.scope).unwrap_or(UniqueWhile::Queued)
+    }
+}
+
 /// A job stored in the queue keyspace.
 ///
 /// Jobs are identified using scru128 because it is time-sequenced and high
@@ -237,6 +290,14 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
+
+    /// Uniqueness constraint for deduplication. When set, new jobs cannot be
+    /// enqueued with this key while the job is in any of the conflicting
+    /// statuses.
+    #[serde(rename = "u")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique: Option<UniqueConstraint>,
 }
 
 /// Retention configuration for completed and dead jobs.
@@ -507,6 +568,35 @@ pub struct ListErrorsPage {
     pub prev: Option<ListErrorsOptions>,
 }
 
+/// Result of a single enqueue operation.
+pub enum EnqueueResult {
+    /// A new job was created.
+    Created(Job),
+    /// The job was a duplicate of an existing job in a conflicting state.
+    Duplicate(Job),
+}
+
+impl EnqueueResult {
+    /// Return a reference to the underlying job regardless of variant.
+    pub fn job(&self) -> &Job {
+        match self {
+            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
+        }
+    }
+
+    /// Return `true` if this result is a duplicate.
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, EnqueueResult::Duplicate(_))
+    }
+
+    /// Consume the result and return the underlying job.
+    pub fn into_job(self) -> Job {
+        match self {
+            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
+        }
+    }
+}
+
 /// Options for enqueuing a new job.
 pub struct EnqueueOptions {
     /// Job type, e.g. "send_email" or "generate_report".
@@ -536,6 +626,13 @@ pub struct EnqueueOptions {
     /// Per-job retention configuration override. When `None`, server
     /// defaults are used at completion/death time.
     pub retention: Option<RetentionConfig>,
+
+    /// Unique key for deduplication. When set, the store checks for an
+    /// existing job with the same key before inserting.
+    pub unique_key: Option<String>,
+
+    /// Uniqueness scope. Defaults to `Queued` when `unique_key` is set.
+    pub unique_while: Option<UniqueWhile>,
 }
 
 impl EnqueueOptions {
@@ -555,6 +652,8 @@ impl EnqueueOptions {
             retry_limit: None,
             backoff: None,
             retention: None,
+            unique_key: None,
+            unique_while: None,
         }
     }
 
@@ -585,6 +684,23 @@ impl EnqueueOptions {
     /// Set the retention configuration and return `self`.
     pub fn retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = Some(retention);
+        self
+    }
+
+    /// Set the unique key and return `self`.
+    ///
+    /// If `unique_while` is not yet set, defaults to `UniqueWhile::Queued`.
+    pub fn unique_key(mut self, key: impl Into<String>) -> Self {
+        self.unique_key = Some(key.into());
+        if self.unique_while.is_none() {
+            self.unique_while = Some(UniqueWhile::Queued);
+        }
+        self
+    }
+
+    /// Set the uniqueness scope and return `self`.
+    pub fn unique_while(mut self, scope: UniqueWhile) -> Self {
+        self.unique_while = Some(scope);
         self
     }
 }
@@ -1108,6 +1224,7 @@ enum IndexKind {
     Queue = b'Q',
     Status = b'S',
     Type = b'T',
+    Unique = b'U',
 }
 
 /// Groups the fjall database handle and all disk keyspaces into a single
@@ -1753,30 +1870,32 @@ impl Store {
     /// and into the priority indexes.
     ///
     /// Subscribers are notified when a job enters the ready state.
-    pub async fn enqueue(&self, now: u64, opts: EnqueueOptions) -> Result<Job, StoreError> {
+    pub async fn enqueue(
+        &self,
+        now: u64,
+        opts: EnqueueOptions,
+    ) -> Result<EnqueueResult, StoreError> {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            // ---- outside tx: prepare everything ----
+            let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
+                (Some(_), Some(scope)) => Some(scope),
+                (Some(_), None) => Some(UniqueWhile::Queued),
+                _ => None,
+            };
+
             let id = scru128::new_string();
-
-            // Read the `ready_at` timestamp, defaulting to now if not present.
             let ready_at = opts.ready_at.unwrap_or(now);
-
-            // We need to check this in a couple of spots: if the job is ready
-            // now, it goes into the Ready status, otherwise it goes into the
-            // Scheduled status.
             let scheduled = ready_at > now;
-
             let status = if scheduled {
                 JobStatus::Scheduled
             } else {
                 JobStatus::Ready
             };
 
-            // Serialize the payload separately — it goes into its own keyspace
-            // so that status-change operations never re-write it.
             let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
 
             let job = Job {
@@ -1795,9 +1914,12 @@ impl Store {
                 retention: opts.retention,
                 purge_at: None,
                 completed_at: None,
+                unique: opts.unique_key.map(|k| UniqueConstraint {
+                    key: k,
+                    scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
+                }),
             };
 
-            // Serialize metadata without the payload for the jobs keyspace.
             let mut meta = job.clone();
             meta.payload = None;
             let meta_bytes = rmp_serde::to_vec_named(&meta)?;
@@ -1807,55 +1929,89 @@ impl Store {
             let queue_key = make_queue_key(&job.queue, &id);
             let status_key = make_status_key(status, &id);
             let type_key = make_type_key(&job.job_type, &id);
+            let unique_idx_key = job.unique.as_ref().map(|uc| make_unique_key(&uc.key));
 
+            // ---- inside tx: unique check + raw inserts only ----
             let mut tx = ks.write_tx();
+
+            // Check for a unique conflict. If found, return the existing
+            // job as a duplicate without inserting the new one.
+            if let Some(ref uc) = job.unique {
+                let scope = uc.unique_while();
+                let idx_key = unique_idx_key.as_ref().unwrap();
+
+                if let Some(existing_id_bytes) = ks.index.get(idx_key)? {
+                    let existing_id = std::str::from_utf8(&existing_id_bytes).map_err(|e| {
+                        StoreError::Corruption(format!(
+                            "unique index value is not valid UTF-8: {e}"
+                        ))
+                    })?;
+                    let existing_job_key = make_job_key(existing_id);
+
+                    if let Some(existing_meta_bytes) = ks.data.get(&existing_job_key)? {
+                        let existing_meta: Job = rmp_serde::from_slice(&existing_meta_bytes)?;
+                        if let Ok(existing_status) = JobStatus::try_from(existing_meta.status) {
+                            if scope.conflicts_with(existing_status) {
+                                drop(tx);
+                                return Ok((EnqueueResult::Duplicate(existing_meta), None));
+                            }
+                        }
+                    }
+                }
+            }
+
             tx.insert(&ks.data, &job_key, &meta_bytes);
             tx.insert(&ks.data, &payload_key, &payload_bytes);
             tx.insert(&ks.index, &queue_key, b"");
             tx.insert(&ks.index, &status_key, b"");
             tx.insert(&ks.index, &type_key, b"");
 
+            if let Some(ref idx_key) = unique_idx_key {
+                tx.insert(&ks.index, idx_key, id.as_bytes());
+            }
+
             let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
 
-            // Insert into the in-memory indexes after commit succeeds.
-            // Ready jobs go into the ready index; scheduled jobs go into the
-            // scheduled index (promoted later by the scheduler).
+            // ---- outside tx: update in-memory indexes ----
             if scheduled {
                 scheduled_index.insert(ready_at, id.clone());
             } else {
                 ready_index.insert(&job.queue, job.priority, job.id.clone());
             }
 
-            Ok((job, Some(sync)))
+            Ok((EnqueueResult::Created(job), Some(sync)))
         })
         .await?;
 
-        let job = await_sync(result).await?;
+        let enqueue_result = await_sync(result).await?;
 
-        match JobStatus::try_from(job.status) {
-            Ok(JobStatus::Ready) => {
-                let _ = self.event_tx.send(StoreEvent::JobCreated {
-                    id: job.id.clone(),
-                    queue: job.queue.clone(),
-                    token: Arc::new(AtomicBool::new(false)),
-                });
-            }
-            Ok(JobStatus::Scheduled) => {
-                let _ = self.event_tx.send(StoreEvent::JobScheduled {
-                    id: job.id.clone(),
-                    ready_at: job.ready_at,
-                });
-            }
-            _ => {
-                tracing::warn!(
-                    job_id = %job.id,
-                    status = job.status,
-                    "enqueue produced unexpected status"
-                );
+        // Only broadcast events for Created results (not Duplicates).
+        if let EnqueueResult::Created(ref job) = enqueue_result {
+            match JobStatus::try_from(job.status) {
+                Ok(JobStatus::Ready) => {
+                    let _ = self.event_tx.send(StoreEvent::JobCreated {
+                        id: job.id.clone(),
+                        queue: job.queue.clone(),
+                        token: Arc::new(AtomicBool::new(false)),
+                    });
+                }
+                Ok(JobStatus::Scheduled) => {
+                    let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                        id: job.id.clone(),
+                        ready_at: job.ready_at,
+                    });
+                }
+                _ => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        status = job.status,
+                        "enqueue produced unexpected status"
+                    );
+                }
             }
         }
 
-        Ok(job)
+        Ok(enqueue_result)
     }
 
     /// Enqueue multiple jobs in a single transaction.
@@ -1867,7 +2023,7 @@ impl Store {
         &self,
         now: u64,
         batch: Vec<EnqueueOptions>,
-    ) -> Result<Vec<Job>, StoreError> {
+    ) -> Result<Vec<EnqueueResult>, StoreError> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
@@ -1877,7 +2033,9 @@ impl Store {
         let scheduled_index = self.scheduled_index.clone();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Pre-build all jobs and serialize before acquiring the write lock.
+            use std::collections::HashMap;
+
+            // ---- outside tx: prepare all jobs ----
             struct PreparedJob {
                 job: Job,
                 meta_bytes: Vec<u8>,
@@ -1887,12 +2045,18 @@ impl Store {
                 queue_key: Vec<u8>,
                 status_key: Vec<u8>,
                 type_key: Vec<u8>,
-                scheduled: bool,
+                unique_idx_key: Option<Vec<u8>>,
             }
 
             let prepared: Vec<PreparedJob> = batch
                 .into_iter()
                 .map(|opts| {
+                    let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
+                        (Some(_), Some(scope)) => Some(scope),
+                        (Some(_), None) => Some(UniqueWhile::Queued),
+                        _ => None,
+                    };
+
                     let id = scru128::new_string();
                     let ready_at = opts.ready_at.unwrap_or(now);
                     let scheduled = ready_at > now;
@@ -1920,87 +2084,132 @@ impl Store {
                         retention: opts.retention,
                         purge_at: None,
                         completed_at: None,
+                        unique: opts.unique_key.map(|k| UniqueConstraint {
+                            key: k,
+                            scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
+                        }),
                     };
 
                     let mut meta = job.clone();
                     meta.payload = None;
                     let meta_bytes = rmp_serde::to_vec_named(&meta)?;
 
-                    let job_key = make_job_key(&id);
-                    let payload_key = make_payload_key(&id);
-                    let queue_key = make_queue_key(&job.queue, &id);
-                    let status_key = make_status_key(status, &id);
-                    let type_key = make_type_key(&job.job_type, &id);
-
                     Ok(PreparedJob {
+                        job_key: make_job_key(&id),
+                        payload_key: make_payload_key(&id),
+                        queue_key: make_queue_key(&job.queue, &id),
+                        status_key: make_status_key(status, &id),
+                        type_key: make_type_key(&job.job_type, &id),
+                        unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
                         job,
                         meta_bytes,
                         payload_bytes,
-                        job_key,
-                        payload_key,
-                        queue_key,
-                        status_key,
-                        type_key,
-                        scheduled,
                     })
                 })
                 .collect::<Result<_, StoreError>>()?;
 
-            // Single write transaction for all jobs.
+            // ---- inside tx: unique checks + raw inserts only ----
             let mut tx = ks.write_tx();
+
+            // Maps unique_key -> index in `results` for intra-batch conflicts.
+            let mut batch_unique_keys: HashMap<String, usize> = HashMap::new();
+            let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
+
             for p in &prepared {
+                if let Some(ref uc) = p.job.unique {
+                    let scope = uc.unique_while();
+
+                    // Intra-batch conflict (no DB read needed).
+                    if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
+                        results.push(EnqueueResult::Duplicate(
+                            results[existing_idx].job().clone(),
+                        ));
+                        continue;
+                    }
+
+                    // DB identified conflict (point reads only).
+                    let idx_key = p.unique_idx_key.as_ref().unwrap();
+                    if let Some(existing_id_bytes) = ks.index.get(idx_key)? {
+                        let existing_id = std::str::from_utf8(&existing_id_bytes).map_err(|e| {
+                            StoreError::Corruption(format!(
+                                "unique index value is not valid UTF-8: {e}"
+                            ))
+                        })?;
+                        if let Some(existing_meta) = ks.data.get(&make_job_key(existing_id))? {
+                            let existing_job: Job = rmp_serde::from_slice(&existing_meta)?;
+                            if let Ok(existing_status) = JobStatus::try_from(existing_job.status) {
+                                if scope.conflicts_with(existing_status) {
+                                    results.push(EnqueueResult::Duplicate(existing_job));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    batch_unique_keys.insert(uc.key.clone(), results.len());
+                }
+
+                // No conflict — insert.
                 tx.insert(&ks.data, &p.job_key, &p.meta_bytes);
                 tx.insert(&ks.data, &p.payload_key, &p.payload_bytes);
                 tx.insert(&ks.index, &p.queue_key, b"");
                 tx.insert(&ks.index, &p.status_key, b"");
                 tx.insert(&ks.index, &p.type_key, b"");
+                if let Some(ref idx_key) = p.unique_idx_key {
+                    tx.insert(&ks.index, idx_key, p.job.id.as_bytes());
+                }
+
+                results.push(EnqueueResult::Created(p.job.clone()));
             }
 
             let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
 
             // Update in-memory indexes after commit succeeds.
-            for p in &prepared {
-                if p.scheduled {
-                    scheduled_index.insert(p.job.ready_at, p.job.id.clone());
-                } else {
-                    ready_index.insert(&p.job.queue, p.job.priority, p.job.id.clone());
+            for r in &results {
+                if let EnqueueResult::Created(job) = r {
+                    if job.status == JobStatus::Scheduled as u8 {
+                        scheduled_index.insert(job.ready_at, job.id.clone());
+                    } else {
+                        ready_index.insert(&job.queue, job.priority, job.id.clone());
+                    }
                 }
             }
 
-            let jobs: Vec<Job> = prepared.into_iter().map(|p| p.job).collect();
-            Ok((jobs, Some(sync)))
+            Ok((results, Some(sync)))
         })
         .await?;
 
-        let jobs = await_sync(result).await?;
+        let enqueue_results = await_sync(result).await?;
 
-        // Broadcast events after sync completes.
-        for job in &jobs {
-            match JobStatus::try_from(job.status) {
-                Ok(JobStatus::Ready) => {
-                    let _ = self.event_tx.send(StoreEvent::JobCreated {
-                        id: job.id.clone(),
-                        queue: job.queue.clone(),
-                        token: Arc::new(AtomicBool::new(false)),
-                    });
-                }
-                Ok(JobStatus::Scheduled) => {
-                    let _ = self.event_tx.send(StoreEvent::JobScheduled {
-                        id: job.id.clone(),
-                        ready_at: job.ready_at,
-                    });
-                }
-                _ => {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        status = job.status,
-                        "enqueue_bulk produced unexpected status"
-                    );
+        // Broadcast events after sync completes (only for Created results).
+        for r in &enqueue_results {
+            if let EnqueueResult::Created(job) = r {
+                match JobStatus::try_from(job.status) {
+                    Ok(JobStatus::Ready) => {
+                        let _ = self.event_tx.send(StoreEvent::JobCreated {
+                            id: job.id.clone(),
+                            queue: job.queue.clone(),
+                            token: Arc::new(AtomicBool::new(false)),
+                        });
+                    }
+                    Ok(JobStatus::Scheduled) => {
+                        let _ = self.event_tx.send(StoreEvent::JobScheduled {
+                            id: job.id.clone(),
+                            ready_at: job.ready_at,
+                        });
+                    }
+                    _ => {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            status = job.status,
+                            "enqueue_bulk produced unexpected status"
+                        );
+                    }
                 }
             }
         }
 
-        Ok(jobs)
+        Ok(enqueue_results)
     }
 
     /// Take the next job from the priority index.
@@ -2150,6 +2359,19 @@ impl Store {
 
                     tx.remove(&ks.index, &pre.old_status_key);
                     tx.insert(&ks.index, &pre.new_status_key, b"");
+
+                    // If unique_while == Queued, remove the unique index when
+                    // the job transitions out of the queue (Ready -> InFlight),
+                    // but only if it still belongs to this job.
+                    if let Some(ref uc) = pre.job.unique {
+                        if uc.unique_while() == UniqueWhile::Queued {
+                            let job_id = pre.job_id.as_bytes();
+                            tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                                Some(v) if v.as_ref() == job_id => None,
+                                other => other.cloned(),
+                            })?;
+                        }
+                    }
                 }
 
                 if cas_conflict_detected {
@@ -2319,6 +2541,19 @@ impl Store {
                 tx.insert(&ks.index, &new_status_key, b"");
                 tx.insert(&ks.index, &purge_key, b"");
 
+                // Remove unique index for Queued or Active scope on completion,
+                // but only if it still belongs to this job.
+                if let Some(ref uc) = job.unique {
+                    let scope = uc.unique_while();
+                    if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
+                        let job_id = id.as_bytes();
+                        tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                            Some(v) if v.as_ref() == job_id => None,
+                            other => other.cloned(),
+                        })?;
+                    }
+                }
+
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
                 ready_index.global.remove(&(job.priority, id));
@@ -2361,158 +2596,180 @@ impl Store {
         let ids: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
         let event_tx = self.event_tx.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            /// A job that has been pre-read and prepared for completion.
-            struct Prepared {
-                id: String,
-                pre_bytes: Slice,
-                priority: u16,
-                /// `None` for zero-retention (will be deleted).
-                updated_bytes: Option<Slice>,
-                /// `Some` for zero-retention (will be deleted).
-                deletion: Option<JobDeletion>,
-                /// Index key updates for non-zero retention jobs.
-                index_keys: Option<RetentionKeys>,
-            }
+        let result =
+            task::spawn_blocking(move || -> Result<_, StoreError> {
+                /// A job that has been pre-read and prepared for completion.
+                struct Prepared {
+                    id: String,
+                    pre_bytes: Slice,
+                    priority: u16,
+                    /// `None` for zero-retention (will be deleted).
+                    updated_bytes: Option<Slice>,
+                    /// `Some` for zero-retention (will be deleted).
+                    deletion: Option<JobDeletion>,
+                    /// Index key updates for non-zero retention jobs.
+                    index_keys: Option<RetentionKeys>,
+                    /// Unique constraint for this job (if any).
+                    unique: Option<UniqueConstraint>,
+                }
 
-            /// Pre-computed index keys for a non-zero-retention completion.
-            struct RetentionKeys {
-                old_status: Vec<u8>,
-                new_status: Vec<u8>,
-                purge: Vec<u8>,
-            }
+                /// Pre-computed index keys for a non-zero-retention completion.
+                struct RetentionKeys {
+                    old_status: Vec<u8>,
+                    new_status: Vec<u8>,
+                    purge: Vec<u8>,
+                }
 
-            let mut not_found: Vec<String> = Vec::new();
+                let mut not_found: Vec<String> = Vec::new();
 
-            loop {
-                // ---- outside tx: pre-read and prepare ----
-                let mut prepared: Vec<Prepared> = Vec::new();
+                loop {
+                    // ---- outside tx: pre-read and prepare ----
+                    let mut prepared: Vec<Prepared> = Vec::new();
 
-                for id in &ids {
-                    let job_key = make_job_key(id);
-                    let pre_bytes = match ks.data.get(&job_key)? {
-                        Some(bytes) => bytes,
-                        None => {
+                    for id in &ids {
+                        let job_key = make_job_key(id);
+                        let pre_bytes = match ks.data.get(&job_key)? {
+                            Some(bytes) => bytes,
+                            None => {
+                                not_found.push(id.clone());
+                                continue;
+                            }
+                        };
+
+                        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+
+                        if job.status != JobStatus::InFlight as u8 {
                             not_found.push(id.clone());
                             continue;
                         }
-                    };
 
-                    let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+                        let retention_ms = job
+                            .retention
+                            .as_ref()
+                            .and_then(|r| r.completed_ms)
+                            .unwrap_or(default_completed_retention_ms);
 
-                    if job.status != JobStatus::InFlight as u8 {
-                        not_found.push(id.clone());
-                        continue;
+                        if retention_ms == 0 {
+                            let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
+                            prepared.push(Prepared {
+                                id: id.clone(),
+                                pre_bytes,
+                                priority: job.priority,
+                                updated_bytes: None,
+                                deletion: Some(del),
+                                index_keys: None,
+                                unique: None,
+                            });
+                        } else {
+                            let purge_at = now + retention_ms;
+                            let old_status_key = make_status_key(JobStatus::InFlight, id);
+                            let new_status_key = make_status_key(JobStatus::Completed, id);
+                            let purge_key = make_purge_key(purge_at, id);
+
+                            let unique = job.unique.clone();
+
+                            job.status = JobStatus::Completed.into();
+                            job.purge_at = Some(purge_at);
+                            job.completed_at = Some(now);
+
+                            let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+                            prepared.push(Prepared {
+                                id: id.clone(),
+                                pre_bytes,
+                                priority: job.priority,
+                                updated_bytes: Some(updated_slice),
+                                deletion: None,
+                                index_keys: Some(RetentionKeys {
+                                    old_status: old_status_key,
+                                    new_status: new_status_key,
+                                    purge: purge_key,
+                                }),
+                                unique,
+                            });
+                        }
                     }
 
-                    let retention_ms = job
-                        .retention
-                        .as_ref()
-                        .and_then(|r| r.completed_ms)
-                        .unwrap_or(default_completed_retention_ms);
-
-                    if retention_ms == 0 {
-                        let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-                        prepared.push(Prepared {
-                            id: id.clone(),
-                            pre_bytes,
-                            priority: job.priority,
-                            updated_bytes: None,
-                            deletion: Some(del),
-                            index_keys: None,
-                        });
-                    } else {
-                        let purge_at = now + retention_ms;
-                        let old_status_key = make_status_key(JobStatus::InFlight, id);
-                        let new_status_key = make_status_key(JobStatus::Completed, id);
-                        let purge_key = make_purge_key(purge_at, id);
-
-                        job.status = JobStatus::Completed.into();
-                        job.purge_at = Some(purge_at);
-                        job.completed_at = Some(now);
-
-                        let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                        prepared.push(Prepared {
-                            id: id.clone(),
-                            pre_bytes,
-                            priority: job.priority,
-                            updated_bytes: Some(updated_slice),
-                            deletion: None,
-                            index_keys: Some(RetentionKeys {
-                                old_status: old_status_key,
-                                new_status: new_status_key,
-                                purge: purge_key,
-                            }),
-                        });
+                    if prepared.is_empty() {
+                        return Ok((
+                            BulkCompleteResult {
+                                completed: Vec::new(),
+                                not_found,
+                            },
+                            None,
+                        ));
                     }
-                }
 
-                if prepared.is_empty() {
+                    // ---- inside tx ----
+                    let mut tx = ks.write_tx();
+                    let mut cas_conflict_detected = false;
+
+                    for p in &prepared {
+                        let job_key = make_job_key(&p.id);
+
+                        if let Some(ref del) = p.deletion {
+                            // Zero-retention: delete via CAS.
+                            let prev = tx.take(&ks.data, &job_key)?;
+                            if prev.as_deref() != Some(&*p.pre_bytes) {
+                                cas_conflict_detected = true;
+                                break;
+                            }
+                            apply_job_deletion(&mut tx, del, &ks);
+                        } else if let Some(ref updated) = p.updated_bytes {
+                            // Non-zero retention: update via CAS.
+                            let prev =
+                                tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
+                            if prev.as_deref() != Some(&*p.pre_bytes) {
+                                cas_conflict_detected = true;
+                                break;
+                            }
+                            let keys = p.index_keys.as_ref().unwrap();
+                            tx.remove(&ks.index, &keys.old_status);
+                            tx.insert(&ks.index, &keys.new_status, b"");
+                            tx.insert(&ks.index, &keys.purge, b"");
+
+                            // Remove unique index for Queued or Active scope,
+                            // but only if it still belongs to this job.
+                            if let Some(ref uc) = p.unique {
+                                let scope = uc.unique_while();
+                                if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
+                                    let job_id = p.id.as_bytes();
+                                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| {
+                                        match v {
+                                            Some(v) if v.as_ref() == job_id => None,
+                                            other => other.cloned(),
+                                        }
+                                    })?;
+                                }
+                            }
+                        }
+                    }
+
+                    if cas_conflict_detected {
+                        drop(tx);
+                        not_found.clear();
+                        continue; // Retry from pre-read.
+                    }
+
+                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+                    // Update ready_index for all completed jobs.
+                    for p in &prepared {
+                        ready_index.global.remove(&(p.priority, p.id.clone()));
+                    }
+
+                    let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
+
                     return Ok((
                         BulkCompleteResult {
-                            completed: Vec::new(),
+                            completed,
                             not_found,
                         },
-                        None,
+                        Some(sync),
                     ));
                 }
-
-                // ---- inside tx ----
-                let mut tx = ks.write_tx();
-                let mut cas_conflict_detected = false;
-
-                for p in &prepared {
-                    let job_key = make_job_key(&p.id);
-
-                    if let Some(ref del) = p.deletion {
-                        // Zero-retention: delete via CAS.
-                        let prev = tx.take(&ks.data, &job_key)?;
-                        if prev.as_deref() != Some(&*p.pre_bytes) {
-                            cas_conflict_detected = true;
-                            break;
-                        }
-                        apply_job_deletion(&mut tx, del, &ks);
-                    } else if let Some(ref updated) = p.updated_bytes {
-                        // Non-zero retention: update via CAS.
-                        let prev =
-                            tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
-                        if prev.as_deref() != Some(&*p.pre_bytes) {
-                            cas_conflict_detected = true;
-                            break;
-                        }
-                        let keys = p.index_keys.as_ref().unwrap();
-                        tx.remove(&ks.index, &keys.old_status);
-                        tx.insert(&ks.index, &keys.new_status, b"");
-                        tx.insert(&ks.index, &keys.purge, b"");
-                    }
-                }
-
-                if cas_conflict_detected {
-                    drop(tx);
-                    not_found.clear();
-                    continue; // Retry from pre-read.
-                }
-
-                let sync = ks.commit(tx, ks.default_commit_mode)?;
-
-                // Update ready_index for all completed jobs.
-                for p in &prepared {
-                    ready_index.global.remove(&(p.priority, p.id.clone()));
-                }
-
-                let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
-
-                return Ok((
-                    BulkCompleteResult {
-                        completed,
-                        not_found,
-                    },
-                    Some(sync),
-                ));
-            }
-        })
-        .await?;
+            })
+            .await?;
 
         let bulk_result = await_sync(result).await?;
 
@@ -2637,6 +2894,20 @@ impl Store {
                     tx.insert(&ks.data, &error_key, &error_bytes);
                     tx.remove(&ks.index, &old_status_key);
                     tx.insert(&ks.index, &new_status_key, b"");
+
+                    // If unique_while == Queued, restore the unique index now
+                    // that the job is re-entering the queue. Only insert if no
+                    // other job has claimed the key while this one was in-flight.
+                    if let Some(ref uc) = job.unique {
+                        if uc.unique_while() == UniqueWhile::Queued {
+                            let id_bytes: Slice = id.as_bytes().into();
+                            tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                                Some(existing) => Some(existing.clone()),
+                                None => Some(id_bytes.clone()),
+                            })?;
+                        }
+                    }
+
                     let sync = ks.commit(tx, ks.default_commit_mode)?;
 
                     scheduled_index.insert(job.ready_at, id.clone());
@@ -2693,6 +2964,19 @@ impl Store {
                 tx.remove(&ks.index, &old_status_key);
                 tx.insert(&ks.index, &new_status_key, b"");
                 tx.insert(&ks.index, &purge_key, b"");
+
+                // Remove unique index for Queued or Active scope on death,
+                // but only if it still belongs to this job.
+                if let Some(ref uc) = job.unique {
+                    let scope = uc.unique_while();
+                    if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
+                        let job_id = id.as_bytes();
+                        tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                            Some(v) if v.as_ref() == job_id => None,
+                            other => other.cloned(),
+                        })?;
+                    }
+                }
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
@@ -3693,6 +3977,19 @@ impl Store {
             tx.insert(&ks.data, &job_key, &updated_bytes);
             tx.remove(&ks.index, &old_status_key);
             tx.insert(&ks.index, &new_status_key, b"");
+
+            // If unique_while == Queued, restore the unique index when
+            // a job recovers from InFlight back to Ready. Only insert if no
+            // other job has claimed the key while this one was in-flight.
+            if let Some(ref uc) = job.unique {
+                if uc.unique_while() == UniqueWhile::Queued {
+                    let id_bytes: Slice = id.as_bytes().into();
+                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                        Some(existing) => Some(existing.clone()),
+                        None => Some(id_bytes.clone()),
+                    })?;
+                }
+            }
         }
 
         let sync = ks.commit(tx, ks.default_commit_mode)?;
@@ -3987,6 +4284,15 @@ fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
     key
 }
 
+/// Build a unique deduplication index key: `U\0{unique_key}`.
+fn make_unique_key(unique_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + unique_key.len());
+    key.push(IndexKind::Unique as u8);
+    key.push(0);
+    key.extend_from_slice(unique_key.as_bytes());
+    key
+}
+
 /// Build an error record key: `E\0{job_id}\0{attempt_be_u32}`.
 ///
 /// The null separator lets us prefix-scan all errors for a given job,
@@ -4030,6 +4336,7 @@ struct JobDeletion {
     type_key: Vec<u8>,
     purge_key: Option<Vec<u8>>,
     error_keys: Vec<Vec<u8>>,
+    unique_idx_key: Option<Vec<u8>>,
 }
 
 /// Collect all keys needed to delete a job. No tx required.
@@ -4042,10 +4349,11 @@ fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDele
         type_key: make_type_key(&job.job_type, id),
         purge_key: job.purge_at.map(|purge_at| make_purge_key(purge_at, id)),
         error_keys: error_keys(ks, id).collect(),
+        unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
     }
 }
 
-/// Apply pre-computed deletion inside an open tx. No reads.
+/// Apply pre-computed deletion inside an open tx.
 fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion, ks: &Keyspaces) {
     tx.remove(&ks.data, &make_job_key(&del.id));
     tx.remove_weak(&ks.data, &make_payload_key(&del.id));
@@ -4055,6 +4363,16 @@ fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion
 
     if let Some(ref purge_key) = del.purge_key {
         tx.remove(&ks.index, purge_key);
+    }
+
+    // Only remove the unique index entry if it still belongs to this job.
+    // Another job may have already claimed the same key.
+    if let Some(ref unique_key) = del.unique_idx_key {
+        let job_id = del.id.as_bytes();
+        let _ = tx.fetch_update(&ks.index, unique_key, |v| match v {
+            Some(v) if v.as_ref() == job_id => None,
+            other => other.cloned(),
+        });
     }
 
     for key in &del.error_keys {
@@ -4117,7 +4435,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!({"task": "test"})),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert!(!job.id.is_empty());
         assert_eq!(job.queue, "default");
@@ -4135,14 +4454,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let job2 = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert_ne!(job1.id, job2.id);
     }
@@ -4156,21 +4477,24 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let second = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let third = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // scru128 IDs sort lexicographically in generation order.
         assert!(first.id < second.id);
@@ -4196,21 +4520,24 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("mid")).priority(5),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let job = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4231,14 +4558,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let job = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4257,14 +4586,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let first = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4300,7 +4631,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let job = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4340,7 +4672,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let job = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4363,7 +4696,8 @@ mod tests {
                     EnqueueOptions::new("test", "default", serde_json::json!(i)),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         // Spawn many concurrent workers all racing to take jobs.
@@ -4408,7 +4742,8 @@ mod tests {
                     EnqueueOptions::new("test", queue, serde_json::json!(i)),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         let queues: HashSet<String> = [queue.to_string()].into_iter().collect();
@@ -4457,21 +4792,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues = HashSet::from(["reports".into()]);
         let job = store
@@ -4501,21 +4839,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues = HashSet::from(["emails".into(), "webhooks".into()]);
         let first = store
@@ -4550,14 +4891,16 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("low")).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let high = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("high")).priority(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues = HashSet::from(["emails".into()]);
         let job = store
@@ -4578,7 +4921,8 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues = HashSet::from(["reports".into()]);
         assert!(
@@ -4599,14 +4943,16 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("low")).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let high = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "webhooks", serde_json::json!("high")).priority(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues = HashSet::from(["emails".into(), "webhooks".into()]);
         let job = store
@@ -4633,7 +4979,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let job = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4662,7 +5009,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4689,7 +5037,8 @@ mod tests {
                     EnqueueOptions::new("test", "default", serde_json::json!(i)),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         let jobs = store
@@ -4709,7 +5058,8 @@ mod tests {
                     EnqueueOptions::new("test", "default", serde_json::json!(i)),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         let jobs = store
@@ -4738,21 +5088,24 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("mid")).priority(5),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let jobs = store
             .take_next_n_jobs(now_millis(), &HashSet::new(), 3)
@@ -4773,14 +5126,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let second = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let jobs = store
             .take_next_n_jobs(now_millis(), &HashSet::new(), 2)
@@ -4800,21 +5155,24 @@ mod tests {
                 EnqueueOptions::new("test", "alpha", serde_json::json!("a1")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "beta", serde_json::json!("b1")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "alpha", serde_json::json!("a2")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues: HashSet<String> = ["alpha".to_string()].into_iter().collect();
         let jobs = store
@@ -4835,7 +5193,8 @@ mod tests {
                     EnqueueOptions::new("test", "default", serde_json::json!(i)),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         let jobs = store
@@ -4857,7 +5216,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!({"key": "value"})),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let jobs = store
             .take_next_n_jobs(now_millis(), &HashSet::new(), 1)
@@ -4878,14 +5238,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Drain the enqueue events.
         while let Ok(StoreEvent::JobCreated { .. }) = rx.try_recv() {}
@@ -4918,7 +5280,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -4945,14 +5308,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -4983,7 +5348,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -5014,7 +5380,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         match rx.recv().await.unwrap() {
             StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
@@ -5031,7 +5398,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -5056,7 +5424,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -5081,7 +5450,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("hello")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let job = store
             .get_job(now_millis(), &enqueued.id)
@@ -5115,7 +5485,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -5143,21 +5514,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert_eq!(page.jobs.len(), 3);
@@ -5175,21 +5549,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().direction(ScanDirection::Desc))
@@ -5210,21 +5587,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().limit(2))
@@ -5242,21 +5622,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().from(&a.id))
@@ -5276,21 +5659,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -5323,7 +5709,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().from(&c.id))
@@ -5342,14 +5729,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5372,14 +5761,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5405,21 +5796,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().limit(2))
@@ -5442,14 +5836,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().limit(2))
@@ -5468,7 +5864,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
         assert!(page.prev.is_none());
@@ -5483,21 +5880,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().from(&a.id).limit(2))
@@ -5521,21 +5921,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // First page.
         let page1 = store
@@ -5562,14 +5965,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take the first job so it becomes InFlight.
         store
@@ -5595,14 +6000,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5627,7 +6034,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().statuses(HashSet::from([JobStatus::InFlight])))
@@ -5645,21 +6053,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -5690,14 +6101,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -5721,7 +6134,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5761,7 +6175,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -5795,21 +6210,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().queues(HashSet::from(["emails".into()])))
@@ -5829,21 +6247,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "webhooks", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -5865,28 +6286,32 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "webhooks", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let d = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "webhooks", serde_json::json!("d")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Ascending: interleaved by job ID (time order).
         let page = store
@@ -5926,7 +6351,8 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().queues(HashSet::from(["reports".into()])))
@@ -5944,21 +6370,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let queues = HashSet::from(["emails".into(), "reports".into()]);
 
@@ -5987,14 +6416,16 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6026,21 +6457,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take a and b so they become InFlight.
         store
@@ -6075,14 +6509,16 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6113,21 +6549,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let _c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take a so it becomes InFlight.
         store
@@ -6181,28 +6620,32 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "webhooks", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "reports", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let d = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("d")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take a and b so they become InFlight.
         store
@@ -6241,14 +6684,16 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6278,21 +6723,24 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -6328,7 +6776,8 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -6350,7 +6799,8 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6402,14 +6852,16 @@ mod tests {
                 EnqueueOptions::new("test", "emails", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "emails", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6450,21 +6902,24 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6501,21 +6956,24 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("generate_report", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().types(HashSet::from(["send_email".into()])))
@@ -6535,21 +6993,24 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("generate_report", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_sms", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -6572,7 +7033,8 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(ListJobsOptions::new().types(HashSet::from(["no_such_type".into()])))
@@ -6590,14 +7052,16 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let taken = store
             .take_next_job(now_millis(), &HashSet::new())
@@ -6627,21 +7091,24 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let c = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -6671,14 +7138,16 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let b = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -6704,21 +7173,24 @@ mod tests {
                 EnqueueOptions::new("send_email", "high", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "low", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("generate_report", "high", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_jobs(
@@ -6741,21 +7213,24 @@ mod tests {
                 EnqueueOptions::new("send_email", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "q", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("generate_report", "q", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take a so it becomes in-flight.
         store
@@ -6785,28 +7260,32 @@ mod tests {
                 EnqueueOptions::new("send_email", "high", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "high", serde_json::json!("b")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("send_email", "low", serde_json::json!("c")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("generate_report", "high", serde_json::json!("d")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take a so it becomes in-flight.
         store
@@ -6844,7 +7323,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future_ms),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert_eq!(job.status, u8::from(JobStatus::Scheduled));
         assert_eq!(job.ready_at, future_ms);
@@ -6872,7 +7352,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(past_ms),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert_eq!(job.status, u8::from(JobStatus::Ready));
         assert_eq!(job.ready_at, past_ms);
@@ -6900,7 +7381,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let after = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -6929,7 +7411,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         assert_eq!(job.status, u8::from(JobStatus::Scheduled));
 
         // Pretend time has passed: ask for jobs due at ready_at.
@@ -6961,7 +7444,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future_ms),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Asking with current time returns no due jobs, but reports the
         // next ready_at so the caller knows when to wake up.
@@ -7000,7 +7484,8 @@ mod tests {
                     EnqueueOptions::new("test", "q", serde_json::json!(i)).ready_at(future + i),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         // All 5 are due at future+10, ask for only 2.
@@ -7030,7 +7515,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let mut rx = store.subscribe();
         let (batch, _) = store.next_scheduled(future, 10).await.unwrap();
@@ -7058,7 +7544,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("later")).ready_at(base + 5000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let earlier = store
             .enqueue(
                 now_millis(),
@@ -7066,7 +7553,8 @@ mod tests {
                     .ready_at(base + 1000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let (batch, _) = store.next_scheduled(base + 5000, 10).await.unwrap();
         assert_eq!(batch.len(), 2);
@@ -7089,7 +7577,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let (batch, next) = store.next_scheduled(now, 10).await.unwrap();
         assert!(batch.is_empty());
@@ -7113,7 +7602,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert!(matches!(
             rx.recv().await.unwrap(),
@@ -7136,7 +7626,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(future),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let (batch, _) = store.next_scheduled(future, 10).await.unwrap();
         store.promote_scheduled(&batch[0]).await.unwrap();
@@ -7175,7 +7666,8 @@ mod tests {
                 EnqueueOptions::new("test", "q", serde_json::json!("due")).ready_at(now + 100),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now_millis(),
@@ -7183,7 +7675,8 @@ mod tests {
                     .ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Ask as of now + 200: only the first job is due.
         let (batch, next) = store.next_scheduled(now + 200, 10).await.unwrap();
@@ -7201,7 +7694,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take the job so it becomes InFlight.
         let taken = store
@@ -7246,7 +7740,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let recovered = store.recover_in_flight().await.unwrap();
         let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
@@ -7266,14 +7761,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let high = store
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take both so they become InFlight.
         store
@@ -7323,7 +7820,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("ready")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // A Scheduled job (far in the future).
         let scheduled = store
@@ -7333,7 +7831,8 @@ mod tests {
                     .ready_at(now + 600_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Recover should find no in-flight jobs, but index the ready one.
         let recovered = store.recover_in_flight().await.unwrap();
@@ -7394,7 +7893,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("payload")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -7537,7 +8037,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Don't take it — job is still Ready.
         let job = store
@@ -7744,7 +8245,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("a")).retry_limit(1),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let job = store
             .take_next_job(now_millis(), &HashSet::new())
             .await
@@ -7902,7 +8404,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!("payload")),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let page = store
             .list_errors(ListErrorsOptions::new(&job.id))
@@ -8056,7 +8559,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!({"x": 1})),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
         assert_eq!(fetched.id, job.id);
@@ -8077,7 +8581,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!({"x": 1})),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
         assert_eq!(fetched.id, job.id);
@@ -8096,21 +8601,24 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(10),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let high = store
             .enqueue(
                 now,
                 EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(0),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let mid = store
             .enqueue(
                 now,
                 EnqueueOptions::new("test", "default", serde_json::json!(null)).priority(5),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let jobs = store.list_ready_jobs(0, 10).await.unwrap();
         let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
@@ -8129,7 +8637,8 @@ mod tests {
                     EnqueueOptions::new("test", "default", serde_json::json!(null)),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         let jobs = store.list_ready_jobs(0, 3).await.unwrap();
@@ -8154,14 +8663,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now,
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // Take one job — it moves to InFlight.
         store.take_next_job(now, &HashSet::new()).await.unwrap();
@@ -8185,7 +8696,8 @@ mod tests {
                     .ready_at(now + 30_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let early = store
             .enqueue(
                 now,
@@ -8193,7 +8705,8 @@ mod tests {
                     .ready_at(now + 10_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let mid = store
             .enqueue(
                 now,
@@ -8201,7 +8714,8 @@ mod tests {
                     .ready_at(now + 20_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let jobs = store.list_scheduled_jobs(0, 10).await.unwrap();
         let ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
@@ -8221,7 +8735,8 @@ mod tests {
                         .ready_at(now + (i + 1) * 10_000),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_job();
         }
 
         let jobs = store.list_scheduled_jobs(0, 3).await.unwrap();
@@ -8247,7 +8762,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         // One scheduled job.
         store
@@ -8257,7 +8773,8 @@ mod tests {
                     .ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         let jobs = store.list_scheduled_jobs(0, 10).await.unwrap();
         assert_eq!(jobs.len(), 1);
@@ -8278,14 +8795,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now,
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         assert_eq!(store.ready_count(), 2);
 
         // Taking a job should decrement the ready count.
@@ -8304,7 +8823,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now,
@@ -8312,7 +8832,8 @@ mod tests {
                     .ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert_eq!(store.ready_count(), 1);
     }
@@ -8331,7 +8852,8 @@ mod tests {
                     .ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now,
@@ -8339,7 +8861,8 @@ mod tests {
                     .ready_at(now + 120_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         assert_eq!(store.scheduled_count(), 2);
 
         // Promoting a scheduled job should decrement the scheduled count.
@@ -8358,7 +8881,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store
             .enqueue(
                 now,
@@ -8366,7 +8890,8 @@ mod tests {
                     .ready_at(now + 60_000),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         assert_eq!(store.scheduled_count(), 1);
     }
@@ -8385,14 +8910,16 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         let job = store
             .enqueue(
                 now,
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
 
         store.take_next_job(now, &HashSet::new()).await.unwrap();
         store.take_next_job(now, &HashSet::new()).await.unwrap();
@@ -8414,7 +8941,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store.take_next_job(now, &HashSet::new()).await.unwrap();
         assert_eq!(store.in_flight_count(), 1);
 
@@ -8437,7 +8965,8 @@ mod tests {
                 EnqueueOptions::new("test", "default", serde_json::json!(null)),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_job();
         store.take_next_job(now, &HashSet::new()).await.unwrap();
         assert_eq!(store.in_flight_count(), 1);
 
@@ -8453,7 +8982,7 @@ mod tests {
         let store = test_store();
         let now = now_millis();
 
-        let jobs = store
+        let jobs: Vec<Job> = store
             .enqueue_bulk(
                 now,
                 vec![
@@ -8463,7 +8992,10 @@ mod tests {
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(EnqueueResult::into_job)
+            .collect();
 
         assert_eq!(jobs.len(), 3);
         assert_eq!(jobs[0].job_type, "a");
@@ -8476,7 +9008,7 @@ mod tests {
         let store = test_store();
         let now = now_millis();
 
-        let jobs = store
+        let jobs: Vec<Job> = store
             .enqueue_bulk(
                 now,
                 vec![
@@ -8486,7 +9018,10 @@ mod tests {
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(EnqueueResult::into_job)
+            .collect();
 
         assert!(jobs[0].id < jobs[1].id);
         assert!(jobs[1].id < jobs[2].id);
@@ -8495,7 +9030,13 @@ mod tests {
     #[tokio::test]
     async fn enqueue_bulk_empty_is_noop() {
         let store = test_store();
-        let jobs = store.enqueue_bulk(now_millis(), vec![]).await.unwrap();
+        let jobs = store
+            .enqueue_bulk(now_millis(), vec![])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(EnqueueResult::into_job)
+            .collect::<Vec<_>>();
         assert!(jobs.is_empty());
     }
 
@@ -8504,7 +9045,7 @@ mod tests {
         let store = test_store();
         let now = now_millis();
 
-        let jobs = store
+        let jobs: Vec<Job> = store
             .enqueue_bulk(
                 now,
                 vec![
@@ -8513,7 +9054,10 @@ mod tests {
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(EnqueueResult::into_job)
+            .collect();
 
         for job in &jobs {
             let fetched = store.get_job(now, &job.id).await.unwrap().unwrap();
@@ -8553,7 +9097,7 @@ mod tests {
         let now = now_millis();
         let future = now + 60_000;
 
-        let jobs = store
+        let jobs: Vec<Job> = store
             .enqueue_bulk(
                 now,
                 vec![
@@ -8563,7 +9107,10 @@ mod tests {
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(EnqueueResult::into_job)
+            .collect();
 
         assert_eq!(jobs[0].status, u8::from(JobStatus::Ready));
         assert_eq!(jobs[1].status, u8::from(JobStatus::Scheduled));
@@ -8634,7 +9181,7 @@ mod tests {
         let store = test_store();
         let now = now_millis();
 
-        let jobs = store
+        let jobs: Vec<Job> = store
             .enqueue_bulk(
                 now,
                 vec![
@@ -8653,7 +9200,10 @@ mod tests {
                 ],
             )
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(EnqueueResult::into_job)
+            .collect();
 
         assert_eq!(jobs[0].priority, 42);
         assert_eq!(jobs[0].retry_limit, Some(5));
@@ -8664,5 +9214,382 @@ mod tests {
         let retention = jobs[0].retention.as_ref().unwrap();
         assert_eq!(retention.completed_ms, Some(3600_000));
         assert_eq!(retention.dead_ms, Some(7200_000));
+    }
+
+    // --- Unique jobs ---
+
+    #[tokio::test]
+    async fn unique_enqueue_returns_duplicate_on_conflict() {
+        let store = test_store();
+        let now = now_millis();
+
+        let opts = || EnqueueOptions::new("task", "q", serde_json::json!(null)).unique_key("key1");
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        assert!(!r1.is_duplicate());
+
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(r2.is_duplicate());
+        assert_eq!(r2.job().id, r1.job().id);
+    }
+
+    #[tokio::test]
+    async fn unique_different_keys_do_not_conflict() {
+        let store = test_store();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)).unique_key("a"),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)).unique_key("b"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r1.is_duplicate());
+        assert!(!r2.is_duplicate());
+        assert_ne!(r1.job().id, r2.job().id);
+    }
+
+    #[tokio::test]
+    async fn unique_queued_scope_allows_after_take() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let opts = || {
+            EnqueueOptions::new("task", "q", serde_json::json!(null))
+                .unique_key("k")
+                .unique_while(UniqueWhile::Queued)
+        };
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        assert!(!r1.is_duplicate());
+
+        // Take the job (Ready -> InFlight) — should release the lock.
+        let taken = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, r1.job().id);
+
+        // Now a duplicate should be allowed.
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(!r2.is_duplicate());
+        assert_ne!(r2.job().id, r1.job().id);
+    }
+
+    #[tokio::test]
+    async fn unique_active_scope_blocks_while_in_flight() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let opts = || {
+            EnqueueOptions::new("task", "q", serde_json::json!(null))
+                .unique_key("k")
+                .unique_while(UniqueWhile::Active)
+        };
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        assert!(!r1.is_duplicate());
+
+        // Take (Ready -> InFlight).
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Should still conflict — active scope includes InFlight.
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(r2.is_duplicate());
+        assert_eq!(r2.job().id, r1.job().id);
+    }
+
+    #[tokio::test]
+    async fn unique_active_scope_allows_after_complete() {
+        let store = test_store_with_retention(60_000, 60_000);
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let opts = || {
+            EnqueueOptions::new("task", "q", serde_json::json!(null))
+                .unique_key("k")
+                .unique_while(UniqueWhile::Active)
+        };
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store.mark_completed(now, &r1.job().id).await.unwrap();
+
+        // Should be allowed now — job is completed, not active.
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(!r2.is_duplicate());
+    }
+
+    #[tokio::test]
+    async fn unique_exists_scope_blocks_while_completed() {
+        let store = test_store_with_retention(60_000, 60_000);
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let opts = || {
+            EnqueueOptions::new("task", "q", serde_json::json!(null))
+                .unique_key("k")
+                .unique_while(UniqueWhile::Exists)
+        };
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store.mark_completed(now, &r1.job().id).await.unwrap();
+
+        // Should still conflict — exists scope includes Completed.
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(r2.is_duplicate());
+    }
+
+    #[tokio::test]
+    async fn unique_exists_scope_allows_after_purge() {
+        let store = test_store_with_retention(0, 0);
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let opts = || {
+            EnqueueOptions::new("task", "q", serde_json::json!(null))
+                .unique_key("k")
+                .unique_while(UniqueWhile::Exists)
+        };
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        // Zero retention — completion immediately deletes the job.
+        store.mark_completed(now, &r1.job().id).await.unwrap();
+
+        // Job is purged — should be allowed now.
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(!r2.is_duplicate());
+    }
+
+    #[tokio::test]
+    async fn unique_stale_index_for_reaped_job_does_not_block() {
+        let store = test_store_with_retention(1, 1);
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null))
+                    .unique_key("k")
+                    .unique_while(UniqueWhile::Exists),
+            )
+            .await
+            .unwrap();
+
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store.mark_completed(now, &r1.job().id).await.unwrap();
+
+        // Purge the job directly.
+        store.purge_job(&r1.job().id).await.unwrap();
+
+        // Unique index entry is stale (points to reaped job) — should not block.
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null))
+                    .unique_key("k")
+                    .unique_while(UniqueWhile::Exists),
+            )
+            .await
+            .unwrap();
+        assert!(!r2.is_duplicate());
+    }
+
+    #[tokio::test]
+    async fn unique_bulk_dedup_within_batch() {
+        let store = test_store();
+        let now = now_millis();
+
+        let opts = || EnqueueOptions::new("task", "q", serde_json::json!(null)).unique_key("same");
+
+        let results = store
+            .enqueue_bulk(now, vec![opts(), opts(), opts()])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].is_duplicate());
+        assert!(results[1].is_duplicate());
+        assert!(results[2].is_duplicate());
+        assert_eq!(results[1].job().id, results[0].job().id);
+        assert_eq!(results[2].job().id, results[0].job().id);
+    }
+
+    #[tokio::test]
+    async fn unique_queued_scope_restores_on_failure_retry() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let opts = || {
+            EnqueueOptions::new("task", "q", serde_json::json!(null))
+                .unique_key("k")
+                .unique_while(UniqueWhile::Queued)
+        };
+
+        let r1 = store.enqueue(now, opts()).await.unwrap();
+        let job_id = r1.into_job().id;
+
+        // Take, then fail with retry (Scheduled).
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .record_failure(
+                now,
+                &job_id,
+                FailureOptions {
+                    message: "oops".into(),
+                    error_type: None,
+                    backtrace: None,
+                    retry_at: Some(now + 60_000),
+                    kill: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Job is back in Scheduled — unique lock should be restored.
+        let r2 = store.enqueue(now, opts()).await.unwrap();
+        assert!(r2.is_duplicate());
+        assert_eq!(r2.job().id, job_id);
+    }
+
+    #[tokio::test]
+    async fn unique_concurrent_enqueues_produce_one_job() {
+        let store = Arc::new(test_store());
+        let now = now_millis();
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.enqueue(
+                    now,
+                    EnqueueOptions::new("task", "q", serde_json::json!(null)).unique_key("race"),
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let results: Vec<EnqueueResult> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let created: Vec<&EnqueueResult> = results.iter().filter(|r| !r.is_duplicate()).collect();
+        assert_eq!(created.len(), 1, "exactly one job should be created");
+
+        // All duplicates should reference the same job.
+        let expected_id = &created[0].job().id;
+        for r in &results {
+            assert_eq!(&r.job().id, expected_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn unique_no_key_has_no_overhead() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue two identical jobs without unique_key — both should succeed.
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r1.is_duplicate());
+        assert!(!r2.is_duplicate());
+        assert_ne!(r1.job().id, r2.job().id);
+    }
+
+    #[tokio::test]
+    async fn unique_recover_in_flight_restores_queued_lock() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null))
+                    .unique_key("k")
+                    .unique_while(UniqueWhile::Queued),
+            )
+            .await
+            .unwrap();
+
+        // Take the job (removes unique lock for queued scope).
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Simulate crash recovery — in-flight jobs move back to ready.
+        let recovered = store.recover_in_flight().await.unwrap();
+        assert_eq!(recovered, 1);
+
+        // Unique lock should be restored — duplicate blocked.
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null))
+                    .unique_key("k")
+                    .unique_while(UniqueWhile::Queued),
+            )
+            .await
+            .unwrap();
+        assert!(r2.is_duplicate());
+        assert_eq!(r2.job().id, r1.job().id);
     }
 }
