@@ -372,10 +372,11 @@ module Zizq
           when :msgpack then self.class.parse_msgpack_stream(response.body, &wrapper)
           end
         ensure
-          response.close
+          response.close rescue nil
         end
       end
-    rescue SocketError, IOError, EOFError, Errno::ECONNRESET, Errno::EPIPE => e
+    rescue SocketError, IOError, EOFError, Errno::ECONNRESET, Errno::EPIPE,
+           OpenSSL::SSL::SSLError => e
       raise ConnectionError, e.message
     end
 
