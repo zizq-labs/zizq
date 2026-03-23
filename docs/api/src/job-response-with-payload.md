@@ -52,6 +52,49 @@
         </tr>
         <tr>
             <td>
+                <div><code>unique_key</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional unique key for this job, which is used to protect
+                against duplicate job enqueues. This is paired with the
+                optional <code>unique_while</code> field which defines the
+                scope within which the job is considered unique.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>unique_while</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                When the job has a unique key, specifies the scope within which
+                that job is considered unique. One of:
+                <dl>
+                    <dt><code>queued</code></dt>
+                    <dd>
+                        Conflicting jobs will not be enqueued while this job is
+                        in the <code>scheduled</code> or <code>ready</code>
+                        statuses.
+                    </dd>
+                    <dt><code>active</code></dt>
+                    <dd>
+                        Conflicting jobs will not be enqueued while this job is
+                        in the <code>scheduled</code>, <code>ready</code> or
+                        <code>in_flight</code> statuses.
+                    </dd>
+                    <dt><code>exists</code></dt>
+                    <dd>
+                        Conflicting jobs will not be enqueued while this job
+                        exists in any status (i.e. until the job is reaped,
+                        according to the retention policy).
+                    </dd>
+                </dl>
+                The default scope is <code>queued</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>payload</code> <em>required</em></div>
                 <div><pre>object</pre></div>
             </td>

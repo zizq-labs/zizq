@@ -6,7 +6,7 @@ language = "en"
 src = "src"
 
 [build]
-build-dir = "../target/docs"
+build-dir = "../../target/docs/api"
 
 [output.html]
 site-url = "/docs/api/"

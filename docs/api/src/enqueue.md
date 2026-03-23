@@ -68,6 +68,56 @@ endpoint wraps an array of `{"jobs": [...]}`.
         </tr>
         <tr>
             <td>
+                <div><code>unique_key</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional unique key for this job, which is used to protect
+                against duplicate job enqueues. This is paired with the
+                optional <code>unique_while</code> field which defines the
+                scope within which the job is considered unique. Uniqueness is
+                status-bound, not time-bound. There is no arbitrary expiry.
+                Conflicting enqueues <em>do not</em> produce errors, but
+                instead behave idempotently. A success response is returned
+                with details of the existing matching job, and its
+                <code>duplicate</code> field set to <code>true</code>. This key
+                is intentionally global across all queues and job types.
+                Clients should prefix it as necessary.
+                <strong>Requires a <em>pro</em> license</strong>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>unique_while</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                When the job has a unique key, specifies the scope within which
+                that job is considered unique. One of:
+                <dl>
+                    <dt><code>queued</code></dt>
+                    <dd>
+                        The job will not be enqueued if another exists in the
+                        <code>scheduled</code> or <code>ready</code> statuses.
+                    </dd>
+                    <dt><code>active</code></dt>
+                    <dd>
+                        The job will not be enqueued if another exists in the
+                        <code>scheduled</code>, <code>ready</code> or
+                        <code>in_flight</code> statuses.
+                    </dd>
+                    <dt><code>exists</code></dt>
+                    <dd>
+                        The job will not be enqueued if another exists in any
+                        status (i.e. until that job is reaped, according to the
+                        retention policy).
+                    </dd>
+                </dl>
+                The default scope is <code>queued</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>backoff</code></div>
                 <div><pre>object</pre></div>
             </td>
@@ -180,13 +230,30 @@ See [Common Job Parameters](#job-parameters).
 
 ### Responses { #post-jobs-response }
 
+#### `200` OK
+
+The request was processed but the specified job was a duplicate of an existing
+job according to its `unique_key` and `unique_while` scope. The returned data
+is that of the existing job, and the `duplicate` flag is set to `true`.
+
+See [Common Job Response](#job-response).
+
 #### `201` Created
+
+The request was processed and a new job has been enqueued.
 
 See [Common Job Response](#job-response).
 
 #### `400` Bad Request
 
 Returned when given invalid inputs.
+
+{{#include ./error-response.md}}
+
+#### `403` Forbidden
+
+Returned when the client attempts to use pro features but the server is not
+configured with a pro license.
 
 {{#include ./error-response.md}}
 
@@ -219,7 +286,19 @@ Enqueues multiple jobs atomically.
 
 ### Responses { #post-jobs-bulk-response }
 
+#### `200` OK
+
+The request was processed but all the specified jobs were duplicates of
+existing jobs according to their `unique_key` and `unique_while` scopes. The
+returned data is that of the existing jobs, and their `duplicate` flags are set
+to `true`.
+
+See [Common Job Response](#job-response).
+
 #### `201` Created
+
+The request was processed and new jobs have been enqueued. Where `unique_key`
+values were present, any duplicates are identified by their `duplicate` flags.
 
 <table>
     <thead>
@@ -246,6 +325,13 @@ Enqueues multiple jobs atomically.
 #### `400` Bad Request
 
 Returned when given invalid inputs.
+
+{{#include ./error-response.md}}
+
+#### `403` Forbidden
+
+Returned when the client attempts to use pro features but the server is not
+configured with a pro license.
 
 {{#include ./error-response.md}}
 
@@ -312,6 +398,74 @@ date: Fri, 13 Mar 2026 09:01:08 GMT
     "ready_at": 1773396035647,
     "status": "scheduled",
     "type": "hello_world"
+}
+```
+
+### Enqueue jobs with unique keys
+
+Unique jobs required a [pro license](https://zizq.io/pricing).
+
+```shell
+http POST http://127.0.0.1:7890/jobs <<'JSON'
+{
+    "queue": "example",
+    "priority": 500,
+    "type": "hello_world",
+    "unique_key": "hello_world:world",
+    "payload": {"greet": "World"}
+}
+JSON
+```
+
+```http
+HTTP/1.1 201 Created
+content-length: 218
+content-type: application/json
+date: Mon, 23 Mar 2026 11:19:58 GMT
+
+{
+    "attempts": 0,
+    "duplicate": false,
+    "id": "03ft8h3ubrx53abhw1fxbora3",
+    "priority": 500,
+    "queue": "example",
+    "ready_at": 1774264798519,
+    "status": "ready",
+    "type": "hello_world",
+    "unique_key": "hello_world:world",
+    "unique_while": "queued"
+}
+```
+
+```shell
+http POST http://127.0.0.1:7890/jobs <<'JSON'
+{
+    "queue": "example",
+    "priority": 500,
+    "type": "hello_world",
+    "unique_key": "hello_world:world",
+    "payload": {"greet": "World"}
+}
+JSON
+```
+
+```http
+HTTP/1.1 200 OK
+content-length: 217
+content-type: application/json
+date: Mon, 23 Mar 2026 11:20:26 GMT
+
+{
+    "attempts": 0,
+    "duplicate": true,
+    "id": "03ft8h3ubrx53abhw1fxbora3",
+    "priority": 500,
+    "queue": "example",
+    "ready_at": 1774264798519,
+    "status": "ready",
+    "type": "hello_world",
+    "unique_key": "hello_world:world",
+    "unique_while": "queued"
 }
 ```
 

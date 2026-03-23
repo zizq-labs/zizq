@@ -1,14 +1,14 @@
 # Introduction
 
 Zizq is a lightweight, self-contained and persistent job queue server with a
-simple HTTP API. Workers interact with the server to enqueue, take, and process
-jobs.
+simple HTTP/2 and HTTP/1.1 API. Workers interact with the server to enqueue,
+take, and process jobs.
 
-If you have not yet installed Zizq, follow the [Getting Started](#) guide
-first. In most cases, you will not need to directly interact with the API and
-will instead install and use a client library for your specific programming
-language. You do not need to read this API documentation if you are only using
-a client library.
+If you have not yet installed Zizq, follow the
+[Getting Started](/docs/getting-started) guide first. In most cases, you will
+not need to directly interact with the API and will instead install and use a
+client library for your specific programming language. You do not need to read
+this API documentation if you are only using a client library.
 
 > [!NOTE]
 > Examples in this documentation use [HTTPie](https://httpie.io/), which is a
@@ -17,11 +17,19 @@ a client library.
 
 ## Base URL
 
-All endpoints are relative to the base URL of the HTTP listener, which by
-default is on `127.0.0.1:7890`.
+All endpoints are relative to the base URL of the server, which by default is
+on `127.0.0.1:7890` for both plain HTTP and HTTPS.
+
+Plain HTTP:
 
 ```text
 http://127.0.0.1:7890/{endpoint}
+```
+
+Secured with TLS:
+
+```text
+https://127.0.0.1:7890/{endpoint}
 ```
 
 ## Content Type
@@ -63,16 +71,13 @@ more `"\n"` newline characters, which the client skips.
 Length-prefixed MessagePack streams are in the following format:
 
 ```text
-\x00\x00\x00\x0c \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00
-\x00\x00\x00\x08 \x00\x00\x00\x00\x00\x00\x00\x00
-\x00\x00\x00\x00
-\x00\x00\x00\x00
-\x00\x00\x00\x0a \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00
-\x00\x00\x00\x00
-\x00\x00\x00\x08 \x00\x00\x00\x00\x00\x00\x00\x00
+[4-byte big-endian] [variable-length binary data]
+[4-byte big-endian] [variable-length binary data]
+...
+[4-byte big-endian] [variable-length binary data]
 ```
 
-The stream consists of 4-byte prefixes, which are 32-bit integers in big-endian
+The stream consists of 4-byte headers, which are 32-bit integers in big-endian
 form and specify the following number of bytes that contain a valid MessagePack
 payload. Empty messages may appear in the stream and are skipped by the client.
 These are naturally identified by the fact they have a zero length
@@ -82,26 +87,39 @@ These are naturally identified by the fact they have a zero length
 
 In order to minimize bloat the server does *not* provide multiple versions of
 each endpoint. Clients should [check the server version](./health.md)
-for compatability. The a change in the major version of the server indicates a
+for compatability. A change in the major version of the server indicates a
 backwards-incompatible change, while minor version changes will always be
 backwards-compatible. Clients should be upgraded accordingly, much like how a
 major RDBMS version upgrade would be managed.
 
 ## Authentication
 
-The server does not currently implement authentication. Any machine that can
-access the port can make API calls. The API should be secured accordingly (e.g.
-only bind to an interface that is on an internal network and not on the public
-internet).
+By default the server operates over plain HTTP and therefore should not be
+exposed to the internet and only operated on trusted internal networks. Any
+machine that can access the port can make API calls to the server. This is a
+convenient default for local development.
+
+### Plain TLS
+
+Communication can be secured with through TLS by providing a certificate and
+its key to the `zizq serve` command. In this mode the server should still be
+limited to trusted internal networks.
+
+### Mutual TLS
+
+When operated with a [pro license](https://zizq.io/pricing) the server can be
+secured with mutual TLS, requiring clients to present a client certificate. In
+this mode the server is safe to expose to the internet. Only clients holding a
+valid client certificate and key are able to communicate with the server.
 
 > [!NOTE]
-> Work is planned to implement optional access control using a combination of
-> Mutual TLS and API keys.
+> Work is planned to implement optional access control (RBAC) using a
+> combination of Mutual TLS and API keys with configured permissions.
 
 ## Common Concepts
 
-It helps to understand the following concepts before reading the documentation
-for each endpoint.
+It helps to understand some key concepts before reading the documentation for
+each endpoint.
 
 ### IDs
 
@@ -112,9 +130,9 @@ same priority.
 
 ### Priorities
 
-Jobs have an 16-bit integer priority (`0` to `65536`). Lower values are
+Jobs have a 16-bit integer priority (`0` to `65536`). Lower values are
 dequeued before higher values. The default is the midpoint `32768`. In practice
-this means if 1000 jobs are enqueued with priority `1000` those jobs will be
+this means if 5,000 jobs are enqueued with priority `900` those jobs will be
 processed in FIFO order, but if during processing a new job is enqueued with
 priority `500` that job will be placed ahead of the existing jobs in the queue
 and will be processed next. This is a powerful construct when used correctly.
