@@ -135,7 +135,7 @@ dequeued before higher values. The default is the midpoint `32768`. In practice
 this means if 5,000 jobs are enqueued with priority `900` those jobs will be
 processed in FIFO order, but if during processing a new job is enqueued with
 priority `500` that job will be placed ahead of the existing jobs in the queue
-and will be processed next. This is a powerful construct when used correctly.
+and will be processed next.
 
 ### Queues
 

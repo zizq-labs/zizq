@@ -97,20 +97,23 @@ endpoint wraps an array of `{"jobs": [...]}`.
                 <dl>
                     <dt><code>queued</code></dt>
                     <dd>
-                        The job will not be enqueued if another exists in the
+                        Other jobs with the same <code>unique_key</code> will
+                        not be enqueued while this job is in the
                         <code>scheduled</code> or <code>ready</code> statuses.
                     </dd>
                     <dt><code>active</code></dt>
                     <dd>
-                        The job will not be enqueued if another exists in the
+                        Other jobs with the same <code>unique_key</code> will
+                        not be enqueued while this job is in the
                         <code>scheduled</code>, <code>ready</code> or
                         <code>in_flight</code> statuses.
                     </dd>
                     <dt><code>exists</code></dt>
                     <dd>
-                        The job will not be enqueued if another exists in any
-                        status (i.e. until that job is reaped, according to the
-                        retention policy).
+                        Other jobs with the same <code>unique_key</code> will
+                        not be enqueued for as long as this job exists (i.e.
+                        until this job is reaped, according to the retention
+                        policy).
                     </dd>
                 </dl>
                 The default scope is <code>queued</code>.

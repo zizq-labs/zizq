@@ -1,7 +1,7 @@
 [book]
-title = "API Reference"
+title = "Zizq API Reference"
 authors = ["Chris Corbyn"]
-description = "HTTP API reference Zizq — The lightweight job queue server"
+description = "Zizq HTTP API reference — The lightweight job queue server"
 language = "en"
 src = "src"
 
