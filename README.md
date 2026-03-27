@@ -1,30 +1,26 @@
-# Zizq
-
-## Job Queue
+# Zizq Job Queue
 
 Zizq is a fast and lightweight self-contained job queue. Download a single
 binary, start the server then enqueue and process jobs in your preferred
-programming language. You're just a `zizq serve` away.
+programming language.
 
 ## Features
 
 Zizq supports a growing number of features.
 
 * Single self-contained executable— no separate data store required
-* No configuration files required
 * Durable and atomic job queues
-* Easy to use `HTTP/2` API with JSON or MsgPack (supports multiplexing)
+* Easy to use `HTTP/1.1` and `HTTP/2` API with JSON or MsgPack
 * Cross-language job enqueueing and execution
-* Arbitrary numbers of named queues
-* FIFO + granular priority job execution
+* Unlimited named queues
+* FIFO ordered and granular priority jobs
 * Scheduled jobs
-* Flexible backoff/retry policies
-* Flexible job retention policies for completed and dead jobs
+* Configurable backoff/retry policies
+* Configurable job retention policies
+* Unique job support
 * APIs to manage the queue contents
-* High job throughput— Over 50K jobs/second
-* An insightful [`zizq top`](#viewing-live-queue-activity) command— visualize
-  your queues in realtime in the terminal
-* One backend that works across multiple programming languages
+* High job throughput
+* An insightful [`zizq top`](#viewing-live-queue-activity) command
 
 ## Documentation
 
@@ -48,7 +44,7 @@ Listening on 127.0.0.1:8901 (admin)
 Listening on 127.0.0.1:7890 (primary)
 ```
 
-If you have a [paid license](https://zizq.io/pricing), specify the license key
+If you have a [pro license](https://zizq.io/pricing), specify the license key
 with `--license-key @/path/to/license.jwt`.
 
 When the server starts, it creates a root directory in which it stores all
@@ -64,15 +60,13 @@ up to listen on a public IP address.
 
 ### Client libraries
 
-Zizq provides client frontends for a number of programming languages. Language
-not listed here? [Reach out to express interest](mailto:chris@zizq.io). Read
-the documentation specific to the client implementation for usage.
+Zizq provides official client libraries. The goal is to provide clients for a
+wide range of languages. We have started with Ruby.
 
-* Ruby
-* Python
-* Node
-* Rust
-* Go
+* [Official Ruby Client](https://github.com/zizq-labs/zizq-ruby)
+
+Want a client for Zizq in a language not currently supported?
+[Reach out to express interest](mailto:chris@zizq.io).
 
 ### Talking to the server
 
@@ -95,91 +89,8 @@ date: Thu, 12 Mar 2026 03:46:14 GMT
 }
 ```
 
-Jobs are enqueued with a HTTP POST request. The `queue` is required but
-arbitrary. The `type` and `payload` fields are also arbitrary but required. The
-`payload` is a JSON value provided to workers that will process this job.
-
-The numeric `priority` is optional and is any value from `0` to `65536`. The
-default is `32768`. Lower numbered priorities are processed earlier than higher
-numbered priorities. Within each priority jobs are enqueued in FIFO order.
-
-```shell
- $ http POST 127.0.0.1:7890/jobs \
-   queue=example \
-   priority:=500 \
-   type=hello_world \
-   payload:='{"greet": "World"}'
-HTTP/1.1 201 Created
-content-length: 143
-content-type: application/json
-date: Thu, 12 Mar 2026 03:50:20 GMT
-
-{
-    "attempts": 0,
-    "id": "03fqs300nc99wa7twropnx7ed",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1773287420571,
-    "status": "ready",
-    "type": "hello_world"
-}
-```
-
-The new job is immediately `"ready"`. With our job enqueued, we can connect a
-worker and start receiving jobs that are ready to process. Workers remain
-connected to this endpoint for as long as they are running, with jobs delivered
-over a streaming response, along with periodic "blank message" heartbeats that
-can be skipped.
-
-```shell
- $ http --stream GET 127.0.0.1:7890/jobs/take
-HTTP/1.1 200 OK
-content-type: application/x-ndjson
-date: Thu, 12 Mar 2026 03:53:45 GMT
-transfer-encoding: chunked
-
-{
-    "attempts": 0,
-    "dequeued_at": 1773287625242,
-    "id": "03fqs300nc99wa7twropnx7ed",
-    "payload": {
-        "greet": "World"
-    },
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1773287420571,
-    "status": "in_flight",
-    "type": "hello_world"
-}
-```
-
-Received jobs are in the `"in_flight"` status and remain in this status until
-the worker reports success or failure (ack or nack). Workers do not receive
-more jobs until they have acknowledged their in-flight jobs. If the worker
-disconnects without sending an acknowledgement, Zizq automatically returns the
-job back to the `"ready"` status so that other workers can process the job.
-
-The worker does some work, then notifies the server of the outcome. Success is
-handled with a HTTP `POST`. Production-ready workers should use `HTTP/2` with
-multiplexing for the best throughput here. A bulk success endpoint also exists
-which provides even greater throughput, especially when paired with
-multiplexing.
-
-```shell
-$ http POST 127.0.0.1:7890/jobs/03fqs300nc99wa7twropnx7ed/success
-HTTP/1.1 204 No Content
-date: Thu, 12 Mar 2026 04:01:39 GMT
-```
-
-Once acknowledged, if more jobs are available, the worker receives the next
-job, then the next, and so on...
-
-Failures are also reported using HTTP `POST` but provide more context which
-Zizq captures for reference. Zizq will automatically reschedule failed jobs
-based on a configurable backoff policy.
-
-The Zizq API supports many other features.
-[Read the API documentation](https://zizq.io/docs/api) for full details.
+Read the [Zizq API Reference](https://zizq.io/docs/api) for full details on the
+Zizq API.
 
 ### Viewing live queue activity
 
