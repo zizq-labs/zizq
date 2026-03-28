@@ -1695,82 +1695,312 @@ fn id_stream(
     IdStream(Box::new(move || iter.next().map(Ok)))
 }
 
-/// Look up full job records from an iterator of raw IDs, returning an error
-/// if any ID is missing from the `data` keyspace (data corruption). Hydrates
-/// each job's payload from the same keyspace using the `P` tag prefix.
+/// A lazy stream of `Job`s, either from an `IdStream` (filtered path) or
+/// from a direct range scan of the data keyspace (unfiltered path).
 ///
-/// Reads are performed through the provided `Readable` (typically a snapshot)
-/// to ensure consistency with the index scan that produced the IDs.
-///
-/// When `now` is provided, jobs with `purge_at <= now` are skipped (logically
-/// invisible before the reaper physically deletes them).
-///
-/// When `filter` is provided, jobs without matching payloads are skipped.
-///
-/// The iterator continues scanning past skippdd jobs until `limit` entries are
-/// collected or the stream is exhausted.
-fn load_jobs_by_ids(
-    reader: &impl Readable,
-    data_ks: &SingleWriterTxKeyspace,
-    ids: impl Iterator<Item = Result<Vec<u8>, StoreError>>,
-    source: &str,
-    now: Option<u64>,
-    filter: Option<&PayloadFilter>,
-    limit: usize,
-    skip_missing: bool,
-) -> Result<Vec<Job>, StoreError> {
-    let mut rows = Vec::new();
+/// When `now` is `Some`, jobs past their `purge_at` are skipped (expired).
+/// When `needs_payload` is true, the payload is hydrated from the data
+/// keyspace. Payload filtering is NOT applied here — use
+/// `PayloadFilteredIter` to wrap this stream when a filter is present.
+enum JobStream<'a, R: Readable> {
+    /// Reads jobs by looking up IDs from an index scan.
+    ById {
+        ids: IdStream<'a>,
+        reader: &'a R,
+        data_ks: &'a SingleWriterTxKeyspace,
+        now: Option<u64>,
+        needs_payload: bool,
+        skip_missing: bool,
+        source: String,
+    },
+    /// Reads jobs directly from a range scan of J-tagged keys.
+    FullScan {
+        /// Boxed to unify the Asc/Desc iterator types.
+        entries: Box<dyn Iterator<Item = fjall::Guard> + 'a>,
+        data_ks: &'a SingleWriterTxKeyspace,
+        reader: &'a R,
+        now: Option<u64>,
+        needs_payload: bool,
+    },
+}
 
-    for result in ids {
-        let id = result?;
+impl<'a, R: Readable> JobStream<'a, R> {
+    /// Construct a `FullScan` variant for the given direction and cursor.
+    fn full_scan(
+        snapshot: &'a R,
+        ks: &'a Keyspaces,
+        from: &Option<String>,
+        direction: ScanDirection,
+        now: Option<u64>,
+        needs_payload: bool,
+    ) -> Self {
+        let job_prefix_start: Vec<u8> = vec![RecordKind::Job as u8, 0];
+        let job_prefix_end: Vec<u8> = vec![RecordKind::Job as u8, 1];
 
-        let job_key = make_job_key(
-            std::str::from_utf8(&id)
-                .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))?,
-        );
-
-        let bytes = match reader.get(data_ks, &job_key)? {
-            Some(bytes) => bytes,
-            None if skip_missing => continue,
-            None => {
-                return Err(StoreError::Corruption(format!(
-                    "job in {source} but missing from data keyspace: {:?}",
-                    String::from_utf8_lossy(&id),
-                )));
+        let entries: Box<dyn Iterator<Item = fjall::Guard> + 'a> = match direction {
+            ScanDirection::Asc => {
+                let start = match from {
+                    Some(cursor) => Bound::Excluded(make_job_key(cursor)),
+                    None => Bound::Included(job_prefix_start),
+                };
+                Box::new(snapshot.range::<Vec<u8>, _>(
+                    ks.data.as_ref(),
+                    (start, Bound::Excluded(job_prefix_end)),
+                ))
+            }
+            ScanDirection::Desc => {
+                let end = match from {
+                    Some(cursor) => Bound::Excluded(make_job_key(cursor)),
+                    None => Bound::Excluded(job_prefix_end),
+                };
+                Box::new(
+                    snapshot
+                        .range::<Vec<u8>, _>(
+                            ks.data.as_ref(),
+                            (Bound::Included(job_prefix_start), end),
+                        )
+                        .rev(),
+                )
             }
         };
 
-        let mut job: Job = rmp_serde::from_slice(&bytes)?;
-
-        // Skip expired jobs (logically invisible).
-        if let Some(now) = now {
-            if job.purge_at.is_some_and(|p| p <= now) {
-                continue;
-            }
-        }
-
-        // Hydrate the payload from the data keyspace.
-        let payload_key = make_payload_key(&job.id);
-        if let Some(payload_bytes) = reader.get(data_ks, &payload_key)? {
-            job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
-        }
-
-        // Apply payload filter if present.
-        if let Some(f) = filter {
-            let payload = job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
-            if !f.matches(payload) {
-                continue;
-            }
-        }
-
-        rows.push(job);
-
-        if rows.len() >= limit {
-            break;
+        Self::FullScan {
+            entries,
+            data_ks: &ks.data,
+            reader: snapshot,
+            now,
+            needs_payload,
         }
     }
 
-    Ok(rows)
+    /// Construct a `ById` variant from a pre-built `IdStream`.
+    fn by_id(
+        ids: IdStream<'a>,
+        reader: &'a R,
+        data_ks: &'a SingleWriterTxKeyspace,
+        now: Option<u64>,
+        needs_payload: bool,
+        skip_missing: bool,
+        source: String,
+    ) -> Self {
+        Self::ById {
+            ids,
+            reader,
+            data_ks,
+            now,
+            needs_payload,
+            skip_missing,
+            source,
+        }
+    }
+}
+
+impl<'a, R: Readable> Iterator for JobStream<'a, R> {
+    type Item = Result<Job, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::ById {
+                ids,
+                reader,
+                data_ks,
+                now,
+                needs_payload,
+                skip_missing,
+                source,
+            } => loop {
+                let id = match ids.next()? {
+                    Ok(id) => id,
+                    Err(e) => return Some(Err(e)),
+                };
+
+                let id_str = match std::str::from_utf8(&id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Some(Err(StoreError::Corruption(format!(
+                            "job ID is not valid UTF-8: {e}"
+                        ))));
+                    }
+                };
+
+                let job_key = make_job_key(id_str);
+                let bytes = match reader.get(*data_ks, &job_key) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) if *skip_missing => continue,
+                    Ok(None) => {
+                        return Some(Err(StoreError::Corruption(format!(
+                            "job in {source} but missing from data keyspace: {id_str:?}",
+                        ))));
+                    }
+                    Err(e) => return Some(Err(e.into())),
+                };
+
+                let mut job: Job = match rmp_serde::from_slice(&bytes) {
+                    Ok(j) => j,
+                    Err(e) => return Some(Err(e.into())),
+                };
+
+                if let Some(now) = *now {
+                    if job.purge_at.is_some_and(|p| p <= now) {
+                        continue;
+                    }
+                }
+
+                if *needs_payload {
+                    let payload_key = make_payload_key(&job.id);
+                    match reader.get(*data_ks, &payload_key) {
+                        Ok(Some(pb)) => match rmp_serde::from_slice(&pb) {
+                            Ok(v) => job.payload = Some(v),
+                            Err(e) => return Some(Err(e.into())),
+                        },
+                        Ok(None) => {}
+                        Err(e) => return Some(Err(e.into())),
+                    }
+                }
+
+                return Some(Ok(job));
+            },
+
+            Self::FullScan {
+                entries,
+                data_ks,
+                reader,
+                now,
+                needs_payload,
+            } => loop {
+                let entry = entries.next()?;
+
+                let (key, value) = match entry.into_inner() {
+                    Ok(kv) => kv,
+                    Err(e) => return Some(Err(e.into())),
+                };
+
+                let mut job: Job = match rmp_serde::from_slice(&value) {
+                    Ok(j) => j,
+                    Err(e) => return Some(Err(e.into())),
+                };
+
+                if let Some(now) = *now {
+                    if job.purge_at.is_some_and(|p| p <= now) {
+                        continue;
+                    }
+                }
+
+                if *needs_payload {
+                    // Swap J tag for P tag to look up payload.
+                    let mut payload_key = key.to_vec();
+                    payload_key[0] = RecordKind::Payload as u8;
+                    match reader.get(*data_ks, &payload_key) {
+                        Ok(Some(pb)) => match rmp_serde::from_slice(&pb) {
+                            Ok(v) => job.payload = Some(v),
+                            Err(e) => return Some(Err(e.into())),
+                        },
+                        Ok(None) => {}
+                        Err(e) => return Some(Err(e.into())),
+                    }
+                }
+
+                return Some(Ok(job));
+            },
+        }
+    }
+}
+
+/// Wraps a job iterator and applies a jq payload filter, skipping
+/// non-matching jobs. The inner iterator must yield jobs with payloads
+/// already hydrated (set `needs_payload: true` on the `JobStream`).
+struct PayloadFilteredIter<I> {
+    inner: I,
+    filter: std::sync::Arc<PayloadFilter>,
+}
+
+impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for PayloadFilteredIter<I> {
+    type Item = Result<Job, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let job = match self.inner.next()? {
+                Ok(j) => j,
+                Err(e) => return Some(Err(e)),
+            };
+
+            let payload = job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
+            if self.filter.matches(payload) {
+                return Some(Ok(job));
+            }
+        }
+    }
+}
+
+/// Build an `IdStream` from index filters and/or ID filters.
+///
+/// Returns `None` when no index filters are active (caller should use a
+/// full-scan `JobStream` instead). Returns `Some((stream, source, has_ids))`
+/// when at least one filter is active.
+fn build_id_stream<'a>(
+    snapshot: &'a impl Readable,
+    ks: &'a Keyspaces,
+    ids: &HashSet<String>,
+    statuses: &HashSet<JobStatus>,
+    queues: &HashSet<String>,
+    types: &HashSet<String>,
+    from: &Option<String>,
+    direction: ScanDirection,
+) -> Option<(IdStream<'a>, String, bool)> {
+    let mut filters: Vec<(&str, IdStream<'a>)> = Vec::new();
+
+    if !queues.is_empty() {
+        filters.push((
+            "jobs_by_queue",
+            merge_sources(
+                queue_scan_sources(snapshot, ks, queues, from, direction),
+                direction,
+            ),
+        ));
+    }
+
+    if !statuses.is_empty() {
+        filters.push((
+            "jobs_by_status",
+            merge_sources(
+                status_scan_sources(snapshot, ks, statuses, from, direction),
+                direction,
+            ),
+        ));
+    }
+
+    if !types.is_empty() {
+        filters.push((
+            "jobs_by_type",
+            merge_sources(
+                type_scan_sources(snapshot, ks, types, from, direction),
+                direction,
+            ),
+        ));
+    }
+
+    let has_id_filter = !ids.is_empty();
+
+    if has_id_filter {
+        filters.push(("jobs_by_id", id_stream(ids, from, direction)));
+    }
+
+    if filters.is_empty() {
+        return None;
+    }
+
+    let source_desc = if filters.len() == 1 {
+        filters[0].0.to_string()
+    } else {
+        let names: Vec<&str> = filters.iter().map(|(n, _)| *n).collect();
+        format!("({})", names.join(" & "))
+    };
+
+    let mut iter = filters.into_iter().map(|(_, s)| s);
+    let first = iter.next().unwrap();
+    let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
+
+    Some((combined, source_desc, has_id_filter))
 }
 
 /// Controls whether the group committer does a full fsync after each batch.
@@ -3407,202 +3637,44 @@ impl Store {
 
         task::spawn_blocking(move || {
             let snapshot = ks.db.read_tx();
-            // We take 1 more job than requested so that we know if there's a
-            // next page or not.
             let fetch = opts.limit.saturating_add(1);
-            let mut rows = Vec::with_capacity(fetch.min(1024));
 
-            // Collect an IdStream per active filter dimension. When
-            // multiple filters are active we intersect them; when only one
-            // is active we use it directly.
-            let mut filters: Vec<(&str, IdStream<'_>)> = Vec::new();
+            let id_stream_opt = build_id_stream(
+                &snapshot,
+                &ks,
+                &opts.ids,
+                &opts.statuses,
+                &opts.queues,
+                &opts.types,
+                &opts.from,
+                opts.direction,
+            );
 
-            if !opts.queues.is_empty() {
-                filters.push((
-                    "jobs_by_queue",
-                    merge_sources(
-                        queue_scan_sources(
-                            &snapshot,
-                            &ks,
-                            &opts.queues,
-                            &opts.from,
-                            opts.direction,
-                        ),
-                        opts.direction,
-                    ),
-                ));
-            }
-
-            if !opts.statuses.is_empty() {
-                filters.push((
-                    "jobs_by_status",
-                    merge_sources(
-                        status_scan_sources(
-                            &snapshot,
-                            &ks,
-                            &opts.statuses,
-                            &opts.from,
-                            opts.direction,
-                        ),
-                        opts.direction,
-                    ),
-                ));
-            }
-
-            if !opts.types.is_empty() {
-                filters.push((
-                    "jobs_by_type",
-                    merge_sources(
-                        type_scan_sources(&snapshot, &ks, &opts.types, &opts.from, opts.direction),
-                        opts.direction,
-                    ),
-                ));
-            }
-
-            if !opts.ids.is_empty() {
-                filters.push((
-                    "jobs_by_id",
-                    id_stream(&opts.ids, &opts.from, opts.direction),
-                ));
-            }
-
-            if !filters.is_empty() {
-                // Build a human-readable source description for error
-                // messages, e.g. "jobs_by_queue" or
-                // "(jobs_by_queue & jobs_by_status)".
-                let source_desc = if filters.len() == 1 {
-                    filters[0].0.to_string()
-                } else {
-                    let names: Vec<&str> = filters.iter().map(|(n, _)| *n).collect();
-                    format!("({})", names.join(" & "))
-                };
-
-                let direction = opts.direction;
-                let mut iter = filters.into_iter().map(|(_, s)| s);
-                let first = iter.next().unwrap();
-                let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
-
-                rows = load_jobs_by_ids(
+            let job_stream = match id_stream_opt {
+                Some((ids, source, has_id_filter)) => JobStream::by_id(
+                    ids,
                     &snapshot,
                     &ks.data,
-                    combined,
-                    &source_desc,
                     opts.now,
-                    opts.filter.as_deref(),
-                    fetch,
-                    !opts.ids.is_empty(),
-                )?;
-            } else {
-                // No filter - scan the data keyspace for J-tagged keys.
-                // Range: [J, 0]..[J, 1] covers all job metadata entries.
-                let job_prefix_start: Vec<u8> = vec![RecordKind::Job as u8, 0];
-                let job_prefix_end: Vec<u8> = vec![RecordKind::Job as u8, 1];
-
-                match opts.direction {
-                    ScanDirection::Asc => {
-                        let range = match &opts.from {
-                            Some(cursor) => snapshot.range::<Vec<u8>, _>(
-                                &ks.data,
-                                (
-                                    Bound::Excluded(make_job_key(cursor)),
-                                    Bound::Excluded(job_prefix_end),
-                                ),
-                            ),
-                            None => snapshot.range::<Vec<u8>, _>(
-                                &ks.data,
-                                (
-                                    Bound::Included(job_prefix_start),
-                                    Bound::Excluded(job_prefix_end),
-                                ),
-                            ),
-                        };
-
-                        for entry in range {
-                            let (key, value) = entry.into_inner()?;
-
-                            let mut job: Job = rmp_serde::from_slice(&value)?;
-
-                            if let Some(now) = opts.now {
-                                if job.purge_at.is_some_and(|p| p <= now) {
-                                    continue;
-                                }
-                            }
-
-                            // Swap J tag for P tag to look up payload.
-                            let mut payload_key = key.to_vec();
-                            payload_key[0] = RecordKind::Payload as u8;
-                            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
-                                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
-                            }
-
-                            if let Some(ref f) = opts.filter {
-                                let payload =
-                                    job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
-                                if !f.matches(payload) {
-                                    continue;
-                                }
-                            }
-
-                            rows.push(job);
-
-                            if rows.len() >= fetch {
-                                break;
-                            }
-                        }
-                    }
-                    ScanDirection::Desc => {
-                        let range = match &opts.from {
-                            Some(cursor) => snapshot.range::<Vec<u8>, _>(
-                                &ks.data,
-                                (
-                                    Bound::Included(job_prefix_start),
-                                    Bound::Excluded(make_job_key(cursor)),
-                                ),
-                            ),
-                            None => snapshot.range::<Vec<u8>, _>(
-                                &ks.data,
-                                (
-                                    Bound::Included(job_prefix_start),
-                                    Bound::Excluded(job_prefix_end),
-                                ),
-                            ),
-                        };
-
-                        for entry in range.rev() {
-                            let (key, value) = entry.into_inner()?;
-
-                            let mut job: Job = rmp_serde::from_slice(&value)?;
-
-                            if let Some(now) = opts.now {
-                                if job.purge_at.is_some_and(|p| p <= now) {
-                                    continue;
-                                }
-                            }
-
-                            // Swap J tag for P tag to look up payload.
-                            let mut payload_key = key.to_vec();
-                            payload_key[0] = RecordKind::Payload as u8;
-                            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
-                                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
-                            }
-
-                            if let Some(ref f) = opts.filter {
-                                let payload =
-                                    job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
-                                if !f.matches(payload) {
-                                    continue;
-                                }
-                            }
-
-                            rows.push(job);
-
-                            if rows.len() >= fetch {
-                                break;
-                            }
-                        }
-                    }
+                    true,
+                    has_id_filter,
+                    source,
+                ),
+                None => {
+                    JobStream::full_scan(&snapshot, &ks, &opts.from, opts.direction, opts.now, true)
                 }
-            }
+            };
+
+            let mut rows: Vec<Job> = if let Some(filter) = opts.filter.clone() {
+                PayloadFilteredIter {
+                    inner: job_stream,
+                    filter,
+                }
+                .take(fetch)
+                .collect::<Result<Vec<_>, _>>()?
+            } else {
+                job_stream.take(fetch).collect::<Result<Vec<_>, _>>()?
+            };
 
             // If we got more rows than the requested limit, we know there's a
             // next page, and we can just discard that extra row now.
