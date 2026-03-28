@@ -50,14 +50,56 @@ See [Common Job Type](#job-type).
 
 {{#include ./error-response.md}}
 
+## `DELETE /jobs/{id}` { #delete-job }
+
+Delete a single job given a known ID.
+
+### Parameters { #delete-job-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job to delete.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #delete-job-response }
+
+#### `204` No Content
+
+Job was successfully deleted.
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
 ## `GET /jobs` { #get-jobs-list }
 
-Retrieve a paginated list of all jobs on the server, in FIFO order (i.e.
-ordered by the job ID, not necessarily prioritised).
+Retrieve a filtered, paginated list of all jobs. Jobs are returned in FIFO
+order by default (i.e. ordered by the job ID, not necessarily prioritised).
 
 > [!NOTE]
 > Zizq uses cursor-based pagination. Pages are enumerated by following the
 > links in the response data
+
+> [!TIP]
+> For more details on the query language used in the `?filter=` parameter, read
+> the language specification on the
+> [jaq website](https://gedenkt.at/jaq/manual/#corelang) or on
+> [jq](https://jqlang.org/manual/#basic-filters).
 
 ### Parameters { #get-jobs-list-parameters }
 
@@ -99,6 +141,20 @@ All options are additive.
             <td>
                 Optional comma-separated list of job statuses for which to list
                 jobs. Defaults to <em>all statuses</em>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>filter</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional <code>jq</code> expression by which to filter jobs by
+                <code>payload</code>. This enables matching on the entire
+                payload, or arbitrarily on a subset of the payload. Filtering
+                is done via
+                <a href="https://gedenkt.at/jaq/manual/#corelang">jaq</a> which
+                is compatible with <code>jq</code>.
             </td>
         </tr>
         <tr>
