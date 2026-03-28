@@ -417,6 +417,10 @@ pub struct ListJobsOptions {
     /// Maximum number of jobs to return.
     pub limit: usize,
 
+    /// Optional ID filter. When non-empty, only jobs with one of these
+    /// IDs are returned. Intersected with other filters when combined.
+    pub ids: HashSet<String>,
+
     /// Optional status filter. When non-empty, only jobs with one of these
     /// statuses are returned, using the status index for efficient lookup.
     pub statuses: HashSet<JobStatus>,
@@ -449,6 +453,7 @@ impl ListJobsOptions {
             from: None,
             direction: ScanDirection::Asc,
             limit: 50,
+            ids: HashSet::new(),
             statuses: HashSet::new(),
             queues: HashSet::new(),
             types: HashSet::new(),
@@ -472,6 +477,15 @@ impl ListJobsOptions {
     /// Set the maximum number of records to return and return `self`.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Filter by job IDs and return `self`.
+    ///
+    /// An empty set means "all jobs". When combined with other filters,
+    /// the result is the intersection.
+    pub fn ids(mut self, ids: HashSet<String>) -> Self {
+        self.ids = ids;
         self
     }
 
@@ -1655,6 +1669,32 @@ fn type_scan_sources<'a>(
         .collect()
 }
 
+/// Build an IdStream from a set of user-provided job IDs, sorted and
+/// filtered by the pagination cursor.
+fn id_stream(
+    ids: &HashSet<String>,
+    from: &Option<String>,
+    direction: ScanDirection,
+) -> IdStream<'static> {
+    let mut sorted: Vec<Vec<u8>> = ids
+        .iter()
+        .filter(|id| match (from, direction) {
+            (Some(cursor), ScanDirection::Asc) => id.as_str() > cursor.as_str(),
+            (Some(cursor), ScanDirection::Desc) => id.as_str() < cursor.as_str(),
+            (None, _) => true,
+        })
+        .map(|id| id.as_bytes().to_vec())
+        .collect();
+
+    match direction {
+        ScanDirection::Asc => sorted.sort(),
+        ScanDirection::Desc => sorted.sort_by(|a, b| b.cmp(a)),
+    }
+
+    let mut iter = sorted.into_iter();
+    IdStream(Box::new(move || iter.next().map(Ok)))
+}
+
 /// Look up full job records from an iterator of raw IDs, returning an error
 /// if any ID is missing from the `data` keyspace (data corruption). Hydrates
 /// each job's payload from the same keyspace using the `P` tag prefix.
@@ -1677,6 +1717,7 @@ fn load_jobs_by_ids(
     now: Option<u64>,
     filter: Option<&PayloadFilter>,
     limit: usize,
+    skip_missing: bool,
 ) -> Result<Vec<Job>, StoreError> {
     let mut rows = Vec::new();
 
@@ -1688,12 +1729,16 @@ fn load_jobs_by_ids(
                 .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))?,
         );
 
-        let bytes = reader.get(data_ks, &job_key)?.ok_or_else(|| {
-            StoreError::Corruption(format!(
-                "job in {source} but missing from data keyspace: {:?}",
-                String::from_utf8_lossy(&id),
-            ))
-        })?;
+        let bytes = match reader.get(data_ks, &job_key)? {
+            Some(bytes) => bytes,
+            None if skip_missing => continue,
+            None => {
+                return Err(StoreError::Corruption(format!(
+                    "job in {source} but missing from data keyspace: {:?}",
+                    String::from_utf8_lossy(&id),
+                )));
+            }
+        };
 
         let mut job: Job = rmp_serde::from_slice(&bytes)?;
 
@@ -3414,6 +3459,13 @@ impl Store {
                 ));
             }
 
+            if !opts.ids.is_empty() {
+                filters.push((
+                    "jobs_by_id",
+                    id_stream(&opts.ids, &opts.from, opts.direction),
+                ));
+            }
+
             if !filters.is_empty() {
                 // Build a human-readable source description for error
                 // messages, e.g. "jobs_by_queue" or
@@ -3438,6 +3490,7 @@ impl Store {
                     opts.now,
                     opts.filter.as_deref(),
                     fetch,
+                    !opts.ids.is_empty(),
                 )?;
             } else {
                 // No filter - scan the data keyspace for J-tagged keys.
@@ -3564,6 +3617,7 @@ impl Store {
                     .from(cursor.to_string())
                     .direction(direction)
                     .limit(opts.limit)
+                    .ids(opts.ids.clone())
                     .statuses(opts.statuses.clone())
                     .queues(opts.queues.clone())
                     .types(opts.types.clone())
@@ -9861,5 +9915,166 @@ mod tests {
 
         // purge_job should NOT emit events.
         assert!(rx.try_recv().is_err());
+    }
+
+    // --- list_jobs with ID filter ---
+
+    #[tokio::test]
+    async fn list_jobs_id_filter_returns_matching_jobs() {
+        let store = test_store();
+        let now = now_millis();
+        let j1 = store
+            .enqueue(now, EnqueueOptions::new("a", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let j2 = store
+            .enqueue(now, EnqueueOptions::new("b", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let _j3 = store
+            .enqueue(now, EnqueueOptions::new("c", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let ids: HashSet<String> = [j1.id.clone(), j2.id.clone()].into();
+        let page = store
+            .list_jobs(ListJobsOptions::new().ids(ids).now(now))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 2);
+        let returned_ids: HashSet<String> = page.jobs.iter().map(|j| j.id.clone()).collect();
+        assert!(returned_ids.contains(&j1.id));
+        assert!(returned_ids.contains(&j2.id));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_id_filter_skips_nonexistent_ids() {
+        let store = test_store();
+        let now = now_millis();
+        let j1 = store
+            .enqueue(now, EnqueueOptions::new("a", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let ids: HashSet<String> = [j1.id.clone(), "0000000000000000000000000".into()].into();
+        let page = store
+            .list_jobs(ListJobsOptions::new().ids(ids).now(now))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, j1.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_id_filter_combined_with_status() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+        let j1 = store
+            .enqueue(now, EnqueueOptions::new("a", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let j2 = store
+            .enqueue(now, EnqueueOptions::new("b", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Take j1 so it becomes InFlight.
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+
+        // Filter for both IDs but only Ready status — should only return j2.
+        let ids: HashSet<String> = [j1.id.clone(), j2.id.clone()].into();
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .ids(ids)
+                    .statuses([JobStatus::Ready].into())
+                    .now(now),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, j2.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_id_filter_combined_with_payload_filter() {
+        let store = test_store();
+        let now = now_millis();
+        let j1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("a", "q", serde_json::json!({"x": 1})),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let j2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("b", "q", serde_json::json!({"x": 2})),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let ids: HashSet<String> = [j1.id.clone(), j2.id.clone()].into();
+        let filter = Arc::new(PayloadFilter::compile(".x == 1").unwrap());
+        let page = store
+            .list_jobs(ListJobsOptions::new().ids(ids).filter(filter).now(now))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, j1.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_id_filter_skips_nonexistent_with_payload_filter() {
+        let store = test_store();
+        let now = now_millis();
+        let j1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("a", "q", serde_json::json!({"x": 1})),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let ids: HashSet<String> = [
+            j1.id.clone(),
+            "0000000000000000000000000".into(), // nonexistent but valid format
+        ]
+        .into();
+        let filter = Arc::new(PayloadFilter::compile(".").unwrap());
+        let page = store
+            .list_jobs(ListJobsOptions::new().ids(ids).filter(filter).now(now))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, j1.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_id_filter_empty_when_none_match() {
+        let store = test_store();
+        let ids: HashSet<String> = ["0000000000000000000000000".into()].into();
+        let page = store
+            .list_jobs(ListJobsOptions::new().ids(ids).now(now_millis()))
+            .await
+            .unwrap();
+
+        assert!(page.jobs.is_empty());
     }
 }

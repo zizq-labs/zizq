@@ -605,6 +605,10 @@ struct ListJobsParams {
     #[serde(default, rename = "type")]
     job_type: CommaSet<String>,
 
+    /// ID filter, comma-delimited.
+    #[serde(default)]
+    id: CommaSet<String>,
+
     /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
     filter: Option<String>,
 }
@@ -1094,6 +1098,15 @@ fn validate_name(field: &str, value: &str) -> Result<(), String> {
         return Err(format!("{field} must not contain null bytes"));
     }
     Ok(())
+}
+
+/// Check that a string looks like a valid scru128 job ID (25 lowercase
+/// alphanumeric characters).
+fn is_valid_job_id(id: &str) -> bool {
+    id.len() == 25
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Handle `POST /jobs` — enqueue a new job.
@@ -1611,6 +1624,20 @@ async fn list_jobs(
     if !params.job_type.is_empty() {
         opts = opts.types(params.job_type.0.clone());
     }
+    if !params.id.is_empty() {
+        for id in params.id.iter() {
+            if !is_valid_job_id(id) {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("invalid job ID: {id:?}"),
+                    },
+                );
+            }
+        }
+        opts = opts.ids(params.id.0.clone());
+    }
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
             Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
@@ -1636,6 +1663,7 @@ async fn list_jobs(
                 &params.status,
                 &params.queue,
                 &params.job_type,
+                &params.id,
                 filter_expr,
             );
             let next = page.next.map(|o| {
@@ -1646,6 +1674,7 @@ async fn list_jobs(
                     &params.status,
                     &params.queue,
                     &params.job_type,
+                    &params.id,
                     filter_expr,
                 )
             });
@@ -1657,6 +1686,7 @@ async fn list_jobs(
                     &params.status,
                     &params.queue,
                     &params.job_type,
+                    &params.id,
                     filter_expr,
                 )
             });
@@ -1709,6 +1739,7 @@ fn build_page_url(
     statuses: &CommaSet<JobStatus>,
     queues: &CommaSet<String>,
     types: &CommaSet<String>,
+    ids: &CommaSet<String>,
     filter: Option<&str>,
 ) -> String {
     let mut url = String::from("/jobs?");
@@ -1725,6 +1756,9 @@ fn build_page_url(
     }
     if !types.is_empty() {
         url.push_str(&format!("&type={types}"));
+    }
+    if !ids.is_empty() {
+        url.push_str(&format!("&id={ids}"));
     }
     if let Some(expr) = filter {
         url.push_str(&format!("&filter={}", urlencoding::encode(expr)));
@@ -5963,5 +5997,52 @@ mod tests {
         let req = empty_request("GET", &format!("/jobs/{}", job.id));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- GET /jobs?id= ---
+
+    #[tokio::test]
+    async fn list_jobs_with_id_filter() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        let j1 = state
+            .store
+            .enqueue(now, EnqueueOptions::new("a", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let _j2 = state
+            .store
+            .enqueue(now, EnqueueOptions::new("b", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = empty_request("GET", &format!("/jobs?id={}", j1.id));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["id"], j1.id);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_with_invalid_id_returns_400() {
+        let req = empty_request("GET", "/jobs?id=not-a-valid-id");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_with_nonexistent_id_returns_empty() {
+        let req = empty_request("GET", "/jobs?id=0000000000000000000000000");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["jobs"].as_array().unwrap().is_empty());
     }
 }
