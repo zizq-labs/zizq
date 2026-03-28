@@ -1538,6 +1538,123 @@ fn intersect_streams<'a>(
     }))
 }
 
+// --- Index scan source builders ---
+//
+// Build MergeSource iterators from the secondary indexes. Used by both
+// list_jobs and delete_jobs.
+
+/// Build queue-index MergeSources for the given queues.
+fn queue_scan_sources<'a>(
+    snapshot: &'a impl Readable,
+    ks: &'a Keyspaces,
+    queues: &HashSet<String>,
+    from: &Option<String>,
+    direction: ScanDirection,
+) -> Vec<MergeSource<'a>> {
+    queues
+        .iter()
+        .map(|queue_name| {
+            let prefix_len = queue_name.len() + 3;
+            let start = match from {
+                Some(cursor) => Bound::Excluded(make_queue_key(queue_name, cursor)),
+                None => Bound::Included(make_queue_key(queue_name, "")),
+            };
+            let mut end_key = Vec::with_capacity(queue_name.len() + 3);
+            end_key.push(IndexKind::Queue as u8);
+            end_key.push(0);
+            end_key.extend_from_slice(queue_name.as_bytes());
+            end_key.push(1);
+            let end = Bound::Excluded(end_key);
+
+            match direction {
+                ScanDirection::Asc => range_source!(
+                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (start, end)),
+                    prefix_len
+                ),
+                ScanDirection::Desc => range_source!(
+                    snapshot
+                        .range::<Vec<u8>, _>(ks.index.as_ref(), (start, end))
+                        .rev(),
+                    prefix_len
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Build status-index MergeSources for the given statuses.
+fn status_scan_sources<'a>(
+    snapshot: &'a impl Readable,
+    ks: &'a Keyspaces,
+    statuses: &HashSet<JobStatus>,
+    from: &Option<String>,
+    direction: ScanDirection,
+) -> Vec<MergeSource<'a>> {
+    statuses
+        .iter()
+        .map(|status| {
+            let prefix = *status as u8;
+            let start = match from {
+                Some(cursor) => Bound::Excluded(make_status_key(*status, cursor)),
+                None => Bound::Included(vec![IndexKind::Status as u8, 0, prefix, 0]),
+            };
+            let end = Bound::Excluded(vec![IndexKind::Status as u8, 0, prefix + 1, 0]);
+
+            match direction {
+                ScanDirection::Asc => range_source!(
+                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (start, end)),
+                    4
+                ),
+                ScanDirection::Desc => range_source!(
+                    snapshot
+                        .range::<Vec<u8>, _>(ks.index.as_ref(), (start, end))
+                        .rev(),
+                    4
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Build type-index MergeSources for the given types.
+fn type_scan_sources<'a>(
+    snapshot: &'a impl Readable,
+    ks: &'a Keyspaces,
+    types: &HashSet<String>,
+    from: &Option<String>,
+    direction: ScanDirection,
+) -> Vec<MergeSource<'a>> {
+    types
+        .iter()
+        .map(|type_name| {
+            let prefix_len = type_name.len() + 3;
+            let start = match from {
+                Some(cursor) => Bound::Excluded(make_type_key(type_name, cursor)),
+                None => Bound::Included(make_type_key(type_name, "")),
+            };
+            let mut end_key = Vec::with_capacity(type_name.len() + 3);
+            end_key.push(IndexKind::Type as u8);
+            end_key.push(0);
+            end_key.extend_from_slice(type_name.as_bytes());
+            end_key.push(1);
+            let end = Bound::Excluded(end_key);
+
+            match direction {
+                ScanDirection::Asc => range_source!(
+                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (start, end)),
+                    prefix_len
+                ),
+                ScanDirection::Desc => range_source!(
+                    snapshot
+                        .range::<Vec<u8>, _>(ks.index.as_ref(), (start, end))
+                        .rev(),
+                    prefix_len
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Look up full job records from an iterator of raw IDs, returning an error
 /// if any ID is missing from the `data` keyspace (data corruption). Hydrates
 /// each job's payload from the same keyspace using the `P` tag prefix.
@@ -3250,108 +3367,6 @@ impl Store {
             let fetch = opts.limit.saturating_add(1);
             let mut rows = Vec::with_capacity(fetch.min(1024));
 
-            // Helper: build queue-index MergeSources for the given queues.
-            let queue_sources = |queues: &HashSet<String>,
-                                 from: &Option<String>,
-                                 direction: ScanDirection|
-             -> Vec<MergeSource<'_>> {
-                queues
-                    .iter()
-                    .map(|queue_name| {
-                        let prefix_len = queue_name.len() + 3;
-                        let start = match from {
-                            Some(cursor) => Bound::Excluded(make_queue_key(queue_name, cursor)),
-                            None => Bound::Included(make_queue_key(queue_name, "")),
-                        };
-                        let mut end_key = Vec::with_capacity(queue_name.len() + 3);
-                        end_key.push(IndexKind::Queue as u8);
-                        end_key.push(0);
-                        end_key.extend_from_slice(queue_name.as_bytes());
-                        end_key.push(1);
-
-                        let end = Bound::Excluded(end_key);
-
-                        match direction {
-                            ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)),
-                                prefix_len
-                            ),
-                            ScanDirection::Desc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)).rev(),
-                                prefix_len
-                            ),
-                        }
-                    })
-                    .collect()
-            };
-
-            // Helper: build status-index MergeSources for the given statuses.
-            let status_sources = |statuses: &HashSet<JobStatus>,
-                                  from: &Option<String>,
-                                  direction: ScanDirection|
-             -> Vec<MergeSource<'_>> {
-                statuses
-                    .iter()
-                    .map(|status| {
-                        let prefix = *status as u8;
-                        let start = match from {
-                            Some(cursor) => Bound::Excluded(make_status_key(*status, cursor)),
-                            None => Bound::Included(vec![IndexKind::Status as u8, 0, prefix, 0]),
-                        };
-                        let end = Bound::Excluded(vec![IndexKind::Status as u8, 0, prefix + 1, 0]);
-
-                        match direction {
-                            ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)),
-                                4
-                            ),
-                            ScanDirection::Desc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)).rev(),
-                                4
-                            ),
-                        }
-                    })
-                    .collect()
-            };
-
-            // Helper: build type-index MergeSources for the given types.
-            // Same key layout as queue: `{type}\0{job_id}`.
-            let type_sources = |types: &HashSet<String>,
-                                from: &Option<String>,
-                                direction: ScanDirection|
-             -> Vec<MergeSource<'_>> {
-                types
-                    .iter()
-                    .map(|type_name| {
-                        let prefix_len = type_name.len() + 3;
-
-                        let start = match from {
-                            Some(cursor) => Bound::Excluded(make_type_key(type_name, cursor)),
-                            None => Bound::Included(make_type_key(type_name, "")),
-                        };
-
-                        let mut end_key = Vec::with_capacity(type_name.len() + 3);
-                        end_key.push(IndexKind::Type as u8);
-                        end_key.push(0);
-                        end_key.extend_from_slice(type_name.as_bytes());
-                        end_key.push(1);
-
-                        let end = Bound::Excluded(end_key);
-
-                        match direction {
-                            ScanDirection::Asc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)),
-                                prefix_len
-                            ),
-                            ScanDirection::Desc => range_source!(
-                                snapshot.range::<Vec<u8>, _>(&ks.index, (start, end)).rev(),
-                                prefix_len
-                            ),
-                        }
-                    })
-                    .collect()
-            };
-
             // Collect an IdStream per active filter dimension. When
             // multiple filters are active we intersect them; when only one
             // is active we use it directly.
@@ -3361,7 +3376,13 @@ impl Store {
                 filters.push((
                     "jobs_by_queue",
                     merge_sources(
-                        queue_sources(&opts.queues, &opts.from, opts.direction),
+                        queue_scan_sources(
+                            &snapshot,
+                            &ks,
+                            &opts.queues,
+                            &opts.from,
+                            opts.direction,
+                        ),
                         opts.direction,
                     ),
                 ));
@@ -3371,7 +3392,13 @@ impl Store {
                 filters.push((
                     "jobs_by_status",
                     merge_sources(
-                        status_sources(&opts.statuses, &opts.from, opts.direction),
+                        status_scan_sources(
+                            &snapshot,
+                            &ks,
+                            &opts.statuses,
+                            &opts.from,
+                            opts.direction,
+                        ),
                         opts.direction,
                     ),
                 ));
@@ -3381,7 +3408,7 @@ impl Store {
                 filters.push((
                     "jobs_by_type",
                     merge_sources(
-                        type_sources(&opts.types, &opts.from, opts.direction),
+                        type_scan_sources(&snapshot, &ks, &opts.types, &opts.from, opts.direction),
                         opts.direction,
                     ),
                 ));
