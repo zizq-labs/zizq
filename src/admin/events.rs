@@ -444,6 +444,14 @@ async fn process_store_event(
             events
         }
         StoreEvent::JobScheduled { .. } => diff_scheduled(store, conn).await,
+        StoreEvent::JobDeleted { id } => {
+            let mut events = Vec::new();
+            conn.in_flight_ids.retain(|(_, wid)| wid != &id);
+            events.extend(diff_ready(store, conn).await);
+            events.extend(diff_in_flight(store, conn).await);
+            events.extend(diff_scheduled(store, conn).await);
+            events
+        }
         StoreEvent::IndexRebuilt => {
             let mut events = diff_ready(store, conn).await;
             events.extend(diff_scheduled(store, conn).await);

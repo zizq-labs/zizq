@@ -1017,7 +1017,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/bulk", post(bulk_enqueue))
         .route("/jobs/success", post(bulk_mark_completed))
         .route("/jobs/take", get(take_jobs))
-        .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}", get(get_job).delete(delete_job))
         .route("/jobs/{id}/success", post(mark_completed))
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
@@ -1520,6 +1520,34 @@ async fn get_job(
         ),
         Err(e) => {
             tracing::error!(%e, "get_job failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `DELETE /jobs/{id}` — delete a job by ID.
+async fn delete_job(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.delete_job(&id).await {
+        Ok(true) => respond(fmt, StatusCode::NO_CONTENT, &()),
+        Ok(false) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: "job not found".into(),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "delete_job failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2197,6 +2225,15 @@ async fn take_jobs(
                                     tracing::debug!(
                                         job_id = %id,
                                         reason = "failed",
+                                        "job removed from in-flight set"
+                                    );
+                                }
+                            }
+                            Ok(StoreEvent::JobDeleted { ref id }) => {
+                                if in_flight.remove(id).is_some() {
+                                    tracing::debug!(
+                                        job_id = %id,
+                                        reason = "deleted",
                                         "job removed from in-flight set"
                                     );
                                 }
@@ -5875,5 +5912,56 @@ mod tests {
         assert!(!jobs[0]["duplicate"].as_bool().unwrap());
         assert!(jobs[1]["duplicate"].as_bool().unwrap());
         assert!(!jobs[2]["duplicate"].as_bool().unwrap());
+    }
+
+    // --- DELETE /jobs/{id} ---
+
+    #[tokio::test]
+    async fn delete_job_returns_204() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = empty_request("DELETE", &format!("/jobs/{}", job.id));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_job_returns_404_for_missing_job() {
+        let req = empty_request("DELETE", "/jobs/nonexistent");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_job_actually_removes_the_job() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = empty_request("DELETE", &format!("/jobs/{}", job.id));
+        app.clone().oneshot(req).await.unwrap();
+
+        // GET should now return 404.
+        let req = empty_request("GET", &format!("/jobs/{}", job.id));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }

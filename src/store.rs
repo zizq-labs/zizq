@@ -804,6 +804,13 @@ pub enum StoreEvent {
     /// due sooner than whatever it was sleeping until. Workers ignore it.
     JobScheduled { id: String, ready_at: u64 },
 
+    /// A job was explicitly deleted via the API (not the normal lifecycle purge).
+    ///
+    /// Workers use this to release capacity when an in-flight job is deleted
+    /// externally. The take stream treats this like a completion — the job
+    /// is gone and the worker should not attempt to ack/nack it.
+    JobDeleted { id: String },
+
     /// Recovery and index rebuilding completed.
     ///
     /// Emitted once when `rebuild_indexes()` finishes. Wakes sleeping
@@ -4206,6 +4213,8 @@ impl Store {
     pub async fn purge_job(&self, id: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
+        let scheduled_index = self.scheduled_index.clone();
+        let in_flight_count = self.in_flight_count.clone();
         let id = id.to_string();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
@@ -4228,14 +4237,44 @@ impl Store {
             apply_job_deletion(&mut tx, &del, &ks);
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-            // Defensive: remove from ready_index in case of inconsistency.
-            ready_index.global.remove(&(job.priority, id));
+            // Remove from in-memory indexes based on the job's status.
+            match status {
+                JobStatus::Ready => {
+                    ready_index.global.remove(&(job.priority, id));
+                }
+                JobStatus::Scheduled => {
+                    scheduled_index.remove(job.ready_at, &id);
+                }
+                JobStatus::InFlight => {
+                    in_flight_count
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(1))
+                        })
+                        .ok();
+                }
+                _ => {}
+            }
 
             Ok((true, Some(sync)))
         })
         .await?;
 
         Ok(await_sync(result).await?)
+    }
+
+    /// Delete a job by ID via the API.
+    ///
+    /// Delegates to `purge_job` for the actual deletion, then emits a
+    /// `JobDeleted` event so that workers can release capacity for
+    /// in-flight jobs that were deleted externally.
+    pub async fn delete_job(&self, id: &str) -> Result<bool, StoreError> {
+        let deleted = self.purge_job(id).await?;
+        if deleted {
+            let _ = self
+                .event_tx
+                .send(StoreEvent::JobDeleted { id: id.to_string() });
+        }
+        Ok(deleted)
     }
 
     /// Hard-delete a batch of jobs in a single transaction.
@@ -9664,5 +9703,136 @@ mod tests {
             .unwrap();
         assert!(r2.is_duplicate());
         assert_eq!(r2.job().id, r1.job().id);
+    }
+
+    // --- delete_job ---
+
+    #[tokio::test]
+    async fn delete_job_removes_ready_job() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        assert!(store.delete_job(&job.id).await.unwrap());
+        assert!(
+            store
+                .get_job(now_millis(), &job.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Should not be takeable.
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap();
+        assert!(taken.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_job_removes_scheduled_job() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let future = now_millis() + 60_000;
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)).ready_at(future),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        assert!(store.delete_job(&job.id).await.unwrap());
+        assert!(
+            store
+                .get_job(now_millis(), &job.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_job_removes_in_flight_job() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let job = enqueue_and_take(&store).await;
+
+        assert!(store.delete_job(&job.id).await.unwrap());
+        assert!(
+            store
+                .get_job(now_millis(), &job.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_job_returns_false_for_missing_job() {
+        let store = test_store();
+        assert!(!store.delete_job("nonexistent").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_job_emits_job_deleted_event() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let mut rx = store.subscribe();
+        store.delete_job(&job.id).await.unwrap();
+
+        match rx.recv().await.unwrap() {
+            StoreEvent::JobDeleted { id } => assert_eq!(id, job.id),
+            other => panic!("expected JobDeleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_job_does_not_emit_event_for_missing_job() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+
+        store.delete_job("nonexistent").await.unwrap();
+
+        // No event should be emitted. Use try_recv to check.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn purge_job_does_not_emit_job_deleted_event() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let mut rx = store.subscribe();
+        store.purge_job(&job.id).await.unwrap();
+
+        // purge_job should NOT emit events.
+        assert!(rx.try_recv().is_err());
     }
 }
