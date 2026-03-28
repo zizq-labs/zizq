@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod commands;
+pub mod filter;
 pub mod license;
 pub mod logging;
 pub mod state;

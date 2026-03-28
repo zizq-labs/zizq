@@ -30,6 +30,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::filter::PayloadFilter;
 use crate::state::AppState;
 
 /// Default priority for jobs that don't specify one.
@@ -603,6 +604,9 @@ struct ListJobsParams {
     /// Type filter, comma-delimited (e.g. "send_email,generate_report").
     #[serde(default, rename = "type")]
     job_type: CommaSet<String>,
+
+    /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
+    filter: Option<String>,
 }
 
 /// Sort order for job listings.
@@ -1579,9 +1583,24 @@ async fn list_jobs(
     if !params.job_type.is_empty() {
         opts = opts.types(params.job_type.0.clone());
     }
+    if let Some(ref expr) = params.filter {
+        match PayloadFilter::compile(expr) {
+            Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
+            Err(e) => {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("invalid filter: {e}"),
+                    },
+                );
+            }
+        }
+    }
 
     match state.store.list_jobs(opts).await {
         Ok(page) => {
+            let filter_expr = params.filter.as_deref();
             let self_url = build_page_url(
                 params.from.as_deref(),
                 params.order,
@@ -1589,6 +1608,7 @@ async fn list_jobs(
                 &params.status,
                 &params.queue,
                 &params.job_type,
+                filter_expr,
             );
             let next = page.next.map(|o| {
                 build_page_url(
@@ -1598,6 +1618,7 @@ async fn list_jobs(
                     &params.status,
                     &params.queue,
                     &params.job_type,
+                    filter_expr,
                 )
             });
             let prev = page.prev.map(|o| {
@@ -1608,6 +1629,7 @@ async fn list_jobs(
                     &params.status,
                     &params.queue,
                     &params.job_type,
+                    filter_expr,
                 )
             });
 
@@ -1659,6 +1681,7 @@ fn build_page_url(
     statuses: &CommaSet<JobStatus>,
     queues: &CommaSet<String>,
     types: &CommaSet<String>,
+    filter: Option<&str>,
 ) -> String {
     let mut url = String::from("/jobs?");
     if let Some(cursor) = from {
@@ -1674,6 +1697,9 @@ fn build_page_url(
     }
     if !types.is_empty() {
         url.push_str(&format!("&type={types}"));
+    }
+    if let Some(expr) = filter {
+        url.push_str(&format!("&filter={}", urlencoding::encode(expr)));
     }
     url
 }

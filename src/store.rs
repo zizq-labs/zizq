@@ -30,6 +30,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use dashmap::DashMap;
 
+use crate::filter::PayloadFilter;
+
 use fjall::config::{FilterPolicy, PinningPolicy};
 use fjall::{PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace, Slice};
 use serde::{Deserialize, Serialize};
@@ -430,6 +432,14 @@ pub struct ListJobsOptions {
     /// Current time for filtering out expired jobs (purge_at <= now).
     /// When `Some`, jobs past their purge_at are skipped.
     pub now: Option<u64>,
+
+    /// Optional jq-style payload filter. When provided, only jobs whose
+    /// payload matches the filter are returned. Payloads are hydrated and
+    /// checked after the index scan narrows the candidate set.
+    ///
+    /// Wrapped in `Arc` because `ListJobsOptions` must be `Clone` for
+    /// pagination, but `PayloadFilter` contains compiled state.
+    pub filter: Option<std::sync::Arc<PayloadFilter>>,
 }
 
 impl ListJobsOptions {
@@ -443,6 +453,7 @@ impl ListJobsOptions {
             queues: HashSet::new(),
             types: HashSet::new(),
             now: None,
+            filter: None,
         }
     }
 
@@ -489,8 +500,14 @@ impl ListJobsOptions {
     }
 
     /// Set the current time for filtering expired jobs and return `self`.
-    pub fn now(mut self, now: u64) -> Self {
-        self.now = Some(now);
+    pub fn now(mut self, now: impl Into<Option<u64>>) -> Self {
+        self.now = now.into();
+        self
+    }
+
+    /// Set the payload filter and return `self`.
+    pub fn filter(mut self, filter: impl Into<Option<Arc<PayloadFilter>>>) -> Self {
+        self.filter = filter.into();
         self
     }
 }
@@ -1521,31 +1538,39 @@ fn intersect_streams<'a>(
 /// Reads are performed through the provided `Readable` (typically a snapshot)
 /// to ensure consistency with the index scan that produced the IDs.
 ///
-/// When `now` is `Some`, jobs with `purge_at <= now` are skipped (logically
-/// invisible before the reaper physically deletes them). The iterator
-/// continues scanning past expired jobs until `limit` entries are collected
-/// or the stream is exhausted.
+/// When `now` is provided, jobs with `purge_at <= now` are skipped (logically
+/// invisible before the reaper physically deletes them).
+///
+/// When `filter` is provided, jobs without matching payloads are skipped.
+///
+/// The iterator continues scanning past skippdd jobs until `limit` entries are
+/// collected or the stream is exhausted.
 fn load_jobs_by_ids(
     reader: &impl Readable,
     data_ks: &SingleWriterTxKeyspace,
     ids: impl Iterator<Item = Result<Vec<u8>, StoreError>>,
     source: &str,
     now: Option<u64>,
+    filter: Option<&PayloadFilter>,
     limit: usize,
 ) -> Result<Vec<Job>, StoreError> {
     let mut rows = Vec::new();
-    for id in ids {
-        let id = id?;
+
+    for result in ids {
+        let id = result?;
+
         let job_key = make_job_key(
             std::str::from_utf8(&id)
                 .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))?,
         );
+
         let bytes = reader.get(data_ks, &job_key)?.ok_or_else(|| {
             StoreError::Corruption(format!(
                 "job in {source} but missing from data keyspace: {:?}",
                 String::from_utf8_lossy(&id),
             ))
         })?;
+
         let mut job: Job = rmp_serde::from_slice(&bytes)?;
 
         // Skip expired jobs (logically invisible).
@@ -1561,11 +1586,21 @@ fn load_jobs_by_ids(
             job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
         }
 
+        // Apply payload filter if present.
+        if let Some(f) = filter {
+            let payload = job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
+            if !f.matches(payload) {
+                continue;
+            }
+        }
+
         rows.push(job);
+
         if rows.len() >= limit {
             break;
         }
     }
+
     Ok(rows)
 }
 
@@ -3226,6 +3261,7 @@ impl Store {
                         end_key.push(0);
                         end_key.extend_from_slice(queue_name.as_bytes());
                         end_key.push(1);
+
                         let end = Bound::Excluded(end_key);
 
                         match direction {
@@ -3281,15 +3317,18 @@ impl Store {
                     .iter()
                     .map(|type_name| {
                         let prefix_len = type_name.len() + 3;
+
                         let start = match from {
                             Some(cursor) => Bound::Excluded(make_type_key(type_name, cursor)),
                             None => Bound::Included(make_type_key(type_name, "")),
                         };
+
                         let mut end_key = Vec::with_capacity(type_name.len() + 3);
                         end_key.push(IndexKind::Type as u8);
                         end_key.push(0);
                         end_key.extend_from_slice(type_name.as_bytes());
                         end_key.push(1);
+
                         let end = Bound::Excluded(end_key);
 
                         match direction {
@@ -3320,6 +3359,7 @@ impl Store {
                     ),
                 ));
             }
+
             if !opts.statuses.is_empty() {
                 filters.push((
                     "jobs_by_status",
@@ -3329,6 +3369,7 @@ impl Store {
                     ),
                 ));
             }
+
             if !opts.types.is_empty() {
                 filters.push((
                     "jobs_by_type",
@@ -3355,13 +3396,21 @@ impl Store {
                 let first = iter.next().unwrap();
                 let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
 
-                rows =
-                    load_jobs_by_ids(&snapshot, &ks.data, combined, &source_desc, opts.now, fetch)?;
+                rows = load_jobs_by_ids(
+                    &snapshot,
+                    &ks.data,
+                    combined,
+                    &source_desc,
+                    opts.now,
+                    opts.filter.as_deref(),
+                    fetch,
+                )?;
             } else {
-                // No filter — scan the data keyspace for J-tagged keys.
+                // No filter - scan the data keyspace for J-tagged keys.
                 // Range: [J, 0]..[J, 1] covers all job metadata entries.
                 let job_prefix_start: Vec<u8> = vec![RecordKind::Job as u8, 0];
                 let job_prefix_end: Vec<u8> = vec![RecordKind::Job as u8, 1];
+
                 match opts.direction {
                     ScanDirection::Asc => {
                         let range = match &opts.from {
@@ -3383,19 +3432,32 @@ impl Store {
 
                         for entry in range {
                             let (key, value) = entry.into_inner()?;
+
                             let mut job: Job = rmp_serde::from_slice(&value)?;
+
                             if let Some(now) = opts.now {
                                 if job.purge_at.is_some_and(|p| p <= now) {
                                     continue;
                                 }
                             }
+
                             // Swap J tag for P tag to look up payload.
                             let mut payload_key = key.to_vec();
                             payload_key[0] = RecordKind::Payload as u8;
                             if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
+
+                            if let Some(ref f) = opts.filter {
+                                let payload =
+                                    job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
+                                if !f.matches(payload) {
+                                    continue;
+                                }
+                            }
+
                             rows.push(job);
+
                             if rows.len() >= fetch {
                                 break;
                             }
@@ -3421,19 +3483,32 @@ impl Store {
 
                         for entry in range.rev() {
                             let (key, value) = entry.into_inner()?;
+
                             let mut job: Job = rmp_serde::from_slice(&value)?;
+
                             if let Some(now) = opts.now {
                                 if job.purge_at.is_some_and(|p| p <= now) {
                                     continue;
                                 }
                             }
+
                             // Swap J tag for P tag to look up payload.
                             let mut payload_key = key.to_vec();
                             payload_key[0] = RecordKind::Payload as u8;
                             if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                             }
+
+                            if let Some(ref f) = opts.filter {
+                                let payload =
+                                    job.payload.as_ref().unwrap_or(&serde_json::Value::Null);
+                                if !f.matches(payload) {
+                                    continue;
+                                }
+                            }
+
                             rows.push(job);
+
                             if rows.len() >= fetch {
                                 break;
                             }
@@ -3451,17 +3526,15 @@ impl Store {
 
             // Build next/prev options, preserving all filters.
             let make_opts = |cursor: &str, direction: ScanDirection| {
-                let mut o = ListJobsOptions::new()
+                ListJobsOptions::new()
                     .from(cursor.to_string())
                     .direction(direction)
                     .limit(opts.limit)
                     .statuses(opts.statuses.clone())
                     .queues(opts.queues.clone())
-                    .types(opts.types.clone());
-                if let Some(now) = opts.now {
-                    o = o.now(now);
-                }
-                o
+                    .types(opts.types.clone())
+                    .now(opts.now)
+                    .filter(opts.filter.clone())
             };
 
             // Next page: exists if over-select found an extra row.
