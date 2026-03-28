@@ -582,6 +582,7 @@ struct FailureRequest {
 
 /// Query parameters for `GET /jobs`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListJobsParams {
     /// Cursor: start after this job ID (exclusive).
     from: Option<String>,
@@ -610,6 +611,30 @@ struct ListJobsParams {
     id: CommaSet<String>,
 
     /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
+    filter: Option<String>,
+}
+
+/// Query parameters for `DELETE /jobs`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteJobsParams {
+    /// ID filter, comma-delimited.
+    #[serde(default)]
+    id: CommaSet<String>,
+
+    /// Status filter, comma-delimited.
+    #[serde(default)]
+    status: CommaSet<JobStatus>,
+
+    /// Queue filter, comma-delimited.
+    #[serde(default)]
+    queue: CommaSet<String>,
+
+    /// Type filter, comma-delimited.
+    #[serde(default, rename = "type")]
+    job_type: CommaSet<String>,
+
+    /// jq expression to filter jobs by payload.
     filter: Option<String>,
 }
 
@@ -719,6 +744,7 @@ impl From<store::ErrorRecord> for ErrorRecord {
 
 /// Query parameters for `GET /jobs/{id}/errors`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListErrorsParams {
     /// Cursor: start after this attempt number (exclusive).
     from: Option<u32>,
@@ -1017,7 +1043,10 @@ pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
-        .route("/jobs", get(list_jobs).post(enqueue))
+        .route(
+            "/jobs",
+            get(list_jobs).post(enqueue).delete(bulk_delete_jobs),
+        )
         .route("/jobs/bulk", post(bulk_enqueue))
         .route("/jobs/success", post(bulk_mark_completed))
         .route("/jobs/take", get(take_jobs))
@@ -1572,6 +1601,93 @@ async fn delete_job(
     }
 }
 
+/// Handle `DELETE /jobs` — bulk delete jobs matching filters.
+async fn bulk_delete_jobs(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<DeleteJobsParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(e) => {
+            return respond(
+                Format::Json,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid query parameters: {e}"),
+                },
+            );
+        }
+    };
+
+    // Validate IDs.
+    for id in params.id.iter() {
+        if !is_valid_job_id(id) {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid job ID: {id:?}"),
+                },
+            );
+        }
+    }
+
+    // Compile payload filter.
+    let filter = if let Some(ref expr) = params.filter {
+        match PayloadFilter::compile(expr) {
+            Ok(f) => Some(std::sync::Arc::new(f)),
+            Err(e) => {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("invalid filter: {e}"),
+                    },
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut opts = store::DeleteJobsOptions::new();
+    if !params.id.is_empty() {
+        opts.ids = params.id.0;
+    }
+    if !params.status.is_empty() {
+        opts.statuses = params
+            .status
+            .iter()
+            .map(|s| store::JobStatus::from(*s))
+            .collect();
+    }
+    if !params.queue.is_empty() {
+        opts.queues = params.queue.0;
+    }
+    if !params.job_type.is_empty() {
+        opts.types = params.job_type.0;
+    }
+    opts.filter = filter;
+
+    match state.store.delete_jobs(opts).await {
+        Ok(count) => {
+            tracing::debug!(count, "bulk delete completed");
+            respond(fmt, StatusCode::NO_CONTENT, &())
+        }
+        Err(e) => {
+            tracing::error!(%e, "bulk_delete_jobs failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
 /// Handle `GET /jobs` — list jobs with cursor-based pagination.
 async fn list_jobs(
     AcceptFormat(fmt): AcceptFormat,
@@ -1940,6 +2056,7 @@ const DEFAULT_PREFETCH: usize = 1;
 
 /// Query parameters for `GET /jobs/take`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TakeParams {
     /// Maximum number of unacknowledged jobs to send before waiting.
     /// 0 means unlimited. Defaults to 1.
@@ -6044,5 +6161,91 @@ mod tests {
 
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert!(body["jobs"].as_array().unwrap().is_empty());
+    }
+
+    // --- DELETE /jobs (bulk) ---
+
+    #[tokio::test]
+    async fn bulk_delete_returns_204() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("DELETE", "/jobs?queue=q");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_by_id_returns_204() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = empty_request("DELETE", &format!("/jobs?id={}", job.id));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_with_invalid_filter_returns_400() {
+        let req = empty_request("DELETE", "/jobs?filter=.x%20====");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_with_invalid_id_returns_400() {
+        let req = empty_request("DELETE", "/jobs?id=not-valid");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_actually_removes_jobs() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        state
+            .store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap();
+
+        let req = empty_request("DELETE", "/jobs");
+        app.clone().oneshot(req).await.unwrap();
+
+        // GET should return empty.
+        let req = empty_request("GET", "/jobs");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["jobs"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_no_matches_returns_204() {
+        let req = empty_request("DELETE", "/jobs?queue=nonexistent");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
     }
 }

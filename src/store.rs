@@ -526,6 +526,37 @@ impl ListJobsOptions {
     }
 }
 
+/// Options for bulk-deleting jobs in `Store::delete_jobs`.
+#[derive(Debug)]
+pub struct DeleteJobsOptions {
+    /// Optional ID filter. When non-empty, only these IDs are candidates.
+    pub ids: HashSet<String>,
+
+    /// Optional status filter.
+    pub statuses: HashSet<JobStatus>,
+
+    /// Optional queue filter.
+    pub queues: HashSet<String>,
+
+    /// Optional type filter.
+    pub types: HashSet<String>,
+
+    /// Optional jq payload filter.
+    pub filter: Option<Arc<PayloadFilter>>,
+}
+
+impl DeleteJobsOptions {
+    pub fn new() -> Self {
+        Self {
+            ids: HashSet::new(),
+            statuses: HashSet::new(),
+            queues: HashSet::new(),
+            types: HashSet::new(),
+            filter: None,
+        }
+    }
+}
+
 /// A page of jobs returned by `Store::list_jobs`.
 #[derive(Debug)]
 pub struct ListJobsPage {
@@ -4428,6 +4459,149 @@ impl Store {
                 .send(StoreEvent::JobDeleted { id: id.to_string() });
         }
         Ok(deleted)
+    }
+
+    /// Bulk-delete jobs matching the given filters.
+    ///
+    /// Acquires the write lock, scans matching jobs under a consistent
+    /// snapshot, deletes each one, and commits in a single transaction.
+    /// Returns the count of deleted jobs.
+    ///
+    /// Emits `StoreEvent::JobDeleted` for each deleted job.
+    pub async fn delete_jobs(&self, opts: DeleteJobsOptions) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
+        let scheduled_index = self.scheduled_index.clone();
+        let in_flight_count = self.in_flight_count.clone();
+        let event_tx = self.event_tx.clone();
+
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            // Acquire the write lock first, then open a snapshot.
+            // The snapshot sees the latest committed state, and since we
+            // hold the writer lock, nothing can commit while we scan + delete.
+            let mut tx = ks.write_tx();
+            let snapshot = ks.db.read_tx();
+
+            let has_payload_filter = opts.filter.is_some();
+            let has_id_filter = !opts.ids.is_empty();
+
+            // Build the job stream: filtered by indexes, or full scan.
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if let Some((id_stream, source, _)) = build_id_stream(
+                    &snapshot,
+                    &ks,
+                    &opts.ids,
+                    &opts.statuses,
+                    &opts.queues,
+                    &opts.types,
+                    &None,
+                    ScanDirection::Asc,
+                ) {
+                    let stream = JobStream::by_id(
+                        id_stream,
+                        &snapshot,
+                        &ks.data,
+                        None,               // no expiry filtering for deletion
+                        has_payload_filter, // only hydrate if filter needs it
+                        has_id_filter,
+                        source,
+                    );
+                    Box::new(stream) as Box<dyn Iterator<Item = Result<Job, StoreError>> + '_>
+                } else {
+                    let stream = JobStream::full_scan(
+                        &snapshot,
+                        &ks,
+                        &None,
+                        ScanDirection::Asc,
+                        None,
+                        has_payload_filter,
+                    );
+                    Box::new(stream) as Box<dyn Iterator<Item = Result<Job, StoreError>> + '_>
+                };
+
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if let Some(ref filter) = opts.filter {
+                    Box::new(PayloadFilteredIter {
+                        inner: jobs,
+                        filter: Arc::clone(filter),
+                    })
+                } else {
+                    jobs
+                };
+
+            // Track deleted jobs for post-commit cleanup.
+            struct Deleted {
+                id: String,
+                status: JobStatus,
+                priority: u16,
+                ready_at: u64,
+            }
+
+            let mut deleted: Vec<Deleted> = Vec::new();
+
+            for result in jobs {
+                let job = result?;
+                let status = JobStatus::try_from(job.status).map_err(|v| {
+                    StoreError::Corruption(format!(
+                        "job {} has unrecognized status byte: {v}",
+                        job.id
+                    ))
+                })?;
+
+                let del = prepare_job_deletion(&job, status, &ks);
+                apply_job_deletion(&mut tx, &del, &ks);
+
+                deleted.push(Deleted {
+                    id: job.id,
+                    status,
+                    priority: job.priority,
+                    ready_at: job.ready_at,
+                });
+            }
+
+            if deleted.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+            // Post-commit: clean up in-memory indexes.
+            let mut in_flight_removed: u64 = 0;
+            for d in &deleted {
+                match d.status {
+                    JobStatus::Ready => {
+                        ready_index.global.remove(&(d.priority, d.id.clone()));
+                    }
+                    JobStatus::Scheduled => {
+                        scheduled_index.remove(d.ready_at, &d.id);
+                    }
+                    JobStatus::InFlight => {
+                        in_flight_removed += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            if in_flight_removed > 0 {
+                in_flight_count
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(in_flight_removed))
+                    })
+                    .ok();
+            }
+
+            let deleted_ids: Vec<String> = deleted.into_iter().map(|d| d.id).collect();
+            Ok((deleted_ids, Some(sync)))
+        })
+        .await?;
+
+        let deleted_ids = await_sync(result).await?;
+
+        for id in &deleted_ids {
+            let _ = event_tx.send(StoreEvent::JobDeleted { id: id.clone() });
+        }
+
+        Ok(deleted_ids.len())
     }
 
     /// Hard-delete a batch of jobs in a single transaction.
@@ -10148,5 +10322,272 @@ mod tests {
             .unwrap();
 
         assert!(page.jobs.is_empty());
+    }
+
+    // --- delete_jobs (bulk) ---
+
+    #[tokio::test]
+    async fn delete_jobs_by_status() {
+        let store = test_store_with_retention(60_000, 60_000);
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        // Create 3 jobs: take and complete one, leave two ready.
+        for _ in 0..3 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+        let taken = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store.mark_completed(now, &taken.id).await.unwrap();
+
+        let mut opts = DeleteJobsOptions::new();
+        opts.statuses = [JobStatus::Ready].into();
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        // The completed job should still exist.
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].status, JobStatus::Completed as u8);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_by_queue() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "keep", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "delete_me", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "delete_me", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let mut opts = DeleteJobsOptions::new();
+        opts.queues = ["delete_me".into()].into();
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].queue, "keep");
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_by_ids() {
+        let store = test_store();
+        let now = now_millis();
+
+        let j1 = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let j2 = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let j3 = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let mut opts = DeleteJobsOptions::new();
+        opts.ids = [j1.id.clone(), j3.id.clone()].into();
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].id, j2.id);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_by_payload_filter() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!({"x": 1})),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!({"x": 2})),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!({"x": 3})),
+            )
+            .await
+            .unwrap();
+
+        let mut opts = DeleteJobsOptions::new();
+        opts.filter = Some(Arc::new(PayloadFilter::compile(".x > 1").unwrap()));
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].payload, Some(serde_json::json!({"x": 1})));
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_with_no_filters_deletes_all() {
+        let store = test_store();
+        let now = now_millis();
+
+        for _ in 0..5 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+
+        let count = store.delete_jobs(DeleteJobsOptions::new()).await.unwrap();
+        assert_eq!(count, 5);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert!(page.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_combined_filters() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        // Two jobs in queue "a", one taken (in-flight), one ready.
+        store
+            .enqueue(now, EnqueueOptions::new("t", "a", serde_json::json!(null)))
+            .await
+            .unwrap();
+        store
+            .enqueue(now, EnqueueOptions::new("t", "a", serde_json::json!(null)))
+            .await
+            .unwrap();
+        // One job in queue "b", ready.
+        store
+            .enqueue(now, EnqueueOptions::new("t", "b", serde_json::json!(null)))
+            .await
+            .unwrap();
+
+        // Take one from "a".
+        store
+            .take_next_job(now, &["a".into()].into())
+            .await
+            .unwrap();
+
+        // Delete ready jobs in queue "a" only.
+        let mut opts = DeleteJobsOptions::new();
+        opts.queues = ["a".into()].into();
+        opts.statuses = [JobStatus::Ready].into();
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 1);
+
+        // In-flight "a" and ready "b" should remain.
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_emits_events() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap();
+        store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap();
+
+        let mut rx = store.subscribe();
+        let count = store.delete_jobs(DeleteJobsOptions::new()).await.unwrap();
+        assert_eq!(count, 2);
+
+        // Should receive 2 JobDeleted events.
+        for _ in 0..2 {
+            match rx.recv().await.unwrap() {
+                StoreEvent::JobDeleted { .. } => {}
+                other => panic!("expected JobDeleted, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_returns_zero_for_no_matches() {
+        let store = test_store();
+        let mut opts = DeleteJobsOptions::new();
+        opts.queues = ["nonexistent".into()].into();
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_skips_nonexistent_ids() {
+        let store = test_store();
+        let now = now_millis();
+
+        let j1 = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let mut opts = DeleteJobsOptions::new();
+        opts.ids = [j1.id, "0000000000000000000000000".into()].into();
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 1);
     }
 }
