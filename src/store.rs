@@ -55,6 +55,12 @@ pub enum StoreError {
 
     /// Internal data inconsistency (e.g. queue references a missing job).
     Corruption(String),
+
+    /// The requested operation is not valid for the job's current state.
+    InvalidOperation(String),
+
+    /// Internal error (e.g. sync channel closed).
+    Internal(String),
 }
 
 impl fmt::Display for StoreError {
@@ -65,6 +71,8 @@ impl fmt::Display for StoreError {
             StoreError::Deserialize(e) => write!(f, "deserialization error: {e}"),
             StoreError::TaskJoin(e) => write!(f, "blocking task failed: {e}"),
             StoreError::Corruption(msg) => write!(f, "data corruption: {msg}"),
+            StoreError::InvalidOperation(msg) => write!(f, "invalid operation: {msg}"),
+            StoreError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
 }
@@ -553,6 +561,92 @@ impl DeleteJobsOptions {
             queues: HashSet::new(),
             types: HashSet::new(),
             filter: None,
+        }
+    }
+}
+
+/// Request to patch a single job's mutable fields.
+///
+/// `None` = leave unchanged. `Some(None)` = clear to default/null.
+/// `Some(Some(v))` = set to `v`.
+///
+/// Fields that are not nullable use plain `Option<T>`.
+#[derive(Debug, Default)]
+pub struct PatchJobOptions {
+    /// Move the job to a different queue.
+    pub queue: Option<String>,
+
+    /// Change the job's priority.
+    pub priority: Option<u16>,
+
+    /// Change when the job becomes ready (milliseconds since epoch).
+    /// `Some(None)` clears to "now" (immediately ready).
+    pub ready_at: Option<Option<u64>>,
+
+    /// Override the retry limit. `Some(None)` clears to server default.
+    pub retry_limit: Option<Option<u32>>,
+
+    /// Override the backoff config. `Some(None)` clears to server default.
+    pub backoff: Option<Option<BackoffConfig>>,
+
+    /// Override the retention config. `Some(None)` clears entirely.
+    /// `Some(Some(patch))` merges individual sub-fields.
+    pub retention: Option<Option<RetentionConfigPatch>>,
+}
+
+/// Merge-patch for `RetentionConfig`.
+///
+/// Each sub-field uses `Option<Option<u64>>`:
+/// - `None` — leave unchanged
+/// - `Some(None)` — clear to server default
+/// - `Some(Some(v))` — set to `v`
+#[derive(Debug, Default, Clone)]
+pub struct RetentionConfigPatch {
+    pub completed_ms: Option<Option<u64>>,
+    pub dead_ms: Option<Option<u64>>,
+}
+
+impl RetentionConfigPatch {
+    /// Apply this patch to an existing retention config (or `None`).
+    ///
+    /// Returns `None` if both sub-fields end up cleared — there is no
+    /// point storing a `RetentionConfig` where every field is `None`.
+    pub fn apply(self, current: Option<RetentionConfig>) -> Option<RetentionConfig> {
+        let mut r = current.unwrap_or(RetentionConfig {
+            completed_ms: None,
+            dead_ms: None,
+        });
+
+        if let Some(v) = self.completed_ms {
+            r.completed_ms = v;
+        }
+        if let Some(v) = self.dead_ms {
+            r.dead_ms = v;
+        }
+
+        if r.completed_ms.is_none() && r.dead_ms.is_none() {
+            None
+        } else {
+            Some(r)
+        }
+    }
+}
+
+impl PatchJobOptions {
+    /// Apply all patches to a mutable job.
+    pub fn apply(&self, job: &mut Job) {
+        if let Some(ref retry_limit) = self.retry_limit {
+            job.retry_limit = *retry_limit;
+        }
+        if let Some(ref backoff) = self.backoff {
+            job.backoff = backoff.clone();
+        }
+        match &self.retention {
+            Some(None) => job.retention = None,
+            Some(Some(patch)) => {
+                job.retention = patch.clone().apply(job.retention.take());
+            }
+            None => {}
         }
     }
 }
@@ -4618,6 +4712,118 @@ impl Store {
         }
 
         Ok(deleted_ids.len())
+    }
+
+    /// Patch a single job's mutable fields.
+    ///
+    /// Returns `Ok(Some(job))` with the updated job on success,
+    /// `Ok(None)` if the job does not exist, or `Err` on failure.
+    ///
+    /// Returns `Err(StoreError::InvalidOperation)` if the job is in a
+    /// terminal state (Completed or Dead).
+    pub async fn patch_job(
+        &self,
+        _now: u64,
+        id: &str,
+        patch: PatchJobOptions,
+    ) -> Result<Option<Job>, StoreError> {
+        let ks = self.ks.clone();
+        let id = id.to_string();
+
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let job_key = make_job_key(&id);
+
+            let mut tx = ks.write_tx();
+
+            // Read, patch, and write in a single fetch_update call.
+            // Errors are captured in patch_err since the closure can only
+            // return Option<Slice>.
+            let mut patched_job: Option<Job> = None;
+            let mut patch_err: Option<StoreError> = None;
+
+            let prev = tx.fetch_update(&ks.data, &job_key, |existing| {
+                let bytes = existing?;
+
+                let mut job: Job = match rmp_serde::from_slice(bytes) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        patch_err = Some(e.into());
+                        return Some(bytes.clone());
+                    }
+                };
+
+                let status = match JobStatus::try_from(job.status) {
+                    Ok(s) => s,
+                    Err(v) => {
+                        patch_err = Some(StoreError::Corruption(format!(
+                            "job {} has unrecognized status byte: {v}",
+                            job.id
+                        )));
+                        return Some(bytes.clone());
+                    }
+                };
+
+                // Reject patches on terminal jobs.
+                if matches!(status, JobStatus::Completed | JobStatus::Dead) {
+                    patch_err = Some(StoreError::InvalidOperation(format!(
+                        "cannot patch job {} in {} status",
+                        job.id,
+                        match status {
+                            JobStatus::Completed => "completed",
+                            JobStatus::Dead => "dead",
+                            _ => unreachable!(),
+                        }
+                    )));
+                    return Some(bytes.clone());
+                }
+
+                // Apply metadata-only patches.
+                patch.apply(&mut job);
+
+                // TODO: queue, priority, ready_at patches with index updates.
+
+                match rmp_serde::to_vec_named(&job) {
+                    Ok(updated) => {
+                        patched_job = Some(job);
+                        Some(updated.into())
+                    }
+                    Err(e) => {
+                        patch_err = Some(e.into());
+                        Some(bytes.clone())
+                    }
+                }
+            })?;
+
+            // Propagate any error from inside the closure.
+            if let Some(e) = patch_err {
+                return Err(e);
+            }
+
+            // If prev was None, the job doesn't exist.
+            if prev.is_none() {
+                return Ok((None, None));
+            }
+
+            // If patched_job is None, the closure returned the original
+            // bytes unchanged (error path wrote them back).
+            let mut job = match patched_job {
+                Some(j) => j,
+                None => return Ok((None, None)),
+            };
+
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+            // Hydrate payload for the response.
+            let payload_key = make_payload_key(&id);
+            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
+                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
+            }
+
+            Ok((Some(job), Some(sync)))
+        })
+        .await?;
+
+        Ok(await_sync(result).await?)
     }
 
     /// Hard-delete a batch of jobs in a single transaction.
@@ -10605,5 +10811,279 @@ mod tests {
         opts.ids = [j1.id, "0000000000000000000000000".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- patch_job ---
+
+    #[tokio::test]
+    async fn patch_job_updates_retry_limit() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let patch = PatchJobOptions {
+            retry_limit: Some(Some(10)),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.retry_limit, Some(10));
+    }
+
+    #[tokio::test]
+    async fn patch_job_clears_retry_limit_with_null() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).retry_limit(5),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        assert_eq!(job.retry_limit, Some(5));
+
+        let patch = PatchJobOptions {
+            retry_limit: Some(None), // clear
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.retry_limit, None);
+    }
+
+    #[tokio::test]
+    async fn patch_job_updates_backoff() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let new_backoff = BackoffConfig {
+            exponent: 3.0,
+            base_ms: 5000,
+            jitter_ms: 1000,
+        };
+
+        let patch = PatchJobOptions {
+            backoff: Some(Some(new_backoff.clone())),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        let b = result.backoff.unwrap();
+        assert_eq!(b.exponent, 3.0);
+        assert_eq!(b.base_ms, 5000);
+        assert_eq!(b.jitter_ms, 1000);
+    }
+
+    #[tokio::test]
+    async fn patch_job_updates_retention() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let patch = PatchJobOptions {
+            retention: Some(Some(RetentionConfigPatch {
+                completed_ms: Some(Some(60_000)),
+                dead_ms: Some(Some(120_000)),
+            })),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        let r = result.retention.unwrap();
+        assert_eq!(r.completed_ms, Some(60_000));
+        assert_eq!(r.dead_ms, Some(120_000));
+    }
+
+    #[tokio::test]
+    async fn patch_job_merges_retention_fields() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).retention(RetentionConfig {
+                    completed_ms: Some(60_000),
+                    dead_ms: Some(120_000),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Patch only dead_ms — completed_ms should be preserved.
+        let patch = PatchJobOptions {
+            retention: Some(Some(RetentionConfigPatch {
+                completed_ms: None,
+                dead_ms: Some(Some(300_000)),
+            })),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        let r = result.retention.unwrap();
+        assert_eq!(r.completed_ms, Some(60_000));
+        assert_eq!(r.dead_ms, Some(300_000));
+    }
+
+    #[tokio::test]
+    async fn patch_job_retention_merge_into_none() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Job has no retention — patching dead_ms should create retention with only dead_ms.
+        let patch = PatchJobOptions {
+            retention: Some(Some(RetentionConfigPatch {
+                completed_ms: None,
+                dead_ms: Some(Some(300_000)),
+            })),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        let r = result.retention.unwrap();
+        assert_eq!(r.completed_ms, None);
+        assert_eq!(r.dead_ms, Some(300_000));
+    }
+
+    #[tokio::test]
+    async fn patch_job_clearing_both_retention_fields_clears_retention() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).retention(RetentionConfig {
+                    completed_ms: Some(60_000),
+                    dead_ms: Some(120_000),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Clear both sub-fields — retention itself should become None.
+        let patch = PatchJobOptions {
+            retention: Some(Some(RetentionConfigPatch {
+                completed_ms: Some(None),
+                dead_ms: Some(None),
+            })),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert!(result.retention.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_job_clearing_one_retention_field_preserves_other() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).retention(RetentionConfig {
+                    completed_ms: Some(60_000),
+                    dead_ms: Some(120_000),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Clear completed_ms, leave dead_ms untouched.
+        let patch = PatchJobOptions {
+            retention: Some(Some(RetentionConfigPatch {
+                completed_ms: Some(None),
+                dead_ms: None,
+            })),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        let r = result.retention.unwrap();
+        assert_eq!(r.completed_ms, None);
+        assert_eq!(r.dead_ms, Some(120_000));
+    }
+
+    #[tokio::test]
+    async fn patch_job_leaves_unmentioned_fields_unchanged() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).retry_limit(5),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Patch only backoff — retry_limit should stay.
+        let patch = PatchJobOptions {
+            backoff: Some(Some(BackoffConfig {
+                exponent: 2.0,
+                base_ms: 1000,
+                jitter_ms: 500,
+            })),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.retry_limit, Some(5));
+        assert!(result.backoff.is_some());
+    }
+
+    #[tokio::test]
+    async fn patch_job_rejects_completed_job() {
+        let store = test_store_with_retention(60_000, 60_000);
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        store.take_next_job(now, &HashSet::new()).await.unwrap();
+        store.mark_completed(now, &job.id).await.unwrap();
+
+        let patch = PatchJobOptions {
+            retry_limit: Some(Some(10)),
+            ..Default::default()
+        };
+
+        let err = store.patch_job(now, &job.id, patch).await.unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn patch_job_returns_none_for_missing_job() {
+        let store = test_store();
+        let patch = PatchJobOptions::default();
+        let result = store
+            .patch_job(now_millis(), "nonexistent", patch)
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }

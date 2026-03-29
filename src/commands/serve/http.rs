@@ -14,7 +14,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::store::{self, ListErrorsOptions, ListJobsOptions, ScanDirection, StoreEvent};
+use crate::store::{
+    self, ListErrorsOptions, ListJobsOptions, ScanDirection, StoreError, StoreEvent,
+};
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -322,7 +324,7 @@ pub struct Job {
 }
 
 impl TryFrom<store::Job> for Job {
-    type Error = store::StoreError;
+    type Error = StoreError;
 
     fn try_from(job: store::Job) -> Result<Self, Self::Error> {
         Self::from_store_job(job, None)
@@ -330,13 +332,13 @@ impl TryFrom<store::Job> for Job {
 }
 
 impl Job {
-    fn try_from_result(result: store::EnqueueResult) -> Result<Self, store::StoreError> {
+    fn try_from_result(result: store::EnqueueResult) -> Result<Self, StoreError> {
         let is_duplicate = result.is_duplicate();
         let job = result.into_job();
         Self::from_store_job(job, Some(is_duplicate))
     }
 
-    fn from_store_job(job: store::Job, duplicate: Option<bool>) -> Result<Self, store::StoreError> {
+    fn from_store_job(job: store::Job, duplicate: Option<bool>) -> Result<Self, StoreError> {
         let unique_while = job.unique.as_ref().map(|uc| match uc.scope {
             0 => "queued".to_string(),
             1 => "active".to_string(),
@@ -345,10 +347,7 @@ impl Job {
         });
 
         let status = store::JobStatus::try_from(job.status).map_err(|v| {
-            store::StoreError::Corruption(format!(
-                "job {} has unrecognized status byte: {v}",
-                job.id
-            ))
+            StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
         })?;
 
         Ok(Self {
@@ -547,6 +546,28 @@ impl From<RetentionConfig> for store::RetentionConfig {
 
 impl From<store::RetentionConfig> for RetentionConfig {
     fn from(r: store::RetentionConfig) -> Self {
+        Self {
+            completed_ms: r.completed_ms,
+            dead_ms: r.dead_ms,
+        }
+    }
+}
+
+/// Merge-patch body for retention config within `PATCH /jobs/{id}`.
+///
+/// Each sub-field distinguishes absent (leave unchanged) from `null`
+/// (clear to server default) from a value (set).
+#[derive(Deserialize)]
+struct RetentionConfigPatchBody {
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    completed_ms: Option<Option<u64>>,
+
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    dead_ms: Option<Option<u64>>,
+}
+
+impl From<RetentionConfigPatchBody> for store::RetentionConfigPatch {
+    fn from(r: RetentionConfigPatchBody) -> Self {
         Self {
             completed_ms: r.completed_ms,
             dead_ms: r.dead_ms,
@@ -1050,7 +1071,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/bulk", post(bulk_enqueue))
         .route("/jobs/success", post(bulk_mark_completed))
         .route("/jobs/take", get(take_jobs))
-        .route("/jobs/{id}", get(get_job).delete(delete_job))
+        .route(
+            "/jobs/{id}",
+            get(get_job).patch(patch_job).delete(delete_job),
+        )
         .route("/jobs/{id}/success", post(mark_completed))
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
@@ -1348,7 +1372,7 @@ async fn bulk_enqueue(
         Ok(store_results) => {
             let all_duplicates =
                 !store_results.is_empty() && store_results.iter().all(|r| r.is_duplicate());
-            let jobs: Result<Vec<Job>, store::StoreError> = store_results
+            let jobs: Result<Vec<Job>, StoreError> = store_results
                 .into_iter()
                 .map(|r| {
                     let mut job = Job::try_from_result(r)?;
@@ -1562,6 +1586,113 @@ async fn get_job(
         ),
         Err(e) => {
             tracing::error!(%e, "get_job failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Deserialize an optional-nullable field for JSON Merge Patch semantics:
+/// - absent -> `None` (don't touch)
+/// - `null` -> `Some(None)` (clear to default)
+/// - value -> `Some(Some(T))` (apply)
+fn deserialize_nullable<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
+/// Request body for `PATCH /jobs/{id}`.
+///
+/// Absent fields are left unchanged. Fields set to `null` are cleared
+/// to their default (server-managed) value.
+#[derive(Deserialize)]
+struct PatchJobBody {
+    /// Override the retry limit. `null` clears to server default.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    retry_limit: Option<Option<u32>>,
+
+    /// Override the backoff config. `null` clears to server default.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    backoff: Option<Option<BackoffConfig>>,
+
+    /// Override the retention config. `null` clears entirely.
+    /// An object merge-patches individual sub-fields.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    retention: Option<Option<RetentionConfigPatchBody>>,
+}
+
+/// Handle `PATCH /jobs/{id}` — update a job's mutable fields.
+///
+/// Mutable fields:
+/// * `retry_limit`
+/// * `backoff`
+/// * `retention`
+///
+/// Immutable fields:
+/// * `type`
+/// * `payload`
+///
+/// Only fields to be patched are included in the request. If a field is
+/// present but set to `null` that field is cleared in the store.
+async fn patch_job(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    NegotiatedBody(body): NegotiatedBody<PatchJobBody>,
+) -> Response {
+    let now = (state.clock)();
+
+    let mut patch = store::PatchJobOptions::default();
+
+    if let Some(retry_limit) = body.retry_limit {
+        patch.retry_limit = Some(retry_limit);
+    }
+    if let Some(backoff) = body.backoff {
+        patch.backoff = Some(backoff.map(Into::into));
+    }
+    if let Some(retention) = body.retention {
+        patch.retention = Some(retention.map(Into::into));
+    }
+
+    match state.store.patch_job(now, &id, patch).await {
+        Ok(Some(job)) => match Job::try_from(job) {
+            Ok(mut job) => {
+                job.payload = None;
+                respond(fmt, StatusCode::OK, &job)
+            }
+            Err(e) => {
+                tracing::error!(%e, "corrupt job data");
+                respond(
+                    fmt,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &ErrorResponse {
+                        error: "internal server error".into(),
+                    },
+                )
+            }
+        },
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: "job not found".into(),
+            },
+        ),
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_job failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6247,5 +6378,106 @@ mod tests {
         let req = empty_request("DELETE", "/jobs?queue=nonexistent");
         let res = test_app().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    // --- PATCH /jobs/{id} ---
+
+    #[tokio::test]
+    async fn patch_job_returns_200_with_updated_job() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"retry_limit": 10}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["retry_limit"], 10);
+        assert_eq!(body["id"], job.id);
+    }
+
+    #[tokio::test]
+    async fn patch_job_returns_404_for_missing_job() {
+        let req = json_request("PATCH", "/jobs/nonexistent", &serde_json::json!({}));
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_job_returns_422_for_completed_job() {
+        let (_, mut state) = test_app_state_with_config({
+            let mut c = store::StorageConfig::default();
+            c.default_completed_retention_ms = 60_000;
+            c
+        });
+        state.store.rebuild_indexes().await.unwrap();
+        let state = Arc::new(state);
+        let app = app(state.clone());
+        let now = crate::time::now_millis();
+
+        let job = state
+            .store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        state
+            .store
+            .take_next_job(now, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+        state.store.mark_completed(now, &job.id).await.unwrap();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"retry_limit": 10}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn patch_job_clears_field_with_null() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).retry_limit(5),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"retry_limit": null}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let text = response_body(res).await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // retry_limit should be absent (skip_serializing_if = None) or null.
+        assert!(
+            !body.as_object().unwrap().contains_key("retry_limit") || body["retry_limit"].is_null(),
+            "expected retry_limit to be absent or null, got: {text}"
+        );
     }
 }
