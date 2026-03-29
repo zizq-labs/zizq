@@ -961,6 +961,15 @@ pub enum StoreEvent {
     /// is gone and the worker should not attempt to ack/nack it.
     JobDeleted { id: String },
 
+    /// A job was modified via PATCH.
+    ///
+    /// The admin layer uses this to re-diff all tabs (ready, scheduled,
+    /// in-flight) since a patch can change queue, priority, status, or
+    /// any combination. Workers and the scheduler ignore this — they
+    /// receive `JobCreated`/`JobScheduled` separately when a status
+    /// transition occurs.
+    JobPatched { id: String },
+
     /// Recovery and index rebuilding completed.
     ///
     /// Emitted once when `rebuild_indexes()` finishes. Wakes sleeping
@@ -4904,6 +4913,9 @@ impl Store {
                 }
                 _ => {} // InFlight — no index changes.
             }
+
+            // Always emit JobPatched so the admin layer can re-diff all tabs.
+            let _ = event_tx.send(StoreEvent::JobPatched { id: job.id.clone() });
 
             Ok((Some(job), Some(sync)))
         })
@@ -11560,6 +11572,7 @@ mod tests {
             }
             other => panic!("expected JobScheduled, got {:?}", other),
         }
+        assert!(matches!(rx.try_recv(), Ok(StoreEvent::JobPatched { .. })));
     }
 
     #[tokio::test]
@@ -11594,6 +11607,7 @@ mod tests {
             }
             other => panic!("expected JobCreated, got {:?}", other),
         }
+        assert!(matches!(rx.try_recv(), Ok(StoreEvent::JobPatched { .. })));
     }
 
     #[tokio::test]
@@ -11629,10 +11643,11 @@ mod tests {
             }
             other => panic!("expected JobScheduled, got {:?}", other),
         }
+        assert!(matches!(rx.try_recv(), Ok(StoreEvent::JobPatched { .. })));
     }
 
     #[tokio::test]
-    async fn patch_job_no_event_when_status_unchanged() {
+    async fn patch_job_no_status_event_when_status_unchanged() {
         let store = test_store();
         let mut rx = store.subscribe();
         let now = now_millis();
@@ -11646,13 +11661,17 @@ mod tests {
         // Drain enqueue events.
         while rx.try_recv().is_ok() {}
 
-        // Patch only priority — no status change, no event.
+        // Patch only priority — no status change, only JobPatched.
         let patch = PatchJobOptions {
             priority: Some(100),
             ..Default::default()
         };
         store.patch_job(now, &job.id, patch).await.unwrap();
 
-        assert!(rx.try_recv().is_err(), "expected no event");
+        match rx.try_recv() {
+            Ok(StoreEvent::JobPatched { id }) => assert_eq!(id, job.id),
+            other => panic!("expected JobPatched, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "expected no further events");
     }
 }
