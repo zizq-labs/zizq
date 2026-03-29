@@ -635,6 +635,12 @@ impl RetentionConfigPatch {
 impl PatchJobOptions {
     /// Apply all patches to a mutable job.
     pub fn apply(&self, job: &mut Job) {
+        if let Some(ref queue) = self.queue {
+            job.queue = queue.clone();
+        }
+        if let Some(priority) = self.priority {
+            job.priority = priority;
+        }
         if let Some(ref retry_limit) = self.retry_limit {
             job.retry_limit = *retry_limit;
         }
@@ -648,6 +654,11 @@ impl PatchJobOptions {
             }
             None => {}
         }
+    }
+
+    /// Whether this patch changes queue or priority (requiring ready index updates).
+    fn changes_index(&self) -> bool {
+        self.queue.is_some() || self.priority.is_some()
     }
 }
 
@@ -1000,6 +1011,14 @@ impl ReadyIndex {
         Self {
             global: SkipMap::new(),
             by_queue: DashMap::new(),
+        }
+    }
+
+    /// Remove a job from both the global and per-queue indexes.
+    fn remove(&self, queue: &str, priority: u16, job_id: &str) {
+        self.global.remove(&(priority, job_id.to_string()));
+        if let Some(set) = self.by_queue.get(queue) {
+            set.remove(&(priority, job_id.to_string()));
         }
     }
 
@@ -4728,6 +4747,7 @@ impl Store {
         patch: PatchJobOptions,
     ) -> Result<Option<Job>, StoreError> {
         let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
         let id = id.to_string();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
@@ -4740,6 +4760,10 @@ impl Store {
             // return Option<Slice>.
             let mut patched_job: Option<Job> = None;
             let mut patch_err: Option<StoreError> = None;
+            // Captured from the pre-patch job for index updates.
+            let mut old_queue: Option<String> = None;
+            let mut old_priority: Option<u16> = None;
+            let mut job_status: Option<JobStatus> = None;
 
             let prev = tx.fetch_update(&ks.data, &job_key, |existing| {
                 let bytes = existing?;
@@ -4777,10 +4801,13 @@ impl Store {
                     return Some(bytes.clone());
                 }
 
-                // Apply metadata-only patches.
-                patch.apply(&mut job);
+                // Capture pre-patch values for index updates.
+                old_queue = Some(job.queue.clone());
+                old_priority = Some(job.priority);
+                job_status = Some(status);
 
-                // TODO: queue, priority, ready_at patches with index updates.
+                // Apply all patches (metadata + queue/priority).
+                patch.apply(&mut job);
 
                 match rmp_serde::to_vec_named(&job) {
                     Ok(updated) => {
@@ -4806,17 +4833,19 @@ impl Store {
 
             // If patched_job is None, the closure returned the original
             // bytes unchanged (error path wrote them back).
-            let mut job = match patched_job {
+            let job = match patched_job {
                 Some(j) => j,
                 None => return Ok((None, None)),
             };
 
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-            // Hydrate payload for the response.
-            let payload_key = make_payload_key(&id);
-            if let Some(payload_bytes) = ks.data.get(&payload_key)? {
-                job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
+            // Update in-memory ready index if queue/priority changed on a Ready job.
+            if patch.changes_index() && job_status == Some(JobStatus::Ready) {
+                let old_q = old_queue.unwrap();
+                let old_p = old_priority.unwrap();
+                ready_index.remove(&old_q, old_p, &job.id);
+                ready_index.insert(&job.queue, job.priority, job.id.clone());
             }
 
             Ok((Some(job), Some(sync)))
@@ -11085,5 +11114,175 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_job_updates_queue() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q1", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let patch = PatchJobOptions {
+            queue: Some("q2".into()),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.queue, "q2");
+
+        // Verify persisted.
+        let fetched = store.get_job(now, &job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.queue, "q2");
+    }
+
+    #[tokio::test]
+    async fn patch_job_updates_priority() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        let patch = PatchJobOptions {
+            priority: Some(100),
+            ..Default::default()
+        };
+
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.priority, 100);
+    }
+
+    #[tokio::test]
+    async fn patch_job_queue_updates_ready_index() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue a job on q1.
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q1", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Move it to q2.
+        let patch = PatchJobOptions {
+            queue: Some("q2".into()),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+
+        // Taking from q1 should yield nothing.
+        let queues: HashSet<String> = ["q1".into()].into();
+        let taken = store.take_next_n_jobs(now, &queues, 1).await.unwrap();
+        assert!(taken.is_empty());
+
+        // Taking from q2 should yield the job.
+        let queues: HashSet<String> = ["q2".into()].into();
+        let taken = store.take_next_n_jobs(now, &queues, 1).await.unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].id, job.id);
+    }
+
+    #[tokio::test]
+    async fn patch_job_priority_updates_ready_index() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue two jobs at different priorities.
+        // job_a at priority 100, job_b at priority 200.
+        let job_a = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(100),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let job_b = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(200),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Before patch: job_a (100) should be taken first.
+        // Patch job_b to priority 50, making it higher priority.
+        let patch = PatchJobOptions {
+            priority: Some(50),
+            ..Default::default()
+        };
+        store.patch_job(now, &job_b.id, patch).await.unwrap();
+
+        // Taking should yield job_b first (priority 50 < 100).
+        let taken = store
+            .take_next_n_jobs(now, &HashSet::<String>::new(), 2)
+            .await
+            .unwrap();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].id, job_b.id);
+        assert_eq!(taken[1].id, job_a.id);
+    }
+
+    #[tokio::test]
+    async fn patch_job_queue_on_scheduled_job() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        // Enqueue a scheduled job.
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q1", serde_json::json!(null)).ready_at(future),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Move it to q2 while still scheduled.
+        let patch = PatchJobOptions {
+            queue: Some("q2".into()),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.queue, "q2");
+
+        // Verify persisted — when it becomes ready it should be on q2.
+        let fetched = store.get_job(now, &job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.queue, "q2");
+    }
+
+    #[tokio::test]
+    async fn patch_job_queue_on_inflight_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q1", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Take the job to put it in-flight.
+        store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+
+        // Move it to q2 while in-flight.
+        let patch = PatchJobOptions {
+            queue: Some("q2".into()),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.queue, "q2");
     }
 }

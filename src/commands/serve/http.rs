@@ -1615,6 +1615,14 @@ where
 /// to their default (server-managed) value.
 #[derive(Deserialize)]
 struct PatchJobBody {
+    /// Move the job to a different queue. Cannot be null.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    queue: Option<Option<String>>,
+
+    /// Change the job's priority. Cannot be null.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    priority: Option<Option<u16>>,
+
     /// Override the retry limit. `null` clears to server default.
     #[serde(default, deserialize_with = "deserialize_nullable")]
     retry_limit: Option<Option<u32>>,
@@ -1632,6 +1640,8 @@ struct PatchJobBody {
 /// Handle `PATCH /jobs/{id}` — update a job's mutable fields.
 ///
 /// Mutable fields:
+/// * `queue`
+/// * `priority`
 /// * `retry_limit`
 /// * `backoff`
 /// * `retention`
@@ -1641,7 +1651,8 @@ struct PatchJobBody {
 /// * `payload`
 ///
 /// Only fields to be patched are included in the request. If a field is
-/// present but set to `null` that field is cleared in the store.
+/// present but set to `null` that field is cleared in the store (for
+/// nullable fields). `queue` and `priority` cannot be null.
 async fn patch_job(
     AcceptFormat(fmt): AcceptFormat,
     State(state): State<Arc<AppState>>,
@@ -1650,8 +1661,42 @@ async fn patch_job(
 ) -> Response {
     let now = (state.clock)();
 
+    match &body.queue {
+        Some(None) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse {
+                    error: "queue cannot be null".into(),
+                },
+            );
+        }
+        Some(Some(queue)) => {
+            if let Err(e) = validate_name("queue", queue) {
+                return respond(
+                    fmt,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &ErrorResponse { error: e },
+                );
+            }
+        }
+        None => {}
+    }
+
+    if let Some(None) = body.priority {
+        return respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse {
+                error: "priority cannot be null".into(),
+            },
+        );
+    }
+
     let mut patch = store::PatchJobOptions::default();
 
+    patch.queue = body.queue.flatten();
+    patch.priority = body.priority.flatten();
     if let Some(retry_limit) = body.retry_limit {
         patch.retry_limit = Some(retry_limit);
     }
@@ -6479,5 +6524,125 @@ mod tests {
             !body.as_object().unwrap().contains_key("retry_limit") || body["retry_limit"].is_null(),
             "expected retry_limit to be absent or null, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_job_updates_queue_and_priority() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q1", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"queue": "q2", "priority": 42}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let text = response_body(res).await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["queue"], "q2");
+        assert_eq!(body["priority"], 42);
+    }
+
+    #[tokio::test]
+    async fn patch_job_rejects_empty_queue() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"queue": ""}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn patch_job_rejects_queue_with_comma() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"queue": "a,b"}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn patch_job_rejects_null_queue() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"queue": null}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn patch_job_rejects_null_priority() {
+        let (state, app) = test_state_and_app();
+
+        let job = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = json_request(
+            "PATCH",
+            &format!("/jobs/{}", job.id),
+            &serde_json::json!({"priority": null}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
