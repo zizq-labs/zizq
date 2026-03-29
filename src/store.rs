@@ -657,7 +657,7 @@ impl PatchJobOptions {
     }
 
     /// Whether this patch changes queue or priority (requiring ready index updates).
-    fn changes_index(&self) -> bool {
+    fn changes_ready_index(&self) -> bool {
         self.queue.is_some() || self.priority.is_some()
     }
 }
@@ -4742,12 +4742,14 @@ impl Store {
     /// terminal state (Completed or Dead).
     pub async fn patch_job(
         &self,
-        _now: u64,
+        now: u64,
         id: &str,
         patch: PatchJobOptions,
     ) -> Result<Option<Job>, StoreError> {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
+        let scheduled_index = self.scheduled_index.clone();
+        let event_tx = self.event_tx.clone();
         let id = id.to_string();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
@@ -4758,12 +4760,9 @@ impl Store {
             // Read, patch, and write in a single fetch_update call.
             // Errors are captured in patch_err since the closure can only
             // return Option<Slice>.
-            let mut patched_job: Option<Job> = None;
+            let mut before: Option<Job> = None;
+            let mut after: Option<Job> = None;
             let mut patch_err: Option<StoreError> = None;
-            // Captured from the pre-patch job for index updates.
-            let mut old_queue: Option<String> = None;
-            let mut old_priority: Option<u16> = None;
-            let mut job_status: Option<JobStatus> = None;
 
             let prev = tx.fetch_update(&ks.data, &job_key, |existing| {
                 let bytes = existing?;
@@ -4801,17 +4800,34 @@ impl Store {
                     return Some(bytes.clone());
                 }
 
-                // Capture pre-patch values for index updates.
-                old_queue = Some(job.queue.clone());
-                old_priority = Some(job.priority);
-                job_status = Some(status);
+                before = Some(job.clone());
 
-                // Apply all patches (metadata + queue/priority).
+                // Apply field patches (queue, priority, metadata).
                 patch.apply(&mut job);
+
+                // Apply ready_at and any resulting status transition.
+                match patch.ready_at {
+                    Some(None) => {
+                        // Clear ready_at → immediately ready.
+                        job.ready_at = now;
+                        if status == JobStatus::Scheduled {
+                            job.status = JobStatus::Ready as u8;
+                        }
+                    }
+                    Some(Some(ts)) => {
+                        job.ready_at = ts;
+                        if ts > now && status == JobStatus::Ready {
+                            job.status = JobStatus::Scheduled as u8;
+                        } else if ts <= now && status == JobStatus::Scheduled {
+                            job.status = JobStatus::Ready as u8;
+                        }
+                    }
+                    None => {}
+                }
 
                 match rmp_serde::to_vec_named(&job) {
                     Ok(updated) => {
-                        patched_job = Some(job);
+                        after = Some(job);
                         Some(updated.into())
                     }
                     Err(e) => {
@@ -4831,21 +4847,62 @@ impl Store {
                 return Ok((None, None));
             }
 
-            // If patched_job is None, the closure returned the original
-            // bytes unchanged (error path wrote them back).
-            let job = match patched_job {
+            let old = match before {
+                Some(j) => j,
+                None => return Ok((None, None)),
+            };
+            let job = match after {
                 Some(j) => j,
                 None => return Ok((None, None)),
             };
 
+            let old_s = JobStatus::try_from(old.status).unwrap();
+            let new_s = JobStatus::try_from(job.status).unwrap();
+
+            // Update on-disk status index if status changed.
+            if old_s != new_s {
+                tx.remove(&ks.index, &make_status_key(old_s, &id));
+                tx.insert(&ks.index, &make_status_key(new_s, &id), b"");
+            }
+
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-            // Update in-memory ready index if queue/priority changed on a Ready job.
-            if patch.changes_index() && job_status == Some(JobStatus::Ready) {
-                let old_q = old_queue.unwrap();
-                let old_p = old_priority.unwrap();
-                ready_index.remove(&old_q, old_p, &job.id);
-                ready_index.insert(&job.queue, job.priority, job.id.clone());
+            // Update in-memory indexes and emit events after commit.
+            match (old_s, new_s) {
+                (JobStatus::Ready, JobStatus::Ready) => {
+                    if patch.changes_ready_index() {
+                        ready_index.remove(&old.queue, old.priority, &job.id);
+                        ready_index.insert(&job.queue, job.priority, job.id.clone());
+                    }
+                }
+                (JobStatus::Ready, JobStatus::Scheduled) => {
+                    ready_index.remove(&old.queue, old.priority, &job.id);
+                    scheduled_index.insert(job.ready_at, job.id.clone());
+                    let _ = event_tx.send(StoreEvent::JobScheduled {
+                        id: job.id.clone(),
+                        ready_at: job.ready_at,
+                    });
+                }
+                (JobStatus::Scheduled, JobStatus::Ready) => {
+                    scheduled_index.remove(old.ready_at, &job.id);
+                    ready_index.insert(&job.queue, job.priority, job.id.clone());
+                    let _ = event_tx.send(StoreEvent::JobCreated {
+                        id: job.id.clone(),
+                        queue: job.queue.clone(),
+                        token: Arc::new(AtomicBool::new(false)),
+                    });
+                }
+                (JobStatus::Scheduled, JobStatus::Scheduled) => {
+                    if old.ready_at != job.ready_at {
+                        scheduled_index.remove(old.ready_at, &job.id);
+                        scheduled_index.insert(job.ready_at, job.id.clone());
+                        let _ = event_tx.send(StoreEvent::JobScheduled {
+                            id: job.id.clone(),
+                            ready_at: job.ready_at,
+                        });
+                    }
+                }
+                _ => {} // InFlight — no index changes.
             }
 
             Ok((Some(job), Some(sync)))
@@ -11284,5 +11341,318 @@ mod tests {
         };
         let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
         assert_eq!(result.queue, "q2");
+    }
+
+    #[tokio::test]
+    async fn patch_job_ready_at_future_moves_ready_to_scheduled() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        assert_eq!(job.status, JobStatus::Ready as u8);
+
+        // Set ready_at to the future → should become Scheduled.
+        let patch = PatchJobOptions {
+            ready_at: Some(Some(future)),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+        assert_eq!(result.ready_at, future);
+
+        // Should no longer be takeable.
+        let taken = store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+        assert!(taken.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_job_clear_ready_at_moves_scheduled_to_ready() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).ready_at(future),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        assert_eq!(job.status, JobStatus::Scheduled as u8);
+
+        // Clear ready_at → should become Ready.
+        let patch = PatchJobOptions {
+            ready_at: Some(None),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.status, JobStatus::Ready as u8);
+
+        // Should now be takeable.
+        let taken = store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().id, job.id);
+    }
+
+    #[tokio::test]
+    async fn patch_job_past_ready_at_moves_scheduled_to_ready() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).ready_at(future),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Set ready_at to the past → should become Ready.
+        let patch = PatchJobOptions {
+            ready_at: Some(Some(now - 1000)),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.status, JobStatus::Ready as u8);
+    }
+
+    #[tokio::test]
+    async fn patch_job_updates_scheduled_index_time() {
+        let store = test_store();
+        let now = now_millis();
+        let future1 = now + 60_000;
+        let future2 = now + 120_000;
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).ready_at(future1),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Move scheduled time further out.
+        let patch = PatchJobOptions {
+            ready_at: Some(Some(future2)),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+        assert_eq!(result.ready_at, future2);
+
+        // Verify the scheduled count is still 1 (old entry removed, new inserted).
+        assert_eq!(store.scheduled_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn patch_job_ready_at_on_inflight_is_data_only() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Take to put in-flight.
+        store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+
+        // Set ready_at while in-flight — should update data but not change status.
+        let patch = PatchJobOptions {
+            ready_at: Some(Some(future)),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.status, JobStatus::InFlight as u8);
+        assert_eq!(result.ready_at, future);
+    }
+
+    #[tokio::test]
+    async fn patch_job_ready_at_and_queue_together() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q1", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Move to q2 and schedule for the future in one patch.
+        let patch = PatchJobOptions {
+            queue: Some("q2".into()),
+            ready_at: Some(Some(future)),
+            ..Default::default()
+        };
+        let result = store.patch_job(now, &job.id, patch).await.unwrap().unwrap();
+        assert_eq!(result.status, JobStatus::Scheduled as u8);
+        assert_eq!(result.queue, "q2");
+        assert_eq!(result.ready_at, future);
+
+        // Not takeable now.
+        let taken = store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+        assert!(taken.is_none());
+
+        // Make it ready again via clearing ready_at.
+        let patch = PatchJobOptions {
+            ready_at: Some(None),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+
+        // Should be on q2.
+        let queues: HashSet<String> = ["q2".into()].into();
+        let taken = store.take_next_job(now, &queues).await.unwrap();
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().id, job.id);
+    }
+
+    #[tokio::test]
+    async fn patch_job_emits_scheduled_when_ready_becomes_scheduled() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Drain enqueue events.
+        while rx.try_recv().is_ok() {}
+
+        let patch = PatchJobOptions {
+            ready_at: Some(Some(future)),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+
+        match rx.try_recv() {
+            Ok(StoreEvent::JobScheduled { id, ready_at }) => {
+                assert_eq!(id, job.id);
+                assert_eq!(ready_at, future);
+            }
+            other => panic!("expected JobScheduled, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_job_emits_created_when_scheduled_becomes_ready() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).ready_at(future),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Drain enqueue events.
+        while rx.try_recv().is_ok() {}
+
+        let patch = PatchJobOptions {
+            ready_at: Some(None),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+
+        match rx.try_recv() {
+            Ok(StoreEvent::JobCreated { id, queue, .. }) => {
+                assert_eq!(id, job.id);
+                assert_eq!(queue, "q");
+            }
+            other => panic!("expected JobCreated, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_job_emits_scheduled_when_scheduled_time_changes() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+        let now = now_millis();
+        let future1 = now + 60_000;
+        let future2 = now + 120_000;
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!(null)).ready_at(future1),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Drain enqueue events.
+        while rx.try_recv().is_ok() {}
+
+        let patch = PatchJobOptions {
+            ready_at: Some(Some(future2)),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+
+        match rx.try_recv() {
+            Ok(StoreEvent::JobScheduled { id, ready_at }) => {
+                assert_eq!(id, job.id);
+                assert_eq!(ready_at, future2);
+            }
+            other => panic!("expected JobScheduled, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_job_no_event_when_status_unchanged() {
+        let store = test_store();
+        let mut rx = store.subscribe();
+        let now = now_millis();
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Drain enqueue events.
+        while rx.try_recv().is_ok() {}
+
+        // Patch only priority — no status change, no event.
+        let patch = PatchJobOptions {
+            priority: Some(100),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+
+        assert!(rx.try_recv().is_err(), "expected no event");
     }
 }

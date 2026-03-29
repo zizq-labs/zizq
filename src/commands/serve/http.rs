@@ -1623,6 +1623,11 @@ struct PatchJobBody {
     #[serde(default, deserialize_with = "deserialize_nullable")]
     priority: Option<Option<u16>>,
 
+    /// Change when the job becomes ready (milliseconds since epoch).
+    /// `null` clears to immediately ready.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    ready_at: Option<Option<u64>>,
+
     /// Override the retry limit. `null` clears to server default.
     #[serde(default, deserialize_with = "deserialize_nullable")]
     retry_limit: Option<Option<u32>>,
@@ -1642,6 +1647,8 @@ struct PatchJobBody {
 /// Mutable fields:
 /// * `queue`
 /// * `priority`
+/// * `ready_at` — setting a future time on a Ready job moves it to Scheduled;
+///   clearing (null) or setting a past time on a Scheduled job makes it Ready
 /// * `retry_limit`
 /// * `backoff`
 /// * `retention`
@@ -1697,6 +1704,9 @@ async fn patch_job(
 
     patch.queue = body.queue.flatten();
     patch.priority = body.priority.flatten();
+    if let Some(ready_at) = body.ready_at {
+        patch.ready_at = Some(ready_at);
+    }
     if let Some(retry_limit) = body.retry_limit {
         patch.retry_limit = Some(retry_limit);
     }
