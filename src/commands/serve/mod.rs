@@ -178,6 +178,12 @@ pub struct Args {
     #[arg(long, value_name = "MODE", value_parser = parse_commit_mode, env = "ZIZQ_ENQUEUE_COMMIT_MODE")]
     enqueue_commit_mode: Option<store::CommitMode>,
 
+    /// Data store block cache size (e.g. "256MB", "1GiB").
+    /// Should not be lower than around 192MB in most cases.
+    /// Recommended: 20–25% of available memory where possible.
+    #[arg(long, default_value = "256MB", value_name = "SIZE", value_parser = parse_byte_size, env = "ZIZQ_CACHE_SIZE")]
+    cache_size: u64,
+
     /// Address to bind the admin API server to.
     #[arg(long, default_value = "127.0.0.1", env = "ZIZQ_ADMIN_HOST")]
     admin_host: String,
@@ -297,6 +303,7 @@ pub async fn run(
 
     // Init/open the store (within the root dir).
     let mut storage_config = crate::store::StorageConfig::from_env()?;
+    storage_config.cache_size = args.cache_size;
     storage_config.default_completed_retention_ms = args.default_completed_job_retention_ms;
     storage_config.default_dead_retention_ms = args.default_dead_job_retention_ms;
     storage_config.default_retry_limit = args.default_retry_limit;

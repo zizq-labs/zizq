@@ -2177,11 +2177,12 @@ impl StorageConfig {
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
         Ok(Self {
-            cache_size: env_parse("ZIZQ_CACHE_SIZE")?.unwrap_or(defaults.cache_size),
-            data_table_size: env_parse("ZIZQ_DATA_TABLE_SIZE")?.unwrap_or(defaults.data_table_size),
-            index_table_size: env_parse("ZIZQ_INDEX_TABLE_SIZE")?
+            cache_size: env_parse_bytes("ZIZQ_CACHE_SIZE")?.unwrap_or(defaults.cache_size),
+            data_table_size: env_parse_bytes("ZIZQ_DATA_TABLE_SIZE")?
+                .unwrap_or(defaults.data_table_size),
+            index_table_size: env_parse_bytes("ZIZQ_INDEX_TABLE_SIZE")?
                 .unwrap_or(defaults.index_table_size),
-            journal_size: env_parse("ZIZQ_JOURNAL_SIZE")?.unwrap_or(defaults.journal_size),
+            journal_size: env_parse_bytes("ZIZQ_JOURNAL_SIZE")?.unwrap_or(defaults.journal_size),
             l0_threshold: env_parse("ZIZQ_L0_THRESHOLD")?.unwrap_or(defaults.l0_threshold),
             default_completed_retention_ms: defaults.default_completed_retention_ms,
             default_dead_retention_ms: defaults.default_dead_retention_ms,
@@ -2240,6 +2241,21 @@ fn env_parse<T: std::str::FromStr>(name: &str) -> Result<Option<T>, EnvConfigErr
         name: name.to_string(),
         value: val,
     })
+}
+
+/// Parse an environment variable as a human-readable byte size (e.g. "256MB",
+/// "1GiB", or a plain number of bytes). Returns `Ok(None)` if unset.
+fn env_parse_bytes(name: &str) -> Result<Option<u64>, EnvConfigError> {
+    let val = match std::env::var(name) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    val.parse::<bytesize::ByteSize>()
+        .map(|b| Some(b.as_u64()))
+        .map_err(|_| EnvConfigError {
+            name: name.to_string(),
+            value: val,
+        })
 }
 
 impl Store {
