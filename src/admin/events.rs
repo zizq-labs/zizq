@@ -278,10 +278,9 @@ async fn send_snapshot_with_subs(
     in_flight_sub: Subscription,
     scheduled_sub: Subscription,
 ) -> Result<ConnectionState, String> {
-    let store = &state.store;
-
-    // In-flight data is always available (free tier).
-    let mut in_flight_jobs = store
+    // Build the initial in-flight ID set from a full query.
+    let mut in_flight_jobs = state
+        .store
         .list_jobs(
             store::ListJobsOptions::new()
                 .statuses([store::JobStatus::InFlight].into())
@@ -296,95 +295,37 @@ async fn send_snapshot_with_subs(
 
     in_flight_jobs.sort_by_key(|j| j.dequeued_at.unwrap_or(0));
 
-    // Build full ordered in-flight ID set from all in-flight jobs.
     let in_flight_ids: BTreeSet<(u64, String)> = in_flight_jobs
         .iter()
         .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
         .collect();
 
-    // Windowed slices of jobs in each state for the snapshot.
-    let capped_ready = store
-        .list_ready_jobs(ready_sub.offset, ready_sub.limit)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(%e, "admin ws: failed to list ready jobs for snapshot");
-            Vec::new()
-        });
-
-    let capped_in_flight: Vec<store::Job> = in_flight_jobs
-        .into_iter()
-        .skip(in_flight_sub.offset)
-        .take(in_flight_sub.limit)
-        .collect();
-
-    let capped_scheduled = store
-        .list_scheduled_jobs(scheduled_sub.offset, scheduled_sub.limit)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(%e, "admin ws: failed to list scheduled jobs for snapshot");
-            Vec::new()
-        });
-
-    // Collect keys for diffing logic.
-    let prev_ready: Vec<(u16, String)> = capped_ready
-        .iter()
-        .map(|j| (j.priority, j.id.clone()))
-        .collect();
-
-    let prev_in_flight: Vec<(u64, String)> = capped_in_flight
-        .iter()
-        .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
-        .collect();
-
-    let prev_scheduled: Vec<(u64, String)> = capped_scheduled
-        .iter()
-        .map(|j| (j.ready_at, j.id.clone()))
-        .collect();
-
-    // Prepare the windowed snapshot of jobs in each state to send to the client.
-    let snapshot = AdminMessage {
-        server: server_status(state),
-        event: AdminEvent::JobSnapshot {
-            ready: JobWindow {
-                offset: ready_sub.offset,
-                items: capped_ready
-                    .into_iter()
-                    .map(AdminJobSummary::from)
-                    .collect(),
-            },
-            in_flight: JobWindow {
-                offset: in_flight_sub.offset,
-                items: capped_in_flight
-                    .into_iter()
-                    .map(AdminJobSummary::from)
-                    .collect(),
-            },
-            scheduled: JobWindow {
-                offset: scheduled_sub.offset,
-                items: capped_scheduled
-                    .into_iter()
-                    .map(AdminJobSummary::from)
-                    .collect(),
-            },
-        },
+    // Seed a ConnectionState with empty baselines — build_snapshot will
+    // populate them and return the snapshot event.
+    let mut conn = ConnectionState {
+        prev_ready: Vec::new(),
+        in_flight_ids,
+        prev_in_flight: Vec::new(),
+        prev_scheduled: Vec::new(),
+        ready_sub,
+        in_flight_sub,
+        scheduled_sub,
     };
 
-    let json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+    let event = build_snapshot(&state.store, &mut conn).await;
+
+    let msg = AdminMessage {
+        server: server_status(state),
+        event,
+    };
+    let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
 
     sender
         .send(Message::Text(json.into()))
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(ConnectionState {
-        prev_ready,
-        in_flight_ids,
-        prev_in_flight,
-        prev_scheduled,
-        ready_sub,
-        in_flight_sub,
-        scheduled_sub,
-    })
+    Ok(conn)
 }
 
 /// Process a store event, returning zero or more `AdminEvent`s to send.
@@ -445,10 +386,10 @@ async fn process_store_event(
         }
         StoreEvent::JobScheduled { .. } => diff_scheduled(store, conn).await,
         StoreEvent::JobPatched { .. } => {
-            let mut events = diff_ready(store, conn).await;
-            events.extend(diff_scheduled(store, conn).await);
-            events.extend(diff_in_flight(store, conn).await);
-            events
+            // Patches can change any field (queue, priority, ready_at, status),
+            // so ID-based diffing won't detect field-level changes within the
+            // visible window. Send a fresh snapshot instead.
+            vec![build_snapshot(store, conn).await]
         }
         StoreEvent::JobDeleted { id } => {
             let mut events = Vec::new();
@@ -667,6 +608,71 @@ async fn diff_scheduled(store: &store::Store, conn: &mut ConnectionState) -> Vec
 
     conn.prev_scheduled = current;
     events
+}
+
+/// Build a fresh `JobSnapshot` event and reset the connection's diff baseline.
+///
+/// Used when incremental diffs can't capture the change (e.g. field-level
+/// patches that don't alter the ID set).
+async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> AdminEvent {
+    let capped_ready = store
+        .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
+        .await
+        .unwrap_or_default();
+
+    let capped_scheduled = store
+        .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
+        .await
+        .unwrap_or_default();
+
+    // In-flight: re-read from the connection's in_flight_ids set
+    // (maintained by JobInFlight/JobCompleted/JobFailed/JobDeleted events).
+    let in_flight_window: Vec<(u64, String)> = conn
+        .in_flight_ids
+        .iter()
+        .skip(conn.in_flight_sub.offset)
+        .take(conn.in_flight_sub.limit)
+        .cloned()
+        .collect();
+
+    let mut in_flight_jobs = Vec::with_capacity(in_flight_window.len());
+    for (_, id) in &in_flight_window {
+        if let Ok(Some(job)) = store.get_job(now_millis(), id).await {
+            in_flight_jobs.push(AdminJobSummary::from(job));
+        }
+    }
+
+    // Reset diff baselines.
+    conn.prev_ready = capped_ready
+        .iter()
+        .map(|j| (j.priority, j.id.clone()))
+        .collect();
+    conn.prev_in_flight = in_flight_window;
+    conn.prev_scheduled = capped_scheduled
+        .iter()
+        .map(|j| (j.ready_at, j.id.clone()))
+        .collect();
+
+    AdminEvent::JobSnapshot {
+        ready: JobWindow {
+            offset: conn.ready_sub.offset,
+            items: capped_ready
+                .into_iter()
+                .map(AdminJobSummary::from)
+                .collect(),
+        },
+        in_flight: JobWindow {
+            offset: conn.in_flight_sub.offset,
+            items: in_flight_jobs,
+        },
+        scheduled: JobWindow {
+            offset: conn.scheduled_sub.offset,
+            items: capped_scheduled
+                .into_iter()
+                .map(AdminJobSummary::from)
+                .collect(),
+        },
+    }
 }
 
 /// Diff two sorted slices, returning `(added, removed)` elements.

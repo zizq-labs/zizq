@@ -659,6 +659,30 @@ struct DeleteJobsParams {
     filter: Option<String>,
 }
 
+/// Query parameters for `PATCH /jobs` — bulk patch.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchJobsParams {
+    /// ID filter, comma-delimited.
+    #[serde(default)]
+    id: CommaSet<String>,
+
+    /// Status filter, comma-delimited.
+    #[serde(default)]
+    status: CommaSet<JobStatus>,
+
+    /// Queue filter, comma-delimited.
+    #[serde(default)]
+    queue: CommaSet<String>,
+
+    /// Type filter, comma-delimited.
+    #[serde(default, rename = "type")]
+    job_type: CommaSet<String>,
+
+    /// jq expression to filter jobs by payload.
+    filter: Option<String>,
+}
+
 /// Sort order for job listings.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1066,7 +1090,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/version", get(version))
         .route(
             "/jobs",
-            get(list_jobs).post(enqueue).delete(bulk_delete_jobs),
+            get(list_jobs)
+                .post(enqueue)
+                .patch(bulk_patch_jobs)
+                .delete(bulk_delete_jobs),
         )
         .route("/jobs/bulk", post(bulk_enqueue))
         .route("/jobs/success", post(bulk_mark_completed))
@@ -1837,7 +1864,7 @@ async fn bulk_delete_jobs(
         None
     };
 
-    let mut opts = store::DeleteJobsOptions::new();
+    let mut opts = store::BulkDeleteOptions::new();
     if !params.id.is_empty() {
         opts.ids = params.id.0;
     }
@@ -1859,10 +1886,184 @@ async fn bulk_delete_jobs(
     match state.store.delete_jobs(opts).await {
         Ok(count) => {
             tracing::debug!(count, "bulk delete completed");
-            respond(fmt, StatusCode::NO_CONTENT, &())
+            respond(
+                fmt,
+                StatusCode::OK,
+                &serde_json::json!({ "deleted": count }),
+            )
         }
         Err(e) => {
             tracing::error!(%e, "bulk_delete_jobs failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PATCH /jobs` — bulk patch jobs matching filters.
+///
+/// Applies the same patch body to all matching jobs. Terminal jobs
+/// (completed/dead) are silently skipped unless explicitly requested
+/// via `?status=`, in which case the request is rejected with 422.
+async fn bulk_patch_jobs(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<PatchJobsParams>, axum::extract::rejection::QueryRejection>,
+    NegotiatedBody(body): NegotiatedBody<PatchJobBody>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(e) => {
+            return respond(
+                Format::Json,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid query parameters: {e}"),
+                },
+            );
+        }
+    };
+
+    // Reject if status filter includes terminal statuses.
+    for s in params.status.iter() {
+        if matches!(s, JobStatus::Completed | JobStatus::Dead) {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse {
+                    error: format!("cannot patch jobs in {s:?} status"),
+                },
+            );
+        }
+    }
+
+    // Validate IDs.
+    for id in params.id.iter() {
+        if !is_valid_job_id(id) {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid job ID: {id:?}"),
+                },
+            );
+        }
+    }
+
+    // Validate queue if provided.
+    match &body.queue {
+        Some(None) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse {
+                    error: "queue cannot be null".into(),
+                },
+            );
+        }
+        Some(Some(queue)) => {
+            if let Err(e) = validate_name("queue", queue) {
+                return respond(
+                    fmt,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &ErrorResponse { error: e },
+                );
+            }
+        }
+        None => {}
+    }
+
+    // Validate priority if provided.
+    if let Some(None) = body.priority {
+        return respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse {
+                error: "priority cannot be null".into(),
+            },
+        );
+    }
+
+    // Compile payload filter.
+    let filter = if let Some(ref expr) = params.filter {
+        match PayloadFilter::compile(expr) {
+            Ok(f) => Some(std::sync::Arc::new(f)),
+            Err(e) => {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("invalid filter: {e}"),
+                    },
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build patch options.
+    let mut patch = store::PatchJobOptions::default();
+    patch.queue = body.queue.flatten();
+    patch.priority = body.priority.flatten();
+    if let Some(ready_at) = body.ready_at {
+        patch.ready_at = Some(ready_at);
+    }
+    if let Some(retry_limit) = body.retry_limit {
+        patch.retry_limit = Some(retry_limit);
+    }
+    if let Some(backoff) = body.backoff {
+        patch.backoff = Some(backoff.map(Into::into));
+    }
+    if let Some(retention) = body.retention {
+        patch.retention = Some(retention.map(Into::into));
+    }
+
+    let opts = store::BulkPatchOptions {
+        ids: if params.id.is_empty() {
+            HashSet::new()
+        } else {
+            params.id.0
+        },
+        statuses: if params.status.is_empty() {
+            HashSet::new()
+        } else {
+            params
+                .status
+                .iter()
+                .map(|s| store::JobStatus::from(*s))
+                .collect()
+        },
+        queues: if params.queue.is_empty() {
+            HashSet::new()
+        } else {
+            params.queue.0
+        },
+        types: if params.job_type.is_empty() {
+            HashSet::new()
+        } else {
+            params.job_type.0
+        },
+        filter,
+        patch,
+    };
+
+    match state.store.patch_jobs(opts).await {
+        Ok(count) => {
+            tracing::debug!(count, "bulk patch completed");
+            respond(
+                fmt,
+                StatusCode::OK,
+                &serde_json::json!({ "patched": count }),
+            )
+        }
+        Err(e) => {
+            tracing::error!(%e, "bulk_patch_jobs failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6353,7 +6554,7 @@ mod tests {
     // --- DELETE /jobs (bulk) ---
 
     #[tokio::test]
-    async fn bulk_delete_returns_204() {
+    async fn bulk_delete_returns_count() {
         let (state, app) = test_state_and_app();
 
         state
@@ -6367,11 +6568,14 @@ mod tests {
 
         let req = empty_request("DELETE", "/jobs?queue=q");
         let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 1);
     }
 
     #[tokio::test]
-    async fn bulk_delete_by_id_returns_204() {
+    async fn bulk_delete_by_id_returns_count() {
         let (state, app) = test_state_and_app();
 
         let job = state
@@ -6386,7 +6590,10 @@ mod tests {
 
         let req = empty_request("DELETE", &format!("/jobs?id={}", job.id));
         let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 1);
     }
 
     #[tokio::test]
@@ -6430,10 +6637,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_delete_no_matches_returns_204() {
+    async fn bulk_delete_no_matches_returns_zero() {
         let req = empty_request("DELETE", "/jobs?queue=nonexistent");
         let res = test_app().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 0);
     }
 
     // --- PATCH /jobs/{id} ---
@@ -6655,5 +6865,74 @@ mod tests {
         );
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- PATCH /jobs (bulk) tests ---
+
+    #[tokio::test]
+    async fn bulk_patch_jobs_updates_matching() {
+        let (state, app) = test_state_and_app();
+
+        for _ in 0..3 {
+            state
+                .store
+                .enqueue(
+                    crate::time::now_millis(),
+                    EnqueueOptions::new("t", "q1", serde_json::json!(null)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = json_request(
+            "PATCH",
+            "/jobs?queue=q1",
+            &serde_json::json!({"queue": "q2"}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let text = response_body(res).await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["patched"], 3);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_jobs_rejects_terminal_status_filter() {
+        let (_, app) = test_state_and_app();
+
+        let req = json_request(
+            "PATCH",
+            "/jobs?status=completed",
+            &serde_json::json!({"priority": 1}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_jobs_rejects_null_queue() {
+        let (_, app) = test_state_and_app();
+
+        let req = json_request("PATCH", "/jobs", &serde_json::json!({"queue": null}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_jobs_returns_zero_for_no_matches() {
+        let (_, app) = test_state_and_app();
+
+        let req = json_request(
+            "PATCH",
+            "/jobs?queue=nonexistent",
+            &serde_json::json!({"priority": 1}),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let text = response_body(res).await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["patched"], 0);
     }
 }

@@ -536,7 +536,7 @@ impl ListJobsOptions {
 
 /// Options for bulk-deleting jobs in `Store::delete_jobs`.
 #[derive(Debug)]
-pub struct DeleteJobsOptions {
+pub struct BulkDeleteOptions {
     /// Optional ID filter. When non-empty, only these IDs are candidates.
     pub ids: HashSet<String>,
 
@@ -553,7 +553,7 @@ pub struct DeleteJobsOptions {
     pub filter: Option<Arc<PayloadFilter>>,
 }
 
-impl DeleteJobsOptions {
+impl BulkDeleteOptions {
     pub fn new() -> Self {
         Self {
             ids: HashSet::new(),
@@ -563,6 +563,30 @@ impl DeleteJobsOptions {
             filter: None,
         }
     }
+}
+
+/// Options for bulk-patching jobs matching a set of filters.
+///
+/// Combines the same filter fields as `BulkDeleteOptions` with the
+/// patch fields from `PatchJobOptions`.
+pub struct BulkPatchOptions {
+    /// Optional ID filter. When non-empty, only these IDs are candidates.
+    pub ids: HashSet<String>,
+
+    /// Optional status filter.
+    pub statuses: HashSet<JobStatus>,
+
+    /// Optional queue filter.
+    pub queues: HashSet<String>,
+
+    /// Optional type filter.
+    pub types: HashSet<String>,
+
+    /// Optional jq payload filter.
+    pub filter: Option<Arc<PayloadFilter>>,
+
+    /// The patch to apply to each matching job.
+    pub patch: PatchJobOptions,
 }
 
 /// Request to patch a single job's mutable fields.
@@ -633,8 +657,17 @@ impl RetentionConfigPatch {
 }
 
 impl PatchJobOptions {
-    /// Apply all patches to a mutable job.
-    pub fn apply(&self, job: &mut Job) {
+    /// Apply all patches to a mutable job, including status transitions
+    /// arising from `ready_at` changes relative to `now`.
+    ///
+    /// Returns a `PatchDiff` capturing the before/after values needed for
+    /// index updates, keyspace maintenance, and event emission.
+    pub(crate) fn apply(&self, job: &mut Job, now: u64) -> PatchDiff {
+        let old_status = JobStatus::try_from(job.status).unwrap();
+        let old_queue = job.queue.clone();
+        let old_priority = job.priority;
+        let old_ready_at = job.ready_at;
+
         if let Some(ref queue) = self.queue {
             job.queue = queue.clone();
         }
@@ -654,11 +687,135 @@ impl PatchJobOptions {
             }
             None => {}
         }
+
+        // Apply ready_at and any resulting status transition.
+        match self.ready_at {
+            Some(None) => {
+                // "Make it ready now" — only meaningful for Scheduled jobs.
+                // For Ready/InFlight, leave ready_at unchanged.
+                if old_status == JobStatus::Scheduled {
+                    job.ready_at = now;
+                    job.status = JobStatus::Ready as u8;
+                }
+            }
+            Some(Some(ts)) => {
+                job.ready_at = ts;
+                if ts > now && old_status == JobStatus::Ready {
+                    job.status = JobStatus::Scheduled as u8;
+                } else if ts <= now && old_status == JobStatus::Scheduled {
+                    job.status = JobStatus::Ready as u8;
+                }
+            }
+            None => {}
+        }
+
+        PatchDiff {
+            id: job.id.clone(),
+            old_status,
+            new_status: JobStatus::try_from(job.status).unwrap(),
+            old_queue,
+            new_queue: job.queue.clone(),
+            old_priority,
+            new_priority: job.priority,
+            old_ready_at,
+            new_ready_at: job.ready_at,
+        }
+    }
+}
+
+/// Lightweight diff capturing the before/after values of a patched job.
+///
+/// Used by both single-job and bulk patch to drive keyspace updates,
+/// in-memory index updates, and event emission without retaining full
+/// `Job` copies.
+pub(crate) struct PatchDiff {
+    id: String,
+    old_status: JobStatus,
+    new_status: JobStatus,
+    old_queue: String,
+    new_queue: String,
+    old_priority: u16,
+    new_priority: u16,
+    old_ready_at: u64,
+    new_ready_at: u64,
+}
+
+impl PatchDiff {
+    /// Update on-disk index keyspaces for status and queue changes.
+    ///
+    /// Must be called before `commit()`.
+    fn update_keyspaces(&self, tx: &mut fjall::SingleWriterWriteTx<'_>, ks: &Keyspaces) {
+        if self.old_status != self.new_status {
+            tx.remove(&ks.index, &make_status_key(self.old_status, &self.id));
+            tx.insert(&ks.index, &make_status_key(self.new_status, &self.id), b"");
+        }
+        if self.old_queue != self.new_queue {
+            tx.remove(&ks.index, &make_queue_key(&self.old_queue, &self.id));
+            tx.insert(&ks.index, &make_queue_key(&self.new_queue, &self.id), b"");
+        }
     }
 
-    /// Whether this patch changes queue or priority (requiring ready index updates).
-    fn changes_ready_index(&self) -> bool {
-        self.queue.is_some() || self.priority.is_some()
+    /// Update in-memory ready and scheduled indexes.
+    ///
+    /// Must be called after a successful `commit()`.
+    fn update_indexes(&self, ready_index: &ReadyIndex, scheduled_index: &ScheduledIndex) {
+        match (self.old_status, self.new_status) {
+            (JobStatus::Ready, JobStatus::Ready) => {
+                if self.old_queue != self.new_queue || self.old_priority != self.new_priority {
+                    ready_index.remove(&self.old_queue, self.old_priority, &self.id);
+                    ready_index.insert(&self.new_queue, self.new_priority, self.id.clone());
+                }
+            }
+            (JobStatus::Ready, JobStatus::Scheduled) => {
+                ready_index.remove(&self.old_queue, self.old_priority, &self.id);
+                scheduled_index.insert(self.new_ready_at, self.id.clone());
+            }
+            (JobStatus::Scheduled, JobStatus::Ready) => {
+                scheduled_index.remove(self.old_ready_at, &self.id);
+                ready_index.insert(&self.new_queue, self.new_priority, self.id.clone());
+            }
+            (JobStatus::Scheduled, JobStatus::Scheduled) => {
+                if self.old_ready_at != self.new_ready_at {
+                    scheduled_index.remove(self.old_ready_at, &self.id);
+                    scheduled_index.insert(self.new_ready_at, self.id.clone());
+                }
+            }
+            _ => {} // InFlight — no index changes.
+        }
+    }
+
+    /// Emit store events for status transitions and the patch itself.
+    ///
+    /// Must be called after sync.
+    fn emit_events(&self, event_tx: &broadcast::Sender<StoreEvent>) {
+        match (self.old_status, self.new_status) {
+            (JobStatus::Ready, JobStatus::Scheduled) => {
+                let _ = event_tx.send(StoreEvent::JobScheduled {
+                    id: self.id.clone(),
+                    ready_at: self.new_ready_at,
+                });
+            }
+            (JobStatus::Scheduled, JobStatus::Ready) => {
+                let _ = event_tx.send(StoreEvent::JobCreated {
+                    id: self.id.clone(),
+                    queue: self.new_queue.clone(),
+                    token: Arc::new(AtomicBool::new(false)),
+                });
+            }
+            (JobStatus::Scheduled, JobStatus::Scheduled)
+                if self.old_ready_at != self.new_ready_at =>
+            {
+                let _ = event_tx.send(StoreEvent::JobScheduled {
+                    id: self.id.clone(),
+                    ready_at: self.new_ready_at,
+                });
+            }
+            _ => {}
+        }
+
+        let _ = event_tx.send(StoreEvent::JobPatched {
+            id: self.id.clone(),
+        });
     }
 }
 
@@ -1863,7 +2020,6 @@ enum JobStream<'a, R: Readable> {
         data_ks: &'a SingleWriterTxKeyspace,
         now: Option<u64>,
         needs_payload: bool,
-        skip_missing: bool,
         source: String,
     },
     /// Reads jobs directly from a range scan of J-tagged keys.
@@ -1933,7 +2089,6 @@ impl<'a, R: Readable> JobStream<'a, R> {
         data_ks: &'a SingleWriterTxKeyspace,
         now: Option<u64>,
         needs_payload: bool,
-        skip_missing: bool,
         source: String,
     ) -> Self {
         Self::ById {
@@ -1942,7 +2097,6 @@ impl<'a, R: Readable> JobStream<'a, R> {
             data_ks,
             now,
             needs_payload,
-            skip_missing,
             source,
         }
     }
@@ -1959,7 +2113,6 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
                 data_ks,
                 now,
                 needs_payload,
-                skip_missing,
                 source,
             } => loop {
                 let id = match ids.next()? {
@@ -1979,11 +2132,14 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
                 let job_key = make_job_key(id_str);
                 let bytes = match reader.get(*data_ks, &job_key) {
                     Ok(Some(bytes)) => bytes,
-                    Ok(None) if *skip_missing => continue,
                     Ok(None) => {
-                        return Some(Err(StoreError::Corruption(format!(
-                            "job in {source} but missing from data keyspace: {id_str:?}",
-                        ))));
+                        // Job was deleted between index scan and data read.
+                        tracing::trace!(
+                            id = id_str,
+                            source = &**source,
+                            "job in index but missing from data keyspace, skipping"
+                        );
+                        continue;
                     }
                     Err(e) => return Some(Err(e.into())),
                 };
@@ -3820,15 +3976,9 @@ impl Store {
             );
 
             let job_stream = match id_stream_opt {
-                Some((ids, source, has_id_filter)) => JobStream::by_id(
-                    ids,
-                    &snapshot,
-                    &ks.data,
-                    opts.now,
-                    true,
-                    has_id_filter,
-                    source,
-                ),
+                Some((ids, source, _has_id_filter)) => {
+                    JobStream::by_id(ids, &snapshot, &ks.data, opts.now, true, source)
+                }
                 None => {
                     JobStream::full_scan(&snapshot, &ks, &opts.from, opts.direction, opts.now, true)
                 }
@@ -4181,13 +4331,21 @@ impl Store {
             let (due_entries, next_ready_at) = scheduled_index.next_due(now, limit);
 
             let mut result = Vec::with_capacity(due_entries.len());
-            for (_ready_at, job_id) in &due_entries {
+            for (ready_at, job_id) in &due_entries {
                 let job_key = make_job_key(job_id);
-                let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
-                    StoreError::Corruption(format!(
-                        "job in scheduled index but missing from data keyspace: {job_id:?}",
-                    ))
-                })?;
+                let job_bytes = match ks.data.get(&job_key)? {
+                    Some(bytes) => bytes,
+                    None => {
+                        // Job was deleted between next_due() and this read.
+                        // Clean up the stale scheduled index entry.
+                        tracing::trace!(
+                            job_id,
+                            "scheduled job missing from data keyspace, skipping"
+                        );
+                        scheduled_index.remove(*ready_at, job_id);
+                        continue;
+                    }
+                };
                 result.push(rmp_serde::from_slice(&job_bytes)?);
             }
 
@@ -4606,7 +4764,7 @@ impl Store {
     /// Returns the count of deleted jobs.
     ///
     /// Emits `StoreEvent::JobDeleted` for each deleted job.
-    pub async fn delete_jobs(&self, opts: DeleteJobsOptions) -> Result<usize, StoreError> {
+    pub async fn delete_jobs(&self, opts: BulkDeleteOptions) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
@@ -4621,7 +4779,6 @@ impl Store {
             let snapshot = ks.db.read_tx();
 
             let has_payload_filter = opts.filter.is_some();
-            let has_id_filter = !opts.ids.is_empty();
 
             // Build the job stream: filtered by indexes, or full scan.
             let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
@@ -4641,7 +4798,6 @@ impl Store {
                         &ks.data,
                         None,               // no expiry filtering for deletion
                         has_payload_filter, // only hydrate if filter needs it
-                        has_id_filter,
                         source,
                     );
                     Box::new(stream) as Box<dyn Iterator<Item = Result<Job, StoreError>> + '_>
@@ -4769,8 +4925,8 @@ impl Store {
             // Read, patch, and write in a single fetch_update call.
             // Errors are captured in patch_err since the closure can only
             // return Option<Slice>.
-            let mut before: Option<Job> = None;
-            let mut after: Option<Job> = None;
+            let mut patched_job: Option<Job> = None;
+            let mut diff: Option<PatchDiff> = None;
             let mut patch_err: Option<StoreError> = None;
 
             let prev = tx.fetch_update(&ks.data, &job_key, |existing| {
@@ -4809,34 +4965,11 @@ impl Store {
                     return Some(bytes.clone());
                 }
 
-                before = Some(job.clone());
-
-                // Apply field patches (queue, priority, metadata).
-                patch.apply(&mut job);
-
-                // Apply ready_at and any resulting status transition.
-                match patch.ready_at {
-                    Some(None) => {
-                        // Clear ready_at → immediately ready.
-                        job.ready_at = now;
-                        if status == JobStatus::Scheduled {
-                            job.status = JobStatus::Ready as u8;
-                        }
-                    }
-                    Some(Some(ts)) => {
-                        job.ready_at = ts;
-                        if ts > now && status == JobStatus::Ready {
-                            job.status = JobStatus::Scheduled as u8;
-                        } else if ts <= now && status == JobStatus::Scheduled {
-                            job.status = JobStatus::Ready as u8;
-                        }
-                    }
-                    None => {}
-                }
+                diff = Some(patch.apply(&mut job, now));
 
                 match rmp_serde::to_vec_named(&job) {
                     Ok(updated) => {
-                        after = Some(job);
+                        patched_job = Some(job);
                         Some(updated.into())
                     }
                     Err(e) => {
@@ -4856,72 +4989,131 @@ impl Store {
                 return Ok((None, None));
             }
 
-            let old = match before {
+            let job = match patched_job {
                 Some(j) => j,
                 None => return Ok((None, None)),
             };
-            let job = match after {
-                Some(j) => j,
-                None => return Ok((None, None)),
-            };
+            let diff = diff.unwrap();
 
-            let old_s = JobStatus::try_from(old.status).unwrap();
-            let new_s = JobStatus::try_from(job.status).unwrap();
-
-            // Update on-disk status index if status changed.
-            if old_s != new_s {
-                tx.remove(&ks.index, &make_status_key(old_s, &id));
-                tx.insert(&ks.index, &make_status_key(new_s, &id), b"");
-            }
+            diff.update_keyspaces(&mut tx, &ks);
 
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-            // Update in-memory indexes and emit events after commit.
-            match (old_s, new_s) {
-                (JobStatus::Ready, JobStatus::Ready) => {
-                    if patch.changes_ready_index() {
-                        ready_index.remove(&old.queue, old.priority, &job.id);
-                        ready_index.insert(&job.queue, job.priority, job.id.clone());
-                    }
-                }
-                (JobStatus::Ready, JobStatus::Scheduled) => {
-                    ready_index.remove(&old.queue, old.priority, &job.id);
-                    scheduled_index.insert(job.ready_at, job.id.clone());
-                    let _ = event_tx.send(StoreEvent::JobScheduled {
-                        id: job.id.clone(),
-                        ready_at: job.ready_at,
-                    });
-                }
-                (JobStatus::Scheduled, JobStatus::Ready) => {
-                    scheduled_index.remove(old.ready_at, &job.id);
-                    ready_index.insert(&job.queue, job.priority, job.id.clone());
-                    let _ = event_tx.send(StoreEvent::JobCreated {
-                        id: job.id.clone(),
-                        queue: job.queue.clone(),
-                        token: Arc::new(AtomicBool::new(false)),
-                    });
-                }
-                (JobStatus::Scheduled, JobStatus::Scheduled) => {
-                    if old.ready_at != job.ready_at {
-                        scheduled_index.remove(old.ready_at, &job.id);
-                        scheduled_index.insert(job.ready_at, job.id.clone());
-                        let _ = event_tx.send(StoreEvent::JobScheduled {
-                            id: job.id.clone(),
-                            ready_at: job.ready_at,
-                        });
-                    }
-                }
-                _ => {} // InFlight — no index changes.
-            }
-
-            // Always emit JobPatched so the admin layer can re-diff all tabs.
-            let _ = event_tx.send(StoreEvent::JobPatched { id: job.id.clone() });
+            diff.update_indexes(&ready_index, &scheduled_index);
+            diff.emit_events(&event_tx);
 
             Ok((Some(job), Some(sync)))
         })
         .await?;
 
         Ok(await_sync(result).await?)
+    }
+
+    /// Patch all jobs matching the given filters in a single transaction.
+    ///
+    /// Scans for matching jobs, applies the patch to each, commits once,
+    /// then updates in-memory indexes and emits events. Terminal jobs
+    /// (Completed/Dead) are silently skipped.
+    ///
+    /// Returns the count of actually patched jobs.
+    pub async fn patch_jobs(&self, opts: BulkPatchOptions) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+        let ready_index = self.ready_index.clone();
+        let scheduled_index = self.scheduled_index.clone();
+        let event_tx = self.event_tx.clone();
+
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let mut tx = ks.write_tx();
+            let snapshot = ks.db.read_tx();
+
+            let has_payload_filter = opts.filter.is_some();
+            let now = crate::time::now_millis();
+
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if let Some((id_stream, source, _)) = build_id_stream(
+                    &snapshot,
+                    &ks,
+                    &opts.ids,
+                    &opts.statuses,
+                    &opts.queues,
+                    &opts.types,
+                    &None,
+                    ScanDirection::Asc,
+                ) {
+                    Box::new(JobStream::by_id(
+                        id_stream,
+                        &snapshot,
+                        &ks.data,
+                        None,
+                        has_payload_filter,
+                        source,
+                    ))
+                } else {
+                    Box::new(JobStream::full_scan(
+                        &snapshot,
+                        &ks,
+                        &None,
+                        ScanDirection::Asc,
+                        None,
+                        has_payload_filter,
+                    ))
+                };
+
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if let Some(ref filter) = opts.filter {
+                    Box::new(PayloadFilteredIter {
+                        inner: jobs,
+                        filter: Arc::clone(filter),
+                    })
+                } else {
+                    jobs
+                };
+
+            let mut diffs: Vec<PatchDiff> = Vec::new();
+
+            for result in jobs {
+                let mut job = result?;
+                let status = match JobStatus::try_from(job.status) {
+                    Ok(s) => s,
+                    Err(_) => continue, // Skip corrupt jobs.
+                };
+
+                // Skip terminal jobs.
+                if matches!(status, JobStatus::Completed | JobStatus::Dead) {
+                    continue;
+                }
+
+                let diff = opts.patch.apply(&mut job, now);
+                diff.update_keyspaces(&mut tx, &ks);
+
+                let updated: Slice = rmp_serde::to_vec_named(&job)?.into();
+                let job_key = make_job_key(&job.id);
+                tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
+
+                diffs.push(diff);
+            }
+
+            if diffs.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+
+            let sync = ks.commit(tx, ks.default_commit_mode)?;
+
+            for diff in &diffs {
+                diff.update_indexes(&ready_index, &scheduled_index);
+            }
+
+            Ok((diffs, Some(sync)))
+        })
+        .await?;
+
+        let diffs = await_sync(result).await?;
+
+        for diff in &diffs {
+            diff.emit_events(&event_tx);
+        }
+
+        Ok(diffs.len())
     }
 
     /// Hard-delete a batch of jobs in a single transaction.
@@ -10666,7 +10858,7 @@ mod tests {
             .unwrap();
         store.mark_completed(now, &taken.id).await.unwrap();
 
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.statuses = [JobStatus::Ready].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
@@ -10707,7 +10899,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.queues = ["delete_me".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
@@ -10741,7 +10933,7 @@ mod tests {
             .unwrap()
             .into_job();
 
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.ids = [j1.id.clone(), j3.id.clone()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
@@ -10781,7 +10973,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.filter = Some(Arc::new(PayloadFilter::compile(".x > 1").unwrap()));
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
@@ -10806,7 +10998,7 @@ mod tests {
                 .unwrap();
         }
 
-        let count = store.delete_jobs(DeleteJobsOptions::new()).await.unwrap();
+        let count = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
         assert_eq!(count, 5);
 
         let page = store
@@ -10844,7 +11036,7 @@ mod tests {
             .unwrap();
 
         // Delete ready jobs in queue "a" only.
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.queues = ["a".into()].into();
         opts.statuses = [JobStatus::Ready].into();
         let count = store.delete_jobs(opts).await.unwrap();
@@ -10873,7 +11065,7 @@ mod tests {
             .unwrap();
 
         let mut rx = store.subscribe();
-        let count = store.delete_jobs(DeleteJobsOptions::new()).await.unwrap();
+        let count = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
         assert_eq!(count, 2);
 
         // Should receive 2 JobDeleted events.
@@ -10888,7 +11080,7 @@ mod tests {
     #[tokio::test]
     async fn delete_jobs_returns_zero_for_no_matches() {
         let store = test_store();
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.queues = ["nonexistent".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 0);
@@ -10905,7 +11097,7 @@ mod tests {
             .unwrap()
             .into_job();
 
-        let mut opts = DeleteJobsOptions::new();
+        let mut opts = BulkDeleteOptions::new();
         opts.ids = [j1.id, "0000000000000000000000000".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 1);
@@ -11673,5 +11865,175 @@ mod tests {
             other => panic!("expected JobPatched, got {:?}", other),
         }
         assert!(rx.try_recv().is_err(), "expected no further events");
+    }
+
+    // --- bulk patch_jobs tests ---
+
+    #[tokio::test]
+    async fn patch_jobs_updates_matching_jobs() {
+        let store = test_store();
+        let now = now_millis();
+
+        for i in 0..3 {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q1", serde_json::json!({"i": i})),
+                )
+                .await
+                .unwrap();
+        }
+
+        let opts = BulkPatchOptions {
+            ids: HashSet::new(),
+            statuses: HashSet::new(),
+            queues: ["q1".into()].into(),
+            types: HashSet::new(),
+            filter: None,
+            patch: PatchJobOptions {
+                queue: Some("q2".into()),
+                ..Default::default()
+            },
+        };
+
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 3);
+
+        // Verify all jobs are on q2 now.
+        let page = store
+            .list_jobs(ListJobsOptions::new().queues(["q2".into()].into()))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn patch_jobs_skips_terminal_jobs() {
+        let store = test_store();
+        let now = now_millis();
+
+        let job = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Take and complete the job.
+        store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+        store.mark_completed(now, &job.id).await.unwrap();
+
+        let opts = BulkPatchOptions {
+            ids: [job.id.clone()].into(),
+            statuses: HashSet::new(),
+            queues: HashSet::new(),
+            types: HashSet::new(),
+            filter: None,
+            patch: PatchJobOptions {
+                priority: Some(99),
+                ..Default::default()
+            },
+        };
+
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn patch_jobs_status_transitions() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        // Enqueue 2 ready jobs.
+        for _ in 0..2 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+
+        // Patch them all to scheduled.
+        let opts = BulkPatchOptions {
+            ids: HashSet::new(),
+            statuses: HashSet::new(),
+            queues: HashSet::new(),
+            types: HashSet::new(),
+            filter: None,
+            patch: PatchJobOptions {
+                ready_at: Some(Some(future)),
+                ..Default::default()
+            },
+        };
+
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        // Nothing should be takeable.
+        let taken = store
+            .take_next_job(now, &HashSet::<String>::new())
+            .await
+            .unwrap();
+        assert!(taken.is_none());
+
+        assert_eq!(store.scheduled_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn patch_jobs_with_id_filter() {
+        let store = test_store();
+        let now = now_millis();
+
+        let job_a = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+        let _job_b = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Only patch job_a.
+        let opts = BulkPatchOptions {
+            ids: [job_a.id.clone()].into(),
+            statuses: HashSet::new(),
+            queues: HashSet::new(),
+            types: HashSet::new(),
+            filter: None,
+            patch: PatchJobOptions {
+                priority: Some(99),
+                ..Default::default()
+            },
+        };
+
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 1);
+
+        let fetched = store.get_job(now, &job_a.id).await.unwrap().unwrap();
+        assert_eq!(fetched.priority, 99);
+    }
+
+    #[tokio::test]
+    async fn patch_jobs_returns_zero_for_no_matches() {
+        let store = test_store();
+
+        let opts = BulkPatchOptions {
+            ids: HashSet::new(),
+            statuses: HashSet::new(),
+            queues: ["nonexistent".into()].into(),
+            types: HashSet::new(),
+            filter: None,
+            patch: PatchJobOptions {
+                priority: Some(99),
+                ..Default::default()
+            },
+        };
+
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 0);
     }
 }
