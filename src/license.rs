@@ -4,21 +4,22 @@
 //! License validation for paid feature gating.
 //!
 //! License keys are Ed25519-signed JWTs containing licensee info, tier, and
-//! expiry. The public key is embedded at compile time via the
-//! `ZIZQ_LICENSE_PUBLIC_KEY` environment variable. Dev builds without the
-//! key cannot validate licenses (and that's fine).
+//! expiry. The public key is hard-coded in the source. Any modification of the
+//! software in order to circumvent license checks is in violation of the
+//! BUSL-1.1 license.
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
-/// Compile-time public key for license verification.
+/// Ed25519 public key for license verification.
 ///
-/// Set `ZIZQ_LICENSE_PUBLIC_KEY` to a PEM-encoded Ed25519 public key when
-/// building release binaries. When unset, `from_token()` returns an error.
-///
-/// In development, this can be done by setting the env var in
-/// .cargo/config.toml.
-const LICENSE_PUBLIC_KEY: Option<&str> = option_env!("ZIZQ_LICENSE_PUBLIC_KEY");
+/// Modifying this key constitutes modification of the software under the terms
+/// of the BUSL-1.1 license.
+const LICENSE_PUBLIC_KEY: &str = r#"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAAo6KrA8jcLkMyzIZI1+IzwQ1zSzyxj29Xv+26RTVUEM=
+-----END PUBLIC KEY-----
+"#;
 
 /// Available license tiers, ordered by capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -56,7 +57,7 @@ impl std::fmt::Display for Tier {
 /// `min_tier()`, add a check in the relevant handler.
 #[derive(Debug, Clone, Copy)]
 pub enum Feature {
-    /// Live queue detail in the `top` command (job lists by status).
+    /// Live queue detail in the `zizq top` command.
     TopLiveQueue,
     /// Example Pro feature for testing the gating machinery.
     ProExample,
@@ -122,13 +123,11 @@ pub enum License {
 }
 
 impl License {
-    /// Parse and validate a license JWT using the compiled-in public key.
+    /// Parse and validate a license JWT using the hard-coded public key.
     ///
-    /// Returns an error if the public key was not compiled in, or if the
-    /// token is invalid/expired.
+    /// Returns an error if the token is invalid or expired.
     pub fn from_token(token: &str) -> Result<Self, String> {
-        let pem = LICENSE_PUBLIC_KEY.ok_or("license validation not available in this build")?;
-        from_token_with_key(token, pem)
+        from_token_with_key(token, LICENSE_PUBLIC_KEY)
     }
 
     /// Check whether this license permits a given feature.
@@ -536,5 +535,21 @@ mod tests {
         let lic = licensed(Tier::Enterprise, 2_000_000);
         lic.require(secs_to_ms(1_000_000), Feature::MutualTls)
             .expect("enterprise license should allow mutual TLS");
+    }
+
+    #[test]
+    fn pem_with_surrounding_whitespace() {
+        let (priv_pem, pub_pem) = gen_keypair();
+        // Wrap in leading/trailing newlines, like a raw string literal.
+        let padded_pem = format!("\n{pub_pem}\n");
+        let claims = TestClaims {
+            sub: "lic_ws".into(),
+            name: "Whitespace Test".into(),
+            exp: future_exp(),
+            tier: "pro".into(),
+        };
+        let token = sign_jwt(&claims, &priv_pem);
+        from_token_with_key(&token, &padded_pem)
+            .expect("PEM with surrounding whitespace should parse");
     }
 }

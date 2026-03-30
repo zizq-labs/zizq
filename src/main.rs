@@ -69,13 +69,18 @@ enum Command {
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
-fn resolve_license_key(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+///
+/// Returns `(token, file_path)` where `file_path` is `Some` when the
+/// token was read from a file (for license hot-reload).
+fn resolve_license_key(
+    value: &str,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     if let Some(path) = value.strip_prefix('@') {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read license key from {path}: {e}"))?;
-        Ok(contents.trim().to_string())
+        Ok((contents.trim().to_string(), Some(path.to_string())))
     } else {
-        Ok(value.to_string())
+        Ok((value.to_string(), None))
     }
 }
 
@@ -92,23 +97,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the software license if present so it can be provided to each
     // subcommand for feature gating.
-    let license = match cli.license_key {
+    let (license, license_key_path) = match cli.license_key {
         Some(ref value) => {
-            let token = resolve_license_key(value)?;
-            License::from_token(&token).map_err(|e| format!("invalid license key: {e}"))?
+            let (token, path) = resolve_license_key(value)?;
+            let lic =
+                License::from_token(&token).map_err(|e| format!("invalid license key: {e}"))?;
+            (lic, path)
         }
-        None => License::Free,
+        None => (License::Free, None),
     };
 
     match cli.command {
         Some(Command::Top(args)) => top::run(args).await,
-        Some(Command::Serve(args)) => serve::run(args, &cli.root_dir, license).await,
+        Some(Command::Serve(args)) => {
+            serve::run(args, &cli.root_dir, license, license_key_path).await
+        }
         Some(Command::Tls(args)) => tls::run(args, &cli.root_dir).await,
         None => {
             serve::run(
                 serve::Args::parse_from(std::env::args()),
                 &cli.root_dir,
                 license,
+                license_key_path,
             )
             .await
         }

@@ -1218,6 +1218,8 @@ async fn enqueue(
         let now_ms = (state.clock)();
         if let Err(e) = state
             .license
+            .read()
+            .unwrap()
             .require(now_ms, crate::license::Feature::UniqueJobs)
         {
             return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
@@ -1352,6 +1354,8 @@ async fn bulk_enqueue(
         let now_ms = (state.clock)();
         if let Err(e) = state
             .license
+            .read()
+            .unwrap()
             .require(now_ms, crate::license::Feature::UniqueJobs)
         {
             return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
@@ -2888,7 +2892,7 @@ mod tests {
         std::mem::forget(shutdown_tx);
         let (admin_events, _) = broadcast::channel(64);
         let state = AppState {
-            license: License::Free,
+            license: std::sync::RwLock::new(License::Free),
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_in_flight_limit: 0,
@@ -4894,7 +4898,7 @@ mod tests {
         std::mem::forget(shutdown_tx);
         let (admin_events, _) = broadcast::channel(64);
         let state = Arc::new(AppState {
-            license: License::Free,
+            license: std::sync::RwLock::new(License::Free),
             store,
             heartbeat_interval_ms: Duration::from_millis(DEFAULT_HEARTBEAT_INTERVAL_MS),
             global_in_flight_limit: 2,
@@ -6298,7 +6302,7 @@ mod tests {
 
     fn pro_app() -> Router {
         let (_, mut state) = test_app_state();
-        state.license = License::Licensed {
+        *state.license.write().unwrap() = License::Licensed {
             licensee_id: "test".into(),
             licensee_name: "Test".into(),
             tier: crate::license::Tier::Pro,

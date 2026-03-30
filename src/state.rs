@@ -6,7 +6,7 @@
 //! [`AppState`] holds the runtime dependencies shared across the HTTP API,
 //! admin WebSocket handlers, and background tasks.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
@@ -24,7 +24,10 @@ pub const DEFAULT_GLOBAL_IN_FLIGHT_LIMIT: u64 = 1024;
 /// Shared server state, passed to all request handlers.
 pub struct AppState {
     /// Validated license determining which paid features are available.
-    pub license: License,
+    ///
+    /// Wrapped in `RwLock` to support hot-reload: a background task can
+    /// update the license without restarting the server.
+    pub license: RwLock<License>,
 
     /// Persistent store for job queue operations.
     pub store: Store,

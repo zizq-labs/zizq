@@ -226,6 +226,13 @@ pub struct Args {
     /// Requires --tls-cert and --tls-key. Requires a Pro license.
     #[arg(long, value_name = "PATH", env = "ZIZQ_TLS_CLIENT_CA")]
     tls_client_ca: Option<String>,
+
+    /// Interval between license key file re-checks (e.g. 60s, 5m).
+    /// When the license key is loaded from a file (--license-key @path),
+    /// the server periodically re-reads the file to detect rotations.
+    /// Set to 0 to disable.
+    #[arg(long = "license-key-check-interval", default_value = "5s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_LICENSE_KEY_CHECK_INTERVAL")]
+    license_key_check_interval_ms: u64,
 }
 
 /// Initializes the database and starts the HTTP server.
@@ -233,6 +240,7 @@ pub async fn run(
     args: Args,
     root_dir: &str,
     license: License,
+    license_key_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Log the application name to stderr so it's obviously something is running.
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -355,7 +363,7 @@ pub async fn run(
 
     // Initialize shared state accessible to all request handlers.
     let state = Arc::new(AppState {
-        license,
+        license: std::sync::RwLock::new(license),
         store,
         heartbeat_interval_ms: Duration::from_millis(args.heartbeat_interval_ms),
         global_in_flight_limit: args.global_in_flight_limit,
@@ -388,6 +396,68 @@ pub async fn run(
         Duration::from_millis(args.reaper_check_interval_ms),
         reaper_shutdown,
     ));
+
+    // Start the license key file watcher if the key was loaded from a file.
+    if let Some(ref path) = license_key_path {
+        let interval_ms = args.license_key_check_interval_ms;
+        if interval_ms > 0 {
+            tracing::info!(
+                path = %path,
+                interval_secs = interval_ms / 1000,
+                "license key file watcher started"
+            );
+
+            let path = path.clone();
+            let state_for_watcher = Arc::clone(&state);
+            let mut watcher_shutdown = state.shutdown.clone();
+
+            tokio::spawn(async move {
+                let mut last_contents = std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                        _ = watcher_shutdown.changed() => break,
+                    }
+
+                    let contents = match std::fs::read_to_string(&path) {
+                        Ok(c) => c.trim().to_string(),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path,
+                                error = %e,
+                                "failed to re-read license key file"
+                            );
+                            continue;
+                        }
+                    };
+
+                    if contents == last_contents {
+                        continue;
+                    }
+
+                    last_contents = contents.clone();
+
+                    match License::from_token(&contents) {
+                        Ok(new_license) => {
+                            tracing::info!("license key file changed, updating license");
+                            log_license(&new_license);
+                            *state_for_watcher.license.write().unwrap() = new_license;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "license key file changed but new token is invalid, keeping current license"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     // Start the admin API listener (unless disabled).
     if !args.no_admin {

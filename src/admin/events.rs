@@ -218,7 +218,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
 /// Build a `ServerStatus` snapshot from the current app state.
 fn server_status(state: &AppState) -> ServerStatus {
-    let tier = match state.license.tier() {
+    let tier = match state.license.read().unwrap().tier() {
         Some(tier) => tier.to_string(),
         None => "free".to_string(),
     };
@@ -243,6 +243,8 @@ fn can_show_live_queue(state: &AppState) -> bool {
     let now_ms = (state.clock)();
     state
         .license
+        .read()
+        .unwrap()
         .require(now_ms, crate::license::Feature::TopLiveQueue)
         .is_ok()
 }
@@ -795,7 +797,7 @@ mod tests {
         let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         Arc::new(AppState {
-            license,
+            license: std::sync::RwLock::new(license),
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
             global_in_flight_limit: 0,

@@ -163,7 +163,7 @@ mod tests {
         let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
         std::mem::forget(dir);
         let state = Arc::new(AppState {
-            license: License::Free,
+            license: std::sync::RwLock::new(License::Free),
             store,
             heartbeat_interval_ms: Duration::from_millis(500),
             global_in_flight_limit: 0,
