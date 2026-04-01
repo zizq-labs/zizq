@@ -612,7 +612,7 @@ struct ListJobsParams {
     #[serde(default)]
     order: Order,
 
-    /// Maximum number of jobs to return (1–200, default 50).
+    /// Maximum number of jobs to return (1–2000, default 50).
     limit: Option<u16>,
 
     /// Status filter, comma-delimited (e.g. "ready,in_flight").
@@ -719,7 +719,7 @@ impl From<ScanDirection> for Order {
 const DEFAULT_PAGE_LIMIT: u16 = 50;
 
 /// Maximum page size for job listings.
-const MAX_PAGE_LIMIT: u16 = 200;
+const MAX_PAGE_LIMIT: u16 = 2000;
 
 /// Response shape for paginated job listings.
 #[derive(Serialize)]
@@ -3865,7 +3865,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_jobs_rejects_limit_over_max() {
-        let req = empty_request("GET", "/jobs?limit=201");
+        let req = empty_request("GET", "/jobs?limit=2001");
         let res = test_app().oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -3875,7 +3875,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_jobs_accepts_max_limit() {
-        let req = empty_request("GET", "/jobs?limit=200");
+        let req = empty_request("GET", "/jobs?limit=2000");
         let res = test_app().oneshot(req).await.unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
