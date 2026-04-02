@@ -245,7 +245,7 @@ of these behaviours are configurable.
 
 ### Job Lifecycle
 
-Jobs progress through the different statues as their lifecycle progresses.
+Jobs progress through the different statuses as their lifecycle progresses.
 
 ![Job Lifecycle](./status_lifecycle.png)
 
