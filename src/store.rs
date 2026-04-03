@@ -4042,6 +4042,59 @@ impl Store {
         .await?
     }
 
+    /// Return all distinct queue names present in the store.
+    ///
+    /// Uses a seek-skip algorithm on the on-disk queue index to enumerate
+    /// queue names in O(distinct queues), not O(total jobs). Each step is
+    /// a single LSM tree seek via `range()`.
+    pub async fn list_queues(&self) -> Result<Vec<String>, StoreError> {
+        let ks = self.ks.clone();
+
+        task::spawn_blocking(move || {
+            let snapshot = ks.db.read_tx();
+
+            let end: Vec<u8> = vec![IndexKind::Queue as u8 + 1, 0];
+            let mut start: Vec<u8> = vec![IndexKind::Queue as u8, 0];
+            let mut queues = Vec::new();
+
+            loop {
+                let mut range = snapshot.range::<Vec<u8>, _>(
+                    ks.index.as_ref(),
+                    (Bound::Included(start.clone()), Bound::Excluded(end.clone())),
+                );
+
+                let entry = match range.next() {
+                    Some(entry) => entry,
+                    None => break,
+                };
+
+                let (key, _) = entry.into_inner()?;
+
+                // Key layout: Q\0{queue_name}\0{job_id} — extract queue_name.
+                let name_start = 2; // skip Q\0
+                let name_end = key[name_start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| name_start + p)
+                    .unwrap_or(key.len());
+                let queue_name = std::str::from_utf8(&key[name_start..name_end])
+                    .map_err(|e| {
+                        StoreError::Corruption(format!("queue name is not valid UTF-8: {e}"))
+                    })?
+                    .to_string();
+                queues.push(queue_name.clone());
+
+                // Advance past all entries for this queue: Q\0{queue_name}\x01
+                start.truncate(2);
+                start.extend_from_slice(queue_name.as_bytes());
+                start.push(1); // one byte past \0 separator
+            }
+
+            Ok(queues)
+        })
+        .await?
+    }
+
     /// List ready jobs in priority order from the in-memory index.
     ///
     /// Iterates the `ReadyIndex` SkipMap and hydrates job metadata from
@@ -12035,5 +12088,63 @@ mod tests {
 
         let count = store.patch_jobs(opts).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_queues_returns_distinct_names() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue jobs on 3 different queues.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "alpha", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "beta", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "gamma", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let queues = store.list_queues().await.unwrap();
+        assert_eq!(queues, vec!["alpha", "beta", "gamma"]);
+
+        // Enqueue more jobs on existing queues — count should not change.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("other", "alpha", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("other", "beta", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let queues = store.list_queues().await.unwrap();
+        assert_eq!(queues, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn list_queues_empty_store() {
+        let store = test_store();
+        let queues = store.list_queues().await.unwrap();
+        assert!(queues.is_empty());
     }
 }

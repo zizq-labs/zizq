@@ -389,6 +389,12 @@ struct VersionResponse {
     version: &'static str,
 }
 
+/// Response shape for the list queues endpoint.
+#[derive(Serialize)]
+struct ListQueuesResponse {
+    queues: Vec<String>,
+}
+
 /// Response shape for all error responses.
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -1088,6 +1094,7 @@ pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
+        .route("/queues", get(list_queues))
         .route(
             "/jobs",
             get(list_jobs)
@@ -1158,15 +1165,31 @@ async fn version(AcceptFormat(fmt): AcceptFormat) -> Response {
     )
 }
 
-/// Validate a queue name, returning an error message if invalid.
-///
-/// Queue names must be non-empty and must not contain `,` (used as a
-/// delimiter in query parameters) or null bytes (used as key separators
-/// in internal indexes).
+/// Handle `GET /queues` — list all distinct queue names.
+async fn list_queues(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    match state.store.list_queues().await {
+        Ok(queues) => respond(fmt, StatusCode::OK, &ListQueuesResponse { queues }),
+        Err(e) => {
+            tracing::error!(%e, "list_queues failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal server error".into(),
+                },
+            )
+        }
+    }
+}
+
 /// Validate a string field used as an index key (queue name, job type, etc.).
 ///
 /// Rejects empty strings, commas (used as a set delimiter in query
-/// parameters), and null bytes (used as a separator in index keys).
+/// parameters), null bytes (used as a separator in index keys), and
+/// glob characters (reserved for future pattern matching support).
 fn validate_name(field: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{field} must not be empty"));
@@ -1176,6 +1199,12 @@ fn validate_name(field: &str, value: &str) -> Result<(), String> {
     }
     if value.contains('\0') {
         return Err(format!("{field} must not contain null bytes"));
+    }
+    if let Some(c) = value
+        .chars()
+        .find(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\'))
+    {
+        return Err(format!("{field} must not contain '{c}' (reserved)"));
     }
     Ok(())
 }
@@ -3239,6 +3268,30 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert!(body["error"].as_str().unwrap().contains(","));
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_queue_name_with_glob_chars() {
+        for name in ["foo*", "bar?", "baz[0]", "qux{ab}", "back\\slash"] {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({"type": "test", "queue": name, "payload": "x"}),
+            );
+            let res = test_app().oneshot(req).await.unwrap();
+
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "expected reject for queue: {name}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+            assert!(
+                body["error"].as_str().unwrap().contains("reserved"),
+                "expected 'reserved' in error for queue: {name}, got: {}",
+                body["error"]
+            );
+        }
     }
 
     #[tokio::test]
@@ -6301,7 +6354,7 @@ mod tests {
     // --- Unique jobs ---
 
     fn pro_app() -> Router {
-        let (_, mut state) = test_app_state();
+        let (_, state) = test_app_state();
         *state.license.write().unwrap() = License::Licensed {
             licensee_id: "test".into(),
             licensee_name: "Test".into(),
@@ -6688,7 +6741,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_job_returns_422_for_completed_job() {
-        let (_, mut state) = test_app_state_with_config({
+        let (_, state) = test_app_state_with_config({
             let mut c = store::StorageConfig::default();
             c.default_completed_retention_ms = 60_000;
             c
@@ -6938,5 +6991,57 @@ mod tests {
         let text = response_body(res).await;
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["patched"], 0);
+    }
+
+    #[tokio::test]
+    async fn list_queues_empty_store() {
+        let req = empty_request("GET", "/queues");
+        let res = test_app().oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body, serde_json::json!({"queues": []}));
+    }
+
+    #[tokio::test]
+    async fn list_queues_returns_distinct_queues() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+
+        use crate::store::EnqueueOptions;
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "payments/invoices", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "payments/refunds", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "webhooks", serde_json::json!(null)),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/queues");
+        let res = app.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"queues": ["payments/invoices", "payments/refunds", "webhooks"]})
+        );
     }
 }
