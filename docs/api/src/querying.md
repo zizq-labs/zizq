@@ -14,48 +14,18 @@ All endpoints return the same Job structure.
 
 {{#include ./job-response-with-payload.md}}
 
-## `GET /jobs/{id}` { #get-job }
+## `GET /queues` { #get-queues-list }
 
-Retrieve a single job given a known ID.
+Get the list of all queues known to the server.
 
-### Parameters { #get-job-parameters }
+> [!NOTE]
+> Queues are not explicitly created in Zizq. Jobs are assigned to arbitrary
+> queue names.
 
-<table>
-    <thead>
-        <tr>
-            <th>Field</th>
-            <th>Description</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td>
-                <div><code>id</code> <em>path</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                ID of the job to retrieve.
-            </td>
-        </tr>
-    </tbody>
-</table>
-
-### Responses { #get-job-response }
+### Responses { #get-queues-list-response }
 
 #### `200` OK
 
-See [Common Job Type](#job-type).
-
-#### `404` Not Found
-
-{{#include ./error-response.md}}
-
-## `DELETE /jobs/{id}` { #delete-job }
-
-Delete a single job given a known ID.
-
-### Parameters { #delete-job-parameters }
-
 <table>
     <thead>
         <tr>
@@ -66,25 +36,15 @@ Delete a single job given a known ID.
     <tbody>
         <tr>
             <td>
-                <div><code>id</code> <em>path</em></div>
-                <div><pre>string</pre></div>
+                <div><code>queues</code> <em>required</em></div>
+                <div><pre>array</pre></div>
             </td>
             <td>
-                ID of the job to delete.
+                Array of queue names (strings).
             </td>
         </tr>
     </tbody>
 </table>
-
-### Responses { #delete-job-response }
-
-#### `204` No Content
-
-Job was successfully deleted.
-
-#### `404` Not Found
-
-{{#include ./error-response.md}}
 
 ## `GET /jobs` { #get-jobs-list }
 
@@ -113,6 +73,15 @@ All options are additive.
         </tr>
     </thead>
     <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional comma-separated list of job IDs to retrieve.
+            </td>
+        </tr>
         <tr>
             <td>
                 <div><code>queue</code> <em>query</em></div>
@@ -179,7 +148,7 @@ All options are additive.
             </td>
             <td>
                 The maximum number of jobs to include per page. Valid values
-                are between 0 and 200. The default is 50.
+                are between 1 and 2000. The default is 50.
             </td>
         </tr>
     </tbody>
@@ -253,6 +222,42 @@ All options are additive.
 #### `400` Bad Request
 
 When given invalid input parameters.
+
+{{#include ./error-response.md}}
+
+## `GET /jobs/{id}` { #get-job }
+
+Retrieve a single job given a known ID.
+
+### Parameters { #get-job-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job to retrieve.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #get-job-response }
+
+#### `200` OK
+
+See [Common Job Type](#job-type).
+
+#### `404` Not Found
 
 {{#include ./error-response.md}}
 
@@ -535,3 +540,115 @@ When given invalid input parameters.
 When the specified job or error does not exist.
 
 {{#include ./error-response.md}}
+
+## Examples
+
+### List all queues
+
+```shell
+http 127.0.0.1:7890/queues
+```
+
+```http
+HTTP/1.1 200 OK
+content-length: 22
+content-type: application/json
+date: Fri, 03 Apr 2026 11:07:43 GMT
+
+{
+    "queues": [
+        "comms",
+        "default",
+        "example",
+        "payments"
+    ]
+}
+```
+
+### List `ready` jobs on a specific queue
+
+```shell
+http GET "http://127.0.0.1:7890/jobs?queue=example&status=ready&limit=2"
+```
+
+```http
+HTTP/1.1 200 OK
+content-length: 584
+content-type: application/json
+date: Fri, 03 Apr 2026 11:00:17 GMT
+
+{
+    "jobs": [
+        {
+            "attempts": 0,
+            "id": "03fvmaj8q5po1huy5nd4xmi5f",
+            "payload": {
+                "greet": "World"
+            },
+            "priority": 500,
+            "queue": "example",
+            "ready_at": 1775213710452,
+            "status": "ready",
+            "type": "hello_world"
+        },
+        {
+            "attempts": 0,
+            "id": "03fvmame0wyuiexbc2033jby2",
+            "payload": {
+                "greet": "World"
+            },
+            "priority": 500,
+            "queue": "example",
+            "ready_at": 1775213737304,
+            "status": "ready",
+            "type": "hello_world",
+            "unique_key": "hello_world:world",
+            "unique_while": "queued"
+        }
+    ],
+    "pages": {
+        "next": "/jobs?from=03fvmame0wyuiexbc2033jby2&order=asc&limit=2&status=ready&queue=example",
+        "prev": null,
+        "self": "/jobs?order=asc&limit=2&status=ready&queue=example"
+    }
+}
+```
+
+### Filter jobs by payload content
+
+> [!NOTE]
+> The following example is intentionally not correctly percent-encoded for
+> readability. HTTPie handles this ok.
+
+```shell
+http GET 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Uni")'
+```
+
+```http
+HTTP/1.1 200 OK
+content-length: 301
+content-type: application/json
+date: Fri, 03 Apr 2026 11:02:51 GMT
+
+{
+    "jobs": [
+        {
+            "attempts": 0,
+            "id": "03fvmbsuryhdkxvb6vjy4qhxp",
+            "payload": {
+                "greet": "Universe"
+            },
+            "priority": 500,
+            "queue": "example",
+            "ready_at": 1775214099613,
+            "status": "ready",
+            "type": "hello_world"
+        }
+    ],
+    "pages": {
+        "next": null,
+        "prev": null,
+        "self": "/jobs?order=asc&limit=50&filter=.greet%20%7C%20startswith%28%22Uni%22%29"
+    }
+}
+```

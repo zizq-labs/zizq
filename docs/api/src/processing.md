@@ -159,7 +159,7 @@ Notify the backend that multiple `in_flight` jobs have completed successfully
 > If your client only supports HTTP/1.1, you should use a keep-alive connection
 > so all acknowledgements share the same connection.
 
-### Parameters { #post-jobs-success-bulk-parameters }
+### Request Body { #post-jobs-success-bulk-body }
 
 <table>
     <thead>
@@ -245,6 +245,19 @@ this job according to the backoff policy.
                 has failed.
             </td>
         </tr>
+    </tbody>
+</table>
+
+### Request Body { #post-jobs-failure-body }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
         <tr>
             <td>
                 <div><code>message</code> <em>required</em></div>

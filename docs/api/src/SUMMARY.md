@@ -5,3 +5,4 @@
 - [Enqueuing Jobs](./enqueue.md)
 - [Taking & Processing Jobs](./processing.md)
 - [Querying Job Data](./querying.md)
+- [Modifying Job Data](./modifying.md)

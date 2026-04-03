@@ -33,7 +33,9 @@ endpoint wraps an array of `{"jobs": [...]}`.
             </td>
             <td>
                 Arbitrary queue name to which the job is assigned. Must not
-                contain <code>","</code> commas.
+                contain any of the follow reserved characters: <code>,</code>,
+                <code>*</code>, <code>?</code>, <code>[</code>, <code>]</code>,
+                <code>{</code>, <code>}</code>, <code>\</code>.
             </td>
         </tr>
         <tr>
@@ -43,7 +45,9 @@ endpoint wraps an array of `{"jobs": [...]}`.
             </td>
             <td>
                 Job type known to your application. Must not contain
-                <code>","</code> commas.
+                any of the follow reserved characters: <code>,</code>,
+                <code>*</code>, <code>?</code>, <code>[</code>, <code>]</code>,
+                <code>{</code>, <code>}</code>, <code>\</code>.
             </td>
         </tr>
         <tr>
@@ -227,7 +231,7 @@ endpoint wraps an array of `{"jobs": [...]}`.
 
 Enqueues a single job.
 
-### Parameters { #post-jobs-parameters }
+### Request Body { #post-jobs-body }
 
 See [Common Job Parameters](#job-parameters).
 
@@ -264,7 +268,7 @@ configured with a pro license.
 
 Enqueues multiple jobs atomically.
 
-### Parameters { #post-jobs-bulk-parameters }
+### Request Body { #post-jobs-bulk-body }
 
 <table>
     <thead>
@@ -406,7 +410,7 @@ date: Fri, 13 Mar 2026 09:01:08 GMT
 
 ### Enqueue jobs with unique keys
 
-Unique jobs required a [pro license](https://zizq.io/pricing).
+Unique jobs require a [pro license](https://zizq.io/pricing).
 
 ```shell
 http POST http://127.0.0.1:7890/jobs <<'JSON'
