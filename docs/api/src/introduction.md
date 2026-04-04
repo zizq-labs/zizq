@@ -146,8 +146,8 @@ different types of workloads from others, for example so that some workers can
 be scaled differently to others.
 
 While the `queue` is a required input when enqueueing jobs, the exact value is
-an arbitrary string specific to your application. The only restriction is that
-they cannot contain the following reserved characters:
+any arbitrary UTF-8 string specific to your application. The only restriction
+is that they cannot contain the following reserved characters:
 `,`, `*`, `?`, `[`, `]`, `{`, `}`, `\`. Queues do not need to be explicitly
 created before they are first used.
 

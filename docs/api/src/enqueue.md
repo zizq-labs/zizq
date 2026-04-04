@@ -32,10 +32,11 @@ endpoint wraps an array of `{"jobs": [...]}`.
                 <div><pre>string</pre></div>
             </td>
             <td>
-                Arbitrary queue name to which the job is assigned. Must not
-                contain any of the follow reserved characters: <code>,</code>,
-                <code>*</code>, <code>?</code>, <code>[</code>, <code>]</code>,
-                <code>{</code>, <code>}</code>, <code>\</code>.
+                Arbitrary queue name to which the job is assigned. Must be
+                valid UTF-8 and must not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
             </td>
         </tr>
         <tr>
@@ -44,10 +45,10 @@ endpoint wraps an array of `{"jobs": [...]}`.
                 <div><pre>string</pre></div>
             </td>
             <td>
-                Job type known to your application. Must not contain
-                any of the follow reserved characters: <code>,</code>,
-                <code>*</code>, <code>?</code>, <code>[</code>, <code>]</code>,
-                <code>{</code>, <code>}</code>, <code>\</code>.
+                Job type known to your application. Must be valid UTF-8 and
+                must not contain any of the follow reserved characters:
+                <code>,</code>, <code>*</code>, <code>?</code>, <code>[</code>,
+                <code>]</code>, <code>{</code>, <code>}</code>, <code>\</code>.
             </td>
         </tr>
         <tr>
