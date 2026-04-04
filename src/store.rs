@@ -1879,25 +1879,44 @@ fn queue_scan_sources<'a>(
         .iter()
         .map(|queue_name| {
             let prefix_len = queue_name.len() + 3;
-            let start = match from {
-                Some(cursor) => Bound::Excluded(make_queue_key(queue_name, cursor)),
-                None => Bound::Included(make_queue_key(queue_name, "")),
-            };
-            let mut end_key = Vec::with_capacity(queue_name.len() + 3);
-            end_key.push(IndexKind::Queue as u8);
-            end_key.push(0);
-            end_key.extend_from_slice(queue_name.as_bytes());
-            end_key.push(1);
-            let end = Bound::Excluded(end_key);
+            let range_start = Bound::Included(make_queue_key(queue_name, ""));
+            let mut range_end_key = Vec::with_capacity(queue_name.len() + 3);
+            range_end_key.push(IndexKind::Queue as u8);
+            range_end_key.push(0);
+            range_end_key.extend_from_slice(queue_name.as_bytes());
+            range_end_key.push(1);
+            let range_end = Bound::Excluded(range_end_key);
 
-            match direction {
-                ScanDirection::Asc => range_source!(
-                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (start, end)),
+            match (direction, from) {
+                (ScanDirection::Asc, Some(cursor)) => range_source!(
+                    snapshot.range::<Vec<u8>, _>(
+                        ks.index.as_ref(),
+                        (
+                            Bound::Excluded(make_queue_key(queue_name, cursor)),
+                            range_end
+                        ),
+                    ),
                     prefix_len
                 ),
-                ScanDirection::Desc => range_source!(
+                (ScanDirection::Asc, None) => range_source!(
+                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (range_start, range_end),),
+                    prefix_len
+                ),
+                (ScanDirection::Desc, Some(cursor)) => range_source!(
                     snapshot
-                        .range::<Vec<u8>, _>(ks.index.as_ref(), (start, end))
+                        .range::<Vec<u8>, _>(
+                            ks.index.as_ref(),
+                            (
+                                range_start,
+                                Bound::Excluded(make_queue_key(queue_name, cursor))
+                            ),
+                        )
+                        .rev(),
+                    prefix_len
+                ),
+                (ScanDirection::Desc, None) => range_source!(
+                    snapshot
+                        .range::<Vec<u8>, _>(ks.index.as_ref(), (range_start, range_end))
                         .rev(),
                     prefix_len
                 ),
@@ -1918,20 +1937,36 @@ fn status_scan_sources<'a>(
         .iter()
         .map(|status| {
             let prefix = *status as u8;
-            let start = match from {
-                Some(cursor) => Bound::Excluded(make_status_key(*status, cursor)),
-                None => Bound::Included(vec![IndexKind::Status as u8, 0, prefix, 0]),
-            };
-            let end = Bound::Excluded(vec![IndexKind::Status as u8, 0, prefix + 1, 0]);
+            let range_start = Bound::Included(vec![IndexKind::Status as u8, 0, prefix, 0]);
+            let range_end = Bound::Excluded(vec![IndexKind::Status as u8, 0, prefix + 1, 0]);
 
-            match direction {
-                ScanDirection::Asc => range_source!(
-                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (start, end)),
+            match (direction, from) {
+                (ScanDirection::Asc, Some(cursor)) => range_source!(
+                    snapshot.range::<Vec<u8>, _>(
+                        ks.index.as_ref(),
+                        (Bound::Excluded(make_status_key(*status, cursor)), range_end),
+                    ),
                     4
                 ),
-                ScanDirection::Desc => range_source!(
+                (ScanDirection::Asc, None) => range_source!(
+                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (range_start, range_end),),
+                    4
+                ),
+                (ScanDirection::Desc, Some(cursor)) => range_source!(
                     snapshot
-                        .range::<Vec<u8>, _>(ks.index.as_ref(), (start, end))
+                        .range::<Vec<u8>, _>(
+                            ks.index.as_ref(),
+                            (
+                                range_start,
+                                Bound::Excluded(make_status_key(*status, cursor))
+                            ),
+                        )
+                        .rev(),
+                    4
+                ),
+                (ScanDirection::Desc, None) => range_source!(
+                    snapshot
+                        .range::<Vec<u8>, _>(ks.index.as_ref(), (range_start, range_end))
                         .rev(),
                     4
                 ),
@@ -1952,25 +1987,41 @@ fn type_scan_sources<'a>(
         .iter()
         .map(|type_name| {
             let prefix_len = type_name.len() + 3;
-            let start = match from {
-                Some(cursor) => Bound::Excluded(make_type_key(type_name, cursor)),
-                None => Bound::Included(make_type_key(type_name, "")),
-            };
-            let mut end_key = Vec::with_capacity(type_name.len() + 3);
-            end_key.push(IndexKind::Type as u8);
-            end_key.push(0);
-            end_key.extend_from_slice(type_name.as_bytes());
-            end_key.push(1);
-            let end = Bound::Excluded(end_key);
+            let range_start = Bound::Included(make_type_key(type_name, ""));
+            let mut range_end_key = Vec::with_capacity(type_name.len() + 3);
+            range_end_key.push(IndexKind::Type as u8);
+            range_end_key.push(0);
+            range_end_key.extend_from_slice(type_name.as_bytes());
+            range_end_key.push(1);
+            let range_end = Bound::Excluded(range_end_key);
 
-            match direction {
-                ScanDirection::Asc => range_source!(
-                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (start, end)),
+            match (direction, from) {
+                (ScanDirection::Asc, Some(cursor)) => range_source!(
+                    snapshot.range::<Vec<u8>, _>(
+                        ks.index.as_ref(),
+                        (Bound::Excluded(make_type_key(type_name, cursor)), range_end),
+                    ),
                     prefix_len
                 ),
-                ScanDirection::Desc => range_source!(
+                (ScanDirection::Asc, None) => range_source!(
+                    snapshot.range::<Vec<u8>, _>(ks.index.as_ref(), (range_start, range_end),),
+                    prefix_len
+                ),
+                (ScanDirection::Desc, Some(cursor)) => range_source!(
                     snapshot
-                        .range::<Vec<u8>, _>(ks.index.as_ref(), (start, end))
+                        .range::<Vec<u8>, _>(
+                            ks.index.as_ref(),
+                            (
+                                range_start,
+                                Bound::Excluded(make_type_key(type_name, cursor))
+                            ),
+                        )
+                        .rev(),
+                    prefix_len
+                ),
+                (ScanDirection::Desc, None) => range_source!(
+                    snapshot
+                        .range::<Vec<u8>, _>(ks.index.as_ref(), (range_start, range_end))
                         .rev(),
                     prefix_len
                 ),

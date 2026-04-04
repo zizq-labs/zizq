@@ -1857,7 +1857,7 @@ async fn bulk_delete_jobs(
         Ok(q) => q,
         Err(e) => {
             return respond(
-                Format::Json,
+                fmt,
                 StatusCode::BAD_REQUEST,
                 &ErrorResponse {
                     error: format!("invalid query parameters: {e}"),
@@ -1953,7 +1953,7 @@ async fn bulk_patch_jobs(
         Ok(q) => q,
         Err(e) => {
             return respond(
-                Format::Json,
+                fmt,
                 StatusCode::BAD_REQUEST,
                 &ErrorResponse {
                     error: format!("invalid query parameters: {e}"),
@@ -2118,7 +2118,7 @@ async fn list_jobs(
         Ok(q) => q,
         Err(e) => {
             return respond(
-                Format::Json,
+                fmt,
                 StatusCode::BAD_REQUEST,
                 &ErrorResponse {
                     error: format!("invalid query parameters: {e}"),
@@ -2324,7 +2324,7 @@ async fn list_errors(
         Ok(q) => q,
         Err(e) => {
             return respond(
-                Format::Json,
+                fmt,
                 StatusCode::BAD_REQUEST,
                 &ErrorResponse {
                     error: format!("invalid query parameters: {e}"),
@@ -3872,6 +3872,154 @@ mod tests {
         let jobs = body["jobs"].as_array().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0]["payload"], "b");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_desc_cursor_paginates_without_duplicates() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+        for label in ["a", "b", "c"] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "q", serde_json::json!(label)),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Page 1: newest two (c, b)
+        let req = empty_request("GET", "/jobs?order=desc&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page1 = body["jobs"].as_array().unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0]["payload"], "c");
+        assert_eq!(page1[1]["payload"], "b");
+
+        // Page 2: follow next link, should get only "a"
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page2 = body["jobs"].as_array().unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0]["payload"], "a");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_desc_cursor_with_queue_filter() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+        for label in ["a", "b", "c"] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "emails", serde_json::json!(label)),
+                )
+                .await
+                .unwrap();
+        }
+        // Decoy in another queue
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "other", serde_json::json!("x")),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?queue=emails&order=desc&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page1 = body["jobs"].as_array().unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0]["payload"], "c");
+        assert_eq!(page1[1]["payload"], "b");
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page2 = body["jobs"].as_array().unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0]["payload"], "a");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_desc_cursor_with_status_filter() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+        for label in ["a", "b", "c"] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "q", serde_json::json!(label)),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs?status=ready&order=desc&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page1 = body["jobs"].as_array().unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0]["payload"], "c");
+        assert_eq!(page1[1]["payload"], "b");
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page2 = body["jobs"].as_array().unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0]["payload"], "a");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_desc_cursor_with_type_filter() {
+        let (state, app) = test_state_and_app();
+        let now = (state.clock)();
+        for label in ["a", "b", "c"] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("send_email", "q", serde_json::json!(label)),
+                )
+                .await
+                .unwrap();
+        }
+        // Decoy with different type
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("other_type", "q", serde_json::json!("x")),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?type=send_email&order=desc&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page1 = body["jobs"].as_array().unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0]["payload"], "c");
+        assert_eq!(page1[1]["payload"], "b");
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let page2 = body["jobs"].as_array().unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0]["payload"], "a");
     }
 
     #[tokio::test]
