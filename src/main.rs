@@ -21,7 +21,7 @@
 
 use clap::{Parser, Subcommand};
 
-use zizq::commands::{serve, tls, top};
+use zizq::commands::{backup, restore, serve, tls, top};
 use zizq::license::License;
 
 /// Struct used to handle command line arguments.
@@ -64,8 +64,16 @@ enum Command {
     /// Launch the interactive terminal UI.
     Top(top::Args),
 
-    /// Generate TLS certificates for use with `zizq serve'.
+    /// Generate TLS certificates for use by the server and clients.
     Tls(tls::Args),
+
+    /// Create a backup archive of the root directory and database from a running server.
+    Backup(backup::Args),
+
+    /// Restore the root directory and database from backup archive.
+    ///
+    /// Writes the backup contents to `--root-dir`, which must not exist.
+    Restore(restore::Args),
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
@@ -113,6 +121,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             serve::run(args, &cli.root_dir, license, license_key_path).await
         }
         Some(Command::Tls(args)) => tls::run(args, &cli.root_dir).await,
+        Some(Command::Backup(args)) => backup::run(args).await,
+        Some(Command::Restore(args)) => restore::run(args, &cli.root_dir).await,
         None => {
             serve::run(
                 serve::Args::parse_from(std::env::args()),

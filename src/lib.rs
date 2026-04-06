@@ -6,6 +6,9 @@
 //! Re-exports the core modules so they can be used by benchmarks and
 //! integration tests without duplicating the module tree.
 
+/// Top-level directory name inside backup archives.
+pub const BACKUP_ARCHIVE_PREFIX: &str = "zizq-root";
+
 pub mod admin;
 pub mod commands;
 pub mod filter;

@@ -24,6 +24,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 use std::ops::Bound;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1330,6 +1331,10 @@ impl ScheduledIndex {
 /// Provides a handle to the persistent store.
 #[derive(Clone)]
 pub struct Store {
+    /// The storage configuration used to open this store, retained so that
+    /// backup snapshots can recreate the database with matching settings.
+    config: StorageConfig,
+
     /// Database handle and all disk keyspaces, shared via `Arc` so that
     /// cloning the `Store` (or moving into `spawn_blocking`) is a single
     /// reference-count bump instead of eight.
@@ -2651,6 +2656,7 @@ impl Store {
         let group_committer = GroupCommitter::start(db.clone(), path.to_path_buf());
 
         Ok(Self {
+            config: config.clone(),
             ks: Arc::new(Keyspaces {
                 db,
                 data,
@@ -4142,6 +4148,96 @@ impl Store {
             }
 
             Ok(queues)
+        })
+        .await?
+    }
+
+    /// Create a consistent backup of the database at the given path.
+    ///
+    /// Takes a read snapshot of the live database and copies all key/value
+    /// pairs from both keyspaces into a new database at `dest`. The new
+    /// database is created with the same `StorageConfig` as the live one.
+    ///
+    /// This runs entirely from a point-in-time snapshot, so it does not
+    /// block or lock the live database.
+    pub async fn backup_snapshot(
+        &self,
+        dest: impl AsRef<Path> + Send + 'static,
+    ) -> Result<(), StoreError> {
+        let ks = self.ks.clone();
+        let config = self.config.clone();
+
+        task::spawn_blocking(move || {
+            let snapshot = ks.db.read_tx();
+            let dest = dest.as_ref();
+
+            // Open a new database with matching settings.
+            let backup_db = fjall::Database::builder(dest)
+                .cache_size(config.cache_size)
+                .max_journaling_size(config.journal_size)
+                .open()
+                .map_err(|e| {
+                    StoreError::Internal(format!("failed to open backup database: {e}"))
+                })?;
+
+            let data_compaction = Arc::new(
+                fjall::compaction::Leveled::default()
+                    .with_l0_threshold(config.l0_threshold)
+                    .with_table_target_size(config.data_table_size),
+            );
+            let index_compaction = Arc::new(
+                fjall::compaction::Leveled::default()
+                    .with_l0_threshold(config.l0_threshold)
+                    .with_table_target_size(config.index_table_size),
+            );
+
+            let backup_data = backup_db
+                .keyspace("data", || {
+                    fjall::KeyspaceCreateOptions::default()
+                        .compaction_strategy(data_compaction)
+                        .max_memtable_size(config.data_table_size)
+                        .filter_block_pinning_policy(PinningPolicy::all(true))
+                        .index_block_pinning_policy(PinningPolicy::all(true))
+                })
+                .map_err(|e| {
+                    StoreError::Internal(format!("failed to create backup data keyspace: {e}"))
+                })?;
+
+            let backup_index = backup_db
+                .keyspace("index", || {
+                    fjall::KeyspaceCreateOptions::default()
+                        .compaction_strategy(index_compaction)
+                        .max_memtable_size(config.index_table_size)
+                        .filter_policy(FilterPolicy::disabled())
+                        .index_block_pinning_policy(PinningPolicy::all(true))
+                })
+                .map_err(|e| {
+                    StoreError::Internal(format!("failed to create backup index keyspace: {e}"))
+                })?;
+
+            // Copy all data keyspace entries.
+            for entry in snapshot.range::<Vec<u8>, _>(&ks.data, ..) {
+                let (key, value) = entry.into_inner()?;
+                backup_data
+                    .insert(&*key, &*value)
+                    .map_err(|e| StoreError::Internal(format!("backup data write failed: {e}")))?;
+            }
+
+            // Copy all index keyspace entries.
+            for entry in snapshot.range::<Vec<u8>, _>(&ks.index, ..) {
+                let (key, value) = entry.into_inner()?;
+                backup_index
+                    .insert(&*key, &*value)
+                    .map_err(|e| StoreError::Internal(format!("backup index write failed: {e}")))?;
+            }
+
+            // Flush and close cleanly.
+            backup_db
+                .persist(fjall::PersistMode::SyncAll)
+                .map_err(|e| StoreError::Internal(format!("backup flush failed: {e}")))?;
+
+            drop(backup_db);
+            Ok(())
         })
         .await?
     }
@@ -12197,5 +12293,71 @@ mod tests {
         let store = test_store();
         let queues = store.list_queues().await.unwrap();
         assert!(queues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_snapshot_copies_all_data() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue some jobs across different queues.
+        for i in 0..5 {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", &format!("q{i}"), serde_json::json!({"i": i})),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Create the backup.
+        let backup_dir = tempfile::tempdir().unwrap();
+        let backup_path = backup_dir.path().join("data");
+        store.backup_snapshot(backup_path.clone()).await.unwrap();
+
+        // Open the backup as a new store and verify the data.
+        let restored = Store::open(&backup_path, Default::default()).unwrap();
+        let opts = ListJobsOptions::new().limit(100).now(now);
+        let page = restored.list_jobs(opts).await.unwrap();
+        assert_eq!(page.jobs.len(), 5);
+
+        let queues = restored.list_queues().await.unwrap();
+        assert_eq!(queues, vec!["q0", "q1", "q2", "q3", "q4"]);
+    }
+
+    #[tokio::test]
+    async fn backup_snapshot_is_point_in_time() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "q", serde_json::json!("before")),
+            )
+            .await
+            .unwrap();
+
+        // Take the backup.
+        let backup_dir = tempfile::tempdir().unwrap();
+        let backup_path = backup_dir.path().join("data");
+        store.backup_snapshot(backup_path.clone()).await.unwrap();
+
+        // Enqueue more after the backup.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "q", serde_json::json!("after")),
+            )
+            .await
+            .unwrap();
+
+        // The backup should only contain the job from before.
+        let restored = Store::open(&backup_path, Default::default()).unwrap();
+        let opts = ListJobsOptions::new().limit(100).now(now);
+        let page = restored.list_jobs(opts).await.unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].payload, Some(serde_json::json!("before")));
     }
 }

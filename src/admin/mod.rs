@@ -8,12 +8,13 @@
 //! The admin API is available on all tiers — only the TUI client
 //! that connects to it requires a license.
 
+pub mod backup;
 pub mod events;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -139,6 +140,7 @@ impl From<store::Job> for AdminJobSummary {
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/events", get(events::event_stream))
+        .route("/backup", post(backup::handle_backup))
         .with_state(state)
 }
 
@@ -290,5 +292,118 @@ mod tests {
         // Server should not panic — sending into the closed connection
         // just silently fails.
         let _ = admin_events.send(AdminEvent::Heartbeat);
+    }
+
+    #[tokio::test]
+    async fn backup_returns_valid_tar_gz() {
+        let (_, state) = test_state();
+
+        // Enqueue a job so the backup has data.
+        state
+            .store
+            .enqueue(
+                now_millis(),
+                crate::store::EnqueueOptions::new("test", "q", serde_json::json!("hello")),
+            )
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{addr}/backup"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/gzip"
+        );
+
+        let bytes = res.bytes().await.unwrap();
+        assert!(bytes.len() > 0);
+
+        // Decompress and verify the archive structure.
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut archive = tar::Archive::new(gz);
+
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        // Should contain zizq-root/data/ and files underneath it.
+        assert!(
+            entries.iter().any(|p| p.starts_with("zizq-root/data")),
+            "archive should contain zizq-root/data/, got: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_produces_restorable_database() {
+        let (_, state) = test_state();
+
+        state
+            .store
+            .enqueue(
+                now_millis(),
+                crate::store::EnqueueOptions::new("test", "q", serde_json::json!("backup_me")),
+            )
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let bytes = client
+            .post(format!("http://{addr}/backup"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        // Extract to a temp directory.
+        let restore_dir = tempfile::tempdir().unwrap();
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut archive = tar::Archive::new(gz);
+
+        let prefix = format!("{}/", crate::BACKUP_ARCHIVE_PREFIX);
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_path_buf();
+            let Some(stripped) = path.strip_prefix(&prefix).ok() else {
+                continue;
+            };
+            let dest = restore_dir.path().join(stripped);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            if entry.header().entry_type().is_dir() {
+                std::fs::create_dir_all(&dest).unwrap();
+            } else {
+                let mut file = std::fs::File::create(&dest).unwrap();
+                std::io::copy(&mut entry, &mut file).unwrap();
+            }
+        }
+
+        // Open the restored database and verify the job is there.
+        let restored = Store::open(restore_dir.path().join("data"), Default::default()).unwrap();
+
+        let now = now_millis();
+        let opts = crate::store::ListJobsOptions::new().limit(100).now(now);
+        let page = restored.list_jobs(opts).await.unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].payload, Some(serde_json::json!("backup_me")));
     }
 }
