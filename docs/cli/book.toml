@@ -1,0 +1,19 @@
+[book]
+title = "Zizq Command Line Reference"
+authors = ["Chris Corbyn"]
+description = "Command line reference for the Zizq binary"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/docs/cli"
+
+[output.html]
+site-url = "/docs/cli/"
+additional-css = ["src/zizq_docs.css"]
+additional-js = ["theme/backoff-chart.js"]
+default-theme = "light"
+preferred-dark-theme = "light"
+
+[output.html.print]
+enable = false

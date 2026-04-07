@@ -1,0 +1,5 @@
+/* Make tables full-width */
+table {
+    width: 100%;
+    display: table;
+}
