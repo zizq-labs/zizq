@@ -38,6 +38,14 @@ Take jobs from one or more queues. This is a **streaming endpoint** — the
 connection stays open and jobs are delivered as newline-delimited JSON as they
 become available.
 
+> [!CAUTION]
+> Any `in_flight` jobs are automatically returned to the queue (the `ready`
+> status) whenever the connection is closed. This is correct and robust, so
+> other workers may receive those in-flight jobs in the case of interruption,
+> however if the reason for disconnection is part of a coordinated worker
+> shutdown process, make sure to acknowledge or fail in-flight jobs before
+> closing the stream.
+
 ### Parameters { #get-jobs-take-parameters }
 
 <table>

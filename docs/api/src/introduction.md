@@ -1,8 +1,8 @@
 # Introduction
 
-Zizq is a lightweight, self-contained and persistent job queue server with a
-simple HTTP/2 and HTTP/1.1 API. Workers interact with the server to enqueue,
-take, and process jobs.
+Zizq is a simple single-binary persistent job queue server with an easy-to-use
+HTTP/2 and HTTP/1.1 API. Workers interact with the server to enqueue, take, and
+process jobs.
 
 If you have not yet installed Zizq, follow the
 [Getting Started](/docs/getting-started) guide first. In most cases, you will
