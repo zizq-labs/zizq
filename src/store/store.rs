@@ -28,9 +28,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crossbeam_skiplist::{SkipMap, SkipSet};
-use dashmap::DashMap;
-
 use crate::filter::PayloadFilter;
 
 use fjall::config::{FilterPolicy, PinningPolicy};
@@ -38,6 +35,9 @@ use fjall::{PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspac
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::task;
+
+use super::ready_index::ReadyIndex;
+use super::scheduled_index::ScheduledIndex;
 
 /// Error type returned by store operations.
 #[derive(Debug)]
@@ -1134,198 +1134,6 @@ pub enum StoreEvent {
     /// workers (so they attempt a drain) and the scheduler (so it polls
     /// immediately for due jobs).
     IndexRebuilt,
-}
-
-/// In-memory priority index for ready jobs (lock-free).
-///
-/// The ready index is inherently ephemeral — jobs live in it for milliseconds
-/// under normal throughput — which is worst-case for LSM trees (high tombstone
-/// churn causes scan latency spikes tied to compaction cycles). Skip lists give
-/// O(log n) lookups without a global mutex, so enqueue (insert) and take
-/// (remove) can operate on the index concurrently. The authoritative source of
-/// data remains in the database; this index is rebuilt on startup via
-/// `Store::rebuild_ready_index` and then kept in sync at runtime.
-///
-/// Keys are `(priority, job_id)`. `Ord` on `(u16, String)` gives priority ASC,
-/// then job_id ASC — exactly the ordering needed (FIFO within same priority,
-/// since scru128 IDs are lexicographically time-ordered).
-struct ReadyIndex {
-    /// Global prioritised job index.
-    ///
-    /// All claims to take a job use this index as the authoritative source of
-    /// truth. If removal from this set fails (CAS operation under the hood)
-    /// then a new candidate must be selected.
-    ///
-    /// Key: `(priority, job_id)`, Value: `queue_name`.
-    /// The value stores the queue name so that after `remove()` we know which
-    /// per-queue set to clean up.
-    global: SkipMap<(u16, String), String>,
-
-    /// Per-queue indexes — for queue-filtered candidate selection.
-    ///
-    /// `DashMap` provides concurrent access to the `queue -> SkipSet` mapping
-    /// without a global lock.
-    ///
-    /// Entries are only removed from this set if they were successfully
-    /// claimed in the global set. No entries should exist in the global set
-    /// that do not exist in the per-queue set (insert order is per-queue first
-    /// then global).
-    by_queue: DashMap<String, SkipSet<(u16, String)>>,
-}
-
-impl ReadyIndex {
-    fn new() -> Self {
-        Self {
-            global: SkipMap::new(),
-            by_queue: DashMap::new(),
-        }
-    }
-
-    /// Remove a job from both the global and per-queue indexes.
-    fn remove(&self, queue: &str, priority: u16, job_id: &str) {
-        self.global.remove(&(priority, job_id.to_string()));
-        if let Some(set) = self.by_queue.get(queue) {
-            set.remove(&(priority, job_id.to_string()));
-        }
-    }
-
-    /// Insert a job into both the per-queue and global indexes.
-    ///
-    /// Inserts into `by_queue` first, then `global`. This ordering
-    /// guarantees that any entry visible in `global` is already in
-    /// `by_queue`, so the unfiltered `remove()` path's by_queue cleanup always
-    /// finds the entry. The filtered path may briefly peek a by_queue entry
-    /// whose global counterpart isn't inserted yet — `global.get()` returns
-    /// `None` and it retries harmlessly.
-    fn insert(&self, queue: &str, priority: u16, job_id: String) {
-        let entry = (priority, job_id);
-        self.by_queue
-            .entry(queue.to_string())
-            .or_insert_with(SkipSet::new)
-            .insert(entry.clone());
-        self.global.insert(entry, queue.to_string());
-    }
-
-    /// Atomically claim the highest-priority (lowest number), oldest ready job.
-    ///
-    /// Returns `(priority, job_id, queue)` if a job was claimed, or `None` if
-    /// the index is empty (or empty for the requested queues).
-    ///
-    /// Both paths use the same CAS pattern: find a candidate entry, call
-    /// `Entry::remove()` (only one thread wins the CAS), and retry on failure.
-    ///
-    /// - Unfiltered (queues is empty): peeks `global.front()` directly.
-    /// - Queue-filtered: peeks each target queue's SkipSet front, picks
-    ///   the minimum, then looks up the global entry via `get()`.
-    ///
-    /// Important: `SkipMap::remove(&key)` is *not* safe as a claim
-    /// mechanism — it returns `Some(entry)` to ALL concurrent callers that
-    /// find the node, regardless of who actually marked it. Only
-    /// `Entry::remove()` (which returns `bool` from the CAS) is safe.
-    fn claim(&self, queues: &HashSet<String>) -> Option<(u16, String, String)> {
-        loop {
-            // Find the best candidate. Unfiltered peeks global directly;
-            // filtered peeks per-queue sets and resolves via global.get().
-            // front() and get() both skip marked (already-claimed) nodes.
-            let candidate = if queues.is_empty() {
-                // If we're just taking a job from any queue, it's just
-                // whatever is at the front of the global queue.
-                let entry = self.global.front()?; // ?: or return None
-                let key = entry.key().clone();
-                let queue = entry.value().clone();
-                Some((entry, key, queue))
-            } else {
-                // If we're taking a job from a specific set of queues, we need
-                // to find the first job on each of those queues and then
-                // select the highest priority/earliest job ID.
-                let (priority, job_id, queue) = queues
-                    .iter()
-                    .filter_map(|q| {
-                        let set = self.by_queue.get(q)?;
-                        let front = set.front()?;
-                        let (priority, job_id) = front.value().clone();
-                        Some((priority, job_id, q.clone()))
-                    })
-                    .min()?; // ?: or return None
-
-                // Look up the global entry for the CAS. Returns None if:
-                // (a) not yet in global (insert race — by_queue is populated
-                //     first, global second), or
-                // (b) already claimed and marked by another thread.
-                // In either case, don't touch by_queue — the insert will
-                // complete shortly (a), or the winner will clean up (b).
-                let key = (priority, job_id);
-                self.global.get(&key).map(|entry| (entry, key, queue))
-            };
-
-            // Claim via Entry::remove() — CAS, only one thread wins.
-            if let Some((entry, (priority, job_id), queue)) = candidate {
-                if entry.remove() {
-                    // Won the claim — clean up the per-queue set.
-                    if let Some(set) = self.by_queue.get(&queue) {
-                        set.remove(&(priority, job_id.clone()));
-                    }
-                    return Some((priority, job_id, queue));
-                }
-            } // else loop again
-        }
-    }
-}
-
-/// In-memory chronological index of scheduled jobs.
-///
-/// Keeps a `SkipSet<(u64, String)>` ordered by `(ready_at, job_id)`.
-/// The tuple's derived `Ord` gives chronological ordering (ready_at ASC),
-/// then FIFO within the same timestamp (scru128 IDs are lexicographically
-/// time-ordered).
-///
-/// Lock-free — uses `crossbeam-skiplist` internally. The scheduler is the
-/// sole consumer of `next_due`/`remove`, so there's no concurrent claim
-/// contention; producers (`enqueue`, `record_failure`) only call `insert`.
-struct ScheduledIndex {
-    entries: SkipSet<(u64, String)>,
-}
-
-impl ScheduledIndex {
-    fn new() -> Self {
-        Self {
-            entries: SkipSet::new(),
-        }
-    }
-
-    fn insert(&self, ready_at: u64, job_id: String) {
-        self.entries.insert((ready_at, job_id));
-    }
-
-    fn remove(&self, ready_at: u64, job_id: &str) {
-        self.entries.remove(&(ready_at, job_id.to_string()));
-    }
-
-    /// Collect entries where `ready_at <= now`, up to `limit`.
-    ///
-    /// Returns `(due_entries, next_ready_at)`:
-    /// - `due_entries`: Vec of `(ready_at, job_id)` tuples that are due now.
-    /// - `next_ready_at`: The `ready_at` of the first future entry, if any.
-    ///   `None` if the batch limit was hit (caller should loop immediately)
-    ///   or if there are no more scheduled jobs at all.
-    fn next_due(&self, now: u64, limit: usize) -> (Vec<(u64, String)>, Option<u64>) {
-        let mut due = Vec::new();
-        for entry in self.entries.iter() {
-            let (ready_at, job_id) = entry.value();
-            if *ready_at > now {
-                // This entry (and everything after) is in the future.
-                return (due, Some(*ready_at));
-            }
-            if due.len() >= limit {
-                // Hit the batch cap but there are more due entries.
-                // Return without a next_ready_at so the caller loops immediately.
-                return (due, None);
-            }
-            due.push((*ready_at, job_id.clone()));
-        }
-        // Exhausted the index — no more scheduled jobs at all.
-        (due, None)
-    }
 }
 
 /// Provides a handle to the persistent store.
@@ -3325,7 +3133,7 @@ impl Store {
                     apply_job_deletion(&mut tx, &del, &ks);
                     let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                    ready_index.global.remove(&(job.priority, id));
+                    ready_index.remove(&job.queue, job.priority, &id);
 
                     return Ok((true, Some(sync)));
                 }
@@ -3372,7 +3180,7 @@ impl Store {
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                ready_index.global.remove(&(job.priority, id));
+                ready_index.remove(&job.queue, job.priority, &id);
 
                 return Ok((true, Some(sync)));
             }
@@ -3417,6 +3225,7 @@ impl Store {
                 /// A job that has been pre-read and prepared for completion.
                 struct Prepared {
                     id: String,
+                    queue: String,
                     pre_bytes: Slice,
                     priority: u16,
                     /// `None` for zero-retention (will be deleted).
@@ -3469,6 +3278,7 @@ impl Store {
                             let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
                             prepared.push(Prepared {
                                 id: id.clone(),
+                                queue: job.queue.clone(),
                                 pre_bytes,
                                 priority: job.priority,
                                 updated_bytes: None,
@@ -3484,6 +3294,7 @@ impl Store {
 
                             let unique = job.unique.clone();
 
+                            let queue = job.queue.clone();
                             job.status = JobStatus::Completed.into();
                             job.purge_at = Some(purge_at);
                             job.completed_at = Some(now);
@@ -3492,6 +3303,7 @@ impl Store {
 
                             prepared.push(Prepared {
                                 id: id.clone(),
+                                queue,
                                 pre_bytes,
                                 priority: job.priority,
                                 updated_bytes: Some(updated_slice),
@@ -3571,7 +3383,7 @@ impl Store {
 
                     // Update ready_index for all completed jobs.
                     for p in &prepared {
-                        ready_index.global.remove(&(p.priority, p.id.clone()));
+                        ready_index.remove(&p.queue, p.priority, &p.id);
                     }
 
                     let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
@@ -3753,7 +3565,7 @@ impl Store {
                     job.status = JobStatus::Dead.into();
                     let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                    ready_index.global.remove(&(job.priority, id));
+                    ready_index.remove(&job.queue, job.priority, &id);
 
                     break (job, sync);
                 }
@@ -3796,7 +3608,7 @@ impl Store {
 
                 let sync = ks.commit(tx, ks.default_commit_mode)?;
 
-                ready_index.global.remove(&(job.priority, id));
+                ready_index.remove(&job.queue, job.priority, &id);
 
                 break (job, sync);
             };
@@ -3878,7 +3690,7 @@ impl Store {
 
     /// Total number of ready jobs across all queues.
     pub fn ready_count(&self) -> usize {
-        self.ready_index.global.len()
+        self.ready_index.len()
     }
 
     /// Total number of in-flight jobs across all connections.
@@ -3888,7 +3700,7 @@ impl Store {
 
     /// Total number of scheduled jobs.
     pub fn scheduled_count(&self) -> usize {
-        self.scheduled_index.entries.len()
+        self.scheduled_index.len()
     }
 
     /// Atomically move a in-flight job back to the priority queue.
@@ -4262,12 +4074,11 @@ impl Store {
 
         task::spawn_blocking(move || {
             let mut jobs = Vec::with_capacity(limit);
-            for entry in ready_index.global.iter().skip(offset) {
+            for (_priority, job_id) in ready_index.iter().skip(offset) {
                 if jobs.len() >= limit {
                     break;
                 }
-                let ((_priority, job_id), _queue) = (entry.key(), entry.value());
-                let job_key = make_job_key(job_id);
+                let job_key = make_job_key(&job_id);
                 if let Some(bytes) = ks.data.get(&job_key)? {
                     let job: Job = rmp_serde::from_slice(&bytes)?;
                     jobs.push(job);
@@ -4289,19 +4100,9 @@ impl Store {
 
         let ready_index = self.ready_index.clone();
 
-        task::spawn_blocking(move || {
-            let mut ids = Vec::with_capacity(limit);
-            for entry in ready_index.global.iter().skip(offset) {
-                if ids.len() >= limit {
-                    break;
-                }
-                let (priority, job_id) = entry.key();
-                ids.push((*priority, job_id.clone()));
-            }
-            ids
-        })
-        .await
-        .unwrap_or_default()
+        task::spawn_blocking(move || ready_index.iter().skip(offset).take(limit).collect())
+            .await
+            .unwrap_or_default()
     }
 
     /// List scheduled jobs in chronological order from the in-memory index.
@@ -4323,12 +4124,11 @@ impl Store {
 
         task::spawn_blocking(move || {
             let mut jobs = Vec::with_capacity(limit);
-            for entry in scheduled_index.entries.iter().skip(offset) {
+            for (_ready_at, job_id) in scheduled_index.iter().skip(offset) {
                 if jobs.len() >= limit {
                     break;
                 }
-                let (_ready_at, job_id) = entry.value();
-                let job_key = make_job_key(job_id);
+                let job_key = make_job_key(&job_id);
                 if let Some(bytes) = ks.data.get(&job_key)? {
                     let job: Job = rmp_serde::from_slice(&bytes)?;
                     jobs.push(job);
@@ -4350,19 +4150,9 @@ impl Store {
 
         let scheduled_index = self.scheduled_index.clone();
 
-        task::spawn_blocking(move || {
-            let mut ids = Vec::with_capacity(limit);
-            for entry in scheduled_index.entries.iter().skip(offset) {
-                if ids.len() >= limit {
-                    break;
-                }
-                let (ready_at, job_id) = entry.value();
-                ids.push((*ready_at, job_id.clone()));
-            }
-            ids
-        })
-        .await
-        .unwrap_or_default()
+        task::spawn_blocking(move || scheduled_index.iter().skip(offset).take(limit).collect())
+            .await
+            .unwrap_or_default()
     }
 
     /// Get a single error record by job ID and attempt number.
@@ -4920,7 +4710,7 @@ impl Store {
             // Remove from in-memory indexes based on the job's status.
             match status {
                 JobStatus::Ready => {
-                    ready_index.global.remove(&(job.priority, id));
+                    ready_index.remove(&job.queue, job.priority, &id);
                 }
                 JobStatus::Scheduled => {
                     scheduled_index.remove(job.ready_at, &id);
@@ -5026,6 +4816,7 @@ impl Store {
             // Track deleted jobs for post-commit cleanup.
             struct Deleted {
                 id: String,
+                queue: String,
                 status: JobStatus,
                 priority: u16,
                 ready_at: u64,
@@ -5047,6 +4838,7 @@ impl Store {
 
                 deleted.push(Deleted {
                     id: job.id,
+                    queue: job.queue,
                     status,
                     priority: job.priority,
                     ready_at: job.ready_at,
@@ -5064,7 +4856,7 @@ impl Store {
             for d in &deleted {
                 match d.status {
                     JobStatus::Ready => {
-                        ready_index.global.remove(&(d.priority, d.id.clone()));
+                        ready_index.remove(&d.queue, d.priority, &d.id);
                     }
                     JobStatus::Scheduled => {
                         scheduled_index.remove(d.ready_at, &d.id);
@@ -5328,7 +5120,7 @@ impl Store {
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // ---- outside tx: prepare all deletions ----
-            let mut deletions: Vec<(JobDeletion, u16)> = Vec::new();
+            let mut deletions: Vec<(JobDeletion, String, u16)> = Vec::new();
 
             for id in &ids {
                 let job_key = make_job_key(id);
@@ -5346,20 +5138,21 @@ impl Store {
                 })?;
 
                 let priority = job.priority;
-                deletions.push((prepare_job_deletion(&job, status, &ks), priority));
+                let queue = job.queue.clone();
+                deletions.push((prepare_job_deletion(&job, status, &ks), queue, priority));
             }
 
             // ---- inside tx (writes only) ----
             let count = deletions.len();
             let mut tx = ks.write_tx();
-            for (del, _) in &deletions {
+            for (del, _, _) in &deletions {
                 apply_job_deletion(&mut tx, del, &ks);
             }
             let sync = ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
-            for (del, priority) in deletions {
-                ready_index.global.remove(&(priority, del.id));
+            for (del, queue, priority) in deletions {
+                ready_index.remove(&queue, priority, &del.id);
             }
 
             Ok((count, Some(sync)))
@@ -12359,5 +12152,79 @@ mod tests {
         let page = restored.list_jobs(opts).await.unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].payload, Some(serde_json::json!("before")));
+    }
+
+    /// Regression test: enqueue to queue X, delete all, enqueue to queue X
+    /// again, then take with a queue filter. The filtered take must deliver
+    /// the new jobs. Previously, `delete_jobs` only removed entries from the
+    /// global ready index but not the per-queue index, leaving orphaned
+    /// entries that caused the filtered take to spin in an infinite loop.
+    #[tokio::test]
+    async fn take_filtered_works_after_delete_and_reenqueue() {
+        let store = test_store();
+        let now = now_millis();
+        let queues: HashSet<String> = ["myqueue".to_string()].into();
+
+        // 1. Enqueue a job to the target queue.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "myqueue", serde_json::json!("first")),
+            )
+            .await
+            .unwrap();
+
+        // 2. Delete all jobs (unscoped).
+        let deleted = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        // 3. Enqueue a new job to the same queue.
+        let enqueued = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "myqueue", serde_json::json!("second")),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // 4. Filtered take must return the new job.
+        let taken = store.take_next_job(now, &queues).await.unwrap();
+        assert!(taken.is_some(), "filtered take should return the new job");
+        assert_eq!(taken.unwrap().id, enqueued.id);
+    }
+
+    /// Same as above but with a queue-scoped delete instead of unscoped.
+    #[tokio::test]
+    async fn take_filtered_works_after_scoped_delete_and_reenqueue() {
+        let store = test_store();
+        let now = now_millis();
+        let queues: HashSet<String> = ["myqueue".to_string()].into();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "myqueue", serde_json::json!("first")),
+            )
+            .await
+            .unwrap();
+
+        let mut delete_opts = BulkDeleteOptions::new();
+        delete_opts.queues = ["myqueue".to_string()].into();
+        let deleted = store.delete_jobs(delete_opts).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let enqueued = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "myqueue", serde_json::json!("second")),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let taken = store.take_next_job(now, &queues).await.unwrap();
+        assert!(taken.is_some(), "filtered take should return the new job");
+        assert_eq!(taken.unwrap().id, enqueued.id);
     }
 }
