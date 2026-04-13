@@ -1,10 +1,13 @@
+# Zizq
+
+Zizq is a simple, single-binary persistent job queue. It is very fast
+(processes over ~ 100,000 jobs per second in the Node.js client on a Macbook
+Pro) and has no external dependencies, including on services such as Redis.
+
+Runs as a HTTP/2 and HTTP/1.1 server backend, with straightforward clients
+currently implemented in Node.js and Ruby, and many more planned.
+
  [![CI](https://github.com/zizq-labs/zizq/actions/workflows/ci.yml/badge.svg)](https://github.com/zizq-labs/zizq/actions/workflows/ci.yml)
-
-# Zizq Job Queue
-
-Zizq is a fast and lightweight self-contained job queue. Download a single
-binary, start the server then enqueue and process jobs in your preferred
-programming language.
 
 ## Features
 
@@ -21,7 +24,7 @@ Zizq supports a growing number of features.
 * Configurable job retention policies
 * Unique job support
 * APIs to manage the queue contents
-* High job throughput
+* Very high job throughput
 * An insightful [`zizq top`](#viewing-live-queue-activity) command
 
 ## Documentation
@@ -63,9 +66,10 @@ up to listen on a public IP address.
 ### Client libraries
 
 Zizq provides official client libraries. The goal is to provide clients for a
-wide range of languages. We have started with Ruby.
+wide range of languages. We have started with Node.js and Ruby.
 
 * [Official Ruby Client](https://github.com/zizq-labs/zizq-ruby)
+* [Official Node.js Client](https://github.com/zizq-labs/zizq-node)
 
 Want a client for Zizq in a language not currently supported?
 [Reach out to express interest](mailto:chris@zizq.io).
