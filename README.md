@@ -1,3 +1,5 @@
+ [![CI](https://github.com/zizq-labs/zizq/actions/workflows/ci.yml/badge.svg)](https://github.com/zizq-labs/zizq/actions/workflows/ci.yml)
+
 # Zizq Job Queue
 
 Zizq is a fast and lightweight self-contained job queue. Download a single
