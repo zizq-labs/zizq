@@ -478,16 +478,17 @@ pub async fn run(
             }
         });
 
-        let admin_addr: std::net::SocketAddr =
+        let admin_bind_addr: std::net::SocketAddr =
             format!("{}:{}", args.admin_host, args.admin_port).parse()?;
-        let admin_tcp = TcpListener::bind(admin_addr).await?;
+        let admin_tcp = TcpListener::bind(admin_bind_addr).await?;
+        let admin_addr = admin_tcp.local_addr()?;
 
         let admin_scheme = if args.admin_tls_cert.is_some() {
             "https"
         } else {
             "http"
         };
-        tracing::info!(addr = %admin_addr, scheme = %admin_scheme, "admin API listening");
+        tracing::info!(api = "admin", addr = %admin_addr, scheme = %admin_scheme, "listening");
 
         if is_tty {
             eprintln!("Listening on {admin_scheme}://{admin_addr} (admin)");
@@ -530,16 +531,19 @@ pub async fn run(
         });
     }
 
-    // Set up the TCP socket for incoming connections.
-    let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    let tcp_listener = TcpListener::bind(addr).await?;
+    // Set up the TCP socket for incoming connections. We resolve the
+    // actual bound address after bind so that port 0 (OS-assigned)
+    // works correctly.
+    let bind_addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
+    let tcp_listener = TcpListener::bind(bind_addr).await?;
+    let addr = tcp_listener.local_addr()?;
 
     let scheme = if args.tls_cert.is_some() {
         "https"
     } else {
         "http"
     };
-    tracing::info!(%addr, %scheme, "primary API listening");
+    tracing::info!(api = "primary", %addr, %scheme, "listening");
 
     if is_tty {
         eprintln!("Listening on {scheme}://{addr} (primary)");
