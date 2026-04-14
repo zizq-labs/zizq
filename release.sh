@@ -3,8 +3,10 @@
 # Build a release binary for the Zizq CLI for a single target.
 #
 # Produces:
-#   target/release/zizq-<version>-<target>[.exe]
-#   target/release/zizq-<version>-<target>[.exe].sha256
+#   target/release/zizq-<version>-<platform>.tar.gz        (unix)
+#   target/release/zizq-<version>-<platform>.tar.gz.sha256
+#   target/release/zizq-<version>-<platform>.zip           (windows)
+#   target/release/zizq-<version>-<platform>.zip.sha256
 #
 # Usage:
 #   ./release.sh --target aarch64-unknown-linux-musl
@@ -183,21 +185,29 @@ fi
 echo "    Compiling (release)..."
 cargo build --release --target "$TARGET" --bin zizq
 
-# --- Copy to output directory ---
+# --- Package ---
 
 CARGO_BIN="target/${TARGET}/release/zizq${EXT}"
-
 OUT_DIR="target/release"
-ARTIFACT="zizq-${VERSION}-${PLATFORM}${EXT}"
-
 mkdir -p "$OUT_DIR"
-cp "$CARGO_BIN" "${OUT_DIR}/${ARTIFACT}"
+
+if [[ "$TARGET" == *-windows-* ]]; then
+    # Windows: zip (preserves nothing special, but it's what Windows users expect).
+    ARCHIVE="zizq-${VERSION}-${PLATFORM}.zip"
+    echo "    Packaging ${ARCHIVE}..."
+    zip -j "${OUT_DIR}/${ARCHIVE}" "$CARGO_BIN"
+else
+    # Unix: tar.gz preserves the executable permission bit.
+    ARCHIVE="zizq-${VERSION}-${PLATFORM}.tar.gz"
+    echo "    Packaging ${ARCHIVE}..."
+    tar -czf "${OUT_DIR}/${ARCHIVE}" -C "$(dirname "$CARGO_BIN")" "$(basename "$CARGO_BIN")"
+fi
 
 # --- Checksum ---
 
 echo "    Computing checksum..."
-(cd "$OUT_DIR" && shasum -a 256 "$ARTIFACT" > "${ARTIFACT}.sha256")
+(cd "$OUT_DIR" && shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256")
 
 echo "==> Done."
-echo "    ${OUT_DIR}/${ARTIFACT}"
-echo "    ${OUT_DIR}/${ARTIFACT}.sha256"
+echo "    ${OUT_DIR}/${ARCHIVE}"
+echo "    ${OUT_DIR}/${ARCHIVE}.sha256"

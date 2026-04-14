@@ -59,3 +59,119 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+  release-binary:
+    name: Release Binary
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry + release build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.github/workflows/ci.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.github/workflows/ci.yml') }}-
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build release binary
+        run: ./release.sh --target x86_64-unknown-linux-musl
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cargo pkgid | sed 's/.*[#@]//')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: zizq-binary-v${{ steps.version.outputs.version }}
+          path: target/release/zizq-*-linux-x86_64.tar.gz
+
+  integration-node:
+    name: Integration (Node)
+    needs: release-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: zizq-binary-v${{ needs.release-binary.outputs.version }}
+          path: server
+      - name: Unpack server binary
+        run: tar -xzf server/zizq-*-linux-x86_64.tar.gz -C server
+
+      - name: Checkout Node client
+        uses: actions/checkout@v5
+        with:
+          repository: zizq-labs/zizq-node
+          ref: main
+          path: client
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Build client artifact
+        working-directory: client
+        run: ./release.sh
+
+      - name: Run integration tests
+        working-directory: client
+        run: |
+          ./integration/run.sh \
+            --binary ${{ github.workspace }}/server/zizq \
+            --tarball target/release/zizq-*.tgz
+
+  integration-ruby:
+    name: Integration (Ruby)
+    needs: release-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: zizq-binary-v${{ needs.release-binary.outputs.version }}
+          path: server
+      - name: Unpack server binary
+        run: tar -xzf server/zizq-*-linux-x86_64.tar.gz -C server
+
+      - name: Checkout Ruby client
+        uses: actions/checkout@v5
+        with:
+          repository: zizq-labs/zizq-ruby
+          ref: main
+          path: client
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: client
+
+      - name: Build client artifact
+        working-directory: client
+        run: ./release.sh
+
+      - name: Run integration tests
+        working-directory: client
+        run: |
+          ./integration/run.sh \
+            --binary ${{ github.workspace }}/server/zizq \
+            --gem target/release/zizq-*.gem
