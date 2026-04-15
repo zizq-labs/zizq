@@ -185,9 +185,46 @@ fi
 echo "    Compiling (release)..."
 cargo build --release --target "$TARGET" --bin zizq
 
-# --- Package ---
+# --- macOS code signing + notarization ---
+#
+# Gated on APPLE_SIGNING_IDENTITY being set. When set, the following env
+# vars are also required:
+#   APPLE_SIGNING_IDENTITY     CN of the Developer ID Application cert
+#   APPLE_API_KEY_PATH         path to the App Store Connect .p8 key
+#   APPLE_API_KEY_ID           the short Key ID
+#   APPLE_API_KEY_ISSUER_ID    the issuer UUID
+#
+# Signing requires the cert to already be in an unlocked keychain on the
+# search path (the CI workflow sets this up). Notarization uses an
+# App Store Connect API key so no Apple ID / 2FA prompts are involved.
 
 CARGO_BIN="target/${TARGET}/release/zizq${EXT}"
+
+if [[ "$TARGET" == *-apple-darwin ]] && [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    echo "    Code signing..."
+    codesign --force --options runtime --timestamp \
+        --sign "$APPLE_SIGNING_IDENTITY" \
+        "$CARGO_BIN"
+
+    # notarytool only accepts .zip/.pkg/.dmg for submission. Build a
+    # throwaway zip containing just the signed binary and discard it
+    # after Apple acknowledges the ticket.
+    NOTARIZE_ZIP="target/${TARGET}/release/zizq-notarize.zip"
+    rm -f "$NOTARIZE_ZIP"
+    /usr/bin/ditto -c -k "$CARGO_BIN" "$NOTARIZE_ZIP"
+
+    echo "    Notarizing (typically 1–5 minutes)..."
+    xcrun notarytool submit "$NOTARIZE_ZIP" \
+        --key "$APPLE_API_KEY_PATH" \
+        --key-id "$APPLE_API_KEY_ID" \
+        --issuer "$APPLE_API_KEY_ISSUER_ID" \
+        --wait
+
+    rm -f "$NOTARIZE_ZIP"
+fi
+
+# --- Package ---
+
 OUT_DIR="target/release"
 mkdir -p "$OUT_DIR"
 
