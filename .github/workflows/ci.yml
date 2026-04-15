@@ -109,10 +109,33 @@ jobs:
 
   # --- Integration tests against client repos ---
 
-  integration-node:
-    name: Integration (Node)
+  discover-node:
+    name: Discover Node Versions
     needs: release-binary
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Discover compatible client versions
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          matrix=$(./.github/scripts/discover-client-versions.sh \
+            node "${{ needs.release-binary.outputs.version }}")
+          echo "Discovered matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  integration-node:
+    name: Integration (Node, ${{ matrix.label }})
+    needs: [release-binary, discover-node]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover-node.outputs.matrix) }}
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -121,11 +144,11 @@ jobs:
       - name: Unpack server binary
         run: tar -xzf server/zizq-*-linux-x86_64.tar.gz -C server
 
-      - name: Checkout Node client
+      - name: Checkout Node client @ ${{ matrix.ref }}
         uses: actions/checkout@v5
         with:
           repository: zizq-labs/zizq-node
-          ref: main
+          ref: ${{ matrix.ref }}
           path: client
           token: ${{ secrets.CROSS_REPO_TOKEN }}
 
@@ -136,21 +159,60 @@ jobs:
           cache: npm
           cache-dependency-path: client/package-lock.json
 
-      - name: Build client artifact
+      - name: Prepare artifact directory
+        run: mkdir -p artifact
+
+      - name: Download release tarball (tagged version)
+        if: matrix.tarball != ''
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          gh release download "${{ matrix.ref }}" \
+            --repo zizq-labs/zizq-node \
+            --pattern "${{ matrix.tarball }}" \
+            --dir artifact
+
+      - name: Build client from source (main)
+        if: matrix.tarball == ''
         working-directory: client
-        run: ./release.sh
+        run: |
+          ./release.sh
+          cp target/release/zizq-*.tgz ../artifact/
 
       - name: Run integration tests
         working-directory: client
         run: |
           ./integration/run.sh \
             --binary ${{ github.workspace }}/server/zizq \
-            --tarball target/release/zizq-*.tgz
+            --tarball ${{ github.workspace }}/artifact/zizq-*.tgz
 
-  integration-ruby:
-    name: Integration (Ruby)
+  discover-ruby:
+    name: Discover Ruby Versions
     needs: release-binary
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Discover compatible client versions
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          matrix=$(./.github/scripts/discover-client-versions.sh \
+            ruby "${{ needs.release-binary.outputs.version }}")
+          echo "Discovered matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  integration-ruby:
+    name: Integration (Ruby, ${{ matrix.label }})
+    needs: [release-binary, discover-ruby]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover-ruby.outputs.matrix) }}
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -159,11 +221,11 @@ jobs:
       - name: Unpack server binary
         run: tar -xzf server/zizq-*-linux-x86_64.tar.gz -C server
 
-      - name: Checkout Ruby client
+      - name: Checkout Ruby client @ ${{ matrix.ref }}
         uses: actions/checkout@v5
         with:
           repository: zizq-labs/zizq-ruby
-          ref: main
+          ref: ${{ matrix.ref }}
           path: client
           token: ${{ secrets.CROSS_REPO_TOKEN }}
 
@@ -174,16 +236,32 @@ jobs:
           bundler-cache: true
           working-directory: client
 
-      - name: Build client artifact
+      - name: Prepare artifact directory
+        run: mkdir -p artifact
+
+      - name: Download release gem (tagged version)
+        if: matrix.tarball != ''
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          gh release download "${{ matrix.ref }}" \
+            --repo zizq-labs/zizq-ruby \
+            --pattern "${{ matrix.tarball }}" \
+            --dir artifact
+
+      - name: Build client from source (main)
+        if: matrix.tarball == ''
         working-directory: client
-        run: ./release.sh
+        run: |
+          ./release.sh
+          cp target/release/zizq-*.gem ../artifact/
 
       - name: Run integration tests
         working-directory: client
         run: |
           ./integration/run.sh \
             --binary ${{ github.workspace }}/server/zizq \
-            --gem target/release/zizq-*.gem
+            --gem ${{ github.workspace }}/artifact/zizq-*.gem
 
   # --- Multi-platform release build (only runs on approval) ---
 
