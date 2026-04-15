@@ -6,11 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # --- Build & Test ---
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -60,6 +65,8 @@ jobs:
       - name: cargo test
         run: cargo test
 
+  # --- Release binary for integration tests (linux only) ---
+
   release-binary:
     name: Release Binary
     needs: test
@@ -99,6 +106,8 @@ jobs:
         with:
           name: zizq-binary-v${{ steps.version.outputs.version }}
           path: target/release/zizq-*-linux-x86_64.tar.gz
+
+  # --- Integration tests against client repos ---
 
   integration-node:
     name: Integration (Node)
@@ -175,3 +184,102 @@ jobs:
           ./integration/run.sh \
             --binary ${{ github.workspace }}/server/zizq \
             --gem target/release/zizq-*.gem
+
+  # --- Multi-platform release build (only runs on approval) ---
+
+  release-all-platforms:
+    name: Release (${{ matrix.platform }})
+    needs: [integration-node, integration-ruby]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            platform: linux-x86_64
+            deps: sudo apt-get install -y musl-tools
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            deps: sudo apt-get install -y musl-tools
+          - target: x86_64-pc-windows-gnu
+            runner: ubuntu-latest
+            platform: windows-x86_64
+            deps: sudo apt-get install -y gcc-mingw-w64-x86-64
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            platform: macos-arm64
+            deps: ""
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            platform: macos-x86_64
+            deps: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + release build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.platform }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.github/workflows/ci.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.platform }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.github/workflows/ci.yml') }}-
+            ${{ runner.os }}-cargo-release-${{ matrix.platform }}-
+
+      - name: Install build dependencies
+        if: matrix.deps != ''
+        run: ${{ matrix.deps }}
+
+      - name: Build release binary
+        run: ./release.sh --target ${{ matrix.target }}
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: zizq-release-${{ matrix.platform }}
+          path: target/release/zizq-*
+
+  # --- Publish GitHub Release (runs after all platforms built) ---
+
+  publish:
+    name: Publish Release
+    needs: release-all-platforms
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cargo pkgid | sed 's/.*[#@]//')" >> "$GITHUB_OUTPUT"
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: zizq-release-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version=${{ steps.version.outputs.version }}
+          # Extract the section for this version (between ## headers).
+          sed -n "/^## ${version}/,/^## /p" CHANGELOG.md | head -n -1 | tail -n +2 > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${{ steps.version.outputs.version }}
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes-file release-notes.md \
+            artifacts/zizq-*
