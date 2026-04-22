@@ -8,7 +8,7 @@ directly.
 ## Downloading a Release
 
 All Zizq releases and release notes are available on the
-[Github releases page](https://github.com/zizq-labs/zizq/releases). Make sure
+[GitHub releases page](https://github.com/zizq-labs/zizq/releases). Make sure
 to choose a release for your operating system and architecture.
 
 Once you have downloaded a release it will need to be extracted.
@@ -19,16 +19,16 @@ Release binaries are gzipped and contain the version number. Extract the file
 from the archive and it should be executable.
 
 ```shell
-tar -xvzf zizq-0.1.0.tar.gz
-./zizq-0.1.0 --help
+tar -xvzf zizq-0.1.0-linux-x86_64.tar.gz
+./zizq --help
 ```
 
 You may prefer to move the `zizq` executable to a standard system path, such as
-`/usr/bin/zizq` or `/usr/local/bin/zizq`, however.
+`/usr/bin/zizq` or `/usr/local/bin/zizq`.
 
 ``` shell
-tar -xvzf zizq-0.1.0.tar.gz
-sudo chown root: zizq-0.1.0 && sudo mv zizq-0.1.0 /usr/bin/zizq
+tar -xvzf zizq-0.1.0-linux-x86_64.tar.gz
+sudo chown root: ./zizq && sudo mv ./zizq /usr/bin/zizq
 zizq --help
 ```
 

@@ -5,11 +5,12 @@ most platforms and provides integration with clients written in just about any
 programming language. The `zizq` binary provides everything needed to run Zizq
 in your environment.
 
-Zizq is open source software and most features are available free forever. Some
-more advanced features require a [license](https://zizq.io/pricing).
+Zizq is source-available software, developed in the open on GitHub and most
+features are available free forever. Some more advanced features require a
+[license](https://zizq.io/pricing).
 
 You can download a release compatible with your environment from the
-[releases page](https://github.com/zizq-labs/zizq/releases) on Github.
+[releases page](https://github.com/zizq-labs/zizq/releases) on GitHub.
 
 ## Key Concepts
 
@@ -68,10 +69,11 @@ independently of one another, or working together as a single system.
 
 ### License Keys
 
-Zizq is open source. Most features are free and do not require a license
-key, but some more advanced features do require a license key. Licenses can be
-[purchased through the website](https://zizq.io/pricing) and function entirely
-offline. Zizq does not require connectivity to a license server.
+Zizq is developed in the open on GitHub. Most features are free and do not
+require a license key, but some more advanced features do require a license key.
+Licenses can be [purchased through the website](https://zizq.io/pricing) and
+function entirely offline. Zizq does not require connectivity to a license
+server.
 
 Clients do not use license keys; license keys are known only to the server.
 

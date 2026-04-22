@@ -1,0 +1,18 @@
+[book]
+title = "Getting Started with Zizq"
+authors = ["Chris Corbyn"]
+description = "Getting started with the Zizq job queue server"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/docs/getting-started"
+
+[output.html]
+site-url = "/docs/getting-started/"
+additional-css = ["src/zizq_docs.css"]
+default-theme = "light"
+preferred-dark-theme = "light"
+
+[output.html.print]
+enable = false
