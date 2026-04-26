@@ -9,7 +9,7 @@
 /// Top-level directory name inside backup archives.
 pub const BACKUP_ARCHIVE_PREFIX: &str = "zizq-root";
 
-pub mod admin;
+pub mod api;
 pub mod commands;
 pub mod filter;
 pub mod license;

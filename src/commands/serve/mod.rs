@@ -17,7 +17,6 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-mod http;
 mod reaper;
 mod scheduler;
 mod tls;
@@ -471,7 +470,7 @@ pub async fn run(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                        let _ = admin_events.send(crate::admin::AdminEvent::Heartbeat);
+                        let _ = admin_events.send(crate::api::admin::AdminEvent::Heartbeat);
                     }
                     _ = shutdown.changed() => break,
                 }
@@ -496,7 +495,7 @@ pub async fn run(
 
         let admin_state = state.clone();
         let admin_shutdown = state.shutdown.clone();
-        let admin_app = crate::admin::app(admin_state);
+        let admin_app = crate::api::admin::app(admin_state);
         let admin_tls_config = match (&args.admin_tls_cert, &args.admin_tls_key) {
             (Some(cert), Some(key)) => Some(tls::build_server_config(
                 cert.as_ref(),
@@ -559,14 +558,14 @@ pub async fn run(
             args.tls_client_ca.as_deref().map(std::path::Path::new),
         )?;
         let listener = tls::TlsListener::new(tcp_listener, config);
-        axum::serve(listener, http::app(state))
+        axum::serve(listener, crate::api::primary::app(state))
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = shutdown_tx.send(());
             })
             .await?;
     } else {
-        axum::serve(tcp_listener, http::app(state))
+        axum::serve(tcp_listener, crate::api::primary::app(state))
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = shutdown_tx.send(());
