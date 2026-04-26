@@ -386,35 +386,6 @@ impl ScanDirection {
     }
 }
 
-/// Result of a single enqueue operation.
-pub enum EnqueueResult {
-    /// A new job was created.
-    Created(Job),
-    /// The job was a duplicate of an existing job in a conflicting state.
-    Duplicate(Job),
-}
-
-impl EnqueueResult {
-    /// Return a reference to the underlying job regardless of variant.
-    pub fn job(&self) -> &Job {
-        match self {
-            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
-        }
-    }
-
-    /// Return `true` if this result is a duplicate.
-    pub fn is_duplicate(&self) -> bool {
-        matches!(self, EnqueueResult::Duplicate(_))
-    }
-
-    /// Consume the result and return the underlying job.
-    pub fn into_job(self) -> Job {
-        match self {
-            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
-        }
-    }
-}
-
 /// Error returned when an environment variable is set but cannot be parsed.
 #[derive(Debug)]
 pub struct EnvConfigError {

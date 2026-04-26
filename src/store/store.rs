@@ -41,9 +41,10 @@ use super::options::{
     BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, FailureOptions, ListErrorsOptions,
     ListJobsOptions, PatchJobOptions,
 };
+use super::results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
 use super::types::{
-    BackoffConfig, EnqueueResult, EnvConfigError, ErrorRecord, Job, JobStatus, ScanDirection,
-    StoreError, UniqueConstraint, UniqueWhile,
+    BackoffConfig, EnvConfigError, ErrorRecord, Job, JobStatus, ScanDirection, StoreError,
+    UniqueConstraint, UniqueWhile,
 };
 
 impl PatchJobOptions {
@@ -207,40 +208,6 @@ impl PatchDiff {
             id: self.id.clone(),
         });
     }
-}
-
-/// A page of jobs returned by `Store::list_jobs`.
-#[derive(Debug)]
-pub struct ListJobsPage {
-    /// The jobs on this page.
-    pub jobs: Vec<Job>,
-
-    /// Options to fetch the next page, or `None` if this is the last page.
-    pub next: Option<ListJobsOptions>,
-
-    /// Options to fetch the previous page, or `None` if this is the first page.
-    pub prev: Option<ListJobsOptions>,
-}
-
-/// A page of error records returned by `Store::list_errors`.
-#[derive(Debug)]
-pub struct ListErrorsPage {
-    /// The error records on this page.
-    pub errors: Vec<ErrorRecord>,
-
-    /// Options to fetch the next page, or `None` if this is the last page.
-    pub next: Option<ListErrorsOptions>,
-
-    /// Options to fetch the previous page, or `None` if this is the first page.
-    pub prev: Option<ListErrorsOptions>,
-}
-
-/// Result of a bulk completion operation.
-pub struct BulkCompleteResult {
-    /// IDs that were successfully marked as completed.
-    pub completed: Vec<String>,
-    /// IDs that were not found in the in-flight set.
-    pub not_found: Vec<String>,
 }
 
 /// Events broadcast by the store when job state changes.
