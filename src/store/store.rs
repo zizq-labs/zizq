@@ -22,7 +22,6 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use std::fmt;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,8 +38,8 @@ use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 
 use super::types::{
-    BackoffConfig, ErrorRecord, Job, JobStatus, RetentionConfig, ScanDirection, StoreError,
-    UniqueConstraint, UniqueWhile,
+    BackoffConfig, EnqueueResult, EnvConfigError, ErrorRecord, Job, JobStatus, RetentionConfig,
+    ScanDirection, StoreError, UniqueConstraint, UniqueWhile,
 };
 
 /// Options for listing jobs with cursor-based pagination in `Store::list_jobs`.
@@ -521,35 +520,6 @@ pub struct ListErrorsPage {
 
     /// Options to fetch the previous page, or `None` if this is the first page.
     pub prev: Option<ListErrorsOptions>,
-}
-
-/// Result of a single enqueue operation.
-pub enum EnqueueResult {
-    /// A new job was created.
-    Created(Job),
-    /// The job was a duplicate of an existing job in a conflicting state.
-    Duplicate(Job),
-}
-
-impl EnqueueResult {
-    /// Return a reference to the underlying job regardless of variant.
-    pub fn job(&self) -> &Job {
-        match self {
-            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
-        }
-    }
-
-    /// Return `true` if this result is a duplicate.
-    pub fn is_duplicate(&self) -> bool {
-        matches!(self, EnqueueResult::Duplicate(_))
-    }
-
-    /// Consume the result and return the underlying job.
-    pub fn into_job(self) -> Job {
-        match self {
-            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
-        }
-    }
 }
 
 /// Options for enqueuing a new job.
@@ -1984,23 +1954,6 @@ impl StorageConfig {
         })
     }
 }
-
-/// Error returned when an environment variable is set but cannot be parsed.
-#[derive(Debug)]
-pub struct EnvConfigError {
-    /// The environment variable name.
-    pub name: String,
-    /// The raw value that failed to parse.
-    pub value: String,
-}
-
-impl fmt::Display for EnvConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid value for {}: {:?}", self.name, self.value,)
-    }
-}
-
-impl std::error::Error for EnvConfigError {}
 
 /// Parse an environment variable as a numeric type. Returns `Ok(None)` if
 /// unset, `Ok(Some(value))` on success, or `Err` if set but unparseable.

@@ -11,12 +11,11 @@ pub use store::{
     DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS, DEFAULT_CACHE_SIZE,
     DEFAULT_COMPLETED_RETENTION_MS, DEFAULT_DATA_TABLE_SIZE, DEFAULT_DEAD_RETENTION_MS,
     DEFAULT_INDEX_TABLE_SIZE, DEFAULT_JOURNAL_SIZE, DEFAULT_L0_THRESHOLD, DEFAULT_RETRY_LIMIT,
-    EnqueueOptions, EnqueueResult, EnvConfigError, FailureOptions, ListErrorsOptions,
-    ListErrorsPage, ListJobsOptions, ListJobsPage, PatchJobOptions, RetentionConfigPatch,
-    StorageConfig, Store, StoreEvent,
+    EnqueueOptions, FailureOptions, ListErrorsOptions, ListErrorsPage, ListJobsOptions,
+    ListJobsPage, PatchJobOptions, RetentionConfigPatch, StorageConfig, Store, StoreEvent,
 };
 
 pub use types::{
-    BackoffConfig, ErrorRecord, Job, JobStatus, RetentionConfig, ScanDirection, StoreError,
-    UniqueConstraint, UniqueWhile,
+    BackoffConfig, EnqueueResult, EnvConfigError, ErrorRecord, Job, JobStatus, RetentionConfig,
+    ScanDirection, StoreError, UniqueConstraint, UniqueWhile,
 };

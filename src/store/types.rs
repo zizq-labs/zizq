@@ -385,3 +385,49 @@ impl ScanDirection {
         }
     }
 }
+
+/// Result of a single enqueue operation.
+pub enum EnqueueResult {
+    /// A new job was created.
+    Created(Job),
+    /// The job was a duplicate of an existing job in a conflicting state.
+    Duplicate(Job),
+}
+
+impl EnqueueResult {
+    /// Return a reference to the underlying job regardless of variant.
+    pub fn job(&self) -> &Job {
+        match self {
+            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
+        }
+    }
+
+    /// Return `true` if this result is a duplicate.
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, EnqueueResult::Duplicate(_))
+    }
+
+    /// Consume the result and return the underlying job.
+    pub fn into_job(self) -> Job {
+        match self {
+            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
+        }
+    }
+}
+
+/// Error returned when an environment variable is set but cannot be parsed.
+#[derive(Debug)]
+pub struct EnvConfigError {
+    /// The environment variable name.
+    pub name: String,
+    /// The raw value that failed to parse.
+    pub value: String,
+}
+
+impl fmt::Display for EnvConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid value for {}: {:?}", self.name, self.value,)
+    }
+}
+
+impl std::error::Error for EnvConfigError {}
