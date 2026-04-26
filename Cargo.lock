@@ -1569,6 +1569,7 @@ checksum = "e82db8c87c7f1ccecb34ce0c24399b8a73081427f3c7c50a5d597925356115e4"
 dependencies = [
  "console",
  "once_cell",
+ "regex",
  "similar",
  "tempfile",
 ]
@@ -4593,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "zizq"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "bytesize",

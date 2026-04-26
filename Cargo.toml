@@ -1,6 +1,6 @@
 [package]
 name = "zizq"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "BUSL-1.1"
 
@@ -56,7 +56,7 @@ tokio-tungstenite = { version = "0.26", features = ["connect", "handshake"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
 rand = "0.8"
-insta = "1"
+insta = { version = "1", features = ["filters"] }
 rcgen = "0.14.7"
 
 [profile.release]
