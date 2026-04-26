@@ -147,7 +147,7 @@ http --stream GET http://localhost:7890/jobs/take | while IFS= read -r job; do
   echo "$job" | jq
 
   echo "Acknowledging completion..."
-  http --quiet POST "http://localhost:7890/jobs/${id}/success" --raw ''
+  http --quiet POST "http://localhost:7890/jobs/${id}/success" </dev/null
 
   echo "Done."
 done
