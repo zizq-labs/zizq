@@ -2,6 +2,7 @@
 
 ## 0.1.1
 
+- Internal refactors (mostly around group commit)
 
 ## 0.1.0
 

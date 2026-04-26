@@ -37,7 +37,7 @@ use tokio::task;
 use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 
-use super::group_committer::{GroupCommitter, SyncResult};
+use super::group_committer::GroupCommitter;
 use super::options::{
     BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, FailureOptions, ListErrorsOptions,
     ListJobsOptions, PatchJobOptions,
@@ -410,49 +410,31 @@ impl Keyspaces {
         self.db.write_tx()
     }
 
-    /// Commit a transaction and enqueue a group persist.
+    /// Commit a transaction and block until durable.
     ///
-    /// Returns the oneshot receiver that resolves with `Ok(())` when
-    /// durable, or `Err(msg)` if the persist failed.
+    /// Calls fjall's `tx.commit()` to buffer the write, then sends a sync
+    /// request to the group committer and blocks until it completes.
+    /// Since this is always called inside `spawn_blocking`, blocking is safe.
     fn commit(
         &self,
         tx: fjall::SingleWriterWriteTx<'_>,
         mode: CommitMode,
-    ) -> Result<tokio::sync::oneshot::Receiver<SyncResult>, StoreError> {
+    ) -> Result<(), StoreError> {
         tx.commit()?;
-        Ok(self.group_committer.persist(mode))
-    }
-}
-
-/// Await an optional group commit sync, returning the value on success.
-///
-/// All `spawn_blocking` closures return `(T, Option<Receiver>)` — `Some`
-/// when a commit happened, `None` on early-return paths. This helper
-/// unwraps the `Result`, awaits the sync if present, and returns `T`.
-async fn await_sync<T>(
-    result: Result<(T, Option<tokio::sync::oneshot::Receiver<SyncResult>>), StoreError>,
-) -> Result<T, StoreError> {
-    let (value, rx) = result?;
-    if let Some(rx) = rx {
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(msg)) => {
-                return Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    msg,
-                ))));
-            }
-            Err(_) => {
-                return Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "group committer channel closed",
-                ))));
-            }
+        let rx = self.group_committer.persist(mode);
+        match rx.blocking_recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                msg,
+            )))),
+            Err(_) => Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "group committer channel closed",
+            )))),
         }
     }
-    Ok(value)
 }
-
 // --- K-way merge helpers ---
 
 /// A source of job IDs for k-way merging. Returns `Some(Ok(id))` for the
@@ -1455,7 +1437,7 @@ impl Store {
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        let enqueue_result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // ---- outside tx: prepare everything ----
             let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
                 (Some(_), Some(scope)) => Some(scope),
@@ -1529,7 +1511,7 @@ impl Store {
                         if let Ok(existing_status) = JobStatus::try_from(existing_meta.status) {
                             if scope.conflicts_with(existing_status) {
                                 drop(tx);
-                                return Ok((EnqueueResult::Duplicate(existing_meta), None));
+                                return Ok(EnqueueResult::Duplicate(existing_meta));
                             }
                         }
                     }
@@ -1546,7 +1528,7 @@ impl Store {
                 tx.insert(&ks.index, idx_key, id.as_bytes());
             }
 
-            let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
+            ks.commit(tx, ks.enqueue_commit_mode)?;
 
             // ---- outside tx: update in-memory indexes ----
             if scheduled {
@@ -1555,11 +1537,9 @@ impl Store {
                 ready_index.insert(&job.queue, job.priority, job.id.clone());
             }
 
-            Ok((EnqueueResult::Created(job), Some(sync)))
+            Ok(EnqueueResult::Created(job))
         })
-        .await?;
-
-        let enqueue_result = await_sync(result).await?;
+        .await??;
 
         // Only broadcast events for Created results (not Duplicates).
         if let EnqueueResult::Created(ref job) = enqueue_result {
@@ -1608,7 +1588,7 @@ impl Store {
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        let enqueue_results = task::spawn_blocking(move || -> Result<_, StoreError> {
             use std::collections::HashMap;
 
             // ---- outside tx: prepare all jobs ----
@@ -1738,7 +1718,7 @@ impl Store {
                 results.push(EnqueueResult::Created(p.job.clone()));
             }
 
-            let sync = ks.commit(tx, ks.enqueue_commit_mode)?;
+            ks.commit(tx, ks.enqueue_commit_mode)?;
 
             // Update in-memory indexes after commit succeeds.
             for r in &results {
@@ -1751,11 +1731,9 @@ impl Store {
                 }
             }
 
-            Ok((results, Some(sync)))
+            Ok(results)
         })
-        .await?;
-
-        let enqueue_results = await_sync(result).await?;
+        .await??;
 
         // Broadcast events after sync completes (only for Created results).
         for r in &enqueue_results {
@@ -1837,7 +1815,7 @@ impl Store {
         let queues = queues.clone();
 
         let spawn_start = std::time::Instant::now();
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        let jobs = task::spawn_blocking(move || -> Result<_, StoreError> {
             let blocking_start = std::time::Instant::now();
             let spawn_wait = blocking_start.duration_since(spawn_start);
 
@@ -1870,7 +1848,7 @@ impl Store {
                         spawn_wait_ms = spawn_wait.as_secs_f64() * 1000.0,
                         "take_next_n_jobs: empty"
                     );
-                    return Ok((Vec::new(), None));
+                    return Ok(Vec::new());
                 }
 
                 // 2. Pre-read phase — read each claimed job from the data keyspace.
@@ -1914,7 +1892,7 @@ impl Store {
                         claimed = claimed.len(),
                         "take_next_n_jobs: all claimed candidates invalid"
                     );
-                    return Ok((Vec::new(), None));
+                    return Ok(Vec::new());
                 }
 
                 // 3. Write phase — one transaction for all valid pre-reads.
@@ -1966,28 +1944,21 @@ impl Store {
 
                 let write_tx_elapsed = blocking_start.elapsed();
 
-                let sync = match ks.commit(tx, ks.default_commit_mode) {
-                    Ok(sync) => sync,
-                    Err(e) => {
-                        // 4. Rollback — re-insert valid entries into the
-                        //    ready index and notify workers.
-                        let _tx = ks.write_tx();
-                        for pre in &valid {
-                            ready_index.insert(
-                                &pre.job.queue,
-                                pre.job.priority,
-                                pre.job_id.clone(),
-                            );
+                if let Err(e) = ks.commit(tx, ks.default_commit_mode) {
+                    // 4. Rollback — re-insert valid entries into the
+                    //    ready index and notify workers.
+                    let _tx = ks.write_tx();
+                    for pre in &valid {
+                        ready_index.insert(&pre.job.queue, pre.job.priority, pre.job_id.clone());
 
-                            let _ = event_tx.send(StoreEvent::JobCreated {
-                                id: pre.job_id.clone(),
-                                queue: pre.job.queue.clone(),
-                                token: Arc::new(AtomicBool::new(false)),
-                            });
-                        }
-                        return Err(e);
+                        let _ = event_tx.send(StoreEvent::JobCreated {
+                            id: pre.job_id.clone(),
+                            queue: pre.job.queue.clone(),
+                            token: Arc::new(AtomicBool::new(false)),
+                        });
                     }
-                };
+                    return Err(e);
+                }
 
                 // 5. Hydrate phase — read payloads for all committed jobs.
                 let hydrate_start = std::time::Instant::now();
@@ -2011,12 +1982,10 @@ impl Store {
                     "take_next_n_jobs"
                 );
 
-                return Ok((jobs, Some(sync)));
+                return Ok(jobs);
             }
         })
-        .await?;
-
-        let jobs = await_sync(result).await?;
+        .await??;
 
         // Update the in-flight counter and broadcast events.
         if !jobs.is_empty() {
@@ -2046,7 +2015,7 @@ impl Store {
         let id = id.to_string();
         let id_for_event = id.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        let completed = task::spawn_blocking(move || -> Result<_, StoreError> {
             // Retry loop: pre-read and pre-compute changes outside the tx,
             // then compare-and-write inside. Retries only if a concurrent job
             // metadata update modified the job between the pre-read and lock
@@ -2056,13 +2025,13 @@ impl Store {
                 // ---- outside tx ----
                 let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
-                    None => return Ok((false, None)),
+                    None => return Ok(false),
                 };
 
                 let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
                 if job.status != JobStatus::InFlight as u8 {
-                    return Ok((false, None));
+                    return Ok(false);
                 }
 
                 let retention_ms = job
@@ -2083,11 +2052,11 @@ impl Store {
                         continue;
                     }
                     apply_job_deletion(&mut tx, &del, &ks);
-                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+                    ks.commit(tx, ks.default_commit_mode)?;
 
                     ready_index.remove(&job.queue, job.priority, &id);
 
-                    return Ok((true, Some(sync)));
+                    return Ok(true);
                 }
 
                 // Non-zero retention: defer deletion to the reaper.
@@ -2130,16 +2099,14 @@ impl Store {
                     }
                 }
 
-                let sync = ks.commit(tx, ks.default_commit_mode)?;
+                ks.commit(tx, ks.default_commit_mode)?;
 
                 ready_index.remove(&job.queue, job.priority, &id);
 
-                return Ok((true, Some(sync)));
+                return Ok(true);
             }
         })
-        .await?;
-
-        let completed = await_sync(result).await?;
+        .await??;
 
         if completed {
             let _ = self
@@ -2271,13 +2238,10 @@ impl Store {
                     }
 
                     if prepared.is_empty() {
-                        return Ok((
-                            BulkCompleteResult {
-                                completed: Vec::new(),
-                                not_found,
-                            },
-                            None,
-                        ));
+                        return Ok(BulkCompleteResult {
+                            completed: Vec::new(),
+                            not_found,
+                        });
                     }
 
                     // ---- inside tx ----
@@ -2331,7 +2295,7 @@ impl Store {
                         continue; // Retry from pre-read.
                     }
 
-                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+                    ks.commit(tx, ks.default_commit_mode)?;
 
                     // Update ready_index for all completed jobs.
                     for p in &prepared {
@@ -2340,18 +2304,15 @@ impl Store {
 
                     let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
 
-                    return Ok((
-                        BulkCompleteResult {
-                            completed,
-                            not_found,
-                        },
-                        Some(sync),
-                    ));
+                    return Ok(BulkCompleteResult {
+                        completed,
+                        not_found,
+                    });
                 }
             })
             .await?;
 
-        let bulk_result = await_sync(result).await?;
+        let bulk_result = result?;
 
         if !bulk_result.completed.is_empty() {
             let _ = self
@@ -2409,17 +2370,17 @@ impl Store {
             // metadata update modified the job between the pre-read and lock
             // acquisition.
             let job_key = make_job_key(&id);
-            let (job, sync) = loop {
+            let job = loop {
                 // ---- outside tx ----
                 let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
-                    None => return Ok((None, None)),
+                    None => return Ok(None),
                 };
 
                 let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
                 if job.status != JobStatus::InFlight as u8 {
-                    return Ok((None, None));
+                    return Ok(None);
                 }
 
                 job.attempts += 1;
@@ -2488,11 +2449,11 @@ impl Store {
                         }
                     }
 
-                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+                    ks.commit(tx, ks.default_commit_mode)?;
 
                     scheduled_index.insert(job.ready_at, id.clone());
 
-                    break (job, sync);
+                    break job;
                 }
 
                 // Dead: check retention to decide sync delete vs deferred.
@@ -2515,11 +2476,11 @@ impl Store {
                     }
                     apply_job_deletion(&mut tx, &del, &ks);
                     job.status = JobStatus::Dead.into();
-                    let sync = ks.commit(tx, ks.default_commit_mode)?;
+                    ks.commit(tx, ks.default_commit_mode)?;
 
                     ready_index.remove(&job.queue, job.priority, &id);
 
-                    break (job, sync);
+                    break job;
                 }
 
                 // Non-zero retention: defer deletion to the reaper.
@@ -2558,18 +2519,16 @@ impl Store {
                     }
                 }
 
-                let sync = ks.commit(tx, ks.default_commit_mode)?;
+                ks.commit(tx, ks.default_commit_mode)?;
 
                 ready_index.remove(&job.queue, job.priority, &id);
 
-                break (job, sync);
+                break job;
             };
 
-            Ok((Some(job), Some(sync)))
+            Ok(Some(job))
         })
-        .await?;
-
-        let result = await_sync(result).await?;
+        .await??;
 
         // Emit events outside spawn_blocking due to &self.event_tx.
         if let Some(ref job) = result {
@@ -2680,13 +2639,13 @@ impl Store {
                 // ---- outside tx ----
                 let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
-                    None => return Ok((None, None)),
+                    None => return Ok(None),
                 };
 
                 let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
 
                 if job.status != JobStatus::InFlight as u8 {
-                    return Ok((None, None));
+                    return Ok(None);
                 }
 
                 let old_status_key = make_status_key(JobStatus::InFlight, &id);
@@ -2711,17 +2670,17 @@ impl Store {
                 tx.remove(&ks.index, &old_status_key);
                 tx.insert(&ks.index, &new_status_key, b"");
 
-                let sync = ks.commit(tx, ks.default_commit_mode)?;
+                ks.commit(tx, ks.default_commit_mode)?;
 
                 // Insert into the in-memory ready index after commit succeeds.
                 ready_index.insert(&queue, priority, id.clone());
 
-                return Ok((Some(queue), Some(sync)));
+                return Ok(Some(queue));
             }
         })
-        .await?;
+        .await??;
 
-        if let Some(queue) = await_sync(result).await? {
+        if let Some(queue) = result {
             let _ = self
                 .in_flight_count
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -3315,7 +3274,7 @@ impl Store {
         let priority = job.priority;
         let ready_at = job.ready_at;
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        task::spawn_blocking(move || -> Result<_, StoreError> {
             // Remove from the in-memory scheduled index *before* commit to
             // prevent data races (same as take_next_job).
             scheduled_index.remove(ready_at, &id);
@@ -3329,13 +3288,13 @@ impl Store {
                 // ---- outside tx ----
                 let pre_bytes = match ks.data.get(&job_key)? {
                     Some(bytes) => bytes,
-                    None => return Ok(((), None)), // Already gone.
+                    None => return Ok(()), // Already gone.
                 };
 
                 let current: Job = rmp_serde::from_slice(&pre_bytes)?;
 
                 if current.status != JobStatus::Scheduled as u8 {
-                    return Ok(((), None)); // No longer scheduled.
+                    return Ok(()); // No longer scheduled.
                 }
 
                 let old_status_key = make_status_key(JobStatus::Scheduled, &id);
@@ -3359,7 +3318,7 @@ impl Store {
                 tx.remove(&ks.index, &old_status_key);
                 tx.insert(&ks.index, &new_status_key, b"");
 
-                let sync = match ks.commit(tx, ks.default_commit_mode) {
+                let _sync = match ks.commit(tx, ks.default_commit_mode) {
                     Ok(sync) => sync,
                     Err(e) => {
                         // Commit failed — re-insert into the scheduled index
@@ -3379,12 +3338,10 @@ impl Store {
                 // Insert into the in-memory ready index after commit succeeds.
                 ready_index.insert(&queue, priority, id);
 
-                return Ok(((), Some(sync)));
+                return Ok(());
             }
         })
-        .await?;
-
-        await_sync(result).await?;
+        .await??;
 
         let _ = self.event_tx.send(StoreEvent::JobCreated {
             id: event_id,
@@ -3404,11 +3361,8 @@ impl Store {
     /// transitions run synchronously; only the durable commit is
     /// awaited.
     pub async fn recover_in_flight(&self) -> Result<usize, StoreError> {
-        let (count, rx) = self.recover_in_flight_jobs()?;
-        if let Some(rx) = rx {
-            await_sync(Ok(((), Some(rx)))).await?;
-        }
-        Ok(count)
+        let store = self.clone();
+        task::spawn_blocking(move || store.recover_in_flight_jobs()).await?
     }
 
     /// Rebuild all in-memory indexes asynchronously.
@@ -3432,9 +3386,7 @@ impl Store {
     /// Runs synchronously so it completes before any API requests are
     /// accepted. Does not touch the in-memory ready index — that's
     /// handled by `rebuild_ready_index`, which runs immediately after.
-    fn recover_in_flight_jobs(
-        &self,
-    ) -> Result<(usize, Option<tokio::sync::oneshot::Receiver<SyncResult>>), StoreError> {
+    fn recover_in_flight_jobs(&self) -> Result<usize, StoreError> {
         let ks = &self.ks;
 
         // Scan the status index for all InFlight jobs.
@@ -3458,7 +3410,7 @@ impl Store {
         drop(snapshot);
 
         if in_flight_ids.is_empty() {
-            return Ok((0, None));
+            return Ok(0);
         }
 
         let count = in_flight_ids.len();
@@ -3494,8 +3446,8 @@ impl Store {
             }
         }
 
-        let sync = ks.commit(tx, ks.default_commit_mode)?;
-        Ok((count, Some(sync)))
+        ks.commit(tx, ks.default_commit_mode)?;
+        Ok(count)
     }
 
     /// Populate the in-memory ready index from the `jobs_by_status` index.
@@ -3644,7 +3596,7 @@ impl Store {
             let job_key = make_job_key(&id);
             let job_bytes = match ks.data.get(&job_key)? {
                 Some(bytes) => bytes,
-                None => return Ok((false, None)), // Already purged.
+                None => return Ok(false), // Already purged.
             };
 
             let job: Job = rmp_serde::from_slice(&job_bytes)?;
@@ -3657,7 +3609,7 @@ impl Store {
             // ---- inside tx (writes only) ----
             let mut tx = ks.write_tx();
             apply_job_deletion(&mut tx, &del, &ks);
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
+            ks.commit(tx, ks.default_commit_mode)?;
 
             // Remove from in-memory indexes based on the job's status.
             match status {
@@ -3677,11 +3629,11 @@ impl Store {
                 _ => {}
             }
 
-            Ok((true, Some(sync)))
+            Ok(true)
         })
-        .await?;
+        .await??;
 
-        Ok(await_sync(result).await?)
+        Ok(result)
     }
 
     /// Delete a job by ID via the API.
@@ -3713,7 +3665,7 @@ impl Store {
         let in_flight_count = self.in_flight_count.clone();
         let event_tx = self.event_tx.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        let deleted_ids = task::spawn_blocking(move || -> Result<_, StoreError> {
             // Acquire the write lock first, then open a snapshot.
             // The snapshot sees the latest committed state, and since we
             // hold the writer lock, nothing can commit while we scan + delete.
@@ -3798,10 +3750,10 @@ impl Store {
             }
 
             if deleted.is_empty() {
-                return Ok((Vec::new(), None));
+                return Ok(Vec::new());
             }
 
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
+            ks.commit(tx, ks.default_commit_mode)?;
 
             // Post-commit: clean up in-memory indexes.
             let mut in_flight_removed: u64 = 0;
@@ -3829,11 +3781,9 @@ impl Store {
             }
 
             let deleted_ids: Vec<String> = deleted.into_iter().map(|d| d.id).collect();
-            Ok((deleted_ids, Some(sync)))
+            Ok(deleted_ids)
         })
-        .await?;
-
-        let deleted_ids = await_sync(result).await?;
+        .await??;
 
         for id in &deleted_ids {
             let _ = event_tx.send(StoreEvent::JobDeleted { id: id.clone() });
@@ -3930,27 +3880,27 @@ impl Store {
 
             // If prev was None, the job doesn't exist.
             if prev.is_none() {
-                return Ok((None, None));
+                return Ok(None);
             }
 
             let job = match patched_job {
                 Some(j) => j,
-                None => return Ok((None, None)),
+                None => return Ok(None),
             };
             let diff = diff.unwrap();
 
             diff.update_keyspaces(&mut tx, &ks);
 
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
+            ks.commit(tx, ks.default_commit_mode)?;
 
             diff.update_indexes(&ready_index, &scheduled_index);
             diff.emit_events(&event_tx);
 
-            Ok((Some(job), Some(sync)))
+            Ok(Some(job))
         })
-        .await?;
+        .await??;
 
-        Ok(await_sync(result).await?)
+        Ok(result)
     }
 
     /// Patch all jobs matching the given filters in a single transaction.
@@ -3966,7 +3916,7 @@ impl Store {
         let scheduled_index = self.scheduled_index.clone();
         let event_tx = self.event_tx.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+        let diffs = task::spawn_blocking(move || -> Result<_, StoreError> {
             let mut tx = ks.write_tx();
             let snapshot = ks.db.read_tx();
 
@@ -4038,20 +3988,18 @@ impl Store {
             }
 
             if diffs.is_empty() {
-                return Ok((Vec::new(), None));
+                return Ok(Vec::new());
             }
 
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
+            ks.commit(tx, ks.default_commit_mode)?;
 
             for diff in &diffs {
                 diff.update_indexes(&ready_index, &scheduled_index);
             }
 
-            Ok((diffs, Some(sync)))
+            Ok(diffs)
         })
-        .await?;
-
-        let diffs = await_sync(result).await?;
+        .await??;
 
         for diff in &diffs {
             diff.emit_events(&event_tx);
@@ -4100,18 +4048,18 @@ impl Store {
             for (del, _, _) in &deletions {
                 apply_job_deletion(&mut tx, del, &ks);
             }
-            let sync = ks.commit(tx, ks.default_commit_mode)?;
+            ks.commit(tx, ks.default_commit_mode)?;
 
             // Defensive: remove from ready_index in case of inconsistency.
             for (del, queue, priority) in deletions {
                 ready_index.remove(&queue, priority, &del.id);
             }
 
-            Ok((count, Some(sync)))
+            Ok(count)
         })
-        .await?;
+        .await??;
 
-        Ok(await_sync(result).await?)
+        Ok(result)
     }
 }
 
