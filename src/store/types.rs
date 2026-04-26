@@ -402,3 +402,20 @@ impl fmt::Display for EnvConfigError {
 }
 
 impl std::error::Error for EnvConfigError {}
+
+/// Controls whether writes are flushed to the OS page cache only (`Buffered`)
+/// or also fsynced to disk (`Fsync`).
+///
+/// - `Buffered` — data is written to the OS page cache and will be fsynced by
+///   the OS eventually. Fastest option; data survives process crashes but not
+///   power loss.
+/// - `Fsync` — data is fsynced to stable storage before the operation returns.
+///   Slower (fsync latency) but survives power loss. The group committer
+///   batches multiple fsyncs into a single call to amortise the per-operation
+///   latency (~3-5 ms on macOS NVMe, <1 ms on Linux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitMode {
+    #[default]
+    Buffered,
+    Fsync,
+}
