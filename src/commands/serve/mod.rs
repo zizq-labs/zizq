@@ -470,7 +470,7 @@ pub async fn run(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                        let _ = admin_events.send(crate::admin::AdminEvent::Heartbeat);
+                        let _ = admin_events.send(crate::api::admin::AdminEvent::Heartbeat);
                     }
                     _ = shutdown.changed() => break,
                 }
@@ -495,7 +495,7 @@ pub async fn run(
 
         let admin_state = state.clone();
         let admin_shutdown = state.shutdown.clone();
-        let admin_app = crate::admin::app(admin_state);
+        let admin_app = crate::api::admin::app(admin_state);
         let admin_tls_config = match (&args.admin_tls_cert, &args.admin_tls_key) {
             (Some(cert), Some(key)) => Some(tls::build_server_config(
                 cert.as_ref(),

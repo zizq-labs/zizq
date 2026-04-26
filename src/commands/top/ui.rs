@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Widget};
 
-use crate::admin::AdminJobSummary;
+use crate::api::admin::AdminJobSummary;
 
 use super::app::{App, ConnectionStatus, Tab};
 

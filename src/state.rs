@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
-use crate::admin::AdminEvent;
+use crate::api::admin::AdminEvent;
 use crate::license::License;
 use crate::store::Store;
 

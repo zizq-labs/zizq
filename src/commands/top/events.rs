@@ -8,7 +8,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::admin::{
+use crate::api::admin::{
     AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, JobWindow, ServerStatus,
 };
 
@@ -216,8 +216,8 @@ fn parse_ws_message(text: &str) -> Option<Event> {
 }
 
 /// Serialize a subscribe message for sending over WebSocket.
-pub fn subscribe_message(list: crate::admin::ListName, offset: usize, limit: usize) -> String {
-    serde_json::to_string(&crate::admin::ClientMessage::Subscribe {
+pub fn subscribe_message(list: crate::api::admin::ListName, offset: usize, limit: usize) -> String {
+    serde_json::to_string(&crate::api::admin::ClientMessage::Subscribe {
         list,
         offset,
         limit,

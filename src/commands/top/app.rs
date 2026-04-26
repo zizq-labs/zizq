@@ -5,7 +5,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::admin::{AdminJobSummary, JobChangeStatus, JobWindow, ServerStatus};
+use crate::api::admin::{AdminJobSummary, JobChangeStatus, JobWindow, ServerStatus};
 use crate::license::Tier;
 
 use super::events::{self, Event};
@@ -35,11 +35,11 @@ impl Tab {
         Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
-    fn list_name(self) -> crate::admin::ListName {
+    fn list_name(self) -> crate::api::admin::ListName {
         match self {
-            Tab::Ready => crate::admin::ListName::Ready,
-            Tab::InFlight => crate::admin::ListName::InFlight,
-            Tab::Scheduled => crate::admin::ListName::Scheduled,
+            Tab::Ready => crate::api::admin::ListName::Ready,
+            Tab::InFlight => crate::api::admin::ListName::InFlight,
+            Tab::Scheduled => crate::api::admin::ListName::Scheduled,
         }
     }
 }
@@ -502,8 +502,8 @@ impl App {
 mod tests {
     use super::*;
 
-    fn default_server() -> crate::admin::ServerStatus {
-        crate::admin::ServerStatus {
+    fn default_server() -> crate::api::admin::ServerStatus {
+        crate::api::admin::ServerStatus {
             version: "1.0.0".to_string(),
             uptime_ms: 5000,
             tier: "pro".to_string(),
