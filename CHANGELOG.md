@@ -2,7 +2,8 @@
 
 ## 0.1.1
 
-- Internal refactors (mostly around group commit)
+- Internal Store refactors (mostly around group commit)
+- Restructured API internals — some log prefixes will have changed
 
 ## 0.1.0
 

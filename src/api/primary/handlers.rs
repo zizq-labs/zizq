@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::api::middleware;
 use crate::filter::PayloadFilter;
 use crate::state::AppState;
 
@@ -398,30 +399,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/errors", get(list_errors))
         .route("/jobs/{id}/errors/{attempt}", get(get_error))
         .fallback(not_found)
-        .layer(axum::middleware::from_fn(request_logging))
+        .layer(axum::middleware::from_fn(
+            middleware::primary_request_logging,
+        ))
         .with_state(state)
-}
-
-// --- Middleware ---
-
-/// Log each request with method, path, status, and latency.
-async fn request_logging(req: Request, next: axum::middleware::Next) -> Response {
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let start = std::time::Instant::now();
-
-    let res = next.run(req).await;
-
-    let elapsed = start.elapsed();
-    tracing::info!(
-        method = %method,
-        path = %uri,
-        status = res.status().as_u16(),
-        latency_ms = format_args!("{:.3}", elapsed.as_secs_f64() * 1000.0),
-        "request"
-    );
-
-    res
 }
 
 /// Generate a random u32 for use as a fallback worker ID.

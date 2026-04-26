@@ -12,6 +12,7 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use super::{backup, events};
+use crate::api::middleware;
 use crate::state::AppState;
 
 /// Build the admin API router.
@@ -19,6 +20,7 @@ pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/events", get(events::event_stream))
         .route("/backup", post(backup::handle_backup))
+        .layer(axum::middleware::from_fn(middleware::admin_request_logging))
         .with_state(state)
 }
 
