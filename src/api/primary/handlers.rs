@@ -1,10 +1,10 @@
 // Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! HTTP layer for the Zizq server.
+//! Primary API request handlers.
 //!
-//! Defines the router, request handlers, content negotiation, take framing,
-//! and all request/response types.
+//! Defines the router, request handlers, content negotiation, and take
+//! framing for the main job queue API.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;

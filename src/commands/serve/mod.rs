@@ -17,7 +17,6 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-mod http;
 mod reaper;
 mod scheduler;
 mod tls;
@@ -559,14 +558,14 @@ pub async fn run(
             args.tls_client_ca.as_deref().map(std::path::Path::new),
         )?;
         let listener = tls::TlsListener::new(tcp_listener, config);
-        axum::serve(listener, http::app(state))
+        axum::serve(listener, crate::api::primary::app(state))
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = shutdown_tx.send(());
             })
             .await?;
     } else {
-        axum::serve(tcp_listener, http::app(state))
+        axum::serve(tcp_listener, crate::api::primary::app(state))
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = shutdown_tx.send(());
