@@ -759,6 +759,19 @@ mod tests {
         lines.join("\n")
     }
 
+    /// Assert a snapshot with filters that normalise dynamic content.
+    /// The client version is replaced with a stable value so version
+    /// bumps don't break snapshot tests.
+    macro_rules! assert_ui_snapshot {
+        ($($arg:tt)*) => {{
+            let mut settings = insta::Settings::clone_current();
+            settings.add_filter(r"Zizq \d+\.\d+\.\d+", "Zizq 0.1.0");
+            settings.bind(|| {
+                insta::assert_snapshot!($($arg)*);
+            });
+        }};
+    }
+
     fn new_app() -> App {
         App {
             host: "127.0.0.1:8901".to_string(),
@@ -785,7 +798,7 @@ mod tests {
     #[test]
     fn render_connecting() {
         let app = new_app();
-        insta::assert_snapshot!(render_to_string(&app, 60, 10));
+        assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
 
     #[test]
@@ -810,7 +823,7 @@ mod tests {
             viewport_height: 0,
             ws_tx: None,
         };
-        insta::assert_snapshot!(render_to_string(&app, 60, 10));
+        assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
 
     #[test]
@@ -835,7 +848,7 @@ mod tests {
             viewport_height: 0,
             ws_tx: None,
         };
-        insta::assert_snapshot!(render_to_string(&app, 60, 10));
+        assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
 
     fn realistic_job(
@@ -950,51 +963,51 @@ mod tests {
     #[test]
     fn render_ready_tab_wide() {
         let app = sample_app(Tab::Ready);
-        insta::assert_snapshot!(render_to_string(&app, 160, 12));
+        assert_ui_snapshot!(render_to_string(&app, 160, 12));
     }
 
     #[test]
     fn render_ready_tab_narrow() {
         let app = sample_app(Tab::Ready);
-        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+        assert_ui_snapshot!(render_to_string(&app, 80, 12));
     }
 
     #[test]
     fn render_in_flight_tab_wide() {
         let app = sample_app(Tab::InFlight);
-        insta::assert_snapshot!(render_to_string(&app, 160, 12));
+        assert_ui_snapshot!(render_to_string(&app, 160, 12));
     }
 
     #[test]
     fn render_in_flight_tab_narrow() {
         let app = sample_app(Tab::InFlight);
-        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+        assert_ui_snapshot!(render_to_string(&app, 80, 12));
     }
 
     #[test]
     fn render_in_flight_tab_narrow_scrolled() {
         let mut app = sample_app(Tab::InFlight);
         app.h_scroll[Tab::InFlight.idx()] = 20;
-        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+        assert_ui_snapshot!(render_to_string(&app, 80, 12));
     }
 
     #[test]
     fn render_in_flight_tab_narrow_scrolled_max() {
         let mut app = sample_app(Tab::InFlight);
         app.h_scroll[Tab::InFlight.idx()] = 40;
-        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+        assert_ui_snapshot!(render_to_string(&app, 80, 12));
     }
 
     #[test]
     fn render_scheduled_tab_wide() {
         let app = sample_app(Tab::Scheduled);
-        insta::assert_snapshot!(render_to_string(&app, 160, 12));
+        assert_ui_snapshot!(render_to_string(&app, 160, 12));
     }
 
     #[test]
     fn render_scheduled_tab_narrow() {
         let app = sample_app(Tab::Scheduled);
-        insta::assert_snapshot!(render_to_string(&app, 80, 12));
+        assert_ui_snapshot!(render_to_string(&app, 80, 12));
     }
 
     #[test]
@@ -1019,7 +1032,7 @@ mod tests {
             viewport_height: 0,
             ws_tx: None,
         };
-        insta::assert_snapshot!(render_to_string(&app, 120, 8));
+        assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
 
     #[test]
@@ -1044,7 +1057,7 @@ mod tests {
             viewport_height: 0,
             ws_tx: None,
         };
-        insta::assert_snapshot!(render_to_string(&app, 120, 8));
+        assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
 
     #[test]
@@ -1091,7 +1104,7 @@ mod tests {
             viewport_height: 0,
             ws_tx: None,
         };
-        insta::assert_snapshot!(render_to_string(&app, 80, 20));
+        assert_ui_snapshot!(render_to_string(&app, 80, 20));
     }
 
     #[test]
@@ -1138,7 +1151,7 @@ mod tests {
             viewport_height: 0,
             ws_tx: None,
         };
-        insta::assert_snapshot!(render_to_string(&app, 120, 12));
+        assert_ui_snapshot!(render_to_string(&app, 120, 12));
     }
 
     #[test]
