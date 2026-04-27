@@ -2822,6 +2822,59 @@ impl Store {
         .await?
     }
 
+    /// Count jobs matching the given filters.
+    ///
+    /// Uses the same index scan and filter machinery as `list_jobs` but
+    /// only counts matching IDs instead of hydrating full job records.
+    /// Payload hydration is skipped unless a payload filter is specified.
+    pub async fn count_jobs(&self, opts: ListJobsOptions) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+
+        task::spawn_blocking(move || -> Result<usize, StoreError> {
+            let snapshot = ks.db.read_tx();
+
+            let id_stream_opt = build_id_stream(
+                &snapshot,
+                &ks,
+                &opts.ids,
+                &opts.statuses,
+                &opts.queues,
+                &opts.types,
+                &None,              // no cursor for count
+                ScanDirection::Asc, // direction doesn't matter for count
+            );
+
+            let needs_payload = opts.filter.is_some();
+
+            let mut job_stream = match id_stream_opt {
+                Some((ids, source, _has_id_filter)) => {
+                    JobStream::by_id(ids, &snapshot, &ks.data, opts.now, needs_payload, source)
+                }
+                None => JobStream::full_scan(
+                    &snapshot,
+                    &ks,
+                    &None,
+                    ScanDirection::Asc,
+                    opts.now,
+                    needs_payload,
+                ),
+            };
+
+            let count = if let Some(filter) = opts.filter.clone() {
+                PayloadFilteredIter {
+                    inner: job_stream,
+                    filter,
+                }
+                .try_fold(0, |acc, r| r.map(|_| acc + 1))?
+            } else {
+                job_stream.try_fold(0, |acc, r| r.map(|_| acc + 1))?
+            };
+
+            Ok(count)
+        })
+        .await?
+    }
+
     /// Return all distinct queue names present in the store.
     ///
     /// Uses a seek-skip algorithm on the on-disk queue index to enumerate
@@ -8624,6 +8677,229 @@ mod tests {
 
         let jobs = store.list_scheduled_jobs(0, 10).await.unwrap();
         assert_eq!(jobs.len(), 1);
+    }
+
+    // --- count_jobs tests ---
+
+    #[tokio::test]
+    async fn count_jobs_empty_store() {
+        let store = test_store();
+        let count = store.count_jobs(ListJobsOptions::new()).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_returns_total() {
+        let store = test_store();
+        let now = now_millis();
+        for i in 0..7 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(i)))
+                .await
+                .unwrap();
+        }
+        let count = store
+            .count_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(count, 7);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_filters_by_status() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue 3 ready jobs.
+        for i in 0..3 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(i)))
+                .await
+                .unwrap();
+        }
+
+        // Take one (moves to in_flight).
+        store
+            .take_next_job(now, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+
+        let ready_count = store
+            .count_jobs(
+                ListJobsOptions::new()
+                    .now(now)
+                    .statuses([JobStatus::Ready].into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_count, 2);
+
+        let in_flight_count = store
+            .count_jobs(
+                ListJobsOptions::new()
+                    .now(now)
+                    .statuses([JobStatus::InFlight].into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(in_flight_count, 1);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_filters_by_queue() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "emails", serde_json::json!(1)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "emails", serde_json::json!(2)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "reports", serde_json::json!(3)),
+            )
+            .await
+            .unwrap();
+
+        let count = store
+            .count_jobs(
+                ListJobsOptions::new()
+                    .now(now)
+                    .queues(["emails".to_string()].into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_filters_by_type() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("send_email", "q", serde_json::json!(1)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("send_email", "q", serde_json::json!(2)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("generate_report", "q", serde_json::json!(3)),
+            )
+            .await
+            .unwrap();
+
+        let count = store
+            .count_jobs(
+                ListJobsOptions::new()
+                    .now(now)
+                    .types(["send_email".to_string()].into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_with_payload_filter() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!({"score": 10})),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!({"score": 50})),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "q", serde_json::json!({"score": 90})),
+            )
+            .await
+            .unwrap();
+
+        let filter = crate::filter::PayloadFilter::compile(".score > 20").unwrap();
+        let count = store
+            .count_jobs(ListJobsOptions::new().now(now).filter(Arc::new(filter)))
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_combined_filters() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("send_email", "emails", serde_json::json!(1)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("send_email", "emails", serde_json::json!(2)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("send_email", "reports", serde_json::json!(3)),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("generate_report", "emails", serde_json::json!(4)),
+            )
+            .await
+            .unwrap();
+
+        let count = store
+            .count_jobs(
+                ListJobsOptions::new()
+                    .now(now)
+                    .queues(["emails".to_string()].into())
+                    .types(["send_email".to_string()].into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     // --- ready_count / scheduled_count tests ---

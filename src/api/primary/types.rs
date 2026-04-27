@@ -304,6 +304,13 @@ pub struct VersionResponse {
     pub version: &'static str,
 }
 
+/// Response shape for the count jobs endpoint.
+#[derive(Serialize)]
+pub struct CountJobsResponse {
+    /// Number of matching jobs.
+    pub count: usize,
+}
+
 /// Response shape for the list queues endpoint.
 #[derive(Serialize)]
 pub struct ListQueuesResponse {
@@ -553,6 +560,30 @@ pub struct ListJobsParams {
     pub id: CommaSet<String>,
 
     /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
+    pub filter: Option<String>,
+}
+
+/// Query parameters for `GET /jobs/count`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountJobsParams {
+    /// ID filter, comma-delimited.
+    #[serde(default)]
+    pub id: CommaSet<String>,
+
+    /// Status filter, comma-delimited.
+    #[serde(default)]
+    pub status: CommaSet<JobStatus>,
+
+    /// Queue filter, comma-delimited.
+    #[serde(default)]
+    pub queue: CommaSet<String>,
+
+    /// Type filter, comma-delimited.
+    #[serde(default, rename = "type")]
+    pub job_type: CommaSet<String>,
+
+    /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
 }
 

@@ -33,10 +33,11 @@ use crate::state::AppState;
 
 use super::types::{
     BulkEnqueueRequest, BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest,
-    CommaSet, DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest,
-    HealthResponse, Job, JobStatus, ListErrorsPages, ListErrorsParams, ListErrorsResponse,
-    ListJobsPages, ListJobsParams, ListJobsResponse, ListQueuesResponse, Order, PatchJobBody,
-    PatchJobsParams, TakeParams, UnsupportedFormatResponse, VersionResponse, parse_unique_while,
+    CommaSet, CountJobsParams, CountJobsResponse, DeleteJobsParams, EnqueueRequest, ErrorRecord,
+    ErrorResponse, FailureRequest, HealthResponse, Job, JobStatus, ListErrorsPages,
+    ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse,
+    ListQueuesResponse, Order, PatchJobBody, PatchJobsParams, TakeParams,
+    UnsupportedFormatResponse, VersionResponse, parse_unique_while,
 };
 
 /// Default priority for jobs that don't specify one.
@@ -389,6 +390,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         )
         .route("/jobs/bulk", post(bulk_enqueue))
         .route("/jobs/success", post(bulk_mark_completed))
+        .route("/jobs/count", get(count_jobs))
         .route("/jobs/take", get(take_jobs))
         .route(
             "/jobs/{id}",
@@ -1531,6 +1533,83 @@ fn build_errors_page_url(job_id: &str, from: Option<u32>, order: Order, limit: u
     let order = serde_json::to_value(order).unwrap();
     url.push_str(&format!("order={}&limit={limit}", order.as_str().unwrap()));
     url
+}
+
+/// Handle `GET /jobs/count` — count jobs matching the given filters.
+async fn count_jobs(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<CountJobsParams>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(e) => {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("invalid query parameters: {e}"),
+                },
+            );
+        }
+    };
+
+    let now = (state.clock)();
+    let mut opts = ListJobsOptions::new().now(now);
+
+    if !params.status.is_empty() {
+        let statuses = params
+            .status
+            .iter()
+            .map(|s| store::JobStatus::from(*s))
+            .collect();
+        opts = opts.statuses(statuses);
+    }
+    if !params.queue.is_empty() {
+        opts = opts.queues(params.queue.0.clone());
+    }
+    if !params.job_type.is_empty() {
+        opts = opts.types(params.job_type.0.clone());
+    }
+    if !params.id.is_empty() {
+        for id in params.id.iter() {
+            if !is_valid_job_id(id) {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("invalid job ID: {id:?}"),
+                    },
+                );
+            }
+        }
+        opts = opts.ids(params.id.0.clone());
+    }
+    if let Some(ref expr) = params.filter {
+        match PayloadFilter::compile(expr) {
+            Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
+            Err(e) => {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("invalid filter: {e}"),
+                    },
+                );
+            }
+        }
+    }
+
+    match state.store.count_jobs(opts).await {
+        Ok(count) => respond(fmt, StatusCode::OK, &CountJobsResponse { count }),
+        Err(e) => respond(
+            fmt,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: format!("{e}"),
+            },
+        ),
+    }
 }
 
 /// Handle `GET /jobs/{id}/errors` — list error records for a job.
@@ -6049,6 +6128,113 @@ mod tests {
 
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["deleted"], 0);
+    }
+
+    // --- GET /jobs/count ---
+
+    #[tokio::test]
+    async fn count_jobs_returns_zero_for_empty_store() {
+        let req = empty_request("GET", "/jobs/count");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_returns_total_count() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for i in 0..5 {
+            state
+                .store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(i)))
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs/count");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 5);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_filters_by_status() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Enqueue 3 ready jobs.
+        for i in 0..3 {
+            state
+                .store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(i)))
+                .await
+                .unwrap();
+        }
+
+        // Take one (moves to in_flight).
+        state
+            .store
+            .take_next_job(now, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/count?status=ready");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_filters_by_queue() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "emails", serde_json::json!(1)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "emails", serde_json::json!(2)),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "reports", serde_json::json!(3)),
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs/count?queue=emails");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_rejects_unknown_params() {
+        let req = empty_request("GET", "/jobs/count?bogus=true");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     // --- PATCH /jobs/{id} ---
