@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.1.2
+## 0.2.0
 
+- Added `GET /jobs/count` (with filter params)
 
 ## 0.1.1
 

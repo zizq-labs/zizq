@@ -106,6 +106,7 @@ jobs:
         with:
           name: zizq-binary-v${{ steps.version.outputs.version }}
           path: target/release/zizq-*-linux-x86_64.tar.gz
+          overwrite: true
 
   # --- Integration tests against client repos ---
 
@@ -142,7 +143,7 @@ jobs:
           name: zizq-binary-v${{ needs.release-binary.outputs.version }}
           path: server
       - name: Unpack server binary
-        run: tar -xzf server/zizq-*-linux-x86_64.tar.gz -C server
+        run: tar -xzf server/zizq-${{ needs.release-binary.outputs.version }}-linux-x86_64.tar.gz -C server
 
       - name: Checkout Node client @ ${{ matrix.ref }}
         uses: actions/checkout@v5
@@ -219,7 +220,7 @@ jobs:
           name: zizq-binary-v${{ needs.release-binary.outputs.version }}
           path: server
       - name: Unpack server binary
-        run: tar -xzf server/zizq-*-linux-x86_64.tar.gz -C server
+        run: tar -xzf server/zizq-${{ needs.release-binary.outputs.version }}-linux-x86_64.tar.gz -C server
 
       - name: Checkout Ruby client @ ${{ matrix.ref }}
         uses: actions/checkout@v5
