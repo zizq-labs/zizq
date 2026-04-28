@@ -247,111 +247,15 @@ pub async fn run(
         eprintln!("Zizq {}", env!("CARGO_PKG_VERSION"));
     }
 
-    // Make sure the root dir exists.
     let root = std::path::Path::new(root_dir);
     std::fs::create_dir_all(root)?;
 
-    // Resolve the effective log directory.
-    let log_dir = if let Some(ref dir) = args.log_dir {
-        Some(PathBuf::from(dir))
-    } else if args.log_to_disk {
-        Some(root.join("log"))
-    } else {
-        None
-    };
-
-    if let Some(ref dir) = log_dir {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    let _log_guard = logging::init(logging::LogConfig {
-        format: args.log_format.as_ref(),
-        level: &args.log_level,
-        log_dir: log_dir.as_deref(),
-        rotation: &args.log_rotation,
-        max_size: args.log_max_size,
-        max_files: args.log_max_files,
-    });
+    let _log_guard = init_logging(&args, root)?;
     log_license(&license);
 
-    // Validate TLS argument combinations.
-    match (&args.tls_cert, &args.tls_key) {
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("--tls-cert and --tls-key must be provided together".into());
-        }
-        _ => {}
-    }
-    if args.tls_client_ca.is_some() && args.tls_cert.is_none() {
-        return Err("--tls-client-ca requires --tls-cert and --tls-key".into());
-    }
-    if args.tls_client_ca.is_some() {
-        let now_ms = (crate::time::now_millis)();
-        license
-            .require(now_ms, Feature::MutualTls)
-            .map_err(|e| format!("cannot enable mTLS: {e}"))?;
-    }
+    validate_tls_args(&args, &license)?;
 
-    // Validate admin TLS argument combinations.
-    match (&args.admin_tls_cert, &args.admin_tls_key) {
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("--admin-tls-cert and --admin-tls-key must be provided together".into());
-        }
-        _ => {}
-    }
-    if args.admin_tls_client_ca.is_some() && args.admin_tls_cert.is_none() {
-        return Err("--admin-tls-client-ca requires --admin-tls-cert and --admin-tls-key".into());
-    }
-    if args.admin_tls_client_ca.is_some() {
-        let now_ms = (crate::time::now_millis)();
-        license
-            .require(now_ms, Feature::MutualTls)
-            .map_err(|e| format!("cannot enable admin mTLS: {e}"))?;
-    }
-
-    // Init/open the store (within the root dir).
-    let mut storage_config = crate::store::StorageConfig::from_env()?;
-    storage_config.cache_size = args.cache_size;
-    storage_config.default_completed_retention_ms = args.default_completed_job_retention_ms;
-    storage_config.default_dead_retention_ms = args.default_dead_job_retention_ms;
-    storage_config.default_retry_limit = args.default_retry_limit;
-    storage_config.default_backoff = store::BackoffConfig {
-        exponent: args.default_backoff_exponent,
-        base_ms: args.default_backoff_base_ms as u32,
-        jitter_ms: args.default_backoff_jitter_ms as u32,
-    };
-    storage_config.default_commit_mode = args.default_commit_mode;
-    storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
-    let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
-    tracing::info!(root_dir = %root.display(), "store opened");
-
-    // Recover orphaned in-flight jobs synchronously before accepting
-    // requests — this avoids races with concurrent job completions.
-    match store.recover_in_flight().await {
-        Ok(0) => {}
-        Ok(recovered) => {
-            tracing::info!(count = recovered, "recovered orphaned in-flight jobs");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "in-flight recovery failed");
-            return Err(e.into());
-        }
-    }
-
-    // Rebuild in-memory indexes asynchronously. Workers wait (sending
-    // heartbeats) until the indexes are ready; the TUI Ready panel
-    // shows empty until then.
-    let store_for_rebuild = store.clone();
-    tokio::spawn(async move {
-        match store_for_rebuild.rebuild_indexes().await {
-            Ok((ready, scheduled)) => {
-                tracing::info!(ready, scheduled, "in-memory indexes rebuilt");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "index rebuild failed");
-                std::process::abort();
-            }
-        }
-    });
+    let store = init_store(&args, root).await?;
 
     // Shutdown signal for long-lived take tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(());
@@ -372,167 +276,30 @@ pub async fn run(
         start_time: std::time::Instant::now(),
     });
 
-    // Start the background scheduler that promotes scheduled jobs to Ready
-    // once their ready_at timestamp arrives.
-    let scheduler_shutdown = state.shutdown.clone();
-    let scheduler_batch_size = std::env::var("ZIZQ_SCHEDULER_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(scheduler::DEFAULT_BATCH_SIZE);
-    tokio::spawn(scheduler::run(
-        state.store.clone(),
-        crate::time::now_millis,
-        scheduler_batch_size,
-        scheduler_shutdown,
-    ));
+    spawn_background_tasks(&args, &state);
 
-    // Start the background reaper that purges expired completed/dead jobs.
-    let reaper_shutdown = state.shutdown.clone();
-    tokio::spawn(reaper::run(
-        state.store.clone(),
-        crate::time::now_millis,
-        reaper::DEFAULT_BATCH_SIZE,
-        Duration::from_millis(args.reaper_check_interval_ms),
-        reaper_shutdown,
-    ));
-
-    // Start the license key file watcher if the key was loaded from a file.
     if let Some(ref path) = license_key_path {
-        let interval_ms = args.license_key_check_interval_ms;
-        if interval_ms > 0 {
-            tracing::info!(
-                path = %path,
-                interval_secs = interval_ms / 1000,
-                "license key file watcher started"
-            );
-
-            let path = path.clone();
-            let state_for_watcher = Arc::clone(&state);
-            let mut watcher_shutdown = state.shutdown.clone();
-
-            tokio::spawn(async move {
-                let mut last_contents = std::fs::read_to_string(&path)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
-                        _ = watcher_shutdown.changed() => break,
-                    }
-
-                    let contents = match std::fs::read_to_string(&path) {
-                        Ok(c) => c.trim().to_string(),
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %path,
-                                error = %e,
-                                "failed to re-read license key file"
-                            );
-                            continue;
-                        }
-                    };
-
-                    if contents == last_contents {
-                        continue;
-                    }
-
-                    last_contents = contents.clone();
-
-                    match License::from_token(&contents) {
-                        Ok(new_license) => {
-                            tracing::info!("license key file changed, updating license");
-                            log_license(&new_license);
-                            *state_for_watcher.license.write().unwrap() = new_license;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "license key file changed but new token is invalid, keeping current license"
-                            );
-                        }
-                    }
-                }
-            });
-        }
+        spawn_license_watcher(path, args.license_key_check_interval_ms, &state);
     }
 
-    // Start the admin API listener (unless disabled).
     if !args.no_admin {
-        // Start the admin heartbeat producer.
-        let admin_events = state.admin_events.clone();
-        let admin_shutdown = state.shutdown.clone();
-
-        tokio::spawn(async move {
-            let mut shutdown = admin_shutdown;
-
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                        let _ = admin_events.send(crate::api::admin::AdminEvent::Heartbeat);
-                    }
-                    _ = shutdown.changed() => break,
-                }
-            }
-        });
-
-        let admin_bind_addr: std::net::SocketAddr =
-            format!("{}:{}", args.admin_host, args.admin_port).parse()?;
-        let admin_tcp = TcpListener::bind(admin_bind_addr).await?;
-        let admin_addr = admin_tcp.local_addr()?;
-
-        let admin_scheme = if args.admin_tls_cert.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        tracing::info!(api = "admin", addr = %admin_addr, scheme = %admin_scheme, "listening");
-
-        if is_tty {
-            eprintln!("Listening on {admin_scheme}://{admin_addr} (admin)");
-        }
-
-        let admin_state = state.clone();
-        let admin_shutdown = state.shutdown.clone();
-        let admin_app = crate::api::admin::app(admin_state);
-        let admin_tls_config = match (&args.admin_tls_cert, &args.admin_tls_key) {
-            (Some(cert), Some(key)) => Some(tls::build_server_config(
-                cert.as_ref(),
-                key.as_ref(),
-                args.admin_tls_client_ca
-                    .as_deref()
-                    .map(std::path::Path::new),
-            )?),
-            _ => None,
-        };
-
-        tokio::spawn(async move {
-            let shutdown = async move {
-                let mut rx = admin_shutdown;
-                let _ = rx.changed().await;
-            };
-
-            let result = if let Some(config) = admin_tls_config {
-                let listener = tls::TlsListener::new(admin_tcp, config);
-                axum::serve(listener, admin_app)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-            } else {
-                axum::serve(admin_tcp, admin_app)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-            };
-
-            if let Err(e) = result {
-                tracing::error!(error = %e, "admin API listener failed");
-            }
-        });
+        start_admin_api(&args, &state, is_tty).await?;
     }
 
-    // Set up the TCP socket for incoming connections. We resolve the
-    // actual bound address after bind so that port 0 (OS-assigned)
-    // works correctly.
+    start_primary_api(&args, state, shutdown_tx, is_tty).await?;
+
+    eprintln!("Server stopped.");
+    Ok(())
+}
+
+/// Start the primary HTTP API server. Blocks until a shutdown signal is
+/// received (SIGTERM/SIGINT), then signals all background tasks to stop.
+async fn start_primary_api(
+    args: &Args,
+    state: Arc<AppState>,
+    shutdown_tx: watch::Sender<()>,
+    is_tty: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let tcp_listener = TcpListener::bind(bind_addr).await?;
     let addr = tcp_listener.local_addr()?;
@@ -548,9 +315,6 @@ pub async fn run(
         eprintln!("Listening on {scheme}://{addr} (primary)");
     }
 
-    // Start the server with graceful shutdown. Signal the watch channel
-    // first so spawned take tasks break out of their loops, allowing
-    // their connections to close.
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
         let config = tls::build_server_config(
             cert.as_ref(),
@@ -573,13 +337,294 @@ pub async fn run(
             .await?;
     }
 
-    eprintln!("Server stopped.");
     Ok(())
 }
 
-/// Async function that returns once a signal is received.
-///
-/// Axum handles waiting for this signal before shutting down.
+/// Start the admin API listener with optional TLS, plus a heartbeat producer
+/// for connected `zizq top` clients.
+async fn start_admin_api(
+    args: &Args,
+    state: &Arc<AppState>,
+    is_tty: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Heartbeat producer for admin WebSocket clients.
+    let admin_events = state.admin_events.clone();
+    let admin_shutdown = state.shutdown.clone();
+
+    tokio::spawn(async move {
+        let mut shutdown = admin_shutdown;
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    let _ = admin_events.send(crate::api::admin::AdminEvent::Heartbeat);
+                }
+                _ = shutdown.changed() => break,
+            }
+        }
+    });
+
+    let admin_bind_addr: std::net::SocketAddr =
+        format!("{}:{}", args.admin_host, args.admin_port).parse()?;
+    let admin_tcp = TcpListener::bind(admin_bind_addr).await?;
+    let admin_addr = admin_tcp.local_addr()?;
+
+    let admin_scheme = if args.admin_tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    tracing::info!(api = "admin", addr = %admin_addr, scheme = %admin_scheme, "listening");
+
+    if is_tty {
+        eprintln!("Listening on {admin_scheme}://{admin_addr} (admin)");
+    }
+
+    let admin_state = state.clone();
+    let admin_shutdown = state.shutdown.clone();
+    let admin_app = crate::api::admin::app(admin_state);
+    let admin_tls_config = match (&args.admin_tls_cert, &args.admin_tls_key) {
+        (Some(cert), Some(key)) => Some(tls::build_server_config(
+            cert.as_ref(),
+            key.as_ref(),
+            args.admin_tls_client_ca
+                .as_deref()
+                .map(std::path::Path::new),
+        )?),
+        _ => None,
+    };
+
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let mut rx = admin_shutdown;
+            let _ = rx.changed().await;
+        };
+
+        let result = if let Some(config) = admin_tls_config {
+            let listener = tls::TlsListener::new(admin_tcp, config);
+            axum::serve(listener, admin_app)
+                .with_graceful_shutdown(shutdown)
+                .await
+        } else {
+            axum::serve(admin_tcp, admin_app)
+                .with_graceful_shutdown(shutdown)
+                .await
+        };
+
+        if let Err(e) = result {
+            tracing::error!(error = %e, "admin API listener failed");
+        }
+    });
+
+    Ok(())
+}
+
+/// Watch the license key file for changes and hot-reload the license when
+/// the file contents change. Does nothing if the check interval is 0.
+fn spawn_license_watcher(path: &str, interval_ms: u64, state: &Arc<AppState>) {
+    if interval_ms == 0 {
+        return;
+    }
+
+    tracing::info!(
+        %path,
+        interval_secs = interval_ms / 1000,
+        "license key file watcher started"
+    );
+
+    let path = path.to_string();
+    let state = Arc::clone(state);
+    let mut shutdown = state.shutdown.clone();
+
+    tokio::spawn(async move {
+        let mut last_contents = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                _ = shutdown.changed() => break,
+            }
+
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c.trim().to_string(),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "failed to re-read license key file"
+                    );
+                    continue;
+                }
+            };
+
+            if contents == last_contents {
+                continue;
+            }
+
+            last_contents = contents.clone();
+
+            match License::from_token(&contents) {
+                Ok(new_license) => {
+                    tracing::info!("license key file changed, updating license");
+                    log_license(&new_license);
+                    *state.license.write().unwrap() = new_license;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "license key file changed but new token is invalid, keeping current license"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Spawn background tasks: index rebuild, job scheduler, and job reaper.
+fn spawn_background_tasks(args: &Args, state: &Arc<AppState>) {
+    // Rebuild in-memory indexes asynchronously. Workers wait (sending
+    // heartbeats) until the indexes are ready.
+    let store_for_rebuild = state.store.clone();
+    tokio::spawn(async move {
+        match store_for_rebuild.rebuild_indexes().await {
+            Ok((ready, scheduled)) => {
+                tracing::info!(ready, scheduled, "in-memory indexes rebuilt");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "index rebuild failed");
+                std::process::abort();
+            }
+        }
+    });
+
+    // Scheduler: promotes scheduled jobs to Ready once their ready_at arrives.
+    let scheduler_shutdown = state.shutdown.clone();
+    let scheduler_batch_size = std::env::var("ZIZQ_SCHEDULER_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(scheduler::DEFAULT_BATCH_SIZE);
+    tokio::spawn(scheduler::run(
+        state.store.clone(),
+        crate::time::now_millis,
+        scheduler_batch_size,
+        scheduler_shutdown,
+    ));
+
+    // Reaper: purges expired completed/dead jobs.
+    let reaper_shutdown = state.shutdown.clone();
+    tokio::spawn(reaper::run(
+        state.store.clone(),
+        crate::time::now_millis,
+        reaper::DEFAULT_BATCH_SIZE,
+        Duration::from_millis(args.reaper_check_interval_ms),
+        reaper_shutdown,
+    ));
+}
+
+/// Open the data store, apply CLI configuration, and recover any orphaned
+/// in-flight jobs from the previous run.
+async fn init_store(
+    args: &Args,
+    root: &std::path::Path,
+) -> Result<Store, Box<dyn std::error::Error>> {
+    let mut storage_config = crate::store::StorageConfig::from_env()?;
+    storage_config.cache_size = args.cache_size;
+    storage_config.default_completed_retention_ms = args.default_completed_job_retention_ms;
+    storage_config.default_dead_retention_ms = args.default_dead_job_retention_ms;
+    storage_config.default_retry_limit = args.default_retry_limit;
+    storage_config.default_backoff = store::BackoffConfig {
+        exponent: args.default_backoff_exponent,
+        base_ms: args.default_backoff_base_ms as u32,
+        jitter_ms: args.default_backoff_jitter_ms as u32,
+    };
+    storage_config.default_commit_mode = args.default_commit_mode;
+    storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
+    let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
+    tracing::info!(root_dir = %root.display(), "store opened");
+
+    match store.recover_in_flight().await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::info!(count = recovered, "recovered orphaned in-flight jobs");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "in-flight recovery failed");
+            return Err(e.into());
+        }
+    }
+
+    Ok(store)
+}
+
+/// Validate that TLS cert/key arguments are provided in matching pairs and
+/// that mTLS requires a Pro license.
+fn validate_tls_args(args: &Args, license: &License) -> Result<(), Box<dyn std::error::Error>> {
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--tls-cert and --tls-key must be provided together".into());
+        }
+        _ => {}
+    }
+    if args.tls_client_ca.is_some() && args.tls_cert.is_none() {
+        return Err("--tls-client-ca requires --tls-cert and --tls-key".into());
+    }
+    if args.tls_client_ca.is_some() {
+        let now_ms = (crate::time::now_millis)();
+        license
+            .require(now_ms, Feature::MutualTls)
+            .map_err(|e| format!("cannot enable mTLS: {e}"))?;
+    }
+
+    match (&args.admin_tls_cert, &args.admin_tls_key) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--admin-tls-cert and --admin-tls-key must be provided together".into());
+        }
+        _ => {}
+    }
+    if args.admin_tls_client_ca.is_some() && args.admin_tls_cert.is_none() {
+        return Err("--admin-tls-client-ca requires --admin-tls-cert and --admin-tls-key".into());
+    }
+    if args.admin_tls_client_ca.is_some() {
+        let now_ms = (crate::time::now_millis)();
+        license
+            .require(now_ms, Feature::MutualTls)
+            .map_err(|e| format!("cannot enable admin mTLS: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Initialize the tracing subscriber with the configured log format, level,
+/// and output destination (stdout or rotated files on disk).
+fn init_logging(
+    args: &Args,
+    root: &std::path::Path,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, Box<dyn std::error::Error>> {
+    let log_dir = if let Some(ref dir) = args.log_dir {
+        Some(PathBuf::from(dir))
+    } else if args.log_to_disk {
+        Some(root.join("log"))
+    } else {
+        None
+    };
+
+    if let Some(ref dir) = log_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    Ok(logging::init(logging::LogConfig {
+        format: args.log_format.as_ref(),
+        level: &args.log_level,
+        log_dir: log_dir.as_deref(),
+        rotation: &args.log_rotation,
+        max_size: args.log_max_size,
+        max_files: args.log_max_files,
+    }))
+}
+
 /// Log license status after the tracing subscriber has been initialized.
 fn log_license(license: &License) {
     match license {
