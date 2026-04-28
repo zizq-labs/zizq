@@ -261,6 +261,101 @@ See [Common Job Type](#job-type).
 
 {{#include ./error-response.md}}
 
+## `GET /jobs/count` { #get-jobs-count }
+
+Get the total number of jobs matching the given parameters.
+
+### Parameters { #get-jobs-count-parameters }
+
+All options are additive.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional comma-separated list of job IDs to include.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>queue</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional comma-separated list of queue names to filter by.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>type</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional comma-separated list of job types to filter by.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>status</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional comma-separated list of job statuses to filter by.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>filter</code> <em>query</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional <code>jq</code> expression to filter jobs by
+                <code>payload</code>.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #get-jobs-count-response }
+
+#### `200` OK
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>count</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of jobs that were matched.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `400` Bad Request
+
+When given invalid input parameters.
+
+{{#include ./error-response.md}}
+
 ## `GET /jobs/{id}/errors` { #get-job-errors-list }
 
 Retrieve a paginated list of errors for a known job in order of attempt.
