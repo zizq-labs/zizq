@@ -34,13 +34,15 @@ use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace, Slice};
 use tokio::sync::broadcast;
 use tokio::task;
 
+use super::cron::CronScheduleIndex;
 use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 
+use super::cron::{CronEntry, CronGroup};
 use super::group_committer::GroupCommitter;
 use super::options::{
-    BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, FailureOptions, ListErrorsOptions,
-    ListJobsOptions, PatchJobOptions,
+    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
+    ListErrorsOptions, ListJobsOptions, PatchJobOptions,
 };
 use super::results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
 use super::types::{
@@ -313,6 +315,9 @@ pub struct Store {
     /// `Ready` once their time arrives.
     scheduled_index: Arc<ScheduledIndex>,
 
+    /// In-memory index of cron entries ordered by `next_enqueue_at`.
+    cron_index: Arc<CronScheduleIndex>,
+
     /// Default retention period for completed jobs (milliseconds).
     default_completed_retention_ms: u64,
 
@@ -354,6 +359,7 @@ pub struct Store {
 /// and errors coexist in the same fjall keyspace without collision.
 #[repr(u8)]
 enum RecordKind {
+    Cron = b'C',
     Error = b'E',
     Job = b'J',
     Payload = b'P',
@@ -1409,6 +1415,7 @@ impl Store {
             }),
             ready_index: Arc::new(ReadyIndex::new()),
             scheduled_index: Arc::new(ScheduledIndex::new()),
+            cron_index: Arc::new(CronScheduleIndex::new()),
             default_completed_retention_ms: config.default_completed_retention_ms,
             default_dead_retention_ms: config.default_dead_retention_ms,
             default_retry_limit: config.default_retry_limit,
@@ -3872,6 +3879,164 @@ impl Store {
 
         Ok(result)
     }
+
+    // --- Cron scheduling ---
+
+    /// Replace all entries in a cron group.
+    ///
+    /// Performs a smart merge: entries with unchanged expressions preserve
+    /// their scheduling state (`next_enqueue_at`, `last_enqueue_at`).
+    /// Entries with changed expressions or new entries get `next_enqueue_at`
+    /// computed from `now`. Entries absent from the input are deleted.
+    ///
+    /// The group metadata record is created if it doesn't exist.
+    pub async fn replace_cron_group(
+        &self,
+        group: &str,
+        entries: Vec<CronEntryOptions>,
+        now: u64,
+    ) -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let group = group.to_string();
+
+        task::spawn_blocking(move || -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
+            let group_key = make_cron_group_key(&group);
+            let prefix = make_cron_group_prefix(&group);
+
+            // Validate all cron expressions before acquiring the write lock.
+            let mut computed_next: Vec<u64> = Vec::with_capacity(entries.len());
+            for input in &entries {
+                let next = cron_next_after(&input.expression, now)?.ok_or_else(|| {
+                    StoreError::InvalidOperation(format!(
+                        "cron expression '{}' has no future occurrences",
+                        input.expression
+                    ))
+                })?;
+                computed_next.push(next);
+            }
+
+            // Acquire the single-writer lock. All reads within this scope
+            // are consistent — no other writer can modify data.
+            let mut tx = ks.write_tx();
+
+            // Load or create group metadata.
+            let existing_group: CronGroup = match ks.data.get(&group_key)? {
+                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                None => {
+                    let group = CronGroup::default();
+                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec(&group)?);
+                    group
+                }
+            };
+
+            // Load all existing entries for this group.
+            let mut range_end = prefix.clone();
+            *range_end.last_mut().unwrap() = 1; // \0 -> \1
+
+            let data: &fjall::Keyspace = ks.data.as_ref();
+            let existing_entries: std::collections::HashMap<String, CronEntry> = data
+                .range::<Vec<u8>, _>((Bound::Included(prefix.clone()), Bound::Excluded(range_end)))
+                .skip(1) // skip the group metadata key
+                .map(|guard| {
+                    let (_, value) = guard.into_inner()?;
+                    let entry: CronEntry = rmp_serde::from_slice(&value)?;
+                    Ok((entry.name.clone(), entry))
+                })
+                .collect::<Result<_, StoreError>>()?;
+
+            // Collect input names before consuming entries (needed for
+            // deletion check below).
+            let input_names: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.name.clone()).collect();
+
+            // Build the new entries with smart merge logic.
+            let mut new_entries = Vec::with_capacity(input_names.len());
+
+            for (input, next_enqueue_at) in entries.into_iter().zip(computed_next) {
+                let entry = if let Some(old) = existing_entries.get(&input.name) {
+                    let (next, last) = if old.expression == input.expression {
+                        // Cron expr is the same — don't reset state.
+                        (old.next_enqueue_at, old.last_enqueue_at)
+                    } else {
+                        // Cron expr changed — recalculate.
+                        (next_enqueue_at, old.last_enqueue_at)
+                    };
+
+                    // Preserve original paused state unless overridden.
+                    let paused = input.paused.unwrap_or(old.paused);
+                    let (paused_at, resumed_at) = match (old.paused, paused) {
+                        // Unpaused -> Paused: set paused_at
+                        (false, true) => (Some(now), old.resumed_at),
+                        // Paused -> Unpaused: set resumed_at
+                        (true, false) => (old.paused_at, Some(now)),
+                        // No change
+                        _ => (old.paused_at, old.resumed_at),
+                    };
+
+                    CronEntry {
+                        name: input.name,
+                        expression: input.expression,
+                        paused,
+                        paused_at,
+                        resumed_at,
+                        job: input.job,
+                        next_enqueue_at: next,
+                        last_enqueue_at: last,
+                    }
+                } else {
+                    CronEntry {
+                        name: input.name,
+                        expression: input.expression,
+                        paused: input.paused.unwrap_or(false),
+                        paused_at: None,
+                        resumed_at: None,
+                        job: input.job,
+                        next_enqueue_at,
+                        last_enqueue_at: None,
+                    }
+                };
+
+                new_entries.push(entry);
+            }
+
+            // Delete removed entries (present in existing but not in input).
+            for (name, _) in &existing_entries {
+                if !input_names.contains(name) {
+                    tx.remove(&ks.data, &make_cron_entry_key(&group, name));
+                }
+            }
+
+            // Write new/updated entries.
+            for entry in &new_entries {
+                let entry_key = make_cron_entry_key(&group, &entry.name);
+                let entry_bytes = rmp_serde::to_vec(entry)?;
+                tx.insert(&ks.data, &entry_key, &entry_bytes);
+            }
+
+            // If the group is now empty, clean up the group metadata key.
+            if new_entries.is_empty() {
+                tx.remove(&ks.data, &group_key);
+            }
+
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            // ---- outside tx: update in-memory cron index ----
+
+            // Remove all old entries from the index.
+            for (name, old_entry) in &existing_entries {
+                cron_index.remove(old_entry.next_enqueue_at, &group, name);
+            }
+
+            // Insert all new entries into the index.
+            for entry in &new_entries {
+                cron_index.insert(entry.next_enqueue_at, group.clone(), entry.name.clone());
+            }
+
+            Ok((existing_group, new_entries))
+        })
+        .await?
+    }
 }
 
 /// Build a job metadata key: `J\0{job_id}`.
@@ -3946,6 +4111,51 @@ fn make_unique_key(unique_key: &str) -> Vec<u8> {
     key.push(0);
     key.extend_from_slice(unique_key.as_bytes());
     key
+}
+
+/// Build a cron group metadata key: `C{group}\0`.
+fn make_cron_group_key(group: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + group.len());
+    key.push(RecordKind::Cron as u8);
+    key.extend_from_slice(group.as_bytes());
+    key.push(0);
+    key
+}
+
+/// Build a cron entry key: `C{group}\0{entry_name}`.
+fn make_cron_entry_key(group: &str, entry_name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + group.len() + entry_name.len());
+    key.push(RecordKind::Cron as u8);
+    key.extend_from_slice(group.as_bytes());
+    key.push(0);
+    key.extend_from_slice(entry_name.as_bytes());
+    key
+}
+
+/// Build a prefix for scanning all cron entries in a group: `C{group}\0`.
+///
+/// This is the same as the group metadata key — entries sort immediately
+/// after the group record because their names are non-empty.
+fn make_cron_group_prefix(group: &str) -> Vec<u8> {
+    make_cron_group_key(group)
+}
+
+/// Compute the next occurrence of a cron expression after `now_ms`.
+///
+/// Returns `None` if the expression has no future occurrences.
+fn cron_next_after(expression: &str, now_ms: u64) -> Result<Option<u64>, StoreError> {
+    let cron = croner::Cron::new(expression)
+        .parse()
+        .map_err(|e| StoreError::InvalidOperation(format!("invalid cron expression: {e}")))?;
+
+    let now_secs = (now_ms / 1000) as i64;
+    let dt = chrono::DateTime::from_timestamp(now_secs, 0)
+        .ok_or_else(|| StoreError::InvalidOperation("invalid timestamp".to_string()))?;
+
+    match cron.find_next_occurrence(&dt, false) {
+        Ok(next) => Ok(Some(next.timestamp() as u64 * 1000)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Build an error record key: `E\0{job_id}\0{attempt_be_u32}`.
