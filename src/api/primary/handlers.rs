@@ -21,7 +21,7 @@ use axum::http::{self, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::sse::{Event, Sse};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
@@ -33,10 +33,10 @@ use crate::state::AppState;
 
 use super::types::{
     BulkEnqueueRequest, BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest,
-    CommaSet, CountJobsParams, CountJobsResponse, CronEntryResponse, CronGroupResponse,
-    DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse,
-    Job, JobStatus, ListErrorsPages, ListErrorsParams, ListErrorsResponse, ListJobsPages,
-    ListJobsParams, ListJobsResponse, ListQueuesResponse, Order, PatchJobBody, PatchJobsParams,
+    CommaSet, CountJobsParams, CountJobsResponse, CronGroupResponse, DeleteJobsParams,
+    EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse, Job, JobStatus,
+    ListErrorsPages, ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams,
+    ListJobsResponse, ListQueuesResponse, Order, PatchJobBody, PatchJobsParams,
     ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse, VersionResponse,
     parse_unique_while,
 };
@@ -401,7 +401,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
         .route("/jobs/{id}/errors/{attempt}", get(get_error))
-        .route("/crons/{name}", put(replace_cron_group))
+        .route("/crons/{name}", get(get_cron_group).put(replace_cron_group))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(
             middleware::primary_request_logging,
@@ -2150,9 +2150,51 @@ async fn take_jobs(
     }
 }
 
-/// Fallback handler for unmatched routes.
 // --- Cron scheduling ---
 
+/// Handle `GET /crons/{name}` — fetch a cron group and its entries.
+async fn get_cron_group(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.get_cron_group(&name).await {
+        Ok(Some((group, entries))) => respond(
+            fmt,
+            StatusCode::OK,
+            &CronGroupResponse::from_store(name, group, entries),
+        ),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("cron group '{name}' not found"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "get_cron_group failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PUT /crons/{name}` — create or replace a cron group and its entries.
 async fn replace_cron_group(
     AcceptFormat(fmt): AcceptFormat,
     State(state): State<Arc<AppState>>,
@@ -2251,19 +2293,11 @@ async fn replace_cron_group(
     };
 
     match state.store.replace_cron_group(&name, opts, now_ms).await {
-        Ok((group, entries)) => {
-            let response = CronGroupResponse {
-                name,
-                paused: group.paused,
-                paused_at: group.paused_at,
-                resumed_at: group.resumed_at,
-                entries: entries
-                    .into_iter()
-                    .map(CronEntryResponse::from_store)
-                    .collect(),
-            };
-            respond(fmt, StatusCode::OK, &response)
-        }
+        Ok((group, entries)) => respond(
+            fmt,
+            StatusCode::OK,
+            &CronGroupResponse::from_store(name, group, entries),
+        ),
         Err(StoreError::InvalidOperation(msg)) => {
             respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg })
         }
@@ -2280,6 +2314,7 @@ async fn replace_cron_group(
     }
 }
 
+/// Fallback handler for unmatched routes.
 async fn not_found(AcceptFormat(fmt): AcceptFormat) -> Response {
     respond(
         fmt,
@@ -6908,5 +6943,48 @@ mod tests {
         );
         let res = pro_app().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cron_get_returns_group() {
+        let app = pro_app();
+
+        // Create a group first.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "* * * * *",
+                    "job": { "type": "test", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET it back.
+        let req = empty_request("GET", "/crons/default");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["name"], "default");
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["name"], "e1");
+    }
+
+    #[tokio::test]
+    async fn cron_get_returns_404_for_missing_group() {
+        let req = empty_request("GET", "/crons/nonexistent");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_get_returns_403_on_free_tier() {
+        let req = empty_request("GET", "/crons/default");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 }
