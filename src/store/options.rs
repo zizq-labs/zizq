@@ -437,6 +437,16 @@ impl EnqueueOptions {
     }
 }
 
+/// Options for replacing an entire cron group via `Store::replace_cron_group`.
+pub struct ReplaceCronGroupOptions {
+    /// Whether the group should be paused. `None` means preserve existing
+    /// state (or default to `false` for new groups).
+    pub paused: Option<bool>,
+
+    /// The entries that should exist in the group after the replace.
+    pub entries: Vec<CronEntryOptions>,
+}
+
 /// A single entry in a `replace_cron_group` request.
 ///
 /// The caller provides the entry definition; the Store computes
@@ -447,6 +457,10 @@ pub struct CronEntryOptions {
 
     /// Cron expression (e.g. `*/15 * * * *`).
     pub expression: String,
+
+    /// IANA timezone name (e.g. `Australia/Melbourne`). `None` means use
+    /// the system's local timezone.
+    pub timezone: Option<String>,
 
     /// Whether this entry should be paused. `None` means preserve existing
     /// state (or default to `false` for new entries).

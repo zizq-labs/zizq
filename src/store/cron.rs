@@ -44,6 +44,13 @@ pub struct CronEntry {
     #[serde(rename = "E")]
     pub expression: String,
 
+    /// IANA timezone name (e.g. `Australia/Melbourne`). When `None`, the
+    /// system's local timezone is used.
+    #[serde(rename = "Z")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+
     /// Whether this entry is paused.
     #[serde(rename = "z")]
     #[serde(default)]

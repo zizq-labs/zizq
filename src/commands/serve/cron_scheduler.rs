@@ -148,7 +148,10 @@ mod tests {
     use super::*;
     use crate::license::{License, Tier};
     use crate::state::{AppState, DEFAULT_GLOBAL_IN_FLIGHT_LIMIT, DEFAULT_HEARTBEAT_INTERVAL_MS};
-    use crate::store::{CronEntryOptions, EnqueueOptions, ListJobsOptions, Store, StoreEvent};
+    use crate::store::{
+        CronEntryOptions, EnqueueOptions, ListJobsOptions, ReplaceCronGroupOptions, Store,
+        StoreEvent,
+    };
     use std::sync::RwLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -199,6 +202,7 @@ mod tests {
         CronEntryOptions {
             name: name.to_string(),
             expression: expression.to_string(),
+            timezone: None,
             paused: None,
             job: EnqueueOptions::new("test_job", "cron-q", serde_json::json!({})),
         }
@@ -246,7 +250,14 @@ mod tests {
         let t = clock.load(Ordering::Relaxed);
 
         store
-            .replace_cron_group("default", vec![cron_entry("e1", "* * * * *")], t)
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry("e1", "* * * * *")],
+                },
+                t,
+            )
             .await
             .unwrap();
 
@@ -291,7 +302,14 @@ mod tests {
         let t = clock.load(Ordering::Relaxed);
 
         store
-            .replace_cron_group("default", vec![cron_entry("e1", "* * * * *")], t)
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry("e1", "* * * * *")],
+                },
+                t,
+            )
             .await
             .unwrap();
 
@@ -327,7 +345,14 @@ mod tests {
 
         // Add a cron entry — this emits CronScheduleChanged.
         store
-            .replace_cron_group("default", vec![cron_entry("e1", "* * * * *")], t)
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry("e1", "* * * * *")],
+                },
+                t,
+            )
             .await
             .unwrap();
 
@@ -379,7 +404,14 @@ mod tests {
         let t = clock.load(Ordering::Relaxed);
 
         store
-            .replace_cron_group("default", vec![cron_entry("e1", "* * * * *")], t)
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry("e1", "* * * * *")],
+                },
+                t,
+            )
             .await
             .unwrap();
 
