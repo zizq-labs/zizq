@@ -2,6 +2,8 @@
 
 ## 0.2.1
 
+- Internal Store refactors around enqueue and bulk enqueue
+
 
 ## 0.2.0
 
