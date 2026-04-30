@@ -3978,7 +3978,7 @@ impl Store {
                 Some(bytes) => rmp_serde::from_slice(&bytes)?,
                 None => {
                     let group = CronGroup::default();
-                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec(&group)?);
+                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group)?);
                     group
                 }
             };
@@ -4063,7 +4063,7 @@ impl Store {
             // Write new/updated entries.
             for entry in &new_entries {
                 let entry_key = make_cron_entry_key(&group, &entry.name);
-                let entry_bytes = rmp_serde::to_vec(entry)?;
+                let entry_bytes = rmp_serde::to_vec_named(entry)?;
                 tx.insert(&ks.data, &entry_key, &entry_bytes);
             }
 
@@ -4192,7 +4192,7 @@ impl Store {
                 let old_next = entry.next_enqueue_at;
                 entry.next_enqueue_at = next;
 
-                let updated_entry_bytes: Slice = rmp_serde::to_vec(&entry)?.into();
+                let updated_entry_bytes: Slice = rmp_serde::to_vec_named(&entry)?.into();
 
                 // ---- inside tx: CAS + enqueue ----
                 let mut tx = ks.write_tx();
@@ -11732,5 +11732,479 @@ mod tests {
         let taken = store.take_next_job(now, &queues).await.unwrap();
         assert!(taken.is_some(), "filtered take should return the new job");
         assert_eq!(taken.unwrap().id, enqueued.id);
+    }
+
+    // --- Cron scheduling ---
+
+    /// Fixed timestamp for cron tests: 2023-11-14 22:13:20 UTC.
+    /// Chosen to be mid-minute so cron calculations are deterministic.
+    const CRON_NOW: u64 = 1_700_000_000_000;
+
+    fn cron_entry_opts(
+        name: &str,
+        expression: &str,
+        queue: &str,
+        job_type: &str,
+    ) -> CronEntryOptions {
+        CronEntryOptions {
+            name: name.to_string(),
+            expression: expression.to_string(),
+            paused: None,
+            job: EnqueueOptions::new(job_type, queue, serde_json::json!({})),
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_creates_new_group() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        let (group, entries) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("every-minute", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(!group.paused);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "every-minute");
+        assert_eq!(entries[0].expression, "* * * * *");
+        assert!(entries[0].next_enqueue_at.is_some());
+        assert!(entries[0].next_enqueue_at.unwrap() > now);
+        assert!(entries[0].last_enqueue_at.is_none());
+        assert!(!entries[0].paused);
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_preserves_state_when_expression_unchanged() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        let (_, entries1) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "*/5 * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        let original_next = entries1[0].next_enqueue_at;
+
+        // Replace with the same expression — next_enqueue_at should be preserved.
+        let (_, entries2) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "*/5 * * * *", "q", "test")],
+                now + 1000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(entries2[0].next_enqueue_at, original_next);
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_recomputes_next_when_expression_changes() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        let (_, entries1) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        let original_next = entries1[0].next_enqueue_at;
+
+        // Replace with a very different expression — next_enqueue_at should change.
+        let (_, entries2) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "0 0 * * *", "q", "test")],
+                now + 1000,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(entries2[0].next_enqueue_at, original_next);
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_removes_absent_entries() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![
+                    cron_entry_opts("e1", "* * * * *", "q", "test"),
+                    cron_entry_opts("e2", "* * * * *", "q", "test"),
+                ],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Replace with only e1 — e2 should be removed.
+        let (_, entries) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "e1");
+
+        // Verify e2 is gone from disk.
+        let e2 = store.get_cron_entry("default", "e2").await.unwrap();
+        assert!(e2.is_none());
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_empty_entries_deletes_group() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Replace with empty entries — group should be cleaned up.
+        let (_, entries) = store
+            .replace_cron_group("default", vec![], now)
+            .await
+            .unwrap();
+
+        assert!(entries.is_empty());
+
+        // Verify entry is gone.
+        let e1 = store.get_cron_entry("default", "e1").await.unwrap();
+        assert!(e1.is_none());
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_invalid_expression_returns_error() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        let result = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("bad", "not a cron expr", "q", "test")],
+                now,
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_preserves_pause_when_omitted() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        // Create an entry and manually pause it.
+        store
+            .replace_cron_group(
+                "default",
+                vec![CronEntryOptions {
+                    paused: Some(true),
+                    ..cron_entry_opts("e1", "* * * * *", "q", "test")
+                }],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Replace with paused omitted — should preserve paused state.
+        let (_, entries) = store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now + 1000,
+            )
+            .await
+            .unwrap();
+
+        assert!(entries[0].paused);
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_explicit_pause_overrides() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Explicitly pause.
+        let (_, entries) = store
+            .replace_cron_group(
+                "default",
+                vec![CronEntryOptions {
+                    paused: Some(true),
+                    ..cron_entry_opts("e1", "* * * * *", "q", "test")
+                }],
+                now + 1000,
+            )
+            .await
+            .unwrap();
+
+        assert!(entries[0].paused);
+        assert!(entries[0].paused_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_cron_entry_returns_entry() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        let entry = store.get_cron_entry("default", "e1").await.unwrap();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().name, "e1");
+    }
+
+    #[tokio::test]
+    async fn get_cron_entry_returns_none_for_missing() {
+        let store = test_store();
+
+        let entry = store.get_cron_entry("default", "missing").await.unwrap();
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn promote_cron_entry_enqueues_job_and_advances() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Get the entry's next_enqueue_at and call promote at that time.
+        let entry = store
+            .get_cron_entry("default", "e1")
+            .await
+            .unwrap()
+            .unwrap();
+        let due_at = entry.next_enqueue_at.unwrap();
+
+        let result = store
+            .promote_cron_entry("default", "e1", due_at)
+            .await
+            .unwrap();
+
+        let updated = result.unwrap();
+        assert!(updated.next_enqueue_at.is_some());
+        assert!(updated.next_enqueue_at.unwrap() > due_at);
+        assert_eq!(updated.last_enqueue_at, Some(due_at));
+
+        // Verify a job was enqueued.
+        let jobs = store
+            .list_jobs(ListJobsOptions::new().queues(["q".to_string()].into()))
+            .await
+            .unwrap();
+        assert_eq!(jobs.jobs.len(), 1);
+        assert_eq!(jobs.jobs[0].job_type, "test");
+    }
+
+    #[tokio::test]
+    async fn promote_cron_entry_skips_when_not_due() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Call promote before the entry is due.
+        let result = store
+            .promote_cron_entry("default", "e1", now)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+
+        // No job should be enqueued.
+        let jobs = store
+            .list_jobs(ListJobsOptions::new().queues(["q".to_string()].into()))
+            .await
+            .unwrap();
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn promote_cron_entry_skips_paused_entry() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![CronEntryOptions {
+                    paused: Some(true),
+                    ..cron_entry_opts("e1", "* * * * *", "q", "test")
+                }],
+                now,
+            )
+            .await
+            .unwrap();
+
+        let entry = store
+            .get_cron_entry("default", "e1")
+            .await
+            .unwrap()
+            .unwrap();
+        let due_at = entry.next_enqueue_at.unwrap();
+
+        let result = store
+            .promote_cron_entry("default", "e1", due_at)
+            .await
+            .unwrap();
+
+        // Entry should be returned (schedule advanced) but no job enqueued.
+        let updated = result.unwrap();
+        assert!(updated.next_enqueue_at.unwrap() > due_at);
+        assert!(updated.last_enqueue_at.is_none()); // Not set when paused.
+
+        let jobs = store
+            .list_jobs(ListJobsOptions::new().queues(["q".to_string()].into()))
+            .await
+            .unwrap();
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn promote_cron_entry_skips_deleted_entry() {
+        let store = test_store();
+
+        let result = store
+            .promote_cron_entry("default", "missing", now_millis())
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_cron_index_populates_from_disk() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![
+                    cron_entry_opts("e1", "* * * * *", "q", "test"),
+                    cron_entry_opts("e2", "*/5 * * * *", "q", "test"),
+                ],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Verify the index has entries.
+        assert!(store.cron_next_due_at().is_some());
+
+        // Simulate a restart by rebuilding.
+        let (_, _, cron) = store.rebuild_indexes().await.unwrap();
+        assert_eq!(cron, 2);
+
+        // Index should still work.
+        assert!(store.cron_next_due_at().is_some());
+    }
+
+    #[tokio::test]
+    async fn cron_next_due_at_reflects_schedule() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        assert!(store.cron_next_due_at().is_none());
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        let next = store.cron_next_due_at();
+        assert!(next.is_some());
+        assert!(next.unwrap() > now);
+    }
+
+    #[tokio::test]
+    async fn next_due_cron_entries_returns_due_entries() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                now,
+            )
+            .await
+            .unwrap();
+
+        let entry = store
+            .get_cron_entry("default", "e1")
+            .await
+            .unwrap()
+            .unwrap();
+        let due_at = entry.next_enqueue_at.unwrap();
+
+        // Before due time — nothing.
+        let due = store.next_due_cron_entries(now);
+        assert!(due.is_empty());
+
+        // At due time.
+        let due = store.next_due_cron_entries(due_at);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, "default");
+        assert_eq!(due[0].2, "e1");
     }
 }
