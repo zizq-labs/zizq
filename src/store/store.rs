@@ -41,8 +41,8 @@ use super::scheduled_index::ScheduledIndex;
 use super::cron::{CronEntry, CronGroup};
 use super::group_committer::GroupCommitter;
 use super::options::{
-    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
-    ListErrorsOptions, ListJobsOptions, PatchJobOptions,
+    BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, FailureOptions, ListErrorsOptions,
+    ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
 };
 use super::results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
 use super::types::{
@@ -3949,13 +3949,15 @@ impl Store {
     pub async fn replace_cron_group(
         &self,
         group: &str,
-        entries: Vec<CronEntryOptions>,
+        opts: ReplaceCronGroupOptions,
         now: u64,
     ) -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
         let ks = self.ks.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
+        let group_paused = opts.paused;
+        let entries = opts.entries;
 
         task::spawn_blocking(move || -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
             let group_key = make_cron_group_key(&group);
@@ -3965,7 +3967,7 @@ impl Store {
             let mut computed_next: Vec<Option<u64>> = Vec::with_capacity(entries.len());
             for input in &entries {
                 // Validates the expression; None means no future occurrences.
-                let next = cron_next_after(&input.expression, now)?;
+                let next = cron_next_after(&input.expression, now, input.timezone.as_deref())?;
                 computed_next.push(next);
             }
 
@@ -3973,13 +3975,35 @@ impl Store {
             // are consistent — no other writer can modify data.
             let mut tx = ks.write_tx();
 
-            // Load or create group metadata.
+            // Load or create group metadata, applying pause state if requested.
             let existing_group: CronGroup = match ks.data.get(&group_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                Some(bytes) => {
+                    let mut g: CronGroup = rmp_serde::from_slice(&bytes)?;
+                    if let Some(paused) = group_paused {
+                        if paused != g.paused {
+                            match (g.paused, paused) {
+                                (false, true) => g.paused_at = Some(now),
+                                (true, false) => g.resumed_at = Some(now),
+                                _ => {}
+                            }
+                            g.paused = paused;
+                        }
+                        tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&g)?);
+                    }
+                    g
+                }
                 None => {
-                    let group = CronGroup::default();
-                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group)?);
-                    group
+                    let g = CronGroup {
+                        paused: group_paused.unwrap_or(false),
+                        paused_at: if group_paused == Some(true) {
+                            Some(now)
+                        } else {
+                            None
+                        },
+                        ..CronGroup::default()
+                    };
+                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&g)?);
+                    g
                 }
             };
 
@@ -4030,6 +4054,7 @@ impl Store {
                     CronEntry {
                         name: input.name,
                         expression: input.expression,
+                        timezone: input.timezone,
                         paused,
                         paused_at,
                         resumed_at,
@@ -4041,6 +4066,7 @@ impl Store {
                     CronEntry {
                         name: input.name,
                         expression: input.expression,
+                        timezone: input.timezone,
                         paused: input.paused.unwrap_or(false),
                         paused_at: None,
                         resumed_at: None,
@@ -4178,7 +4204,7 @@ impl Store {
                 let is_paused = group_paused || entry.paused;
 
                 // Compute next occurrence (None if no future occurrences).
-                let next = cron_next_after(&entry.expression, now)?;
+                let next = cron_next_after(&entry.expression, now, entry.timezone.as_deref())?;
 
                 // Prepare the job enqueue (unless paused).
                 let prepared = if !is_paused {
@@ -4341,8 +4367,20 @@ fn make_cron_group_prefix(group: &str) -> Vec<u8> {
 /// Compute the next occurrence of a cron expression after `now_ms`.
 ///
 /// Returns `None` if the expression has no future occurrences.
-fn cron_next_after(expression: &str, now_ms: u64) -> Result<Option<u64>, StoreError> {
+/// Compute the next occurrence of a cron expression after `now_ms`.
+///
+/// When `timezone` is `Some`, the expression is evaluated in that IANA
+/// timezone (e.g. "Australia/Melbourne"). When `None`, the system's
+/// local timezone is used.
+///
+/// Returns `None` if the expression has no future occurrences.
+fn cron_next_after(
+    expression: &str,
+    now_ms: u64,
+    timezone: Option<&str>,
+) -> Result<Option<u64>, StoreError> {
     let cron = croner::Cron::new(expression)
+        .with_seconds_optional()
         .parse()
         .map_err(|e| StoreError::InvalidOperation(format!("invalid cron expression: {e}")))?;
 
@@ -4350,9 +4388,21 @@ fn cron_next_after(expression: &str, now_ms: u64) -> Result<Option<u64>, StoreEr
     let dt = chrono::DateTime::from_timestamp(now_secs, 0)
         .ok_or_else(|| StoreError::InvalidOperation("invalid timestamp".to_string()))?;
 
-    match cron.find_next_occurrence(&dt, false) {
-        Ok(next) => Ok(Some(next.timestamp() as u64 * 1000)),
-        Err(_) => Ok(None),
+    if let Some(tz_name) = timezone {
+        let tz: chrono_tz::Tz = tz_name
+            .parse()
+            .map_err(|_| StoreError::InvalidOperation(format!("invalid timezone: {tz_name:?}")))?;
+        let dt_tz = dt.with_timezone(&tz);
+        match cron.find_next_occurrence(&dt_tz, false) {
+            Ok(next) => Ok(Some(next.timestamp() as u64 * 1000)),
+            Err(_) => Ok(None),
+        }
+    } else {
+        let local = dt.with_timezone(&chrono::Local);
+        match cron.find_next_occurrence(&local, false) {
+            Ok(next) => Ok(Some(next.timestamp() as u64 * 1000)),
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -4632,7 +4682,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use crate::store::options::RetentionConfigPatch;
+    use crate::store::options::{CronEntryOptions, RetentionConfigPatch};
     use crate::store::types::RetentionConfig;
     use crate::time::now_millis;
 
@@ -11749,6 +11799,7 @@ mod tests {
         CronEntryOptions {
             name: name.to_string(),
             expression: expression.to_string(),
+            timezone: None,
             paused: None,
             job: EnqueueOptions::new(job_type, queue, serde_json::json!({})),
         }
@@ -11762,7 +11813,10 @@ mod tests {
         let (group, entries) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("every-minute", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("every-minute", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -11786,7 +11840,10 @@ mod tests {
         let (_, entries1) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "*/5 * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "*/5 * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -11798,7 +11855,10 @@ mod tests {
         let (_, entries2) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "*/5 * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "*/5 * * * *", "q", "test")],
+                },
                 now + 1000,
             )
             .await
@@ -11815,7 +11875,10 @@ mod tests {
         let (_, entries1) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -11827,7 +11890,10 @@ mod tests {
         let (_, entries2) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "0 0 * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "0 0 * * *", "q", "test")],
+                },
                 now + 1000,
             )
             .await
@@ -11844,10 +11910,13 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![
-                    cron_entry_opts("e1", "* * * * *", "q", "test"),
-                    cron_entry_opts("e2", "* * * * *", "q", "test"),
-                ],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![
+                        cron_entry_opts("e1", "* * * * *", "q", "test"),
+                        cron_entry_opts("e2", "* * * * *", "q", "test"),
+                    ],
+                },
                 now,
             )
             .await
@@ -11857,7 +11926,10 @@ mod tests {
         let (_, entries) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -11879,7 +11951,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -11887,7 +11962,14 @@ mod tests {
 
         // Replace with empty entries — group should be cleaned up.
         let (_, entries) = store
-            .replace_cron_group("default", vec![], now)
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![],
+                },
+                now,
+            )
             .await
             .unwrap();
 
@@ -11906,7 +11988,10 @@ mod tests {
         let result = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("bad", "not a cron expr", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("bad", "not a cron expr", "q", "test")],
+                },
                 now,
             )
             .await;
@@ -11923,10 +12008,13 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![CronEntryOptions {
-                    paused: Some(true),
-                    ..cron_entry_opts("e1", "* * * * *", "q", "test")
-                }],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![CronEntryOptions {
+                        paused: Some(true),
+                        ..cron_entry_opts("e1", "* * * * *", "q", "test")
+                    }],
+                },
                 now,
             )
             .await
@@ -11936,7 +12024,10 @@ mod tests {
         let (_, entries) = store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now + 1000,
             )
             .await
@@ -11953,7 +12044,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -11963,10 +12057,13 @@ mod tests {
         let (_, entries) = store
             .replace_cron_group(
                 "default",
-                vec![CronEntryOptions {
-                    paused: Some(true),
-                    ..cron_entry_opts("e1", "* * * * *", "q", "test")
-                }],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![CronEntryOptions {
+                        paused: Some(true),
+                        ..cron_entry_opts("e1", "* * * * *", "q", "test")
+                    }],
+                },
                 now + 1000,
             )
             .await
@@ -11984,7 +12081,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -12011,7 +12111,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -12052,7 +12155,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -12082,10 +12188,13 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![CronEntryOptions {
-                    paused: Some(true),
-                    ..cron_entry_opts("e1", "* * * * *", "q", "test")
-                }],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![CronEntryOptions {
+                        paused: Some(true),
+                        ..cron_entry_opts("e1", "* * * * *", "q", "test")
+                    }],
+                },
                 now,
             )
             .await
@@ -12135,10 +12244,13 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![
-                    cron_entry_opts("e1", "* * * * *", "q", "test"),
-                    cron_entry_opts("e2", "*/5 * * * *", "q", "test"),
-                ],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![
+                        cron_entry_opts("e1", "* * * * *", "q", "test"),
+                        cron_entry_opts("e2", "*/5 * * * *", "q", "test"),
+                    ],
+                },
                 now,
             )
             .await
@@ -12165,7 +12277,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -12184,7 +12299,10 @@ mod tests {
         store
             .replace_cron_group(
                 "default",
-                vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
                 now,
             )
             .await
@@ -12206,5 +12324,104 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].1, "default");
         assert_eq!(due[0].2, "e1");
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_respects_timezone() {
+        let store = test_store();
+        let now = CRON_NOW; // 2023-11-14 22:13:20 UTC
+
+        // Create two entries with the same expression but different timezones.
+        // "0 9 * * *" = 9:00 AM daily.
+        // In UTC, next 9:00 AM is 2023-11-15 09:00 UTC.
+        // In Australia/Melbourne (UTC+11 in Nov), next 9:00 AM local is
+        // 2023-11-14 22:00 UTC (already passed) → 2023-11-15 22:00 UTC.
+        let utc_entry = CronEntryOptions {
+            timezone: Some("UTC".to_string()),
+            ..cron_entry_opts("utc-9am", "0 9 * * *", "q", "test")
+        };
+        let melb_entry = CronEntryOptions {
+            timezone: Some("Australia/Melbourne".to_string()),
+            ..cron_entry_opts("melb-9am", "0 9 * * *", "q", "test")
+        };
+
+        let (_, entries) = store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![utc_entry, melb_entry],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        let utc_next = entries
+            .iter()
+            .find(|e| e.name == "utc-9am")
+            .unwrap()
+            .next_enqueue_at
+            .unwrap();
+        let melb_next = entries
+            .iter()
+            .find(|e| e.name == "melb-9am")
+            .unwrap()
+            .next_enqueue_at
+            .unwrap();
+
+        // They should be different — Melbourne 9 AM is a different UTC time than UTC 9 AM.
+        assert_ne!(utc_next, melb_next);
+
+        // UTC 9 AM should be earlier (it's ~11 hours before Melbourne 9 AM in UTC).
+        assert!(utc_next < melb_next);
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_invalid_timezone_returns_error() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        let entry = CronEntryOptions {
+            timezone: Some("Not/A/Timezone".to_string()),
+            ..cron_entry_opts("bad-tz", "* * * * *", "q", "test")
+        };
+
+        let result = store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![entry],
+                },
+                now,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_accepts_6_field_expression() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        // 6-field: second minute hour dom month dow
+        let (_, entries) = store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("every-30s", "*/30 * * * * *", "q", "test")],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        // With seconds, next occurrence should be within 30 seconds.
+        let next = entries[0].next_enqueue_at.unwrap();
+        assert!(next > now);
+        assert!(next <= now + 30_000);
     }
 }

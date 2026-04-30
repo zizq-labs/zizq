@@ -12,7 +12,8 @@ mod types;
 
 pub use options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
-    ListErrorsOptions, ListJobsOptions, PatchJobOptions, RetentionConfigPatch,
+    ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
+    RetentionConfigPatch,
 };
 
 pub use results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
