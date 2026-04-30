@@ -9,6 +9,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::filter::PayloadFilter;
 
 use super::types::{BackoffConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile};
@@ -305,40 +307,63 @@ impl ListErrorsOptions {
 }
 
 /// Options for enqueuing a new job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnqueueOptions {
     /// Job type, e.g. "send_email" or "generate_report".
+    #[serde(rename = "T")]
     pub job_type: String,
 
     /// Queue this job belongs to.
+    #[serde(rename = "Q")]
     pub queue: String,
 
     /// Arbitrary payload provided by the client.
+    #[serde(rename = "P")]
     pub payload: serde_json::Value,
 
     /// Priority (lower number = higher priority). Defaults to 0.
+    #[serde(rename = "N")]
     pub priority: u16,
 
     /// When the job becomes eligible to run (milliseconds since Unix epoch).
     /// `None` means immediately.
+    #[serde(rename = "r")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<u64>,
 
     /// Per-job override for maximum retries. When `None`, the server
     /// default applies at failure time.
+    #[serde(rename = "l")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_limit: Option<u32>,
 
     /// Per-job backoff configuration override. When `None`, server defaults
     /// apply at failure time.
+    #[serde(rename = "b")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff: Option<BackoffConfig>,
 
     /// Per-job retention configuration override. When `None`, server
     /// defaults are used at completion/death time.
+    #[serde(rename = "e")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionConfig>,
 
     /// Unique key for deduplication. When set, the store checks for an
     /// existing job with the same key before inserting.
+    #[serde(rename = "u")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_key: Option<String>,
 
     /// Uniqueness scope. Defaults to `Queued` when `unique_key` is set.
+    #[serde(rename = "w")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_while: Option<UniqueWhile>,
 }
 
@@ -410,6 +435,25 @@ impl EnqueueOptions {
         self.unique_while = Some(scope);
         self
     }
+}
+
+/// A single entry in a `replace_cron_group` request.
+///
+/// The caller provides the entry definition; the Store computes
+/// `next_enqueue_at` from the expression and `now`.
+pub struct CronEntryOptions {
+    /// Entry name (unique within the group).
+    pub name: String,
+
+    /// Cron expression (e.g. `*/15 * * * *`).
+    pub expression: String,
+
+    /// Whether this entry should be paused. `None` means preserve existing
+    /// state (or default to `false` for new entries).
+    pub paused: Option<bool>,
+
+    /// Job template — the fields used to enqueue a job when this entry fires.
+    pub job: EnqueueOptions,
 }
 
 /// Options for recording a job failure.

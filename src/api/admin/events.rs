@@ -406,6 +406,10 @@ async fn process_store_event(
             events.extend(diff_scheduled(store, conn).await);
             events
         }
+        StoreEvent::CronScheduleChanged => {
+            // TODO: emit cron-specific admin events for `zizq top`.
+            Vec::new()
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
+mod cron;
 mod group_committer;
 mod options;
 mod ready_index;
@@ -10,8 +11,8 @@ mod store;
 mod types;
 
 pub use options::{
-    BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, FailureOptions, ListErrorsOptions,
-    ListJobsOptions, PatchJobOptions, RetentionConfigPatch,
+    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
+    ListErrorsOptions, ListJobsOptions, PatchJobOptions, RetentionConfigPatch,
 };
 
 pub use results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
@@ -22,6 +23,8 @@ pub use store::{
     DEFAULT_DEAD_RETENTION_MS, DEFAULT_INDEX_TABLE_SIZE, DEFAULT_JOURNAL_SIZE,
     DEFAULT_L0_THRESHOLD, DEFAULT_RETRY_LIMIT, StorageConfig, Store, StoreEvent,
 };
+
+pub use cron::{CronEntry, CronGroup};
 
 pub use types::{
     BackoffConfig, CommitMode, EnvConfigError, ErrorRecord, Job, JobStatus, RetentionConfig,

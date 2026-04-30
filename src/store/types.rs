@@ -122,12 +122,21 @@ impl TryFrom<u8> for JobStatus {
 }
 
 /// Uniqueness scope — which job statuses constitute a conflict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as a u8 for compact storage in the data keyspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
 #[repr(u8)]
 pub enum UniqueWhile {
     Queued = 0,
     Active = 1,
     Exists = 2,
+}
+
+impl From<UniqueWhile> for u8 {
+    fn from(v: UniqueWhile) -> Self {
+        v as u8
+    }
 }
 
 impl TryFrom<u8> for UniqueWhile {

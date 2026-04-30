@@ -2091,6 +2091,7 @@ async fn take_jobs(
                             Ok(StoreEvent::JobInFlight { .. }) => {}
                             Ok(StoreEvent::JobScheduled { .. }) => {}
                             Ok(StoreEvent::JobPatched { .. }) => {}
+                            Ok(StoreEvent::CronScheduleChanged) => {}
                             Ok(StoreEvent::IndexRebuilt) => {
                                 // Indexes just became available — mint
                                 // an unclaimed token so the drain phase
