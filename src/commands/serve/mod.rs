@@ -17,6 +17,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+mod cron_scheduler;
 mod reaper;
 mod scheduler;
 mod tls;
@@ -490,8 +491,8 @@ fn spawn_background_tasks(args: &Args, state: &Arc<AppState>) {
     let store_for_rebuild = state.store.clone();
     tokio::spawn(async move {
         match store_for_rebuild.rebuild_indexes().await {
-            Ok((ready, scheduled)) => {
-                tracing::info!(ready, scheduled, "in-memory indexes rebuilt");
+            Ok((ready, scheduled, cron)) => {
+                tracing::info!(ready, scheduled, cron, "in-memory indexes rebuilt");
             }
             Err(e) => {
                 tracing::error!(error = %e, "index rebuild failed");
@@ -521,6 +522,15 @@ fn spawn_background_tasks(args: &Args, state: &Arc<AppState>) {
         reaper::DEFAULT_BATCH_SIZE,
         Duration::from_millis(args.reaper_check_interval_ms),
         reaper_shutdown,
+    ));
+
+    // Cron scheduler: enqueues jobs from cron entries when they become due.
+    let cron_state = Arc::clone(state);
+    let cron_shutdown = state.shutdown.clone();
+    tokio::spawn(cron_scheduler::run(
+        cron_state,
+        crate::time::now_millis,
+        cron_shutdown,
     ));
 }
 

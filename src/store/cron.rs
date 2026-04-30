@@ -65,9 +65,13 @@ pub struct CronEntry {
     #[serde(rename = "J")]
     pub job: super::EnqueueOptions,
 
-    /// Next scheduled enqueue time (ms since epoch).
+    /// Next scheduled enqueue time (ms since epoch). `None` if the
+    /// expression has no future occurrences (e.g. a one-shot schedule
+    /// that has already fired).
     #[serde(rename = "n")]
-    pub next_enqueue_at: u64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_enqueue_at: Option<u64>,
 
     /// Last time a job was enqueued from this entry (ms since epoch).
     #[serde(rename = "l")]
@@ -122,18 +126,14 @@ impl CronScheduleIndex {
         map.keys().next().copied()
     }
 
-    /// Remove and return all entries where `next_enqueue_at <= now`.
-    pub fn take_due(&self, now: u64) -> Vec<(u64, String, String)> {
-        let mut map = self.inner.lock().unwrap();
+    /// Return all entries where `next_enqueue_at <= now` without removing them.
+    pub fn due_entries(&self, now: u64) -> Vec<(u64, String, String)> {
+        let map = self.inner.lock().unwrap();
         let mut due = Vec::new();
 
-        // Collect keys up to `now`.
-        let due_keys: Vec<u64> = map.range(..=now).map(|(k, _)| *k).collect();
-        for key in due_keys {
-            if let Some(entries) = map.remove(&key) {
-                for (group, entry_name) in entries {
-                    due.push((key, group, entry_name));
-                }
+        for (ts, entries) in map.range(..=now) {
+            for (group, entry_name) in entries {
+                due.push((*ts, group.clone(), entry_name.clone()));
             }
         }
 
@@ -184,36 +184,36 @@ mod tests {
     }
 
     #[test]
-    fn index_take_due() {
+    fn index_due_entries() {
         let idx = CronScheduleIndex::new();
         idx.insert(100, "g1".into(), "e1".into());
         idx.insert(200, "g1".into(), "e2".into());
         idx.insert(300, "g1".into(), "e3".into());
         idx.insert(400, "g2".into(), "e4".into());
 
-        let due = idx.take_due(250);
+        let due = idx.due_entries(250);
         assert_eq!(due.len(), 2);
         assert_eq!(due[0], (100, "g1".into(), "e1".into()));
         assert_eq!(due[1], (200, "g1".into(), "e2".into()));
 
-        // Those entries are removed from the index.
-        assert_eq!(idx.next_due_at(), Some(300));
+        // Read-only — entries remain in the index.
+        assert_eq!(idx.next_due_at(), Some(100));
     }
 
     #[test]
-    fn index_take_due_none_ready() {
+    fn index_due_entries_none_ready() {
         let idx = CronScheduleIndex::new();
         idx.insert(1000, "g1".into(), "e1".into());
 
-        let due = idx.take_due(500);
+        let due = idx.due_entries(500);
         assert!(due.is_empty());
         assert_eq!(idx.next_due_at(), Some(1000));
     }
 
     #[test]
-    fn index_take_due_empty() {
+    fn index_due_entries_empty() {
         let idx = CronScheduleIndex::new();
-        let due = idx.take_due(1000);
+        let due = idx.due_entries(1000);
         assert!(due.is_empty());
     }
 
@@ -224,9 +224,11 @@ mod tests {
         idx.insert(1000, "g1".into(), "e2".into());
         idx.insert(1000, "g2".into(), "e3".into());
 
-        let due = idx.take_due(1000);
+        let due = idx.due_entries(1000);
         assert_eq!(due.len(), 3);
         assert!(due.iter().all(|(ts, _, _)| *ts == 1000));
-        assert_eq!(idx.next_due_at(), None);
+
+        // Read-only — entries remain in the index.
+        assert_eq!(idx.next_due_at(), Some(1000));
     }
 }

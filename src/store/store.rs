@@ -282,6 +282,11 @@ pub enum StoreEvent {
     /// transition occurs.
     JobPatched { id: String },
 
+    /// A cron schedule was modified (created, replaced, paused, deleted, etc.).
+    ///
+    /// The cron scheduler listens for this to recalculate its sleep timer.
+    CronScheduleChanged,
+
     /// Recovery and index rebuilding completed.
     ///
     /// Emitted once when `rebuild_indexes()` finishes. Wakes sleeping
@@ -3188,15 +3193,18 @@ impl Store {
     /// Sets `index_ready` to `false` while rebuilding and emits
     /// `IndexRebuilt` when complete. Workers wait on `index_ready`
     /// before taking jobs.
-    pub async fn rebuild_indexes(&self) -> Result<(usize, usize), StoreError> {
+    pub async fn rebuild_indexes(&self) -> Result<(usize, usize, usize), StoreError> {
         self.index_ready.store(false, Ordering::Release);
 
-        let (ready, scheduled) =
-            tokio::try_join!(self.rebuild_ready_index(), self.rebuild_scheduled_index(),)?;
+        let (ready, scheduled, cron) = tokio::try_join!(
+            self.rebuild_ready_index(),
+            self.rebuild_scheduled_index(),
+            self.rebuild_cron_index(),
+        )?;
 
         self.index_ready.store(true, Ordering::Release);
         let _ = self.event_tx.send(StoreEvent::IndexRebuilt);
-        Ok((ready, scheduled))
+        Ok((ready, scheduled, cron))
     }
 
     /// Move orphaned in-flight jobs back to Ready in the LSM indexes.
@@ -3351,6 +3359,54 @@ impl Store {
 
                 scheduled_index.insert(job.ready_at, job_id);
                 count += 1;
+            }
+
+            Ok(count)
+        })
+        .await?
+    }
+
+    /// Rebuild the in-memory cron schedule index from disk.
+    ///
+    /// Scans all `C` tag entries in the data keyspace, skipping group
+    /// metadata records, and inserts each entry's `next_enqueue_at` into
+    /// the cron schedule index.
+    async fn rebuild_cron_index(&self) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+
+        task::spawn_blocking(move || -> Result<usize, StoreError> {
+            // Scan all keys with the cron tag prefix: [C .. D)
+            let start = vec![RecordKind::Cron as u8];
+            let end = vec![RecordKind::Cron as u8 + 1];
+            let range = (Bound::Included(start), Bound::Excluded(end));
+
+            let data: &fjall::Keyspace = ks.data.as_ref();
+            let mut count = 0;
+
+            for guard in data.range::<Vec<u8>, _>(range) {
+                let (key, value) = guard.into_inner()?;
+
+                // Group metadata keys end with \0 (no entry name after it).
+                // Entry keys have content after the \0.
+                if let Some(pos) = key.iter().position(|&b| b == 0) {
+                    if pos + 1 >= key.len() {
+                        // Group metadata — skip.
+                        continue;
+                    }
+                }
+
+                let entry: CronEntry = rmp_serde::from_slice(&value)?;
+                if let Some(next) = entry.next_enqueue_at {
+                    // Extract group name from key: C{group}\0{entry_name}
+                    let group_end = key.iter().position(|&b| b == 0).unwrap();
+                    let group = String::from_utf8(key[1..group_end].to_vec()).map_err(|e| {
+                        StoreError::Corruption(format!("cron group name is not valid UTF-8: {e}"))
+                    })?;
+
+                    cron_index.insert(next, group, entry.name.clone());
+                    count += 1;
+                }
             }
 
             Ok(count)
@@ -3898,6 +3954,7 @@ impl Store {
     ) -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
         let ks = self.ks.clone();
         let cron_index = self.cron_index.clone();
+        let event_tx = self.event_tx.clone();
         let group = group.to_string();
 
         task::spawn_blocking(move || -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
@@ -3905,14 +3962,10 @@ impl Store {
             let prefix = make_cron_group_prefix(&group);
 
             // Validate all cron expressions before acquiring the write lock.
-            let mut computed_next: Vec<u64> = Vec::with_capacity(entries.len());
+            let mut computed_next: Vec<Option<u64>> = Vec::with_capacity(entries.len());
             for input in &entries {
-                let next = cron_next_after(&input.expression, now)?.ok_or_else(|| {
-                    StoreError::InvalidOperation(format!(
-                        "cron expression '{}' has no future occurrences",
-                        input.expression
-                    ))
-                })?;
+                // Validates the expression; None means no future occurrences.
+                let next = cron_next_after(&input.expression, now)?;
                 computed_next.push(next);
             }
 
@@ -3953,14 +4006,14 @@ impl Store {
             // Build the new entries with smart merge logic.
             let mut new_entries = Vec::with_capacity(input_names.len());
 
-            for (input, next_enqueue_at) in entries.into_iter().zip(computed_next) {
+            for (input, computed) in entries.into_iter().zip(computed_next) {
                 let entry = if let Some(old) = existing_entries.get(&input.name) {
                     let (next, last) = if old.expression == input.expression {
                         // Cron expr is the same — don't reset state.
                         (old.next_enqueue_at, old.last_enqueue_at)
                     } else {
                         // Cron expr changed — recalculate.
-                        (next_enqueue_at, old.last_enqueue_at)
+                        (computed, old.last_enqueue_at)
                     };
 
                     // Preserve original paused state unless overridden.
@@ -3992,7 +4045,7 @@ impl Store {
                         paused_at: None,
                         resumed_at: None,
                         job: input.job,
-                        next_enqueue_at,
+                        next_enqueue_at: computed,
                         last_enqueue_at: None,
                     }
                 };
@@ -4025,15 +4078,160 @@ impl Store {
 
             // Remove all old entries from the index.
             for (name, old_entry) in &existing_entries {
-                cron_index.remove(old_entry.next_enqueue_at, &group, name);
+                if let Some(next) = old_entry.next_enqueue_at {
+                    cron_index.remove(next, &group, name);
+                }
             }
 
             // Insert all new entries into the index.
             for entry in &new_entries {
-                cron_index.insert(entry.next_enqueue_at, group.clone(), entry.name.clone());
+                if let Some(next) = entry.next_enqueue_at {
+                    cron_index.insert(next, group.clone(), entry.name.clone());
+                }
             }
 
+            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+
             Ok((existing_group, new_entries))
+        })
+        .await?
+    }
+
+    /// Load a single cron entry from the store.
+    pub async fn get_cron_entry(
+        &self,
+        group: &str,
+        entry_name: &str,
+    ) -> Result<Option<CronEntry>, StoreError> {
+        let ks = self.ks.clone();
+        let key = make_cron_entry_key(group, entry_name);
+
+        task::spawn_blocking(move || -> Result<Option<CronEntry>, StoreError> {
+            match ks.data.get(&key)? {
+                Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes)?)),
+                None => Ok(None),
+            }
+        })
+        .await?
+    }
+
+    /// Peek at the earliest due timestamp in the cron schedule index.
+    pub fn cron_next_due_at(&self) -> Option<u64> {
+        self.cron_index.next_due_at()
+    }
+
+    /// Return all cron entries where `next_enqueue_at <= now`.
+    ///
+    /// Read-only — does not modify the in-memory index. The caller
+    /// (cron scheduler) processes each entry via `promote_cron_entry`.
+    pub fn next_due_cron_entries(&self, now: u64) -> Vec<(u64, String, String)> {
+        self.cron_index.due_entries(now)
+    }
+
+    /// Atomically advance a due cron entry's schedule and enqueue its job.
+    ///
+    /// Pre-reads the entry and group outside the write tx, then uses
+    /// `fetch_update` to CAS the entry inside the tx. Retries if the
+    /// entry was modified concurrently. Returns early without writing
+    /// if the entry is paused, not actually due, or no longer exists.
+    pub async fn promote_cron_entry(
+        &self,
+        group: &str,
+        entry_name: &str,
+        now: u64,
+    ) -> Result<Option<CronEntry>, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let ready_index = self.ready_index.clone();
+        let scheduled_index = self.scheduled_index.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+        let entry_name = entry_name.to_string();
+
+        task::spawn_blocking(move || -> Result<Option<CronEntry>, StoreError> {
+            let entry_key = make_cron_entry_key(&group, &entry_name);
+            let group_key = make_cron_group_key(&group);
+
+            loop {
+                // ---- outside tx: pre-read ----
+                let pre_bytes = match ks.data.get(&entry_key)? {
+                    Some(bytes) => bytes,
+                    None => return Ok(None), // Entry deleted.
+                };
+                let mut entry: CronEntry = rmp_serde::from_slice(&pre_bytes)?;
+
+                // Not due: either no future occurrence or not yet due.
+                match entry.next_enqueue_at {
+                    None => return Ok(None),
+                    Some(next) if next > now => return Ok(None),
+                    _ => {}
+                }
+
+                // Check if group or entry is paused.
+                let group_paused = match ks.data.get(&group_key)? {
+                    Some(bytes) => {
+                        let g: CronGroup = rmp_serde::from_slice(&bytes)?;
+                        g.paused
+                    }
+                    None => false,
+                };
+                let is_paused = group_paused || entry.paused;
+
+                // Compute next occurrence (None if no future occurrences).
+                let next = cron_next_after(&entry.expression, now)?;
+
+                // Prepare the job enqueue (unless paused).
+                let prepared = if !is_paused {
+                    entry.last_enqueue_at = Some(now);
+                    Some(prepare_enqueue(entry.job.clone(), now)?)
+                } else {
+                    None
+                };
+
+                // Advance the schedule (time moves forward regardless of pause).
+                let old_next = entry.next_enqueue_at;
+                entry.next_enqueue_at = next;
+
+                let updated_entry_bytes: Slice = rmp_serde::to_vec(&entry)?.into();
+
+                // ---- inside tx: CAS + enqueue ----
+                let mut tx = ks.write_tx();
+
+                // CAS the cron entry — retry if it changed since pre-read.
+                let prev =
+                    tx.fetch_update(&ks.data, &entry_key, |_| Some(updated_entry_bytes.clone()))?;
+
+                if prev.as_deref() != Some(&*pre_bytes) {
+                    drop(tx);
+                    continue; // Entry changed — retry.
+                }
+
+                // Enqueue the job if not paused.
+                let enqueue_result = if let Some(ref p) = prepared {
+                    Some(apply_enqueue(&mut tx, &ks, p)?)
+                } else {
+                    None
+                };
+
+                ks.commit(tx, ks.enqueue_commit_mode)?;
+
+                // ---- outside tx: update in-memory indexes ----
+
+                // Update cron schedule index.
+                if let Some(old) = old_next {
+                    cron_index.remove(old, &group, &entry_name);
+                }
+                if let Some(next) = next {
+                    cron_index.insert(next, group.clone(), entry_name.clone());
+                }
+
+                // Finalize job enqueue (in-memory indexes + events).
+                if let Some(ref result) = enqueue_result {
+                    finalize_enqueue(result, &ready_index, &scheduled_index, &event_tx);
+                }
+
+                return Ok(Some(entry));
+            }
         })
         .await?
     }
@@ -7745,7 +7943,7 @@ mod tests {
 
         // Recover should move it back to Ready and rebuild the index.
         let recovered = store.recover_in_flight().await.unwrap();
-        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
+        let (indexed, _scheduled, _cron) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 1);
         assert_eq!(indexed, 1);
 
@@ -7773,7 +7971,7 @@ mod tests {
             .into_job();
 
         let recovered = store.recover_in_flight().await.unwrap();
-        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
+        let (indexed, _scheduled, _cron) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 0);
         // The already-ready job should be indexed.
         assert_eq!(indexed, 1);
@@ -7815,7 +8013,7 @@ mod tests {
 
         // Recover both.
         let recovered = store.recover_in_flight().await.unwrap();
-        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
+        let (indexed, _scheduled, _cron) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 2);
         assert_eq!(indexed, 2);
 
@@ -7865,7 +8063,7 @@ mod tests {
 
         // Recover should find no in-flight jobs, but index the ready one.
         let recovered = store.recover_in_flight().await.unwrap();
-        let (indexed, _scheduled) = store.rebuild_indexes().await.unwrap();
+        let (indexed, _scheduled, _cron) = store.rebuild_indexes().await.unwrap();
         assert_eq!(recovered, 0);
         assert_eq!(indexed, 1);
 
