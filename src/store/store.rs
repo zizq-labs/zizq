@@ -4123,6 +4123,50 @@ impl Store {
         .await?
     }
 
+    /// Load a cron group and all its entries.
+    ///
+    /// Returns `None` if the group does not exist.
+    pub async fn get_cron_group(
+        &self,
+        group: &str,
+    ) -> Result<Option<(CronGroup, Vec<CronEntry>)>, StoreError> {
+        let ks = self.ks.clone();
+        let group = group.to_string();
+
+        task::spawn_blocking(
+            move || -> Result<Option<(CronGroup, Vec<CronEntry>)>, StoreError> {
+                let group_key = make_cron_group_key(&group);
+                let prefix = make_cron_group_prefix(&group);
+
+                let snapshot = ks.db.read_tx();
+
+                let group_meta: CronGroup = match snapshot.get(&ks.data, &group_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => return Ok(None),
+                };
+
+                let mut range_end = prefix.clone();
+                *range_end.last_mut().unwrap() = 1; // \0 → \1
+
+                let entries: Vec<CronEntry> = snapshot
+                    .range::<Vec<u8>, _>(
+                        ks.data.as_ref(),
+                        (Bound::Included(prefix.clone()), Bound::Excluded(range_end)),
+                    )
+                    .skip(1) // skip group metadata key
+                    .map(|guard| {
+                        let (_, value) = guard.into_inner()?;
+                        let entry: CronEntry = rmp_serde::from_slice(&value)?;
+                        Ok(entry)
+                    })
+                    .collect::<Result<_, StoreError>>()?;
+
+                Ok(Some((group_meta, entries)))
+            },
+        )
+        .await?
+    }
+
     /// Load a single cron entry from the store.
     pub async fn get_cron_entry(
         &self,

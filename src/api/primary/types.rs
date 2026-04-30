@@ -900,6 +900,25 @@ pub struct CronGroupResponse {
     pub entries: Vec<CronEntryResponse>,
 }
 
+impl CronGroupResponse {
+    pub fn from_store(
+        name: String,
+        group: store::CronGroup,
+        entries: Vec<store::CronEntry>,
+    ) -> Self {
+        Self {
+            name,
+            paused: group.paused,
+            paused_at: group.paused_at,
+            resumed_at: group.resumed_at,
+            entries: entries
+                .into_iter()
+                .map(CronEntryResponse::from_store)
+                .collect(),
+        }
+    }
+}
+
 /// Response shape for a single cron entry.
 #[derive(Serialize)]
 pub struct CronEntryResponse {
