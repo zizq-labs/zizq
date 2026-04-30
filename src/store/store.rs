@@ -1436,138 +1436,25 @@ impl Store {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
+        let event_tx = self.event_tx.clone();
 
-        let enqueue_result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // ---- outside tx: prepare everything ----
-            let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
-                (Some(_), Some(scope)) => Some(scope),
-                (Some(_), None) => Some(UniqueWhile::Queued),
-                _ => None,
-            };
+        task::spawn_blocking(move || -> Result<_, StoreError> {
+            let prepared = prepare_enqueue(opts, now)?;
 
-            let id = scru128::new_string();
-            let ready_at = opts.ready_at.unwrap_or(now);
-            let scheduled = ready_at > now;
-            let status = if scheduled {
-                JobStatus::Scheduled
-            } else {
-                JobStatus::Ready
-            };
-
-            let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
-
-            let job = Job {
-                id: id.clone(),
-                job_type: opts.job_type,
-                queue: opts.queue,
-                priority: opts.priority,
-                payload: Some(opts.payload),
-                status: status.into(),
-                ready_at,
-                attempts: 0,
-                retry_limit: opts.retry_limit,
-                backoff: opts.backoff,
-                dequeued_at: None,
-                failed_at: None,
-                retention: opts.retention,
-                purge_at: None,
-                completed_at: None,
-                unique: opts.unique_key.map(|k| UniqueConstraint {
-                    key: k,
-                    scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
-                }),
-            };
-
-            let mut meta = job.clone();
-            meta.payload = None;
-            let meta_bytes = rmp_serde::to_vec_named(&meta)?;
-
-            let job_key = make_job_key(&id);
-            let payload_key = make_payload_key(&id);
-            let queue_key = make_queue_key(&job.queue, &id);
-            let status_key = make_status_key(status, &id);
-            let type_key = make_type_key(&job.job_type, &id);
-            let unique_idx_key = job.unique.as_ref().map(|uc| make_unique_key(&uc.key));
-
-            // ---- inside tx: unique check + raw inserts only ----
             let mut tx = ks.write_tx();
+            let result = apply_enqueue(&mut tx, &ks, &prepared)?;
 
-            // Check for a unique conflict. If found, return the existing
-            // job as a duplicate without inserting the new one.
-            if let Some(ref uc) = job.unique {
-                let scope = uc.unique_while();
-                let idx_key = unique_idx_key.as_ref().unwrap();
-
-                if let Some(existing_id_bytes) = ks.index.get(idx_key)? {
-                    let existing_id = std::str::from_utf8(&existing_id_bytes).map_err(|e| {
-                        StoreError::Corruption(format!(
-                            "unique index value is not valid UTF-8: {e}"
-                        ))
-                    })?;
-                    let existing_job_key = make_job_key(existing_id);
-
-                    if let Some(existing_meta_bytes) = ks.data.get(&existing_job_key)? {
-                        let existing_meta: Job = rmp_serde::from_slice(&existing_meta_bytes)?;
-                        if let Ok(existing_status) = JobStatus::try_from(existing_meta.status) {
-                            if scope.conflicts_with(existing_status) {
-                                drop(tx);
-                                return Ok(EnqueueResult::Duplicate(existing_meta));
-                            }
-                        }
-                    }
-                }
-            }
-
-            tx.insert(&ks.data, &job_key, &meta_bytes);
-            tx.insert(&ks.data, &payload_key, &payload_bytes);
-            tx.insert(&ks.index, &queue_key, b"");
-            tx.insert(&ks.index, &status_key, b"");
-            tx.insert(&ks.index, &type_key, b"");
-
-            if let Some(ref idx_key) = unique_idx_key {
-                tx.insert(&ks.index, idx_key, id.as_bytes());
-            }
-
-            ks.commit(tx, ks.enqueue_commit_mode)?;
-
-            // ---- outside tx: update in-memory indexes ----
-            if scheduled {
-                scheduled_index.insert(ready_at, id.clone());
+            if result.is_duplicate() {
+                drop(tx);
             } else {
-                ready_index.insert(&job.queue, job.priority, job.id.clone());
+                ks.commit(tx, ks.enqueue_commit_mode)?;
             }
 
-            Ok(EnqueueResult::Created(job))
+            finalize_enqueue(&result, &ready_index, &scheduled_index, &event_tx);
+
+            Ok(result)
         })
-        .await??;
-
-        // Only broadcast events for Created results (not Duplicates).
-        if let EnqueueResult::Created(ref job) = enqueue_result {
-            match JobStatus::try_from(job.status) {
-                Ok(JobStatus::Ready) => {
-                    let _ = self.event_tx.send(StoreEvent::JobCreated {
-                        id: job.id.clone(),
-                        queue: job.queue.clone(),
-                        token: Arc::new(AtomicBool::new(false)),
-                    });
-                }
-                Ok(JobStatus::Scheduled) => {
-                    let _ = self.event_tx.send(StoreEvent::JobScheduled {
-                        id: job.id.clone(),
-                        ready_at: job.ready_at,
-                    });
-                }
-                _ => {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        status = job.status,
-                        "enqueue produced unexpected status"
-                    );
-                }
-            }
-        }
-
-        Ok(enqueue_result)
+        .await?
     }
 
     /// Enqueue multiple jobs in a single transaction.
@@ -1587,84 +1474,16 @@ impl Store {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
+        let event_tx = self.event_tx.clone();
 
-        let enqueue_results = task::spawn_blocking(move || -> Result<_, StoreError> {
+        task::spawn_blocking(move || -> Result<_, StoreError> {
             use std::collections::HashMap;
 
-            // ---- outside tx: prepare all jobs ----
-            struct PreparedJob {
-                job: Job,
-                meta_bytes: Vec<u8>,
-                payload_bytes: Vec<u8>,
-                job_key: Vec<u8>,
-                payload_key: Vec<u8>,
-                queue_key: Vec<u8>,
-                status_key: Vec<u8>,
-                type_key: Vec<u8>,
-                unique_idx_key: Option<Vec<u8>>,
-            }
-
-            let prepared: Vec<PreparedJob> = batch
+            let prepared: Vec<PreparedEnqueue> = batch
                 .into_iter()
-                .map(|opts| {
-                    let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
-                        (Some(_), Some(scope)) => Some(scope),
-                        (Some(_), None) => Some(UniqueWhile::Queued),
-                        _ => None,
-                    };
-
-                    let id = scru128::new_string();
-                    let ready_at = opts.ready_at.unwrap_or(now);
-                    let scheduled = ready_at > now;
-                    let status = if scheduled {
-                        JobStatus::Scheduled
-                    } else {
-                        JobStatus::Ready
-                    };
-
-                    let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
-
-                    let job = Job {
-                        id: id.clone(),
-                        job_type: opts.job_type,
-                        queue: opts.queue,
-                        priority: opts.priority,
-                        payload: Some(opts.payload),
-                        status: status.into(),
-                        ready_at,
-                        attempts: 0,
-                        retry_limit: opts.retry_limit,
-                        backoff: opts.backoff,
-                        dequeued_at: None,
-                        failed_at: None,
-                        retention: opts.retention,
-                        purge_at: None,
-                        completed_at: None,
-                        unique: opts.unique_key.map(|k| UniqueConstraint {
-                            key: k,
-                            scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
-                        }),
-                    };
-
-                    let mut meta = job.clone();
-                    meta.payload = None;
-                    let meta_bytes = rmp_serde::to_vec_named(&meta)?;
-
-                    Ok(PreparedJob {
-                        job_key: make_job_key(&id),
-                        payload_key: make_payload_key(&id),
-                        queue_key: make_queue_key(&job.queue, &id),
-                        status_key: make_status_key(status, &id),
-                        type_key: make_type_key(&job.job_type, &id),
-                        unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
-                        job,
-                        meta_bytes,
-                        payload_bytes,
-                    })
-                })
+                .map(|opts| prepare_enqueue(opts, now))
                 .collect::<Result<_, StoreError>>()?;
 
-            // ---- inside tx: unique checks + raw inserts only ----
             let mut tx = ks.write_tx();
 
             // Maps unique_key -> index in `results` for intra-batch conflicts.
@@ -1672,98 +1491,37 @@ impl Store {
             let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
 
             for p in &prepared {
+                // Intra-batch unique conflict check (no DB read needed).
                 if let Some(ref uc) = p.job.unique {
-                    let scope = uc.unique_while();
-
-                    // Intra-batch conflict (no DB read needed).
                     if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
                         results.push(EnqueueResult::Duplicate(
                             results[existing_idx].job().clone(),
                         ));
                         continue;
                     }
+                }
 
-                    // DB identified conflict (point reads only).
-                    let idx_key = p.unique_idx_key.as_ref().unwrap();
-                    if let Some(existing_id_bytes) = ks.index.get(idx_key)? {
-                        let existing_id = std::str::from_utf8(&existing_id_bytes).map_err(|e| {
-                            StoreError::Corruption(format!(
-                                "unique index value is not valid UTF-8: {e}"
-                            ))
-                        })?;
-                        if let Some(existing_meta) = ks.data.get(&make_job_key(existing_id))? {
-                            let existing_job: Job = rmp_serde::from_slice(&existing_meta)?;
-                            if let Ok(existing_status) = JobStatus::try_from(existing_job.status) {
-                                if scope.conflicts_with(existing_status) {
-                                    results.push(EnqueueResult::Duplicate(existing_job));
-                                    continue;
-                                }
-                            }
-                        }
+                let result = apply_enqueue(&mut tx, &ks, p)?;
+
+                // Track unique keys for intra-batch dedup.
+                if let EnqueueResult::Created(ref job) = result {
+                    if let Some(ref uc) = job.unique {
+                        batch_unique_keys.insert(uc.key.clone(), results.len());
                     }
-
-                    batch_unique_keys.insert(uc.key.clone(), results.len());
                 }
 
-                // No conflict — insert.
-                tx.insert(&ks.data, &p.job_key, &p.meta_bytes);
-                tx.insert(&ks.data, &p.payload_key, &p.payload_bytes);
-                tx.insert(&ks.index, &p.queue_key, b"");
-                tx.insert(&ks.index, &p.status_key, b"");
-                tx.insert(&ks.index, &p.type_key, b"");
-                if let Some(ref idx_key) = p.unique_idx_key {
-                    tx.insert(&ks.index, idx_key, p.job.id.as_bytes());
-                }
-
-                results.push(EnqueueResult::Created(p.job.clone()));
+                results.push(result);
             }
 
             ks.commit(tx, ks.enqueue_commit_mode)?;
 
-            // Update in-memory indexes after commit succeeds.
             for r in &results {
-                if let EnqueueResult::Created(job) = r {
-                    if job.status == JobStatus::Scheduled as u8 {
-                        scheduled_index.insert(job.ready_at, job.id.clone());
-                    } else {
-                        ready_index.insert(&job.queue, job.priority, job.id.clone());
-                    }
-                }
+                finalize_enqueue(r, &ready_index, &scheduled_index, &event_tx);
             }
 
             Ok(results)
         })
-        .await??;
-
-        // Broadcast events after sync completes (only for Created results).
-        for r in &enqueue_results {
-            if let EnqueueResult::Created(job) = r {
-                match JobStatus::try_from(job.status) {
-                    Ok(JobStatus::Ready) => {
-                        let _ = self.event_tx.send(StoreEvent::JobCreated {
-                            id: job.id.clone(),
-                            queue: job.queue.clone(),
-                            token: Arc::new(AtomicBool::new(false)),
-                        });
-                    }
-                    Ok(JobStatus::Scheduled) => {
-                        let _ = self.event_tx.send(StoreEvent::JobScheduled {
-                            id: job.id.clone(),
-                            ready_at: job.ready_at,
-                        });
-                    }
-                    _ => {
-                        tracing::warn!(
-                            job_id = %job.id,
-                            status = job.status,
-                            "enqueue_bulk produced unexpected status"
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(enqueue_results)
+        .await?
     }
 
     /// Take the next job from the priority index.
@@ -4274,6 +4032,168 @@ fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion
 
     for key in &del.error_keys {
         tx.remove_weak(&ks.data, key);
+    }
+}
+
+/// Pre-computed data for inserting a job into the store.
+///
+/// Built by `prepare_enqueue` from `EnqueueOptions`, consumed by
+/// `apply_enqueue` inside a write transaction. This separates the pure
+/// computation (serialization, key building) from the transactional writes,
+/// allowing callers to compose enqueue with other operations in the same tx.
+struct PreparedEnqueue {
+    job: Job,
+    meta_bytes: Vec<u8>,
+    payload_bytes: Vec<u8>,
+    job_key: Vec<u8>,
+    payload_key: Vec<u8>,
+    queue_key: Vec<u8>,
+    status_key: Vec<u8>,
+    type_key: Vec<u8>,
+    unique_idx_key: Option<Vec<u8>>,
+}
+
+/// Build a `PreparedEnqueue` from `EnqueueOptions` and the current time.
+///
+/// Pure computation — no IO, no transaction needed.
+fn prepare_enqueue(opts: EnqueueOptions, now: u64) -> Result<PreparedEnqueue, StoreError> {
+    let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
+        (Some(_), Some(scope)) => Some(scope),
+        (Some(_), None) => Some(UniqueWhile::Queued),
+        _ => None,
+    };
+
+    let id = scru128::new_string();
+    let ready_at = opts.ready_at.unwrap_or(now);
+    let scheduled = ready_at > now;
+    let status = if scheduled {
+        JobStatus::Scheduled
+    } else {
+        JobStatus::Ready
+    };
+
+    let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
+
+    let job = Job {
+        id: id.clone(),
+        job_type: opts.job_type,
+        queue: opts.queue,
+        priority: opts.priority,
+        payload: Some(opts.payload),
+        status: status.into(),
+        ready_at,
+        attempts: 0,
+        retry_limit: opts.retry_limit,
+        backoff: opts.backoff,
+        dequeued_at: None,
+        failed_at: None,
+        retention: opts.retention,
+        purge_at: None,
+        completed_at: None,
+        unique: opts.unique_key.map(|k| UniqueConstraint {
+            key: k,
+            scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
+        }),
+    };
+
+    let mut meta = job.clone();
+    meta.payload = None;
+    let meta_bytes = rmp_serde::to_vec_named(&meta)?;
+
+    Ok(PreparedEnqueue {
+        job_key: make_job_key(&id),
+        payload_key: make_payload_key(&id),
+        queue_key: make_queue_key(&job.queue, &id),
+        status_key: make_status_key(status, &id),
+        type_key: make_type_key(&job.job_type, &id),
+        unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
+        job,
+        meta_bytes,
+        payload_bytes,
+    })
+}
+
+/// Insert a prepared enqueue into an open write transaction.
+///
+/// Checks for unique constraint conflicts first. Returns `Duplicate` if a
+/// conflict is found (nothing is written), `Created` otherwise.
+///
+/// Does NOT commit the transaction — the caller is responsible for
+/// committing (possibly after adding other writes to the same tx).
+fn apply_enqueue(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    p: &PreparedEnqueue,
+) -> Result<EnqueueResult, StoreError> {
+    // Check for a unique conflict.
+    if let Some(ref uc) = p.job.unique {
+        let scope = uc.unique_while();
+        let idx_key = p.unique_idx_key.as_ref().unwrap();
+
+        if let Some(existing_id_bytes) = ks.index.get(idx_key)? {
+            let existing_id = std::str::from_utf8(&existing_id_bytes).map_err(|e| {
+                StoreError::Corruption(format!("unique index value is not valid UTF-8: {e}"))
+            })?;
+
+            if let Some(existing_meta_bytes) = ks.data.get(&make_job_key(existing_id))? {
+                let existing_meta: Job = rmp_serde::from_slice(&existing_meta_bytes)?;
+                if let Ok(existing_status) = JobStatus::try_from(existing_meta.status) {
+                    if scope.conflicts_with(existing_status) {
+                        return Ok(EnqueueResult::Duplicate(existing_meta));
+                    }
+                }
+            }
+        }
+    }
+
+    tx.insert(&ks.data, &p.job_key, &p.meta_bytes);
+    tx.insert(&ks.data, &p.payload_key, &p.payload_bytes);
+    tx.insert(&ks.index, &p.queue_key, b"");
+    tx.insert(&ks.index, &p.status_key, b"");
+    tx.insert(&ks.index, &p.type_key, b"");
+
+    if let Some(ref idx_key) = p.unique_idx_key {
+        tx.insert(&ks.index, idx_key, p.job.id.as_bytes());
+    }
+
+    Ok(EnqueueResult::Created(p.job.clone()))
+}
+
+/// Update in-memory indexes for a successfully enqueued job.
+///
+/// Call after the transaction has been committed. Updates the ready or
+/// scheduled index depending on the job's status.
+fn finalize_enqueue(
+    result: &EnqueueResult,
+    ready_index: &ReadyIndex,
+    scheduled_index: &ScheduledIndex,
+    event_tx: &broadcast::Sender<StoreEvent>,
+) {
+    if let EnqueueResult::Created(job) = result {
+        match JobStatus::try_from(job.status) {
+            Ok(JobStatus::Ready) => {
+                ready_index.insert(&job.queue, job.priority, job.id.clone());
+                let _ = event_tx.send(StoreEvent::JobCreated {
+                    id: job.id.clone(),
+                    queue: job.queue.clone(),
+                    token: Arc::new(AtomicBool::new(false)),
+                });
+            }
+            Ok(JobStatus::Scheduled) => {
+                scheduled_index.insert(job.ready_at, job.id.clone());
+                let _ = event_tx.send(StoreEvent::JobScheduled {
+                    id: job.id.clone(),
+                    ready_at: job.ready_at,
+                });
+            }
+            _ => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    status = job.status,
+                    "enqueue produced unexpected status"
+                );
+            }
+        }
     }
 }
 
