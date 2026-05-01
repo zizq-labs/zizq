@@ -846,6 +846,19 @@ pub fn default_prefetch() -> usize {
 
 // --- Cron scheduling types ---
 
+/// Response shape for `GET /crons`.
+#[derive(Serialize)]
+pub struct ListCronGroupsResponse {
+    pub crons: Vec<String>,
+}
+
+/// Request shape for `PATCH /crons/{name}`.
+#[derive(Deserialize)]
+pub struct PatchCronGroupRequest {
+    /// Whether the group should be paused.
+    pub paused: bool,
+}
+
 /// Request shape for `PUT /crons/{name}`.
 #[derive(Deserialize)]
 pub struct ReplaceCronGroupRequest {

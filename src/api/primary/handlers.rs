@@ -35,10 +35,10 @@ use super::types::{
     BulkEnqueueRequest, BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest,
     CommaSet, CountJobsParams, CountJobsResponse, CronGroupResponse, DeleteJobsParams,
     EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse, Job, JobStatus,
-    ListErrorsPages, ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams,
-    ListJobsResponse, ListQueuesResponse, Order, PatchJobBody, PatchJobsParams,
-    ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse, VersionResponse,
-    parse_unique_while,
+    ListCronGroupsResponse, ListErrorsPages, ListErrorsParams, ListErrorsResponse, ListJobsPages,
+    ListJobsParams, ListJobsResponse, ListQueuesResponse, Order, PatchCronGroupRequest,
+    PatchJobBody, PatchJobsParams, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
+    VersionResponse, parse_unique_while,
 };
 
 /// Default priority for jobs that don't specify one.
@@ -401,7 +401,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
         .route("/jobs/{id}/errors/{attempt}", get(get_error))
-        .route("/crons/{name}", get(get_cron_group).put(replace_cron_group))
+        .route("/crons", get(list_cron_groups))
+        .route(
+            "/crons/{name}",
+            get(get_cron_group)
+                .put(replace_cron_group)
+                .patch(patch_cron_group)
+                .delete(delete_cron_group),
+        )
         .fallback(not_found)
         .layer(axum::middleware::from_fn(
             middleware::primary_request_logging,
@@ -2152,6 +2159,36 @@ async fn take_jobs(
 
 // --- Cron scheduling ---
 
+/// Handle `GET /crons` — list all cron group names.
+async fn list_cron_groups(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.list_cron_groups().await {
+        Ok(crons) => respond(fmt, StatusCode::OK, &ListCronGroupsResponse { crons }),
+        Err(e) => {
+            tracing::error!(%e, "list_cron_groups failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
 /// Handle `GET /crons/{name}` — fetch a cron group and its entries.
 async fn get_cron_group(
     AcceptFormat(fmt): AcceptFormat,
@@ -2215,6 +2252,22 @@ async fn replace_cron_group(
     // Validate group name.
     if let Err(msg) = validate_name("cron group name", &name) {
         return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
+    }
+
+    // Check for duplicate entry names.
+    {
+        let mut seen = HashSet::with_capacity(req.entries.len());
+        for entry in &req.entries {
+            if !seen.insert(&entry.name) {
+                return respond(
+                    fmt,
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse {
+                        error: format!("duplicate cron entry name: {:?}", entry.name),
+                    },
+                );
+            }
+        }
     }
 
     // Convert request entries to store options.
@@ -2303,6 +2356,113 @@ async fn replace_cron_group(
         }
         Err(e) => {
             tracing::error!(%e, "replace_cron_group failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PATCH /crons/{name}` — update group-level fields (pause/unpause).
+async fn patch_cron_group(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<PatchCronGroupRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state
+        .store
+        .patch_cron_group(&name, req.paused, now_ms)
+        .await
+    {
+        Ok(Some(group)) => {
+            // Re-fetch the full group with entries for the response.
+            match state.store.get_cron_group(&name).await {
+                Ok(Some((_, entries))) => respond(
+                    fmt,
+                    StatusCode::OK,
+                    &CronGroupResponse::from_store(name, group, entries),
+                ),
+                Ok(None) => respond(
+                    fmt,
+                    StatusCode::NOT_FOUND,
+                    &ErrorResponse {
+                        error: format!("cron group '{name}' not found"),
+                    },
+                ),
+                Err(e) => {
+                    tracing::error!(%e, "patch_cron_group: failed to re-fetch group");
+                    respond(
+                        fmt,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse {
+                            error: "internal error".into(),
+                        },
+                    )
+                }
+            }
+        }
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("cron group '{name}' not found"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_cron_group failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `DELETE /crons/{name}` — delete a cron group and all its entries.
+async fn delete_cron_group(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.delete_cron_group(&name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("cron group '{name}' not found"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "delete_cron_group failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6888,6 +7048,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cron_put_rejects_duplicate_entry_names() {
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [
+                    { "name": "e1", "expression": "* * * * *", "job": { "type": "t", "queue": "q", "payload": {} } },
+                    { "name": "e1", "expression": "*/5 * * * *", "job": { "type": "t", "queue": "q", "payload": {} } },
+                ]
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("duplicate"));
+    }
+
+    #[tokio::test]
     async fn cron_put_accepts_group_level_paused() {
         let req = cron_put(
             "default",
@@ -6984,6 +7162,174 @@ mod tests {
     #[tokio::test]
     async fn cron_get_returns_403_on_free_tier() {
         let req = empty_request("GET", "/crons/default");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cron_delete_removes_group() {
+        let app = pro_app();
+
+        // Create a group.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "* * * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Delete it.
+        let req = empty_request("DELETE", "/crons/default");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // Verify it's gone.
+        let req = empty_request("GET", "/crons/default");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_delete_returns_404_for_missing_group() {
+        let req = empty_request("DELETE", "/crons/nonexistent");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_delete_returns_403_on_free_tier() {
+        let req = empty_request("DELETE", "/crons/default");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn cron_patch(name: &str, body: &serde_json::Value) -> Request {
+        json_request("PATCH", &format!("/crons/{name}"), body)
+    }
+
+    #[tokio::test]
+    async fn cron_patch_pauses_group() {
+        let app = pro_app();
+
+        // Create a group.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "* * * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Pause it.
+        let req = cron_patch("default", &serde_json::json!({ "paused": true }));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["paused"], true);
+        assert!(body["paused_at"].is_number());
+        // Entries should still be returned.
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_unpauses_group() {
+        let app = pro_app();
+
+        // Create a paused group.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "paused": true,
+                "entries": [{
+                    "name": "e1",
+                    "expression": "* * * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Unpause it.
+        let req = cron_patch("default", &serde_json::json!({ "paused": false }));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["paused"], false);
+        assert!(body["resumed_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn cron_patch_returns_404_for_missing_group() {
+        let req = cron_patch("nonexistent", &serde_json::json!({ "paused": true }));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_returns_403_on_free_tier() {
+        let req = cron_patch("default", &serde_json::json!({ "paused": true }));
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cron_list_returns_group_names() {
+        let app = pro_app();
+
+        // Create two groups.
+        for name in &["alpha", "beta"] {
+            let req = cron_put(
+                name,
+                &serde_json::json!({
+                    "entries": [{
+                        "name": "e1",
+                        "expression": "* * * * *",
+                        "job": { "type": "t", "queue": "q", "payload": {} }
+                    }]
+                }),
+            );
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        let req = empty_request("GET", "/crons");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let crons = body["crons"].as_array().unwrap();
+        assert_eq!(crons.len(), 2);
+        assert!(crons.contains(&serde_json::json!("alpha")));
+        assert!(crons.contains(&serde_json::json!("beta")));
+    }
+
+    #[tokio::test]
+    async fn cron_list_returns_empty_when_no_groups() {
+        let req = empty_request("GET", "/crons");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["crons"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cron_list_returns_403_on_free_tier() {
+        let req = empty_request("GET", "/crons");
         let res = test_app().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }

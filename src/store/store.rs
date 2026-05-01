@@ -4123,6 +4123,58 @@ impl Store {
         .await?
     }
 
+    /// List all cron group names.
+    ///
+    /// Uses a prefix-stepping range scan over `C` tag keys, extracting
+    /// distinct group names. Same O(n) approach as `list_queues`.
+    pub async fn list_cron_groups(&self) -> Result<Vec<String>, StoreError> {
+        let ks = self.ks.clone();
+
+        task::spawn_blocking(move || {
+            let snapshot = ks.db.read_tx();
+
+            let end: Vec<u8> = vec![RecordKind::Cron as u8 + 1];
+            let mut start: Vec<u8> = vec![RecordKind::Cron as u8];
+            let mut groups = Vec::new();
+
+            loop {
+                let mut range = snapshot.range::<Vec<u8>, _>(
+                    ks.data.as_ref(),
+                    (Bound::Included(start.clone()), Bound::Excluded(end.clone())),
+                );
+
+                let entry = match range.next() {
+                    Some(entry) => entry,
+                    None => break,
+                };
+
+                let (key, _) = entry.into_inner()?;
+
+                // Key layout: C{group_name}\0... — extract group_name.
+                let name_start = 1; // skip C tag
+                let name_end = key[name_start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| name_start + p)
+                    .unwrap_or(key.len());
+                let group_name = std::str::from_utf8(&key[name_start..name_end])
+                    .map_err(|e| {
+                        StoreError::Corruption(format!("cron group name is not valid UTF-8: {e}"))
+                    })?
+                    .to_string();
+                groups.push(group_name.clone());
+
+                // Advance past all keys for this group: C{group_name}\x01
+                start.truncate(1); // keep C tag
+                start.extend_from_slice(group_name.as_bytes());
+                start.push(1); // one byte past \0 separator
+            }
+
+            Ok(groups)
+        })
+        .await?
+    }
+
     /// Load a cron group and all its entries.
     ///
     /// Returns `None` if the group does not exist.
@@ -4164,6 +4216,107 @@ impl Store {
                 Ok(Some((group_meta, entries)))
             },
         )
+        .await?
+    }
+
+    /// Update group-level metadata (currently just pause state).
+    ///
+    /// Returns the updated group, or `None` if the group does not exist.
+    pub async fn patch_cron_group(
+        &self,
+        group: &str,
+        paused: bool,
+        now: u64,
+    ) -> Result<Option<CronGroup>, StoreError> {
+        let ks = self.ks.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+
+        task::spawn_blocking(move || -> Result<Option<CronGroup>, StoreError> {
+            let group_key = make_cron_group_key(&group);
+
+            let mut tx = ks.write_tx();
+
+            let mut group_meta: CronGroup = match ks.data.get(&group_key)? {
+                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                None => return Ok(None),
+            };
+
+            if paused != group_meta.paused {
+                match (group_meta.paused, paused) {
+                    (false, true) => group_meta.paused_at = Some(now),
+                    (true, false) => group_meta.resumed_at = Some(now),
+                    _ => {}
+                }
+                group_meta.paused = paused;
+                tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group_meta)?);
+                ks.commit(tx, ks.default_commit_mode)?;
+                let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+            }
+
+            Ok(Some(group_meta))
+        })
+        .await?
+    }
+
+    /// Delete a cron group and all its entries.
+    ///
+    /// Returns `true` if the group existed and was deleted, `false` if it
+    /// did not exist.
+    pub async fn delete_cron_group(&self, group: &str) -> Result<bool, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+
+        task::spawn_blocking(move || -> Result<bool, StoreError> {
+            let group_key = make_cron_group_key(&group);
+            let prefix = make_cron_group_prefix(&group);
+
+            let mut tx = ks.write_tx();
+
+            // Check if the group exists.
+            if ks.data.get(&group_key)?.is_none() {
+                return Ok(false);
+            }
+
+            // Collect all entry keys and their next_enqueue_at for index cleanup.
+            let mut range_end = prefix.clone();
+            *range_end.last_mut().unwrap() = 1;
+
+            let data: &fjall::Keyspace = ks.data.as_ref();
+            let mut entries_to_remove: Vec<(String, Option<u64>)> = Vec::new();
+
+            for guard in data
+                .range::<Vec<u8>, _>((Bound::Included(prefix.clone()), Bound::Excluded(range_end)))
+            {
+                let (key, value) = guard.into_inner()?;
+                // Remove everything — group metadata and all entries.
+                tx.remove(&ks.data, key.as_ref());
+
+                // Track entry next_enqueue_at for index cleanup (skip group key).
+                if key.len() > prefix.len() {
+                    let entry: CronEntry = rmp_serde::from_slice(&value)?;
+                    entries_to_remove.push((entry.name, entry.next_enqueue_at));
+                }
+            }
+
+            // Remove the group metadata key itself.
+            tx.remove(&ks.data, &group_key);
+
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            // ---- outside tx: update in-memory cron index ----
+            for (entry_name, next) in &entries_to_remove {
+                if let Some(next) = next {
+                    cron_index.remove(*next, &group, entry_name);
+                }
+            }
+
+            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+
+            Ok(true)
+        })
         .await?
     }
 
@@ -12467,5 +12620,224 @@ mod tests {
         let next = entries[0].next_enqueue_at.unwrap();
         assert!(next > now);
         assert!(next <= now + 30_000);
+    }
+
+    #[tokio::test]
+    async fn list_cron_groups_returns_names() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        assert!(store.list_cron_groups().await.unwrap().is_empty());
+
+        for name in &["alpha", "beta", "gamma"] {
+            store
+                .replace_cron_group(
+                    name,
+                    ReplaceCronGroupOptions {
+                        paused: None,
+                        entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut groups = store.list_cron_groups().await.unwrap();
+        groups.sort();
+        assert_eq!(groups, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn list_cron_groups_handles_common_prefixes() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        // Groups with shared prefixes that could confuse prefix scanning.
+        for name in &["billing", "billing-events", "billing-payments"] {
+            store
+                .replace_cron_group(
+                    name,
+                    ReplaceCronGroupOptions {
+                        paused: None,
+                        entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut groups = store.list_cron_groups().await.unwrap();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec!["billing", "billing-events", "billing-payments"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_cron_group_removes_group_and_entries() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![
+                        cron_entry_opts("e1", "* * * * *", "q", "test"),
+                        cron_entry_opts("e2", "* * * * *", "q", "test"),
+                    ],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(store.delete_cron_group("default").await.unwrap());
+
+        // Group should be gone.
+        assert!(store.get_cron_group("default").await.unwrap().is_none());
+
+        // Entries should be gone.
+        assert!(
+            store
+                .get_cron_entry("default", "e1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_cron_entry("default", "e2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Should not appear in listing.
+        assert!(store.list_cron_groups().await.unwrap().is_empty());
+
+        // Index should be empty.
+        assert!(store.cron_next_due_at().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_cron_group_returns_false_for_missing() {
+        let store = test_store();
+        assert!(!store.delete_cron_group("nonexistent").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_cron_group_does_not_affect_other_groups() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        for name in &["keep", "delete"] {
+            store
+                .replace_cron_group(
+                    name,
+                    ReplaceCronGroupOptions {
+                        paused: None,
+                        entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+
+        store.delete_cron_group("delete").await.unwrap();
+
+        let groups = store.list_cron_groups().await.unwrap();
+        assert_eq!(groups, vec!["keep"]);
+
+        // The kept group should still have its entry.
+        assert!(store.get_cron_entry("keep", "e1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn get_cron_group_returns_group_and_entries() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![
+                        cron_entry_opts("e1", "* * * * *", "q", "test"),
+                        cron_entry_opts("e2", "*/5 * * * *", "q", "test"),
+                    ],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        let (group, entries) = store.get_cron_group("default").await.unwrap().unwrap();
+        assert!(!group.paused);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "e1");
+        assert_eq!(entries[1].name, "e2");
+    }
+
+    #[tokio::test]
+    async fn get_cron_group_returns_none_for_missing() {
+        let store = test_store();
+        assert!(store.get_cron_group("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_cron_group_pauses_and_unpauses() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        // Pause.
+        let group = store
+            .patch_cron_group("default", true, now + 1000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(group.paused);
+        assert_eq!(group.paused_at, Some(now + 1000));
+        assert!(group.resumed_at.is_none());
+
+        // Unpause.
+        let group = store
+            .patch_cron_group("default", false, now + 2000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!group.paused);
+        assert_eq!(group.paused_at, Some(now + 1000));
+        assert_eq!(group.resumed_at, Some(now + 2000));
+    }
+
+    #[tokio::test]
+    async fn patch_cron_group_returns_none_for_missing() {
+        let store = test_store();
+        assert!(
+            store
+                .patch_cron_group("missing", true, CRON_NOW)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
