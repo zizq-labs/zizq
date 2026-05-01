@@ -33,6 +33,9 @@ pub enum StoreError {
     /// The requested operation is not valid for the job's current state.
     InvalidOperation(String),
 
+    /// A resource already exists (e.g. duplicate cron entry name).
+    Conflict(String),
+
     /// Internal error (e.g. sync channel closed).
     Internal(String),
 }
@@ -46,6 +49,7 @@ impl fmt::Display for StoreError {
             StoreError::TaskJoin(e) => write!(f, "blocking task failed: {e}"),
             StoreError::Corruption(msg) => write!(f, "data corruption: {msg}"),
             StoreError::InvalidOperation(msg) => write!(f, "invalid operation: {msg}"),
+            StoreError::Conflict(msg) => write!(f, "conflict: {msg}"),
             StoreError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }

@@ -33,12 +33,13 @@ use crate::state::AppState;
 
 use super::types::{
     BulkEnqueueRequest, BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest,
-    CommaSet, CountJobsParams, CountJobsResponse, CronGroupResponse, DeleteJobsParams,
-    EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse, Job, JobStatus,
-    ListCronGroupsResponse, ListErrorsPages, ListErrorsParams, ListErrorsResponse, ListJobsPages,
-    ListJobsParams, ListJobsResponse, ListQueuesResponse, Order, PatchCronGroupRequest,
-    PatchJobBody, PatchJobsParams, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
-    VersionResponse, parse_unique_while,
+    CommaSet, CountJobsParams, CountJobsResponse, CronEntryRequest, CronEntryResponse,
+    CronGroupResponse, DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse,
+    FailureRequest, HealthResponse, Job, JobStatus, ListCronGroupsResponse, ListErrorsPages,
+    ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse,
+    ListQueuesResponse, Order, PatchCronGroupRequest, PatchJobBody, PatchJobsParams,
+    ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse, VersionResponse,
+    parse_unique_while,
 };
 
 /// Default priority for jobs that don't specify one.
@@ -408,6 +409,14 @@ pub fn app(state: Arc<AppState>) -> Router {
                 .put(replace_cron_group)
                 .patch(patch_cron_group)
                 .delete(delete_cron_group),
+        )
+        .route("/crons/{name}/entries", post(add_cron_entry))
+        .route(
+            "/crons/{name}/entries/{entry}",
+            get(get_cron_entry)
+                .put(put_cron_entry)
+                .patch(patch_cron_entry)
+                .delete(delete_cron_entry),
         )
         .fallback(not_found)
         .layer(axum::middleware::from_fn(
@@ -2159,6 +2168,53 @@ async fn take_jobs(
 
 // --- Cron scheduling ---
 
+/// Validate a cron entry request and convert it to store options.
+fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOptions, String> {
+    validate_name("cron entry name", &entry.name)?;
+    validate_name("type", &entry.job.job_type)?;
+    validate_name("queue", &entry.job.queue)?;
+
+    if entry.job.ready_at.is_some() {
+        return Err("ready_at is not supported for cron entries".into());
+    }
+
+    let unique_while = if let Some(ref s) = entry.job.unique_while {
+        Some(parse_unique_while(s)?)
+    } else {
+        None
+    };
+
+    let priority = entry.job.priority.unwrap_or(DEFAULT_PRIORITY);
+
+    let mut opts =
+        store::EnqueueOptions::new(entry.job.job_type, entry.job.queue, entry.job.payload)
+            .priority(priority);
+
+    if let Some(retry_limit) = entry.job.retry_limit {
+        opts = opts.retry_limit(retry_limit);
+    }
+    if let Some(backoff) = entry.job.backoff {
+        opts = opts.backoff(backoff.into());
+    }
+    if let Some(retention) = entry.job.retention {
+        opts = opts.retention(retention.into());
+    }
+    if let Some(key) = entry.job.unique_key {
+        opts = opts.unique_key(key);
+    }
+    if let Some(uw) = unique_while {
+        opts = opts.unique_while(uw);
+    }
+
+    Ok(store::CronEntryOptions {
+        name: entry.name,
+        expression: entry.expression,
+        timezone: entry.timezone,
+        paused: entry.paused,
+        job: opts,
+    })
+}
+
 /// Handle `GET /crons` — list all cron group names.
 async fn list_cron_groups(
     AcceptFormat(fmt): AcceptFormat,
@@ -2270,74 +2326,13 @@ async fn replace_cron_group(
         }
     }
 
-    // Convert request entries to store options.
+    // Validate and convert entries.
     let mut entry_opts = Vec::with_capacity(req.entries.len());
     for entry in req.entries {
-        // Validate entry name.
-        if let Err(msg) = validate_name("cron entry name", &entry.name) {
-            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
+        match validate_cron_entry(entry) {
+            Ok(opts) => entry_opts.push(opts),
+            Err(e) => return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: e }),
         }
-
-        // Validate job fields.
-        if let Err(msg) = validate_name("type", &entry.job.job_type) {
-            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
-        }
-        if let Err(msg) = validate_name("queue", &entry.job.queue) {
-            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
-        }
-
-        // ready_at is not supported for cron entries.
-        if entry.job.ready_at.is_some() {
-            return respond(
-                fmt,
-                StatusCode::BAD_REQUEST,
-                &ErrorResponse {
-                    error: "ready_at is not supported for cron entries".into(),
-                },
-            );
-        }
-
-        // Parse unique_while if present.
-        let unique_while = if let Some(ref s) = entry.job.unique_while {
-            match parse_unique_while(s) {
-                Ok(uw) => Some(uw),
-                Err(e) => {
-                    return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: e });
-                }
-            }
-        } else {
-            None
-        };
-
-        let priority = entry.job.priority.unwrap_or(DEFAULT_PRIORITY);
-
-        let mut opts =
-            store::EnqueueOptions::new(entry.job.job_type, entry.job.queue, entry.job.payload)
-                .priority(priority);
-
-        if let Some(retry_limit) = entry.job.retry_limit {
-            opts = opts.retry_limit(retry_limit);
-        }
-        if let Some(backoff) = entry.job.backoff {
-            opts = opts.backoff(backoff.into());
-        }
-        if let Some(retention) = entry.job.retention {
-            opts = opts.retention(retention.into());
-        }
-        if let Some(key) = entry.job.unique_key {
-            opts = opts.unique_key(key);
-        }
-        if let Some(uw) = unique_while {
-            opts = opts.unique_while(uw);
-        }
-
-        entry_opts.push(store::CronEntryOptions {
-            name: entry.name,
-            expression: entry.expression,
-            timezone: entry.timezone,
-            paused: entry.paused,
-            job: opts,
-        });
     }
 
     let opts = store::ReplaceCronGroupOptions {
@@ -2356,6 +2351,171 @@ async fn replace_cron_group(
         }
         Err(e) => {
             tracing::error!(%e, "replace_cron_group failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PUT /crons/{name}/entries/{entry}` — create or replace a single cron entry.
+async fn put_cron_entry(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((name, entry_name)): Path<(String, String)>,
+    NegotiatedBody(req): NegotiatedBody<CronEntryRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    if let Err(msg) = validate_name("cron group name", &name) {
+        return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
+    }
+
+    // The entry name in the URL takes precedence.
+    let mut opts = match validate_cron_entry(req) {
+        Ok(opts) => opts,
+        Err(e) => return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: e }),
+    };
+    opts.name = entry_name;
+
+    match state.store.put_cron_entry(&name, opts, now_ms).await {
+        Ok(entry) => respond(fmt, StatusCode::OK, &CronEntryResponse::from_store(entry)),
+        Err(StoreError::InvalidOperation(msg)) => {
+            respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg })
+        }
+        Err(e) => {
+            tracing::error!(%e, "put_cron_entry failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `GET /crons/{name}/entries/{entry}` — fetch a single cron entry.
+async fn get_cron_entry(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((name, entry)): Path<(String, String)>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.get_cron_entry(&name, &entry).await {
+        Ok(Some(entry)) => respond(fmt, StatusCode::OK, &CronEntryResponse::from_store(entry)),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("cron entry '{entry}' not found in group '{name}'"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "get_cron_entry failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PATCH /crons/{name}/entries/{entry}` — update entry-level fields (pause/unpause).
+async fn patch_cron_entry(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((name, entry)): Path<(String, String)>,
+    NegotiatedBody(req): NegotiatedBody<PatchCronGroupRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state
+        .store
+        .patch_cron_entry(&name, &entry, req.paused, now_ms)
+        .await
+    {
+        Ok(Some(entry)) => respond(fmt, StatusCode::OK, &CronEntryResponse::from_store(entry)),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("cron entry '{entry}' not found in group '{name}'"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_cron_entry failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `DELETE /crons/{name}/entries/{entry}` — delete a single cron entry.
+async fn delete_cron_entry(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((name, entry)): Path<(String, String)>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.delete_cron_entry(&name, &entry).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("cron entry '{entry}' not found in group '{name}'"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "delete_cron_entry failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2425,6 +2585,57 @@ async fn patch_cron_group(
         ),
         Err(e) => {
             tracing::error!(%e, "patch_cron_group failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /crons/{name}/entries` — add a single entry to a cron group.
+async fn add_cron_entry(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<CronEntryRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    if let Err(msg) = validate_name("cron group name", &name) {
+        return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg });
+    }
+
+    let opts = match validate_cron_entry(req) {
+        Ok(opts) => opts,
+        Err(e) => return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: e }),
+    };
+
+    match state.store.add_cron_entry(&name, opts, now_ms).await {
+        Ok(entry) => respond(
+            fmt,
+            StatusCode::CREATED,
+            &CronEntryResponse::from_store(entry),
+        ),
+        Err(StoreError::Conflict(msg)) => {
+            respond(fmt, StatusCode::CONFLICT, &ErrorResponse { error: msg })
+        }
+        Err(StoreError::InvalidOperation(msg)) => {
+            respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg })
+        }
+        Err(e) => {
+            tracing::error!(%e, "add_cron_entry failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -7330,6 +7541,361 @@ mod tests {
     #[tokio::test]
     async fn cron_list_returns_403_on_free_tier() {
         let req = empty_request("GET", "/crons");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn cron_post_entry(group: &str, body: &serde_json::Value) -> Request {
+        json_request("POST", &format!("/crons/{group}/entries"), body)
+    }
+
+    #[tokio::test]
+    async fn cron_post_entry_creates_entry() {
+        let req = cron_post_entry(
+            "default",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "test", "queue": "q", "payload": { "x": 1 } }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["name"], "e1");
+        assert_eq!(body["expression"], "* * * * *");
+        assert!(body["next_enqueue_at"].is_number());
+        assert_eq!(body["job"]["type"], "test");
+    }
+
+    #[tokio::test]
+    async fn cron_post_entry_auto_creates_group() {
+        let app = pro_app();
+
+        // POST an entry to a group that doesn't exist.
+        let req = cron_post_entry(
+            "new-group",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "t", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // The group should now be GETable.
+        let req = empty_request("GET", "/crons/new-group");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cron_post_entry_returns_409_on_duplicate() {
+        let app = pro_app();
+
+        let entry = serde_json::json!({
+            "name": "e1",
+            "expression": "* * * * *",
+            "job": { "type": "t", "queue": "q", "payload": {} }
+        });
+
+        // First POST — should succeed.
+        let req = cron_post_entry("default", &entry);
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // Second POST — should conflict.
+        let req = cron_post_entry("default", &entry);
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn cron_post_entry_returns_403_on_free_tier() {
+        let req = cron_post_entry(
+            "default",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "t", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cron_post_entry_validates_fields() {
+        // Invalid expression.
+        let req = cron_post_entry(
+            "default",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "bad",
+                "job": { "type": "t", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cron_delete_entry_removes_entry() {
+        let app = pro_app();
+
+        // Create a group with two entries.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [
+                    { "name": "e1", "expression": "* * * * *", "job": { "type": "t", "queue": "q", "payload": {} } },
+                    { "name": "e2", "expression": "* * * * *", "job": { "type": "t", "queue": "q", "payload": {} } },
+                ]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Delete e1.
+        let req = empty_request("DELETE", "/crons/default/entries/e1");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // Verify e1 is gone, e2 remains.
+        let req = empty_request("GET", "/crons/default");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "e2");
+    }
+
+    #[tokio::test]
+    async fn cron_delete_entry_returns_404_for_missing() {
+        let req = empty_request("DELETE", "/crons/default/entries/missing");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_delete_entry_returns_403_on_free_tier() {
+        let req = empty_request("DELETE", "/crons/default/entries/e1");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cron_get_entry_returns_entry() {
+        let app = pro_app();
+
+        // Create a group with an entry.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "* * * * *",
+                    "job": { "type": "test", "queue": "q", "payload": { "x": 1 } }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET the entry.
+        let req = empty_request("GET", "/crons/default/entries/e1");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["name"], "e1");
+        assert_eq!(body["expression"], "* * * * *");
+        assert_eq!(body["job"]["type"], "test");
+    }
+
+    #[tokio::test]
+    async fn cron_get_entry_returns_404_for_missing() {
+        let req = empty_request("GET", "/crons/default/entries/missing");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_get_entry_returns_403_on_free_tier() {
+        let req = empty_request("GET", "/crons/default/entries/e1");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn cron_put_entry(group: &str, entry: &str, body: &serde_json::Value) -> Request {
+        json_request("PUT", &format!("/crons/{group}/entries/{entry}"), body)
+    }
+
+    #[tokio::test]
+    async fn cron_put_entry_creates_new_entry() {
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "ignored",
+                "expression": "* * * * *",
+                "job": { "type": "test", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        // URL name takes precedence over body name.
+        assert_eq!(body["name"], "e1");
+        assert!(body["next_enqueue_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn cron_put_entry_replaces_existing_entry() {
+        let app = pro_app();
+
+        // Create entry.
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "old_type", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Replace with new job type.
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "new_type", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["job"]["type"], "new_type");
+    }
+
+    #[tokio::test]
+    async fn cron_put_entry_preserves_schedule_when_expression_unchanged() {
+        let app = pro_app();
+
+        // Create entry.
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "*/5 * * * *",
+                "job": { "type": "t", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body1: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let original_next = body1["next_enqueue_at"].as_u64().unwrap();
+
+        // Replace with same expression but different payload.
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "*/5 * * * *",
+                "job": { "type": "t", "queue": "q", "payload": { "updated": true } }
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body2: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body2["next_enqueue_at"].as_u64().unwrap(), original_next);
+    }
+
+    #[tokio::test]
+    async fn cron_put_entry_returns_403_on_free_tier() {
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "t", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn cron_patch_entry(group: &str, entry: &str, body: &serde_json::Value) -> Request {
+        json_request("PATCH", &format!("/crons/{group}/entries/{entry}"), body)
+    }
+
+    #[tokio::test]
+    async fn cron_patch_entry_pauses() {
+        let app = pro_app();
+
+        // Create entry.
+        let req = cron_put_entry(
+            "default",
+            "e1",
+            &serde_json::json!({
+                "name": "e1",
+                "expression": "* * * * *",
+                "job": { "type": "t", "queue": "q", "payload": {} }
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Pause it.
+        let req = cron_patch_entry("default", "e1", &serde_json::json!({ "paused": true }));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["paused"], true);
+        assert!(body["paused_at"].is_number());
+
+        // Unpause it.
+        let req = cron_patch_entry("default", "e1", &serde_json::json!({ "paused": false }));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["paused"], false);
+        assert!(body["resumed_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn cron_patch_entry_returns_404_for_missing() {
+        let req = cron_patch_entry("default", "missing", &serde_json::json!({ "paused": true }));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_entry_returns_403_on_free_tier() {
+        let req = cron_patch_entry("default", "e1", &serde_json::json!({ "paused": true }));
         let res = test_app().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }

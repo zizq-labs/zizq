@@ -41,8 +41,8 @@ use super::scheduled_index::ScheduledIndex;
 use super::cron::{CronEntry, CronGroup};
 use super::group_committer::GroupCommitter;
 use super::options::{
-    BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, FailureOptions, ListErrorsOptions,
-    ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
+    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
+    ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
 };
 use super::results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
 use super::types::{
@@ -4028,56 +4028,14 @@ impl Store {
                 entries.iter().map(|e| e.name.clone()).collect();
 
             // Build the new entries with smart merge logic.
-            let mut new_entries = Vec::with_capacity(input_names.len());
-
-            for (input, computed) in entries.into_iter().zip(computed_next) {
-                let entry = if let Some(old) = existing_entries.get(&input.name) {
-                    let (next, last) = if old.expression == input.expression {
-                        // Cron expr is the same — don't reset state.
-                        (old.next_enqueue_at, old.last_enqueue_at)
-                    } else {
-                        // Cron expr changed — recalculate.
-                        (computed, old.last_enqueue_at)
-                    };
-
-                    // Preserve original paused state unless overridden.
-                    let paused = input.paused.unwrap_or(old.paused);
-                    let (paused_at, resumed_at) = match (old.paused, paused) {
-                        // Unpaused -> Paused: set paused_at
-                        (false, true) => (Some(now), old.resumed_at),
-                        // Paused -> Unpaused: set resumed_at
-                        (true, false) => (old.paused_at, Some(now)),
-                        // No change
-                        _ => (old.paused_at, old.resumed_at),
-                    };
-
-                    CronEntry {
-                        name: input.name,
-                        expression: input.expression,
-                        timezone: input.timezone,
-                        paused,
-                        paused_at,
-                        resumed_at,
-                        job: input.job,
-                        next_enqueue_at: next,
-                        last_enqueue_at: last,
-                    }
-                } else {
-                    CronEntry {
-                        name: input.name,
-                        expression: input.expression,
-                        timezone: input.timezone,
-                        paused: input.paused.unwrap_or(false),
-                        paused_at: None,
-                        resumed_at: None,
-                        job: input.job,
-                        next_enqueue_at: computed,
-                        last_enqueue_at: None,
-                    }
-                };
-
-                new_entries.push(entry);
-            }
+            let new_entries: Vec<CronEntry> = entries
+                .into_iter()
+                .zip(computed_next)
+                .map(|(input, computed)| {
+                    let existing = existing_entries.get(&input.name);
+                    merge_cron_entry(input, existing, computed, now)
+                })
+                .collect();
 
             // Delete removed entries (present in existing but not in input).
             for (name, _) in &existing_entries {
@@ -4091,11 +4049,6 @@ impl Store {
                 let entry_key = make_cron_entry_key(&group, &entry.name);
                 let entry_bytes = rmp_serde::to_vec_named(entry)?;
                 tx.insert(&ks.data, &entry_key, &entry_bytes);
-            }
-
-            // If the group is now empty, clean up the group metadata key.
-            if new_entries.is_empty() {
-                tx.remove(&ks.data, &group_key);
             }
 
             ks.commit(tx, ks.default_commit_mode)?;
@@ -4216,6 +4169,228 @@ impl Store {
                 Ok(Some((group_meta, entries)))
             },
         )
+        .await?
+    }
+
+    /// Add a single entry to a cron group.
+    ///
+    /// Creates the group if it does not exist. Returns `Err` with
+    /// `StoreError::Conflict` if an entry with the same name already
+    /// exists in the group.
+    pub async fn add_cron_entry(
+        &self,
+        group: &str,
+        opts: CronEntryOptions,
+        now: u64,
+    ) -> Result<CronEntry, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+
+        task::spawn_blocking(move || -> Result<CronEntry, StoreError> {
+            // Validate the cron expression before acquiring the write lock.
+            let next_enqueue_at = cron_next_after(&opts.expression, now, opts.timezone.as_deref())?;
+
+            let group_key = make_cron_group_key(&group);
+            let entry_key = make_cron_entry_key(&group, &opts.name);
+
+            let mut tx = ks.write_tx();
+
+            // Load or create group metadata.
+            if ks.data.get(&group_key)?.is_none() {
+                let group_meta = CronGroup::default();
+                tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group_meta)?);
+            }
+
+            // Check for conflict.
+            if ks.data.get(&entry_key)?.is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "cron entry '{}' already exists in group '{}'",
+                    opts.name, group
+                )));
+            }
+
+            let entry = CronEntry {
+                name: opts.name,
+                expression: opts.expression,
+                timezone: opts.timezone,
+                paused: opts.paused.unwrap_or(false),
+                paused_at: None,
+                resumed_at: None,
+                job: opts.job,
+                next_enqueue_at,
+                last_enqueue_at: None,
+            };
+
+            tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
+
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            // ---- outside tx: update in-memory cron index ----
+            if let Some(next) = entry.next_enqueue_at {
+                cron_index.insert(next, group.clone(), entry.name.clone());
+            }
+
+            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+
+            Ok(entry)
+        })
+        .await?
+    }
+
+    /// Create or replace a single entry in a cron group.
+    ///
+    /// Creates the group if it does not exist. If the entry already exists,
+    /// applies the same smart merge as `replace_cron_group`: preserves
+    /// scheduling state when the expression is unchanged, preserves pause
+    /// state when omitted.
+    pub async fn put_cron_entry(
+        &self,
+        group: &str,
+        opts: CronEntryOptions,
+        now: u64,
+    ) -> Result<CronEntry, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+
+        task::spawn_blocking(move || -> Result<CronEntry, StoreError> {
+            let next_enqueue_at = cron_next_after(&opts.expression, now, opts.timezone.as_deref())?;
+
+            let group_key = make_cron_group_key(&group);
+            let entry_key = make_cron_entry_key(&group, &opts.name);
+
+            let mut tx = ks.write_tx();
+
+            // Load or create group metadata.
+            if ks.data.get(&group_key)?.is_none() {
+                let group_meta = CronGroup::default();
+                tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group_meta)?);
+            }
+
+            // Load existing entry for smart merge.
+            let old_entry: Option<CronEntry> = match ks.data.get(&entry_key)? {
+                Some(bytes) => Some(rmp_serde::from_slice(&bytes)?),
+                None => None,
+            };
+
+            let entry = merge_cron_entry(opts, old_entry.as_ref(), next_enqueue_at, now);
+
+            tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
+
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            // ---- outside tx: update in-memory cron index ----
+            if let Some(old) = &old_entry {
+                if let Some(next) = old.next_enqueue_at {
+                    cron_index.remove(next, &group, &entry.name);
+                }
+            }
+            if let Some(next) = entry.next_enqueue_at {
+                cron_index.insert(next, group.clone(), entry.name.clone());
+            }
+
+            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+
+            Ok(entry)
+        })
+        .await?
+    }
+
+    /// Delete a single entry from a cron group.
+    ///
+    /// Returns `true` if the entry existed and was deleted, `false` if
+    /// the group or entry does not exist.
+    /// Update a single cron entry's pause state.
+    ///
+    /// Returns the updated entry, or `None` if the group or entry does
+    /// not exist.
+    pub async fn patch_cron_entry(
+        &self,
+        group: &str,
+        entry_name: &str,
+        paused: bool,
+        now: u64,
+    ) -> Result<Option<CronEntry>, StoreError> {
+        let ks = self.ks.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+        let entry_name = entry_name.to_string();
+
+        task::spawn_blocking(move || -> Result<Option<CronEntry>, StoreError> {
+            let group_key = make_cron_group_key(&group);
+            let entry_key = make_cron_entry_key(&group, &entry_name);
+
+            // Check group exists.
+            if ks.data.get(&group_key)?.is_none() {
+                return Ok(None);
+            }
+
+            let mut tx = ks.write_tx();
+
+            let mut entry: CronEntry = match ks.data.get(&entry_key)? {
+                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                None => return Ok(None),
+            };
+
+            if paused != entry.paused {
+                match (entry.paused, paused) {
+                    (false, true) => entry.paused_at = Some(now),
+                    (true, false) => entry.resumed_at = Some(now),
+                    _ => {}
+                }
+                entry.paused = paused;
+                tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
+                ks.commit(tx, ks.default_commit_mode)?;
+                let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+            }
+
+            Ok(Some(entry))
+        })
+        .await?
+    }
+
+    pub async fn delete_cron_entry(
+        &self,
+        group: &str,
+        entry_name: &str,
+    ) -> Result<bool, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let event_tx = self.event_tx.clone();
+        let group = group.to_string();
+        let entry_name = entry_name.to_string();
+
+        task::spawn_blocking(move || -> Result<bool, StoreError> {
+            let group_key = make_cron_group_key(&group);
+            let entry_key = make_cron_entry_key(&group, &entry_name);
+
+            // Check group exists.
+            if ks.data.get(&group_key)?.is_none() {
+                return Ok(false);
+            }
+
+            // Load entry for index cleanup.
+            let entry: CronEntry = match ks.data.get(&entry_key)? {
+                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                None => return Ok(false),
+            };
+
+            let mut tx = ks.write_tx();
+            tx.remove(&ks.data, &entry_key);
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            // ---- outside tx: update in-memory cron index ----
+            if let Some(next) = entry.next_enqueue_at {
+                cron_index.remove(next, &group, &entry_name);
+            }
+
+            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+
+            Ok(true)
+        })
         .await?
     }
 
@@ -4571,6 +4746,62 @@ fn make_cron_group_prefix(group: &str) -> Vec<u8> {
 /// local timezone is used.
 ///
 /// Returns `None` if the expression has no future occurrences.
+/// Merge a `CronEntryOptions` with an optional existing `CronEntry`.
+///
+/// When an existing entry is present and the expression hasn't changed,
+/// preserves `next_enqueue_at` and `last_enqueue_at`. When `paused` is
+/// omitted in the options, preserves the existing pause state. Tracks
+/// `paused_at` / `resumed_at` transitions.
+///
+/// `computed_next` is the pre-computed next enqueue time from the new
+/// expression — used only when the expression has changed or the entry
+/// is new.
+fn merge_cron_entry(
+    opts: CronEntryOptions,
+    existing: Option<&CronEntry>,
+    computed_next: Option<u64>,
+    now: u64,
+) -> CronEntry {
+    if let Some(old) = existing {
+        let (next, last) = if old.expression == opts.expression {
+            (old.next_enqueue_at, old.last_enqueue_at)
+        } else {
+            (computed_next, old.last_enqueue_at)
+        };
+
+        let paused = opts.paused.unwrap_or(old.paused);
+        let (paused_at, resumed_at) = match (old.paused, paused) {
+            (false, true) => (Some(now), old.resumed_at),
+            (true, false) => (old.paused_at, Some(now)),
+            _ => (old.paused_at, old.resumed_at),
+        };
+
+        CronEntry {
+            name: opts.name,
+            expression: opts.expression,
+            timezone: opts.timezone,
+            paused,
+            paused_at,
+            resumed_at,
+            job: opts.job,
+            next_enqueue_at: next,
+            last_enqueue_at: last,
+        }
+    } else {
+        CronEntry {
+            name: opts.name,
+            expression: opts.expression,
+            timezone: opts.timezone,
+            paused: opts.paused.unwrap_or(false),
+            paused_at: None,
+            resumed_at: None,
+            job: opts.job,
+            next_enqueue_at: computed_next,
+            last_enqueue_at: None,
+        }
+    }
+}
+
 fn cron_next_after(
     expression: &str,
     now_ms: u64,
@@ -12141,7 +12372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_cron_group_empty_entries_deletes_group() {
+    async fn replace_cron_group_empty_entries_removes_entries_but_keeps_group() {
         let store = test_store();
         let now = CRON_NOW;
 
@@ -12157,7 +12388,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Replace with empty entries — group should be cleaned up.
+        // Replace with empty entries — entries removed, group persists.
         let (_, entries) = store
             .replace_cron_group(
                 "default",
@@ -12172,9 +12403,13 @@ mod tests {
 
         assert!(entries.is_empty());
 
-        // Verify entry is gone.
+        // Entry should be gone.
         let e1 = store.get_cron_entry("default", "e1").await.unwrap();
         assert!(e1.is_none());
+
+        // Group should still exist.
+        let group = store.get_cron_group("default").await.unwrap();
+        assert!(group.is_some());
     }
 
     #[tokio::test]
@@ -12839,5 +13074,98 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_cron_entry_removes_single_entry() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![
+                        cron_entry_opts("e1", "* * * * *", "q", "test"),
+                        cron_entry_opts("e2", "* * * * *", "q", "test"),
+                    ],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(store.delete_cron_entry("default", "e1").await.unwrap());
+
+        // e1 is gone, e2 remains.
+        assert!(
+            store
+                .get_cron_entry("default", "e1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_cron_entry("default", "e2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Group still exists.
+        assert!(store.get_cron_group("default").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_cron_entry_returns_false_for_missing_group() {
+        let store = test_store();
+        assert!(!store.delete_cron_entry("nonexistent", "e1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_cron_entry_returns_false_for_missing_entry() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(!store.delete_cron_entry("default", "missing").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_cron_entry_leaves_empty_group() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    entries: vec![cron_entry_opts("e1", "* * * * *", "q", "test")],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(store.delete_cron_entry("default", "e1").await.unwrap());
+
+        // Group persists with no entries.
+        let (group, entries) = store.get_cron_group("default").await.unwrap().unwrap();
+        assert!(!group.paused);
+        assert!(entries.is_empty());
     }
 }
