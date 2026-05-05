@@ -53,6 +53,17 @@ endpoint wraps an array of `{"jobs": [...]}`.
         </tr>
         <tr>
             <td>
+                <div><code>priority</code></div>
+                <div><pre>int16</pre></div>
+            </td>
+            <td>
+                Optional numeric priority for the job. Lower values are
+                processed first (higher priority). The default value is
+                <code>32768<code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>ready_at</code></div>
                 <div><pre>int64</pre></div>
             </td>

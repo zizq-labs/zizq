@@ -35,6 +35,16 @@
         </tr>
         <tr>
             <td>
+                <div><code>priority</code> <em>required</em></div>
+                <div><pre>int16</pre></div>
+            </td>
+            <td>
+                Numeric priority for the job. Lower values are processed first
+                (higher priority). The default value is <code>32768<code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>status</code> <em>required</em></div>
                 <div><pre>string</pre></div>
             </td>

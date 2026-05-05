@@ -41,7 +41,8 @@ with your system and extract it. You should put the executable somewhere on
 your PATH but you can also just run it from the current directory.
 
 ```shell
-tar -xvzf zizq-0.1.0-linux-x86_64.tar.gz
+curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.3.0/zizq-0.3.0-linux-x86_64.tar.gz
+tar -xvzf zizq-0.3.0-linux-x86_64.tar.gz
 ```
 
 ### Starting the server
@@ -55,7 +56,7 @@ starts the server. This is the default when no other subcommand is specified.
 
 ```shell
 $ ./zizq serve
-Zizq 0.1.0
+Zizq 0.3.0
 Listening on 127.0.0.1:8901 (admin)
 Listening on 127.0.0.1:7890 (primary)
 ```
