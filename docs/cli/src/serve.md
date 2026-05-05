@@ -16,7 +16,7 @@ zizq serve
 ```
 
 ``` text
-Zizq 0.1.0
+Zizq 0.3.0
 2026-04-05T05:41:26.893318Z  INFO zizq::commands::serve: no license key provided, running in free tier
 2026-04-05T05:41:27.081150Z  INFO zizq::commands::serve: store opened root_dir=./zizq-root
 2026-04-05T05:41:27.081547Z  INFO zizq::commands::serve: admin API listening addr=127.0.0.1:8901 scheme=http
@@ -34,7 +34,7 @@ curl http://127.0.0.1:7890/version
 ```
 
 ``` json
-{"version":"0.1.0"}
+{"version":"0.3.0"}
 ```
 
 ## Specifying the Root Directory
