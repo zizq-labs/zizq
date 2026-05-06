@@ -339,7 +339,7 @@ pub struct UnsupportedFormatResponse {
 /// Jobs are required to specify the queue that they target and a payload to be
 /// provided when dequeued. Priority is optional, defaulting to the center of
 /// the priority range.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct EnqueueRequest {
     /// The job type, e.g. "send_email" or "generate_report".
     #[serde(rename = "type")]
@@ -349,6 +349,7 @@ pub struct EnqueueRequest {
     pub queue: String,
 
     /// Optional job priority (lower is higher priority).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u16>,
 
     /// Arbitrary job payload provided to the client on dequeue.
@@ -356,26 +357,32 @@ pub struct EnqueueRequest {
 
     /// Optional timestamp (ms since epoch) when the job becomes eligible to
     /// run. If omitted or in the past, the job is immediately ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<u64>,
 
     /// Per-job maximum retries before the job is killed on failure. When
     /// omitted, the server default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_limit: Option<u32>,
 
     /// Per-job backoff configuration override. When omitted, the server
     /// default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff: Option<BackoffConfig>,
 
     /// Per-job retention configuration override. When omitted, the server
     /// default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionConfig>,
 
     /// Unique key for deduplication. When present, the store checks for an
     /// existing job with the same key before inserting.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_key: Option<String>,
 
     /// Uniqueness scope: "queued" (default), "active", or "exists".
     /// Only valid when `unique_key` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_while: Option<String>,
 }
 
@@ -835,4 +842,164 @@ pub struct TakeParams {
 
 pub fn default_prefetch() -> usize {
     DEFAULT_PREFETCH
+}
+
+// --- Cron scheduling types ---
+
+/// Response shape for `GET /crons`.
+#[derive(Serialize)]
+pub struct ListCronGroupsResponse {
+    pub crons: Vec<String>,
+}
+
+/// Request shape for `PATCH /crons/{name}`.
+#[derive(Deserialize)]
+pub struct PatchCronGroupRequest {
+    /// Whether the group should be paused.
+    pub paused: bool,
+}
+
+/// Request shape for `PUT /crons/{name}`.
+#[derive(Deserialize)]
+pub struct ReplaceCronGroupRequest {
+    /// Whether the group should be paused. Omitted means preserve existing
+    /// state (or default to `false` for new groups).
+    pub paused: Option<bool>,
+
+    pub entries: Vec<CronEntryRequest>,
+}
+
+/// A single cron entry in a replace request.
+#[derive(Deserialize)]
+pub struct CronEntryRequest {
+    /// Entry name (unique within the group).
+    pub name: String,
+
+    /// Cron expression (e.g. `*/15 * * * *`).
+    pub expression: String,
+
+    /// IANA timezone name (e.g. `Australia/Melbourne`). When omitted,
+    /// the server's local timezone is used.
+    pub timezone: Option<String>,
+
+    /// Whether this entry should be paused. Omitted means preserve
+    /// existing state (or default to `false` for new entries).
+    pub paused: Option<bool>,
+
+    /// Job template — same fields as the enqueue request. `ready_at` is
+    /// accepted for compatibility but must not be set (validated in the
+    /// handler).
+    pub job: EnqueueRequest,
+}
+
+/// Response shape for `PUT /crons/{name}` and `GET /crons/{name}`.
+#[derive(Serialize)]
+pub struct CronGroupResponse {
+    /// Group name.
+    pub name: String,
+
+    /// Whether the group is paused.
+    pub paused: bool,
+
+    /// When the group was last paused (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<u64>,
+
+    /// When the group was last resumed (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<u64>,
+
+    /// Entries in the group.
+    pub entries: Vec<CronEntryResponse>,
+}
+
+impl CronGroupResponse {
+    pub fn from_store(
+        name: String,
+        group: store::CronGroup,
+        entries: Vec<store::CronEntry>,
+    ) -> Self {
+        Self {
+            name,
+            paused: group.paused,
+            paused_at: group.paused_at,
+            resumed_at: group.resumed_at,
+            entries: entries
+                .into_iter()
+                .map(CronEntryResponse::from_store)
+                .collect(),
+        }
+    }
+}
+
+/// Response shape for a single cron entry.
+#[derive(Serialize)]
+pub struct CronEntryResponse {
+    /// Entry name.
+    pub name: String,
+
+    /// Cron expression.
+    pub expression: String,
+
+    /// IANA timezone name. `None` means system local timezone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+
+    /// Whether this entry is paused.
+    pub paused: bool,
+
+    /// When this entry was last paused (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<u64>,
+
+    /// When this entry was last resumed (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<u64>,
+
+    /// Job template (same shape as an enqueue request).
+    pub job: EnqueueRequest,
+
+    /// Next scheduled enqueue time (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_enqueue_at: Option<u64>,
+
+    /// Last time a job was enqueued from this entry (ms since epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_enqueue_at: Option<u64>,
+}
+
+impl CronEntryResponse {
+    pub fn from_store(entry: store::CronEntry) -> Self {
+        let unique_while = entry.job.unique_while.map(|uw| {
+            match uw {
+                store::UniqueWhile::Queued => "queued",
+                store::UniqueWhile::Active => "active",
+                store::UniqueWhile::Exists => "exists",
+            }
+            .to_string()
+        });
+
+        CronEntryResponse {
+            name: entry.name,
+            expression: entry.expression,
+            timezone: entry.timezone,
+            paused: entry.paused,
+            paused_at: entry.paused_at,
+            resumed_at: entry.resumed_at,
+            job: EnqueueRequest {
+                job_type: entry.job.job_type,
+                queue: entry.job.queue,
+                payload: entry.job.payload,
+                priority: Some(entry.job.priority),
+                ready_at: entry.job.ready_at,
+                retry_limit: entry.job.retry_limit,
+                backoff: entry.job.backoff.map(Into::into),
+                retention: entry.job.retention.map(Into::into),
+                unique_key: entry.job.unique_key,
+                unique_while,
+            },
+            next_enqueue_at: entry.next_enqueue_at,
+            last_enqueue_at: entry.last_enqueue_at,
+        }
+    }
 }

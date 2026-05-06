@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+- Add Cron scheduling support (Pro) with multiple cron "groups"
+
 ## 0.2.1
 
 - Internal Store refactors around enqueue and bulk enqueue

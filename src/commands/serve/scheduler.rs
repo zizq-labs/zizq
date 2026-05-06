@@ -172,15 +172,36 @@ mod tests {
         (time, move || t.load(Ordering::Relaxed))
     }
 
-    /// Yield to let the scheduler process events. The scheduler uses
-    /// `spawn_blocking` for store operations, which run on real threads.
-    /// We alternate between brief real sleeps (so blocking tasks finish)
-    /// and async yields (so the scheduler task gets polled and processes
-    /// results). Multiple rounds handle the multi-step scheduler loop
-    /// (next_scheduled → promote → next_scheduled again).
+    /// Wait for `n` `JobCreated` events on the store's broadcast channel.
+    /// Deterministic — no timing-based flakes. Panics after 5 seconds
+    /// (simulated time) if the expected events don't arrive.
+    async fn wait_for_n_promoted(store: &Store, n: usize) {
+        let mut rx = store.subscribe();
+        let mut count = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while count < n {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Ok(StoreEvent::JobCreated { .. }) => count += 1,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("event channel closed after {count}/{n} promotions");
+                        }
+                        _ => continue,
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out after {count}/{n} promotions");
+                }
+            }
+        }
+    }
+
+    /// Yield to let the scheduler process events. Used for negative tests
+    /// (asserting nothing happened) where we can't wait for a specific event.
     async fn yield_scheduler() {
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(1));
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(2));
             tokio::task::yield_now().await;
         }
     }
@@ -208,11 +229,10 @@ mod tests {
             .unwrap()
             .into_job();
 
-        // Advance the clock past the job's ready_at and let the scheduler
-        // timer fire.
+        // Advance the clock past the job's ready_at and wait for promotion.
         clock.store(t + 1_001, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(1_001)).await;
-        yield_scheduler().await;
+        wait_for_n_promoted(&store, 1).await;
 
         let job = store.get_job(t, &job.id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Ready as u8);
@@ -248,7 +268,7 @@ mod tests {
 
         clock.store(t + 1_001, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(1_001)).await;
-        yield_scheduler().await;
+        wait_for_n_promoted(&store, 3).await;
 
         for id in &ids {
             let job = store.get_job(t, id).await.unwrap().unwrap();
@@ -325,7 +345,7 @@ mod tests {
         // Advance past the early job's ready_at but not the late one.
         clock.store(t + 2_001, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(2_001)).await;
-        yield_scheduler().await;
+        wait_for_n_promoted(&store, 1).await;
 
         let early_job = store.get_job(t, &early.id).await.unwrap().unwrap();
         assert_eq!(early_job.status, JobStatus::Ready as u8);
@@ -377,7 +397,7 @@ mod tests {
         // Advance past the early job only.
         clock.store(t + 2_001, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(2_001)).await;
-        yield_scheduler().await;
+        wait_for_n_promoted(&store, 1).await;
 
         let early_job = store.get_job(t, &early.id).await.unwrap().unwrap();
         assert_eq!(
@@ -418,17 +438,10 @@ mod tests {
 
         clock.store(t + 1_001, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(1_001)).await;
-        // One yield per scan-promote cycle. The small batch_size forces
-        // multiple cycles (each involving multiple spawn_blocking calls),
-        // and each cycle needs its own yield_scheduler budget of real
-        // wall-clock time for the blocking tasks to complete.
-        let cycles = (ids.len() + batch_size - 1) / batch_size;
-        for _ in 0..cycles {
-            yield_scheduler().await;
-        }
-
         // All 3 should be promoted even though batch_size is 2 — the
         // scheduler loops immediately when the batch was full.
+        wait_for_n_promoted(&store, 3).await;
+
         for id in &ids {
             let job = store.get_job(t, id).await.unwrap().unwrap();
             assert_eq!(job.status, JobStatus::Ready as u8);

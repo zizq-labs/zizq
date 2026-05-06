@@ -48,6 +48,14 @@ echo "  Updated Cargo.toml"
 cargo update -p zizq --quiet 2>/dev/null || cargo generate-lockfile --quiet 2>/dev/null || true
 echo "  Updated Cargo.lock"
 
+# Update docs.
+for doc in docs/getting-started/src/quick-start.md docs/cli/src/installation.md README.md
+do
+    sed -i "s/Zizq ${CURRENT}/Zizq ${NEW}/" $doc
+    sed -i "s/\\/v${CURRENT}\\//\\/v${NEW}\\//" $doc
+    sed -i "s/zizq-${CURRENT}/zizq-${NEW}/" $doc
+done
+
 # Add new CHANGELOG section if it doesn't already exist.
 if ! grep -q "^## ${NEW}" CHANGELOG.md 2>/dev/null; then
     sed -i "0,/^## /s//## ${NEW}\n\n\n## /" CHANGELOG.md

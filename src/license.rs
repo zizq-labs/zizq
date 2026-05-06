@@ -67,6 +67,8 @@ pub enum Feature {
     MutualTls,
     /// Unique job deduplication at enqueue time.
     UniqueJobs,
+    /// Cron scheduling — periodic job enqueue from cron expressions.
+    CronScheduling,
 }
 
 impl Feature {
@@ -78,6 +80,7 @@ impl Feature {
             Feature::EnterpriseExample => Tier::Enterprise,
             Feature::MutualTls => Tier::Pro,
             Feature::UniqueJobs => Tier::Pro,
+            Feature::CronScheduling => Tier::Pro,
         }
     }
 }
@@ -90,6 +93,7 @@ impl std::fmt::Display for Feature {
             Feature::EnterpriseExample => write!(f, "enterprise example"),
             Feature::MutualTls => write!(f, "mutual TLS"),
             Feature::UniqueJobs => write!(f, "unique jobs"),
+            Feature::CronScheduling => write!(f, "cron scheduling"),
         }
     }
 }

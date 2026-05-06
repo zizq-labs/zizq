@@ -33,6 +33,9 @@ pub enum StoreError {
     /// The requested operation is not valid for the job's current state.
     InvalidOperation(String),
 
+    /// A resource already exists (e.g. duplicate cron entry name).
+    Conflict(String),
+
     /// Internal error (e.g. sync channel closed).
     Internal(String),
 }
@@ -46,6 +49,7 @@ impl fmt::Display for StoreError {
             StoreError::TaskJoin(e) => write!(f, "blocking task failed: {e}"),
             StoreError::Corruption(msg) => write!(f, "data corruption: {msg}"),
             StoreError::InvalidOperation(msg) => write!(f, "invalid operation: {msg}"),
+            StoreError::Conflict(msg) => write!(f, "conflict: {msg}"),
             StoreError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -122,12 +126,21 @@ impl TryFrom<u8> for JobStatus {
 }
 
 /// Uniqueness scope — which job statuses constitute a conflict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as a u8 for compact storage in the data keyspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
 #[repr(u8)]
 pub enum UniqueWhile {
     Queued = 0,
     Active = 1,
     Exists = 2,
+}
+
+impl From<UniqueWhile> for u8 {
+    fn from(v: UniqueWhile) -> Self {
+        v as u8
+    }
 }
 
 impl TryFrom<u8> for UniqueWhile {
