@@ -32,10 +32,16 @@ pub enum Event {
     PageUp,
     /// Scroll the cursor down one page.
     PageDown,
+    /// Jump to the first row.
+    GoToStart,
+    /// Jump to the last row.
+    GoToEnd,
+    /// Suspend the process (Ctrl-Z).
+    Suspend,
     /// Server connection attempt in progress.
     ServerConnecting,
     /// Server connection established.
-    ServerConnected,
+    ServerConnected { url: String },
     /// Heartbeat received from server.
     ServerHeartbeat { server: ServerStatus },
     /// Snapshot of ready, in-flight, and scheduled job queues.
@@ -69,7 +75,12 @@ impl Event {
     pub fn is_scroll(&self) -> bool {
         matches!(
             self,
-            Event::ScrollUp | Event::ScrollDown | Event::PageUp | Event::PageDown
+            Event::ScrollUp
+                | Event::ScrollDown
+                | Event::PageUp
+                | Event::PageDown
+                | Event::GoToStart
+                | Event::GoToEnd
         )
     }
 }
@@ -78,39 +89,54 @@ impl Event {
 /// them to the event channel.
 pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
     tokio::task::spawn_blocking(move || {
-        use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind};
+        use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
 
         loop {
             if let Ok(CtEvent::Key(key)) = event::read() {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             let _ = tx.blocking_send(Event::Quit);
                             break;
                         }
-                        KeyCode::Tab => {
+                        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+                            let _ = tx.blocking_send(Event::Suspend);
+                        }
+                        (KeyCode::Tab, _) => {
                             let _ = tx.blocking_send(Event::NextTab);
                         }
-                        KeyCode::BackTab => {
+                        (KeyCode::BackTab, _) => {
                             let _ = tx.blocking_send(Event::PrevTab);
                         }
-                        KeyCode::Right => {
+                        (KeyCode::Right, _) => {
                             let _ = tx.blocking_send(Event::ScrollRight);
                         }
-                        KeyCode::Left => {
+                        (KeyCode::Left, _) => {
                             let _ = tx.blocking_send(Event::ScrollLeft);
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                             let _ = tx.blocking_send(Event::ScrollUp);
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
                             let _ = tx.blocking_send(Event::ScrollDown);
                         }
-                        KeyCode::PageUp => {
+                        (KeyCode::PageUp, _) => {
                             let _ = tx.blocking_send(Event::PageUp);
                         }
-                        KeyCode::PageDown => {
+                        (KeyCode::PageDown, _) => {
                             let _ = tx.blocking_send(Event::PageDown);
+                        }
+                        (KeyCode::Char('g'), _) => {
+                            let _ = tx.blocking_send(Event::GoToStart);
+                        }
+                        (KeyCode::Char('G'), _) => {
+                            let _ = tx.blocking_send(Event::GoToEnd);
+                        }
+                        (KeyCode::Home, _) => {
+                            let _ = tx.blocking_send(Event::GoToStart);
+                        }
+                        (KeyCode::End, _) => {
+                            let _ = tx.blocking_send(Event::GoToEnd);
                         }
                         _ => {}
                     }
@@ -158,9 +184,10 @@ async fn connect_ws(
     use reqwest_websocket::{Message, RequestBuilderExt};
 
     let response = http_client.get(url).upgrade().send().await?;
+    let connected_url = response.url().origin().ascii_serialization();
     let mut websocket = response.into_websocket().await?;
 
-    let _ = tx.send(Event::ServerConnected).await;
+    let _ = tx.send(Event::ServerConnected { url: connected_url }).await;
 
     loop {
         tokio::select! {

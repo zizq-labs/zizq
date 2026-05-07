@@ -62,16 +62,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn terminal input reader (blocking, runs in a thread).
     events::read_terminal_events(tx.clone());
 
-    let host = reqwest::Url::parse(&args.admin.url)
-        .ok()
-        .and_then(|u| {
-            let host = u.host_str()?.to_string();
-            match u.port() {
-                Some(port) => Some(format!("{host}:{port}")),
-                None => Some(host),
-            }
-        })
-        .unwrap_or_else(|| args.admin.url.clone());
+    let host = args.admin.url.clone();
 
     // Spawn WebSocket connection manager (async, bidirectional).
     events::manage_ws_connection(tx, ws_out_rx, args.admin.url, http_client);
@@ -94,6 +85,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // Scroll events set a short debounce instead of rendering
         // immediately, so holding an arrow key batches updates.
         let mut scroll_dirty = false;
+        let mut should_suspend = false;
 
         loop {
             tokio::select! {
@@ -102,6 +94,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 _ = tokio::time::sleep(scroll_debounce), if scroll_dirty => break,
                 event = rx.recv() => {
                     match event {
+                        Some(Event::Suspend) => {
+                            should_suspend = true;
+                            break;
+                        }
                         Some(event) => {
                             let immediate = event.is_user_input();
                             let scroll = event.is_scroll();
@@ -136,6 +132,26 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         if should_quit {
             break;
+        }
+
+        if should_suspend {
+            // Restore terminal, send SIGTSTP to ourselves, then re-enter.
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            terminal.show_cursor()?;
+
+            #[cfg(unix)]
+            {
+                unsafe {
+                    libc::raise(libc::SIGTSTP);
+                }
+            }
+
+            // When resumed (SIGCONT), re-enter the TUI.
+            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+            enable_raw_mode()?;
+            terminal.clear()?;
+            continue;
         }
 
         app.now_ms = crate::time::now_millis();

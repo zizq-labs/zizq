@@ -4631,7 +4631,7 @@ dependencies = [
 
 [[package]]
 name = "zizq"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "bytesize",
@@ -4655,6 +4655,7 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "jsonwebtoken",
+ "libc",
  "rand 0.8.5",
  "ratatui",
  "rcgen",
