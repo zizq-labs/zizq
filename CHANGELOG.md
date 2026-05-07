@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Improved key bindings in `zizq top` (g, G, Home, End, ^C, ^Z)
+
 ## 0.3.0
 
 - Add Cron scheduling support (Pro) with multiple cron "groups"

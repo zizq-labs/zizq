@@ -282,11 +282,18 @@ impl App {
             Event::PageDown => {
                 self.page_down();
             }
+            Event::GoToStart => {
+                self.go_to_start();
+            }
+            Event::GoToEnd => {
+                self.go_to_end();
+            }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;
             }
-            Event::ServerConnected => {
+            Event::ServerConnected { url } => {
                 self.status = ConnectionStatus::Connected;
+                self.host = url;
             }
             Event::ServerHeartbeat { server } => {
                 self.apply_server_status(server);
@@ -376,6 +383,9 @@ impl App {
                 self.in_flight_jobs.clear();
                 self.scheduled_jobs.clear();
                 self.list_states = Default::default();
+            }
+            Event::Suspend => {
+                // Handled by the main event loop before reaching here.
             }
         }
         false
@@ -494,6 +504,31 @@ impl App {
             ls.scroll_pos = ls.cursor - self.viewport_height + 1;
         }
         ls.follow_bottom = ls.cursor == total - 1;
+        self.maybe_prefetch();
+    }
+
+    fn go_to_start(&mut self) {
+        let total = self.effective_total();
+        if total == 0 {
+            return;
+        }
+        let ls = &mut self.list_states[self.active_tab.idx()];
+        ls.cursor = 0;
+        ls.scroll_pos = 0;
+        ls.follow_bottom = false;
+    }
+
+    fn go_to_end(&mut self) {
+        let total = self.effective_total();
+        if total == 0 {
+            return;
+        }
+        let ls = &mut self.list_states[self.active_tab.idx()];
+        ls.cursor = total - 1;
+        if self.viewport_height > 0 && ls.cursor >= self.viewport_height {
+            ls.scroll_pos = ls.cursor - self.viewport_height + 1;
+        }
+        ls.follow_bottom = true;
         self.maybe_prefetch();
     }
 }
