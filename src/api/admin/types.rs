@@ -51,7 +51,7 @@ pub enum AdminEvent {
         id: String,
         status: JobChangeStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
-        job: Option<AdminJobSummary>,
+        job: Option<AdminJob>,
     },
 }
 
@@ -59,7 +59,7 @@ pub enum AdminEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobWindow {
     pub offset: usize,
-    pub items: Vec<AdminJobSummary>,
+    pub items: Vec<AdminJob>,
 }
 
 /// Client-to-server message for controlling subscriptions.
@@ -70,6 +70,9 @@ pub enum ClientMessage {
         list: ListName,
         offset: usize,
         limit: usize,
+    },
+    SetDetailLevel {
+        detail: bool,
     },
 }
 
@@ -96,9 +99,13 @@ pub enum JobChangeStatus {
     Dead,
 }
 
-/// Summary of a job for the admin dashboard (no payload).
+/// A job as seen by the admin API.
+///
+/// Always includes the core fields needed for the dashboard table. When
+/// detail mode is enabled, additional fields (payload, retry_limit, etc.)
+/// are populated. Extra fields are silently ignored by older clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminJobSummary {
+pub struct AdminJob {
     pub id: String,
     pub queue: String,
     pub job_type: String,
@@ -109,10 +116,62 @@ pub struct AdminJobSummary {
     pub dequeued_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<AdminBackoff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<AdminRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_while: Option<String>,
 }
 
-impl From<store::Job> for AdminJobSummary {
-    fn from(job: store::Job) -> Self {
+/// Backoff configuration for the admin API (human-readable field names).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminBackoff {
+    pub base_ms: u32,
+    pub exponent: f32,
+    pub jitter_ms: u32,
+}
+
+/// Retention configuration for the admin API (human-readable field names).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminRetention {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_ms: Option<u64>,
+}
+
+impl AdminJob {
+    /// Convert a store job to an admin job.
+    ///
+    /// When `detail` is true, includes payload and other extended fields.
+    pub fn from_store(job: store::Job, detail: bool) -> Self {
+        let (unique_key, unique_while) = if detail {
+            match job.unique {
+                Some(ref uc) => (
+                    Some(uc.key.clone()),
+                    Some(
+                        match uc.scope {
+                            0 => "queued",
+                            1 => "active",
+                            2 => "exists",
+                            _ => "queued",
+                        }
+                        .to_string(),
+                    ),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
         Self {
             id: job.id,
             queue: job.queue,
@@ -122,6 +181,27 @@ impl From<store::Job> for AdminJobSummary {
             attempts: job.attempts,
             dequeued_at: job.dequeued_at,
             failed_at: job.failed_at,
+            payload: if detail { job.payload } else { None },
+            retry_limit: if detail { job.retry_limit } else { None },
+            backoff: if detail {
+                job.backoff.map(|b| AdminBackoff {
+                    base_ms: b.base_ms,
+                    exponent: b.exponent,
+                    jitter_ms: b.jitter_ms,
+                })
+            } else {
+                None
+            },
+            retention: if detail {
+                job.retention.map(|r| AdminRetention {
+                    completed_ms: r.completed_ms,
+                    dead_ms: r.dead_ms,
+                })
+            } else {
+                None
+            },
+            unique_key,
+            unique_while,
         }
     }
 }
