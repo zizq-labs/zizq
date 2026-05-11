@@ -59,7 +59,7 @@ endpoint wraps an array of `{"jobs": [...]}`.
             <td>
                 Optional numeric priority for the job. Lower values are
                 processed first (higher priority). The default value is
-                <code>32768<code>.
+                <code>32768</code>.
             </td>
         </tr>
         <tr>

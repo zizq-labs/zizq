@@ -134,7 +134,7 @@ Now let's process that job with a little `bash` script loop and a sprinkle of
 [`jq`](https://jqlang.org/) just to help with the JSON in bash.
 
 > [!NOTE]
-> This script does not exit until it is iterrupted. The while loop receives
+> This script does not exit until it is interrupted. The while loop receives
 > lines of JSON from the server. Blank lines are heartbeats and are skipped.
 
 ```bash

@@ -8,5 +8,5 @@
 - [Durability](./durability.md)
 - [License Key Management](./licenses.md)
 - [Backup & Restore](./backups.md)
-- [Viewing the Live Queue](./zizq-top.md)
+- [Viewing Live Activity in `zizq top`](./zizq-top.md)
 - [Generating TLS Certificates](./tls.md)
