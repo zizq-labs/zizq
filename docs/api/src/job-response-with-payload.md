@@ -40,7 +40,7 @@
             </td>
             <td>
                 Numeric priority for the job. Lower values are processed first
-                (higher priority). The default value is <code>32768<code>.
+                (higher priority). The default value is <code>32768</code>.
             </td>
         </tr>
         <tr>
