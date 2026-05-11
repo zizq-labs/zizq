@@ -26,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
 use super::{
-    AdminEvent, AdminJobSummary, AdminMessage, ClientMessage, JobChangeStatus, JobWindow, ListName,
+    AdminEvent, AdminJob, AdminMessage, ClientMessage, JobChangeStatus, JobWindow, ListName,
     ServerStatus,
 };
 use crate::state::AppState;
@@ -75,6 +75,9 @@ struct ConnectionState {
     ready_sub: Subscription,
     in_flight_sub: Subscription,
     scheduled_sub: Subscription,
+
+    /// Whether to include full job details (payload, retry_limit, etc.).
+    detail: bool,
 }
 
 /// WebSocket endpoint that streams admin events to connected clients.
@@ -123,6 +126,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 limit,
                             )
                             .await;
+                        }
+                        Some(ClientMessage::SetDetailLevel { detail }) => {
+                            conn.detail = detail;
+                            // Resend a snapshot so the client gets the new detail level.
+                            let event = build_snapshot(store, &mut conn).await;
+                            let msg = AdminMessage {
+                                server: server_status(&send_state),
+                                event,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -312,6 +329,7 @@ async fn send_snapshot_with_subs(
         ready_sub,
         in_flight_sub,
         scheduled_sub,
+        detail: false,
     };
 
     let event = build_snapshot(&state.store, &mut conn).await;
@@ -447,17 +465,17 @@ async fn handle_subscribe(
     }
 
     // Re-send a full snapshot at the new window.
-    let ready_window = {
-        let jobs = store
-            .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
-            .await
-            .unwrap_or_default();
-        let keys: Vec<(u16, String)> = jobs.iter().map(|j| (j.priority, j.id.clone())).collect();
-        conn.prev_ready = keys;
-        JobWindow {
-            offset: conn.ready_sub.offset,
-            items: jobs.into_iter().map(AdminJobSummary::from).collect(),
-        }
+    let ready_jobs = store
+        .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
+        .await
+        .unwrap_or_default();
+    conn.prev_ready = ready_jobs
+        .iter()
+        .map(|j| (j.priority, j.id.clone()))
+        .collect();
+    let ready_window = JobWindow {
+        offset: conn.ready_sub.offset,
+        items: to_admin_jobs(store, ready_jobs, conn.detail).await,
     };
 
     let in_flight_items: Vec<store::Job> = {
@@ -482,21 +500,21 @@ async fn handle_subscribe(
         offset: conn.in_flight_sub.offset,
         items: in_flight_items
             .into_iter()
-            .map(AdminJobSummary::from)
+            .map(|j| AdminJob::from_store(j, conn.detail))
             .collect(),
     };
 
-    let scheduled_window = {
-        let jobs = store
-            .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
-            .await
-            .unwrap_or_default();
-        let keys: Vec<(u64, String)> = jobs.iter().map(|j| (j.ready_at, j.id.clone())).collect();
-        conn.prev_scheduled = keys;
-        JobWindow {
-            offset: conn.scheduled_sub.offset,
-            items: jobs.into_iter().map(AdminJobSummary::from).collect(),
-        }
+    let scheduled_jobs = store
+        .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
+        .await
+        .unwrap_or_default();
+    conn.prev_scheduled = scheduled_jobs
+        .iter()
+        .map(|j| (j.ready_at, j.id.clone()))
+        .collect();
+    let scheduled_window = JobWindow {
+        offset: conn.scheduled_sub.offset,
+        items: to_admin_jobs(store, scheduled_jobs, conn.detail).await,
     };
 
     let snapshot = AdminMessage {
@@ -537,7 +555,7 @@ async fn diff_ready(store: &store::Store, conn: &mut ConnectionState) -> Vec<Adm
             events.push(AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::Ready,
-                job: Some(AdminJobSummary::from(job)),
+                job: Some(AdminJob::from_store(job, conn.detail)),
             });
         }
     }
@@ -574,7 +592,7 @@ async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec
             events.push(AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::InFlight,
-                job: Some(AdminJobSummary::from(job)),
+                job: Some(AdminJob::from_store(job, conn.detail)),
             });
         }
     }
@@ -607,13 +625,34 @@ async fn diff_scheduled(store: &store::Store, conn: &mut ConnectionState) -> Vec
             events.push(AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::Scheduled,
-                job: Some(AdminJobSummary::from(job)),
+                job: Some(AdminJob::from_store(job, conn.detail)),
             });
         }
     }
 
     conn.prev_scheduled = current;
     events
+}
+
+/// Convert a list of store jobs to admin jobs, hydrating payloads when detail
+/// mode is active. The list functions (`list_ready_jobs`, etc.) don't read
+/// payloads from disk, so when detail is on we re-fetch each job via `get_job`.
+async fn to_admin_jobs(store: &store::Store, jobs: Vec<store::Job>, detail: bool) -> Vec<AdminJob> {
+    if !detail {
+        return jobs
+            .into_iter()
+            .map(|j| AdminJob::from_store(j, false))
+            .collect();
+    }
+    let mut result = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let hydrated = store.get_job(now_millis(), &job.id).await;
+        match hydrated {
+            Ok(Some(j)) => result.push(AdminJob::from_store(j, true)),
+            _ => result.push(AdminJob::from_store(job, true)),
+        }
+    }
+    result
 }
 
 /// Build a fresh `JobSnapshot` event and reset the connection's diff baseline.
@@ -644,7 +683,7 @@ async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> Adm
     let mut in_flight_jobs = Vec::with_capacity(in_flight_window.len());
     for (_, id) in &in_flight_window {
         if let Ok(Some(job)) = store.get_job(now_millis(), id).await {
-            in_flight_jobs.push(AdminJobSummary::from(job));
+            in_flight_jobs.push(AdminJob::from_store(job, conn.detail));
         }
     }
 
@@ -659,13 +698,13 @@ async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> Adm
         .map(|j| (j.ready_at, j.id.clone()))
         .collect();
 
+    let ready_items = to_admin_jobs(store, capped_ready, conn.detail).await;
+    let scheduled_items = to_admin_jobs(store, capped_scheduled, conn.detail).await;
+
     AdminEvent::JobSnapshot {
         ready: JobWindow {
             offset: conn.ready_sub.offset,
-            items: capped_ready
-                .into_iter()
-                .map(AdminJobSummary::from)
-                .collect(),
+            items: ready_items,
         },
         in_flight: JobWindow {
             offset: conn.in_flight_sub.offset,
@@ -673,10 +712,7 @@ async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> Adm
         },
         scheduled: JobWindow {
             offset: conn.scheduled_sub.offset,
-            items: capped_scheduled
-                .into_iter()
-                .map(AdminJobSummary::from)
-                .collect(),
+            items: scheduled_items,
         },
     }
 }

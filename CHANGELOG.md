@@ -3,6 +3,7 @@
 ## 0.3.1
 
 - Improved key bindings in `zizq top` (g, G, Home, End, ^C, ^Z)
+- Press `i` in `zizq top` to see job detail
 
 ## 0.3.0
 

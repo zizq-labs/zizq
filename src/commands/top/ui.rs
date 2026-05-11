@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Widget};
 
-use crate::api::admin::AdminJobSummary;
+use crate::api::admin::AdminJob;
 
 use super::app::{App, ConnectionStatus, Tab};
 
@@ -202,15 +202,41 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         None
     };
 
-    let (table_area, msg_area) = if subscription_limit.is_some() {
-        let split = Layout::vertical([
-            Constraint::Min(0),    // table
-            Constraint::Length(4), // blank line + 2-line message + blank line
-        ])
-        .split(content_area);
-        (split[0], Some(split[1]))
-    } else {
-        (content_area, None)
+    // Split content area into table + optional detail panel + optional cap message.
+    // Panel height: min(DETAIL_PANEL_MAX, 30% of content area).
+    // Suppressed if the table would get fewer than MIN_TABLE_ROWS body rows.
+    let detail_height = DETAIL_PANEL_MAX.min((content_area.height * 30 / 100).max(1));
+    let show_detail_panel =
+        app.show_detail && content_area.height > detail_height + MIN_TABLE_ROWS + 1;
+
+    let (table_area, detail_area, msg_area) = {
+        let mut constraints = vec![Constraint::Min(0)]; // table always first
+
+        if show_detail_panel {
+            constraints.push(Constraint::Length(detail_height));
+        }
+        if subscription_limit.is_some() {
+            constraints.push(Constraint::Length(4));
+        }
+
+        let split = Layout::vertical(constraints).split(content_area);
+        let mut idx = 1;
+
+        let detail = if show_detail_panel {
+            let area = split[idx];
+            idx += 1;
+            Some(area)
+        } else {
+            None
+        };
+
+        let msg = if subscription_limit.is_some() {
+            Some(split[idx])
+        } else {
+            None
+        };
+
+        (split[0], detail, msg)
     };
 
     // Store the viewport height (minus 1 for the header row) so
@@ -256,6 +282,149 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         render_scrollable(frame, table, table_area, tab_scroll);
     }
 
+    // Detail panel — job metadata on the left, payload on the right.
+    if let Some(area) = detail_area {
+        let heading_style = Style::default().fg(tab_fg()).bg(Color::Yellow);
+
+        let ls = &app.list_states[app.active_tab.idx()];
+        let jobs = match app.active_tab {
+            Tab::Ready => &app.ready_jobs,
+            Tab::InFlight => &app.in_flight_jobs,
+            Tab::Scheduled => &app.scheduled_jobs,
+        };
+
+        let buf_idx = ls.cursor.checked_sub(ls.buffer_offset);
+        let job = buf_idx.and_then(|i| jobs.get(i));
+
+        if let Some(job) = job {
+            // Split into left (metadata) and right (payload).
+            let halves =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(area);
+
+            // Left column: heading + key-value metadata.
+            let dim = Style::default().fg(Color::DarkGray);
+            let val = Style::default().fg(Color::White);
+
+            let left_heading = Line::from(Span::styled(
+                pad_to("  ATTRIBUTES", halves[0].width),
+                heading_style,
+            ));
+
+            let status = match app.active_tab {
+                Tab::Ready => "ready",
+                Tab::InFlight => "in_flight",
+                Tab::Scheduled => "scheduled",
+            };
+
+            let attempts_value = match job.retry_limit {
+                Some(limit) => format!("{}/{}", job.attempts, limit),
+                None => job.attempts.to_string(),
+            };
+
+            let mut meta: Vec<Line> = vec![
+                left_heading,
+                detail_line("  ID", job.id.clone(), dim, val),
+                detail_line("  Queue", job.queue.clone(), dim, val),
+                detail_line("  Type", job.job_type.clone(), dim, val),
+                detail_line("  Priority", job.priority.to_string(), dim, val),
+                detail_line("  Status", status, dim, val),
+                detail_line("  Ready At", format_timestamp(job.ready_at), dim, val),
+            ];
+
+            if let Some(at) = job.failed_at {
+                meta.push(detail_line("  Failed At", format_timestamp(at), dim, val));
+            }
+            if let Some(at) = job.dequeued_at {
+                meta.push(detail_line("  Dequeued At", format_timestamp(at), dim, val));
+            }
+
+            meta.push(detail_line(
+                "  Attempts / Retry Limit",
+                attempts_value,
+                dim,
+                val,
+            ));
+
+            if let Some(ref b) = job.backoff {
+                meta.push(detail_line(
+                    "  Backoff",
+                    format!(
+                        "base={},exponent={},jitter={}",
+                        b.base_ms, b.exponent, b.jitter_ms
+                    ),
+                    dim,
+                    val,
+                ));
+            }
+
+            if let Some(ref r) = job.retention {
+                let parts: Vec<String> = [
+                    r.completed_ms
+                        .map(|ms| format!("completed={}", format_duration_ms(ms))),
+                    r.dead_ms
+                        .map(|ms| format!("dead={}", format_duration_ms(ms))),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !parts.is_empty() {
+                    meta.push(detail_line(
+                        "  Retention Policy",
+                        parts.join(", "),
+                        dim,
+                        val,
+                    ));
+                }
+            }
+
+            if let Some(ref key) = job.unique_key {
+                let scope = job.unique_while.as_deref().unwrap_or("queued");
+                meta.push(detail_line(
+                    "  Unique Key",
+                    format!("{scope} {key}"),
+                    dim,
+                    val,
+                ));
+            }
+
+            frame.render_widget(Paragraph::new(meta), halves[0]);
+
+            // Right column: heading + pretty-printed payload.
+            let right_heading = Line::from(Span::styled(
+                pad_to(" PAYLOAD", halves[1].width),
+                heading_style,
+            ));
+
+            let mut payload_lines: Vec<Line> = vec![right_heading];
+            match &job.payload {
+                Some(payload) => {
+                    let pretty = serde_json::to_string_pretty(payload)
+                        .unwrap_or_else(|_| payload.to_string());
+                    payload_lines.extend(pretty.lines().map(|l| Line::raw(format!(" {l}"))));
+                }
+                None => {
+                    payload_lines.push(Line::styled(" (not loaded)", dim));
+                }
+            }
+
+            frame.render_widget(Paragraph::new(payload_lines), halves[1]);
+        } else {
+            // Heading bar even when no job selected.
+            let heading = Line::from(Span::styled(
+                pad_to("  ATTRIBUTES", area.width),
+                heading_style,
+            ));
+            frame.render_widget(
+                Paragraph::new(vec![
+                    heading,
+                    Line::styled("  No job selected", Style::default().fg(Color::DarkGray)),
+                ]),
+                area,
+            );
+        }
+    }
+
     if let Some(cap) = subscription_limit {
         let msg = Paragraph::new(vec![
             Line::default(),
@@ -274,6 +443,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     let help = Paragraph::new(Line::from(vec![
         Span::styled(" Tab ", key_style),
         Span::styled("Change Tab", label_style),
+        Span::styled("  i ", key_style),
+        Span::styled("Info", label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
     ]));
@@ -284,6 +455,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 /// the table renders at this width and the visible portion is determined by
 /// the horizontal scroll offset.
 const MIN_TABLE_WIDTH: u16 = 120;
+
+/// Maximum height of the detail panel (heading + all possible fields).
+const DETAIL_PANEL_MAX: u16 = 13;
+
+/// Minimum table body rows required before showing the detail panel.
+const MIN_TABLE_ROWS: u16 = 3;
 
 /// Style for the cursor-highlighted row.
 const CURSOR_STYLE: Style = Style::new().fg(Color::Black).bg(Color::LightCyan);
@@ -494,7 +671,7 @@ fn priority_style(highlighted: bool) -> Style {
 }
 
 /// Build a table widget for the Ready pane.
-fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64, cursor_row: Option<usize>) -> Table<'_> {
+fn job_table_ready(jobs: &[AdminJob], now_ms: u64, cursor_row: Option<usize>) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
@@ -550,11 +727,7 @@ fn job_table_ready(jobs: &[AdminJobSummary], now_ms: u64, cursor_row: Option<usi
 }
 
 /// Build a table widget for the In-Flight pane.
-fn job_table_in_flight(
-    jobs: &[AdminJobSummary],
-    now_ms: u64,
-    cursor_row: Option<usize>,
-) -> Table<'_> {
+fn job_table_in_flight(jobs: &[AdminJob], now_ms: u64, cursor_row: Option<usize>) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
@@ -611,11 +784,7 @@ fn job_table_in_flight(
 }
 
 /// Build a table widget for the Scheduled pane.
-fn job_table_scheduled(
-    jobs: &[AdminJobSummary],
-    now_ms: u64,
-    cursor_row: Option<usize>,
-) -> Table<'_> {
+fn job_table_scheduled(jobs: &[AdminJob], now_ms: u64, cursor_row: Option<usize>) -> Table<'_> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
         Cell::from(Line::from("PRIORITY").alignment(Alignment::Right)),
@@ -668,6 +837,39 @@ fn job_table_scheduled(
         ],
     )
     .header(header)
+}
+
+/// Build a single key-value line for the detail panel metadata column.
+/// Width of the label column in detail panel metadata lines.
+const DETAIL_LABEL_WIDTH: usize = 26;
+
+fn detail_line(
+    label: &str,
+    value: impl Into<String>,
+    label_style: Style,
+    value_style: Style,
+) -> Line<'static> {
+    let padded = format!("{:width$}", label, width = DETAIL_LABEL_WIDTH);
+    Line::from(vec![
+        Span::styled(padded, label_style),
+        Span::styled(value.into(), value_style),
+    ])
+}
+
+/// Pad a string to a given width with trailing spaces.
+fn pad_to(s: &str, width: u16) -> String {
+    format!("{:width$}", s, width = width as usize)
+}
+
+/// Format a millisecond timestamp as a local date/time with UTC offset.
+fn format_timestamp(ms: u64) -> String {
+    use chrono::{Local, TimeZone};
+    let secs = (ms / 1_000) as i64;
+    let nsecs = ((ms % 1_000) * 1_000_000) as u32;
+    match Local.timestamp_opt(secs, nsecs) {
+        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+        _ => format!("{ms}"),
+    }
 }
 
 /// Format time until a scheduled job is due, or how overdue it is.
@@ -791,6 +993,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         }
     }
@@ -821,6 +1024,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
@@ -846,6 +1050,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
@@ -860,8 +1065,8 @@ mod tests {
         attempts: u32,
         dequeued_at: Option<u64>,
         failed_at: Option<u64>,
-    ) -> AdminJobSummary {
-        AdminJobSummary {
+    ) -> AdminJob {
+        AdminJob {
             id: id.to_string(),
             queue: queue.to_string(),
             job_type: job_type.to_string(),
@@ -870,6 +1075,12 @@ mod tests {
             attempts,
             dequeued_at,
             failed_at,
+            payload: None,
+            retry_limit: None,
+            backoff: None,
+            retention: None,
+            unique_key: None,
+            unique_while: None,
         }
     }
 
@@ -956,6 +1167,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         }
     }
@@ -1011,6 +1223,35 @@ mod tests {
     }
 
     #[test]
+    fn render_detail_panel() {
+        use crate::api::admin::{AdminBackoff, AdminRetention};
+
+        let mut app = sample_app(Tab::InFlight);
+        app.show_detail = true;
+
+        // Give the first in-flight job full detail fields.
+        app.in_flight_jobs[0].payload = Some(serde_json::json!({
+            "to": "user@example.com",
+            "subject": "Welcome!",
+            "urgent": true,
+        }));
+        app.in_flight_jobs[0].retry_limit = Some(25);
+        app.in_flight_jobs[0].backoff = Some(AdminBackoff {
+            base_ms: 15000,
+            exponent: 4.0,
+            jitter_ms: 30000,
+        });
+        app.in_flight_jobs[0].retention = Some(AdminRetention {
+            completed_ms: Some(604_800_000),
+            dead_ms: Some(2_592_000_000),
+        });
+        app.in_flight_jobs[0].unique_key = Some("report:annual:2026".to_string());
+        app.in_flight_jobs[0].unique_while = Some("active".to_string());
+
+        assert_ui_snapshot!(render_to_string(&app, 160, 30));
+    }
+
+    #[test]
     fn render_empty_ready_tab() {
         let app = App {
             host: "127.0.0.1:8901".to_string(),
@@ -1030,6 +1271,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
@@ -1055,6 +1297,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
@@ -1102,6 +1345,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
@@ -1149,6 +1393,7 @@ mod tests {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));

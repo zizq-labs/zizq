@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui.rs
-expression: "render_to_string(&app, 160, 12)"
+expression: "render_to_string(&app, 160, 30)"
 ---
   Zizq 0.1.0
 ● Connected 127.0.0.1:8901
@@ -13,4 +13,22 @@ expression: "render_to_string(&app, 160, 12)"
                          ID   PRIORITY QUEUE                        DURATION   ATTEMPTS TYPE
 70a2bb46e1f07a0c908d7a2bb40          0 default                            3s          1 generate_annual_report_email
 70a1aa35d0e06b0b807c691aa30          0 billing                         2m30s          3 charge_subscription
+
+
+
+
+
+
+
+
+
+
+
+
+  ATTRIBUTES                                                                     PAYLOAD
+  ID                      0195b70a2bb46e1f07a0c908d7a2bb40                       {
+  Queue                   default                                                  "subject": "Welcome!",
+  Type                    generate_annual_report_email                             "to": "user@example.com",
+  Priority                0                                                        "urgent": true
+  Status                  in_flight                                              }
  Tab Change Tab  i Info  q Quit

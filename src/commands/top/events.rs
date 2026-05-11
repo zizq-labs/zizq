@@ -9,7 +9,7 @@
 use tokio::sync::mpsc;
 
 use crate::api::admin::{
-    AdminEvent, AdminJobSummary, AdminMessage, JobChangeStatus, JobWindow, ServerStatus,
+    AdminEvent, AdminJob, AdminMessage, ClientMessage, JobChangeStatus, JobWindow, ServerStatus,
 };
 
 /// Unified event type for the TUI event loop.
@@ -36,6 +36,8 @@ pub enum Event {
     GoToStart,
     /// Jump to the last row.
     GoToEnd,
+    /// Toggle the detail panel.
+    ToggleDetail,
     /// Suspend the process (Ctrl-Z).
     Suspend,
     /// Server connection attempt in progress.
@@ -56,7 +58,7 @@ pub enum Event {
         server: ServerStatus,
         id: String,
         status: JobChangeStatus,
-        job: Option<AdminJobSummary>,
+        job: Option<AdminJob>,
     },
     /// Server connection lost.
     ServerDisconnected,
@@ -67,7 +69,12 @@ impl Event {
     pub fn is_user_input(&self) -> bool {
         matches!(
             self,
-            Event::Quit | Event::NextTab | Event::PrevTab | Event::ScrollLeft | Event::ScrollRight
+            Event::Quit
+                | Event::NextTab
+                | Event::PrevTab
+                | Event::ScrollLeft
+                | Event::ScrollRight
+                | Event::ToggleDetail
         )
     }
 
@@ -125,6 +132,9 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                         }
                         (KeyCode::PageDown, _) => {
                             let _ = tx.blocking_send(Event::PageDown);
+                        }
+                        (KeyCode::Char('i'), _) => {
+                            let _ = tx.blocking_send(Event::ToggleDetail);
                         }
                         (KeyCode::Char('g'), _) => {
                             let _ = tx.blocking_send(Event::GoToStart);
@@ -240,6 +250,12 @@ fn parse_ws_message(text: &str) -> Option<Event> {
             job,
         }),
     }
+}
+
+/// Serialize a detail-level message for sending over WebSocket.
+pub fn detail_level_message(detail: bool) -> String {
+    serde_json::to_string(&ClientMessage::SetDetailLevel { detail })
+        .expect("ClientMessage serialization cannot fail")
 }
 
 /// Serialize a subscribe message for sending over WebSocket.

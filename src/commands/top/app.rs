@@ -5,7 +5,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::api::admin::{AdminJobSummary, JobChangeStatus, JobWindow, ServerStatus};
+use crate::api::admin::{AdminJob, JobChangeStatus, JobWindow, ServerStatus};
 use crate::license::Tier;
 
 use super::events::{self, Event};
@@ -90,14 +90,15 @@ pub struct App {
     pub total_ready: usize,
     pub total_in_flight: usize,
     pub total_scheduled: usize,
-    pub ready_jobs: Vec<AdminJobSummary>,
-    pub in_flight_jobs: Vec<AdminJobSummary>,
-    pub scheduled_jobs: Vec<AdminJobSummary>,
+    pub ready_jobs: Vec<AdminJob>,
+    pub in_flight_jobs: Vec<AdminJob>,
+    pub scheduled_jobs: Vec<AdminJob>,
     pub now_ms: u64,
     pub active_tab: Tab,
     pub h_scroll: [u16; 3],
     pub list_states: [ListState; 3],
     pub viewport_height: usize,
+    pub show_detail: bool,
     pub ws_tx: Option<mpsc::Sender<String>>,
 }
 
@@ -121,6 +122,7 @@ impl Clone for App {
             h_scroll: self.h_scroll,
             list_states: self.list_states.clone(),
             viewport_height: self.viewport_height,
+            show_detail: self.show_detail,
             ws_tx: self.ws_tx.clone(),
         }
     }
@@ -146,6 +148,7 @@ impl App {
             h_scroll: [0; 3],
             list_states: Default::default(),
             viewport_height: 0,
+            show_detail: false,
             ws_tx: None,
         }
     }
@@ -238,6 +241,14 @@ impl App {
         }
     }
 
+    /// Send the current detail level to the server.
+    fn send_detail_level(&self) {
+        if let Some(tx) = &self.ws_tx {
+            let msg = events::detail_level_message(self.show_detail);
+            let _ = tx.try_send(msg);
+        }
+    }
+
     /// Apply server status fields from any message.
     fn apply_server_status(&mut self, server: ServerStatus) {
         self.status = ConnectionStatus::Connected;
@@ -288,12 +299,21 @@ impl App {
             Event::GoToEnd => {
                 self.go_to_end();
             }
+            Event::ToggleDetail => {
+                self.show_detail = !self.show_detail;
+                self.send_detail_level();
+            }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;
             }
             Event::ServerConnected { url } => {
                 self.status = ConnectionStatus::Connected;
                 self.host = url;
+                // Resend detail level so the server knows our preference
+                // after a reconnect.
+                if self.show_detail {
+                    self.send_detail_level();
+                }
             }
             Event::ServerHeartbeat { server } => {
                 self.apply_server_status(server);
@@ -516,6 +536,7 @@ impl App {
         ls.cursor = 0;
         ls.scroll_pos = 0;
         ls.follow_bottom = false;
+        self.maybe_prefetch();
     }
 
     fn go_to_end(&mut self) {
@@ -549,8 +570,8 @@ mod tests {
         }
     }
 
-    fn job(id: &str, priority: u16, dequeued_at: Option<u64>) -> AdminJobSummary {
-        AdminJobSummary {
+    fn job(id: &str, priority: u16, dequeued_at: Option<u64>) -> AdminJob {
+        AdminJob {
             id: id.to_string(),
             queue: "q".to_string(),
             job_type: "t".to_string(),
@@ -559,6 +580,12 @@ mod tests {
             attempts: 0,
             dequeued_at,
             failed_at: None,
+            payload: None,
+            retry_limit: None,
+            backoff: None,
+            retention: None,
+            unique_key: None,
+            unique_while: None,
         }
     }
 
@@ -580,7 +607,7 @@ mod tests {
         }
     }
 
-    fn ids(jobs: &[AdminJobSummary]) -> Vec<&str> {
+    fn ids(jobs: &[AdminJob]) -> Vec<&str> {
         jobs.iter().map(|j| j.id.as_str()).collect()
     }
 
@@ -835,7 +862,7 @@ mod tests {
                 server: default_server(),
                 id: id.to_string(),
                 status: JobChangeStatus::Scheduled,
-                job: Some(AdminJobSummary {
+                job: Some(AdminJob {
                     id: id.to_string(),
                     queue: "q".to_string(),
                     job_type: "t".to_string(),
@@ -844,6 +871,12 @@ mod tests {
                     attempts: 0,
                     dequeued_at: None,
                     failed_at: None,
+                    payload: None,
+                    retry_limit: None,
+                    backoff: None,
+                    retention: None,
+                    unique_key: None,
+                    unique_while: None,
                 }),
             }
         };
@@ -863,7 +896,7 @@ mod tests {
                 server: default_server(),
                 id: id.to_string(),
                 status: JobChangeStatus::Scheduled,
-                job: Some(AdminJobSummary {
+                job: Some(AdminJob {
                     id: id.to_string(),
                     queue: "q".to_string(),
                     job_type: "t".to_string(),
@@ -872,6 +905,12 @@ mod tests {
                     attempts: 0,
                     dequeued_at: None,
                     failed_at: None,
+                    payload: None,
+                    retry_limit: None,
+                    backoff: None,
+                    retention: None,
+                    unique_key: None,
+                    unique_while: None,
                 }),
             }
         };
@@ -897,7 +936,7 @@ mod tests {
                 server: default_server(),
                 id: id.to_string(),
                 status: JobChangeStatus::Scheduled,
-                job: Some(AdminJobSummary {
+                job: Some(AdminJob {
                     id: id.to_string(),
                     queue: "q".to_string(),
                     job_type: "t".to_string(),
@@ -906,6 +945,12 @@ mod tests {
                     attempts: 0,
                     dequeued_at: None,
                     failed_at: None,
+                    payload: None,
+                    retry_limit: None,
+                    backoff: None,
+                    retention: None,
+                    unique_key: None,
+                    unique_while: None,
                 }),
             }
         };
