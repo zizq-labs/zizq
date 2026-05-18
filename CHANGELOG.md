@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.2
+
+
 ## 0.3.1
 
 - Improved key bindings in `zizq top` (g, G, Home, End, ^C, ^Z)

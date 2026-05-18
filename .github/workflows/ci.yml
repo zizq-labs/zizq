@@ -376,7 +376,12 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_KEY_ISSUER_ID: ${{ secrets.APPLE_API_KEY_ISSUER_ID }}
-        run: ./release.sh --target ${{ matrix.target }}
+        run: |
+          # Clear any stale packaged artifacts a restored `target/`
+          # cache may carry forward from an earlier version's build —
+          # otherwise the upload globs would sweep them into the release.
+          rm -f target/release/zizq-*
+          ./release.sh --target ${{ matrix.target }}
 
       - name: Clean up macOS keychain
         if: always() && runner.os == 'macOS'
@@ -425,4 +430,4 @@ jobs:
           gh release create "v${version}" \
             --title "v${version}" \
             --notes-file release-notes.md \
-            artifacts/zizq-*
+            artifacts/zizq-${version}-*
