@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-language="${1:?language required (node|ruby)}"
+language="${1:?language required (node|ruby|rust)}"
 server_version="${2:?server version required}"
 
 case "$language" in
@@ -43,6 +43,21 @@ case "$language" in
       gh api "repos/${repo}/contents/${version_path}?ref=main" --jq '.content' \
         | base64 -d \
         | grep -oE 'VERSION\s*=\s*"[^"]+"' \
+        | head -n1 \
+        | sed -E 's/.*"([^"]+)".*/\1/'
+    }
+    ;;
+  rust)
+    repo="zizq-labs/zizq-rust"
+    version_path="Cargo.toml"
+    asset_prefix="zizq-"
+    asset_suffix=".crate"
+    # `^version` anchors on package-level keys; inline-table deps like
+    # `tokio = { version = "1" }` don't match.
+    extract_main_version() {
+      gh api "repos/${repo}/contents/${version_path}?ref=main" --jq '.content' \
+        | base64 -d \
+        | grep -oE '^version\s*=\s*"[^"]+"' \
         | head -n1 \
         | sed -E 's/.*"([^"]+)".*/\1/'
     }

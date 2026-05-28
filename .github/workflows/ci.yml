@@ -264,20 +264,105 @@ jobs:
             --binary ${{ github.workspace }}/server/zizq \
             --gem ${{ github.workspace }}/artifact/zizq-*.gem
 
+  discover-rust:
+    name: Discover Rust Versions
+    needs: release-binary
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Discover compatible client versions
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          matrix=$(./.github/scripts/discover-client-versions.sh \
+            rust "${{ needs.release-binary.outputs.version }}")
+          echo "Discovered matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  integration-rust:
+    name: Integration (Rust, ${{ matrix.label }})
+    needs: [release-binary, discover-rust]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover-rust.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: zizq-binary-v${{ needs.release-binary.outputs.version }}
+          path: server
+      - name: Unpack server binary
+        run: tar -xzf server/zizq-${{ needs.release-binary.outputs.version }}-linux-x86_64.tar.gz -C server
+
+      - name: Checkout Rust client @ ${{ matrix.ref }}
+        uses: actions/checkout@v5
+        with:
+          repository: zizq-labs/zizq-rust
+          ref: ${{ matrix.ref }}
+          path: client
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-rust-integration-${{ hashFiles('client/Cargo.toml', 'client/Cargo.lock', 'client/integration/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rust-integration-
+
+      - name: Prepare artifact directory
+        run: mkdir -p artifact
+
+      - name: Download release crate (tagged version)
+        if: matrix.tarball != ''
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          gh release download "${{ matrix.ref }}" \
+            --repo zizq-labs/zizq-rust \
+            --pattern "${{ matrix.tarball }}" \
+            --dir artifact
+
+      - name: Build client from source (main)
+        if: matrix.tarball == ''
+        working-directory: client
+        run: |
+          ./release.sh
+          cp target/release/zizq-*.crate ../artifact/
+
+      - name: Run integration tests
+        working-directory: client
+        run: |
+          ./integration/run.sh \
+            --binary ${{ github.workspace }}/server/zizq \
+            --crate ${{ github.workspace }}/artifact/zizq-*.crate
+
   # --- Integration gate (stable check name for branch protection) ---
 
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    needs: [integration-node, integration-ruby]
+    needs: [integration-node, integration-ruby, integration-rust]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.integration-node.result }}" != "success" ] || \
-             [ "${{ needs.integration-ruby.result }}" != "success" ]; then
+             [ "${{ needs.integration-ruby.result }}" != "success" ] || \
+             [ "${{ needs.integration-rust.result }}" != "success" ]; then
             echo "Integration tests failed or were skipped."
             echo "  Node: ${{ needs.integration-node.result }}"
             echo "  Ruby: ${{ needs.integration-ruby.result }}"
+            echo "  Rust: ${{ needs.integration-rust.result }}"
             exit 1
           fi
           echo "All integration tests passed."
