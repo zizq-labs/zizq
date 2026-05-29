@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post};
 
-use super::{backup, events};
+use super::{backup, compact, events};
 use crate::api::middleware;
 use crate::state::AppState;
 
@@ -20,6 +20,7 @@ pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/events", get(events::event_stream))
         .route("/backup", post(backup::handle_backup))
+        .route("/compact", post(compact::handle_compact))
         .layer(axum::middleware::from_fn(middleware::admin_request_logging))
         .with_state(state)
 }
@@ -286,5 +287,33 @@ mod tests {
         let page = restored.list_jobs(opts).await.unwrap();
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].payload, Some(serde_json::json!("backup_me")));
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_returns_ok() {
+        let (_, state) = test_state();
+
+        // Write some data so compaction has something to do.
+        state
+            .store
+            .enqueue(
+                now_millis(),
+                crate::store::EnqueueOptions::new("test", "q", serde_json::json!("hello")),
+            )
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{addr}/compact"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 204);
     }
 }

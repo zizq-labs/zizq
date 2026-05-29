@@ -1206,6 +1206,12 @@ pub struct StorageConfig {
     /// Optional per-operation commit mode for enqueue. When `None`,
     /// enqueue inherits `default_commit_mode`.
     pub enqueue_commit_mode: Option<CommitMode>,
+
+    /// After a bulk mutation affects at least this many records, force a
+    /// full LSM compaction to reclaim tombstones. Without this, leveled
+    /// compaction can leave large pockets of garbage in the upper levels
+    /// for a long time on quiet databases. Set to 0 to disable.
+    pub auto_compact_threshold: u64,
 }
 
 /// Default block cache capacity (256 MiB).
@@ -1242,6 +1248,11 @@ pub const DEFAULT_COMPLETED_RETENTION_MS: u64 = 0;
 /// Default retention period for dead jobs (milliseconds). 7 days.
 pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 
+/// Default threshold for auto-compacting after a bulk mutation. Bulk
+/// operations that mutate at least this many records trigger a full
+/// compaction once they commit.
+pub const DEFAULT_AUTO_COMPACT_THRESHOLD: u64 = 10_000;
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -1260,6 +1271,7 @@ impl Default for StorageConfig {
             },
             default_commit_mode: CommitMode::default(),
             enqueue_commit_mode: None,
+            auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
         }
     }
 }
@@ -1278,6 +1290,7 @@ impl StorageConfig {
     /// | `ZIZQ_L0_THRESHOLD`       | `l0_threshold`     |
     /// | `ZIZQ_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
     /// | `ZIZQ_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
+    /// | `ZIZQ_AUTO_COMPACT_THRESHOLD` | `auto_compact_threshold` |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
         Ok(Self {
@@ -1313,6 +1326,8 @@ impl StorageConfig {
                     });
                 }
             },
+            auto_compact_threshold: env_parse("ZIZQ_AUTO_COMPACT_THRESHOLD")?
+                .unwrap_or(defaults.auto_compact_threshold),
         })
     }
 }
@@ -2698,6 +2713,34 @@ impl Store {
         .await?
     }
 
+    /// Force a full LSM compaction of both keyspaces, reclaiming tombstones
+    /// that leveled compaction has left in upper levels.
+    ///
+    /// Leveled compaction triggers on level-size ratios, so after a large
+    /// bulk delete (or any operation that produces many tombstones without
+    /// matching live writes) the upper levels can sit on garbage for a long
+    /// time on a quiet database. A full compaction merges every level down
+    /// and drops tombstones whose seqnos are safe to GC.
+    ///
+    /// Runs on a blocking thread and may take seconds for large keyspaces.
+    /// Excludes other (background leveled) compactions while running, but
+    /// reads and writes at the LSM level proceed normally — they don't
+    /// touch the compaction lock. Concurrent zizq transactions also aren't
+    /// serialized against this since we bypass the txn writer lock.
+    //
+    // `major_compact` is `#[doc(hidden)]` in fjall 3.0.x / 3.1.x. It works
+    // and is the intended escape hatch for this use case, but the API is
+    // not formally stable yet; recheck on each fjall upgrade.
+    pub async fn compact_all(&self) -> Result<(), StoreError> {
+        let ks = self.ks.clone();
+        task::spawn_blocking(move || -> Result<(), StoreError> {
+            ks.data.inner().major_compact()?;
+            ks.index.inner().major_compact()?;
+            Ok(())
+        })
+        .await?
+    }
+
     /// Create a consistent backup of the database at the given path.
     ///
     /// Takes a read snapshot of the live database and copies all key/value
@@ -3663,6 +3706,14 @@ impl Store {
             let _ = event_tx.send(StoreEvent::JobDeleted { id: id.clone() });
         }
 
+        // Force a full compaction when we've written enough tombstones that
+        // leveled compaction would otherwise leave them sitting in upper
+        // levels on a quiet database.
+        let threshold = self.config.auto_compact_threshold;
+        if threshold > 0 && deleted_ids.len() as u64 >= threshold {
+            self.compact_all().await?;
+        }
+
         Ok(deleted_ids.len())
     }
 
@@ -3877,6 +3928,14 @@ impl Store {
 
         for diff in &diffs {
             diff.emit_events(&event_tx);
+        }
+
+        // See the equivalent block in `delete_jobs` — bulk patches that
+        // change indexed fields write tombstones to the index keyspace,
+        // and we want to reclaim those once the batch is large enough.
+        let threshold = self.config.auto_compact_threshold;
+        if threshold > 0 && diffs.len() as u64 >= threshold {
+            self.compact_all().await?;
         }
 
         Ok(diffs.len())
@@ -11078,6 +11137,74 @@ mod tests {
         opts.ids = [j1.id, "0000000000000000000000000".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- compact_all + auto-compact ---
+
+    #[tokio::test]
+    async fn compact_all_succeeds_on_empty_store() {
+        let store = test_store();
+        store.compact_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_all_succeeds_after_writes_and_deletes() {
+        let store = test_store();
+        let now = now_millis();
+
+        for _ in 0..50 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+        let count = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
+        assert_eq!(count, 50);
+
+        store.compact_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_triggers_auto_compact_above_threshold() {
+        // Threshold = 5 means a 5-job delete should pass the trigger path.
+        // We can't easily observe major_compact ran from the public API,
+        // so the assertion is that delete_jobs still succeeds and returns
+        // the correct count when the auto-compact branch fires.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageConfig::default();
+        config.auto_compact_threshold = 5;
+        let store = Store::open(dir.path().join("data"), config).unwrap();
+        std::mem::forget(dir);
+
+        let now = now_millis();
+        for _ in 0..5 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+        let count = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_skips_auto_compact_when_disabled() {
+        // threshold = 0 disables auto-compact entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageConfig::default();
+        config.auto_compact_threshold = 0;
+        let store = Store::open(dir.path().join("data"), config).unwrap();
+        std::mem::forget(dir);
+
+        let now = now_millis();
+        for _ in 0..3 {
+            store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+                .await
+                .unwrap();
+        }
+        let count = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
+        assert_eq!(count, 3);
     }
 
     // --- patch_job ---

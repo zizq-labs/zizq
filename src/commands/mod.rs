@@ -6,6 +6,7 @@
 use clap::Parser;
 
 pub mod backup;
+pub mod compact;
 pub mod restore;
 pub mod serve;
 pub mod tls;

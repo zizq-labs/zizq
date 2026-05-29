@@ -21,7 +21,7 @@
 
 use clap::{Parser, Subcommand};
 
-use zizq::commands::{backup, restore, serve, tls, top};
+use zizq::commands::{backup, compact, restore, serve, tls, top};
 use zizq::license::License;
 
 /// Struct used to handle command line arguments.
@@ -74,6 +74,10 @@ enum Command {
     ///
     /// Writes the backup contents to `--root-dir`, which must not exist.
     Restore(restore::Args),
+
+    /// Force a full LSM compaction on a running server to reclaim
+    /// disk/tombstone space.
+    Compact(compact::Args),
 }
 
 /// Resolve a license key value, reading from a file if `@`-prefixed.
@@ -123,6 +127,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Tls(args)) => tls::run(args, &cli.root_dir).await,
         Some(Command::Backup(args)) => backup::run(args).await,
         Some(Command::Restore(args)) => restore::run(args, &cli.root_dir).await,
+        Some(Command::Compact(args)) => compact::run(args).await,
         None => {
             serve::run(
                 serve::Args::parse_from(std::env::args()),
