@@ -4493,6 +4493,66 @@ impl Store {
         .await?
     }
 
+    /// Delete every cron group and entry in a single transaction.
+    ///
+    /// Returns the number of groups deleted. Emits a single
+    /// `CronScheduleChanged` event regardless of how many groups were
+    /// removed.
+    pub async fn delete_cron_groups(&self) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+        let cron_index = self.cron_index.clone();
+        let event_tx = self.event_tx.clone();
+
+        let count = task::spawn_blocking(move || -> Result<usize, StoreError> {
+            let data: &fjall::Keyspace = ks.data.as_ref();
+            let start: Vec<u8> = vec![RecordKind::Cron as u8];
+            let end: Vec<u8> = vec![RecordKind::Cron as u8 + 1];
+
+            let mut tx = ks.write_tx();
+            let mut groups_seen: HashSet<Vec<u8>> = HashSet::new();
+
+            for guard in data.range::<Vec<u8>, _>((Bound::Included(start), Bound::Excluded(end))) {
+                let (key, _) = guard.into_inner()?;
+                let key_bytes = key.as_ref();
+
+                // Key layout: C{group}\0... — the group-meta key is C{group}
+                // (no trailing \0). We dedupe by the prefix up to and
+                // including the first \0 (or the whole key for the meta).
+                let group_end = key_bytes[1..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| 1 + p)
+                    .unwrap_or(key_bytes.len());
+                groups_seen.insert(key_bytes[..group_end].to_vec());
+
+                tx.remove(&ks.data, key_bytes);
+            }
+
+            if groups_seen.is_empty() {
+                return Ok(0);
+            }
+
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            cron_index.clear();
+
+            Ok(groups_seen.len())
+        })
+        .await??;
+
+        if count > 0 {
+            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
+        }
+
+        // Reclaim tombstone space when the wipe was large enough.
+        let threshold = self.config.auto_compact_threshold;
+        if threshold > 0 && count as u64 >= threshold {
+            self.compact_all().await?;
+        }
+
+        Ok(count)
+    }
+
     /// Delete a cron group and all its entries.
     ///
     /// Returns `true` if the group existed and was deleted, `false` if it
@@ -13090,6 +13150,44 @@ mod tests {
     async fn delete_cron_group_returns_false_for_missing() {
         let store = test_store();
         assert!(!store.delete_cron_group("nonexistent").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_cron_groups_returns_zero_for_empty_store() {
+        let store = test_store();
+        let count = store.delete_cron_groups().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_cron_groups_removes_all_groups_and_entries() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        for name in &["g1", "g2", "g3"] {
+            store
+                .replace_cron_group(
+                    name,
+                    ReplaceCronGroupOptions {
+                        paused: None,
+                        entries: vec![
+                            cron_entry_opts("e1", "* * * * *", "q", "test"),
+                            cron_entry_opts("e2", "*/5 * * * *", "q", "test"),
+                        ],
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+
+        let count = store.delete_cron_groups().await.unwrap();
+        assert_eq!(count, 3);
+
+        assert!(store.list_cron_groups().await.unwrap().is_empty());
+        assert!(store.cron_next_due_at().is_none());
+        assert!(store.get_cron_entry("g1", "e1").await.unwrap().is_none());
+        assert!(store.get_cron_group("g2").await.unwrap().is_none());
     }
 
     #[tokio::test]

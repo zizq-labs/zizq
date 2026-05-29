@@ -9,6 +9,9 @@
 - Added `POST /compact` admin endpoint to trigger a full compaction on
   demand. Returns 204 No Content on success.
 - Added `zizq compact` CLI subcommand that calls the admin endpoint.
+- Added `DELETE /crons` to wipe every cron group in one call (Pro).
+- Added `POST /reset` to wipe every cron group and every job in a single
+  request. Returns 204 No Content. Useful for testing.
 
 ## 0.3.1
 
