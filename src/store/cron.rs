@@ -127,6 +127,11 @@ impl CronScheduleIndex {
         }
     }
 
+    /// Drop every entry from the index.
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+
     /// Peek at the earliest due timestamp, if any.
     pub fn next_due_at(&self) -> Option<u64> {
         let map = self.inner.lock().unwrap();

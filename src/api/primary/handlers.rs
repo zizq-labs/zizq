@@ -402,7 +402,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
         .route("/jobs/{id}/errors/{attempt}", get(get_error))
-        .route("/crons", get(list_cron_groups))
+        .route(
+            "/crons",
+            get(list_cron_groups).delete(bulk_delete_cron_groups),
+        )
         .route(
             "/crons/{name}",
             get(get_cron_group)
@@ -418,6 +421,7 @@ pub fn app(state: Arc<AppState>) -> Router {
                 .patch(patch_cron_entry)
                 .delete(delete_cron_entry),
         )
+        .route("/reset", post(reset))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(
             middleware::primary_request_logging,
@@ -2647,6 +2651,43 @@ async fn add_cron_entry(
     }
 }
 
+/// Handle `DELETE /crons` — delete every cron group in a single batch.
+async fn bulk_delete_cron_groups(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::CronScheduling)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.delete_cron_groups().await {
+        Ok(count) => {
+            tracing::debug!(count, "bulk delete cron groups completed");
+            respond(
+                fmt,
+                StatusCode::OK,
+                &serde_json::json!({ "deleted": count }),
+            )
+        }
+        Err(e) => {
+            tracing::error!(%e, "bulk_delete_cron_groups failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
 /// Handle `DELETE /crons/{name}` — delete a cron group and all its entries.
 async fn delete_cron_group(
     AcceptFormat(fmt): AcceptFormat,
@@ -2683,6 +2724,42 @@ async fn delete_cron_group(
             )
         }
     }
+}
+
+/// Handle `POST /reset` — wipe every cron group and every job.
+///
+/// Composes `Store::delete_cron_groups` + `Store::delete_jobs` (no filter),
+/// so existing event subscribers (cron scheduler, take streams, etc.) see
+/// the normal per-deletion events without needing any reset-specific
+/// handling.
+async fn reset(AcceptFormat(fmt): AcceptFormat, State(state): State<Arc<AppState>>) -> Response {
+    if let Err(e) = state.store.delete_cron_groups().await {
+        tracing::error!(%e, "reset: delete_cron_groups failed");
+        return respond(
+            fmt,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: "internal error".into(),
+            },
+        );
+    }
+
+    if let Err(e) = state
+        .store
+        .delete_jobs(store::BulkDeleteOptions::new())
+        .await
+    {
+        tracing::error!(%e, "reset: delete_jobs failed");
+        return respond(
+            fmt,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: "internal error".into(),
+            },
+        );
+    }
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Fallback handler for unmatched routes.
@@ -7420,6 +7497,53 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn cron_bulk_delete_removes_all_groups() {
+        let app = pro_app();
+
+        for name in ["g1", "g2"] {
+            let req = cron_put(
+                name,
+                &serde_json::json!({
+                    "entries": [{
+                        "name": "e1",
+                        "expression": "* * * * *",
+                        "job": { "type": "t", "queue": "q", "payload": {} }
+                    }]
+                }),
+            );
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        let req = empty_request("DELETE", "/crons");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 2);
+
+        let req = empty_request("GET", "/crons");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["crons"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn cron_bulk_delete_empty_returns_zero() {
+        let req = empty_request("DELETE", "/crons");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 0);
+    }
+
+    #[tokio::test]
+    async fn cron_bulk_delete_returns_403_on_free_tier() {
+        let req = empty_request("DELETE", "/crons");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
     fn cron_patch(name: &str, body: &serde_json::Value) -> Request {
         json_request("PATCH", &format!("/crons/{name}"), body)
     }
@@ -7898,5 +8022,69 @@ mod tests {
         let req = cron_patch_entry("default", "e1", &serde_json::json!({ "paused": true }));
         let res = test_app().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- POST /reset ---
+
+    #[tokio::test]
+    async fn reset_clears_jobs_and_crons() {
+        let app = pro_app();
+
+        // Enqueue a job.
+        let req = json_request(
+            "POST",
+            "/jobs",
+            &serde_json::json!({ "type": "t", "queue": "q", "payload": {} }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // Create a cron group.
+        let req = cron_put(
+            "g1",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "* * * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Reset.
+        let req = empty_request("POST", "/reset");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // Jobs gone.
+        let req = empty_request("GET", "/jobs/count");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 0);
+
+        // Crons gone.
+        let req = empty_request("GET", "/crons");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["crons"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn reset_is_noop_on_empty_store() {
+        let req = empty_request("POST", "/reset");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn reset_works_on_free_tier() {
+        // /reset is unrestricted; the cron delete step internally finds
+        // nothing on a free tier (since crons couldn't be created) and
+        // the job delete proceeds normally.
+        let req = empty_request("POST", "/reset");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
     }
 }
