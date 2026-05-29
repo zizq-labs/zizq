@@ -9,6 +9,7 @@
 //! that connects to it requires a license.
 
 pub mod backup;
+pub mod compact;
 pub mod events;
 mod handlers;
 mod types;

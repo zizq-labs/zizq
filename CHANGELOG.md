@@ -1,7 +1,14 @@
 # Changelog
 
-## 0.3.2
+## 0.4.0
 
+- Force a full LSM compaction after large bulk deletes and bulk patches to
+  reclaim tombstone space that leveled compaction would otherwise leave in
+  upper levels on quiet databases. Threshold is configurable via
+  `ZIZQ_AUTO_COMPACT_THRESHOLD` (default 10000, set to 0 to disable).
+- Added `POST /compact` admin endpoint to trigger a full compaction on
+  demand. Returns 204 No Content on success.
+- Added `zizq compact` CLI subcommand that calls the admin endpoint.
 
 ## 0.3.1
 
