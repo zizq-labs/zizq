@@ -495,6 +495,41 @@ The specified cron group does not exist.
 
 {{#include ./error-response.md}}
 
+## `DELETE /crons` { #delete-crons-bulk }
+
+Delete every cron group and its entries in a single request. Returns the
+number of groups removed.
+
+### Responses { #delete-crons-bulk-response }
+
+#### `200` OK
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>deleted</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of cron groups that were deleted.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `403` Forbidden
+
+Returned when the server is not configured with a pro license.
+
+{{#include ./error-response.md}}
+
 ## `DELETE /crons/{group}` { #delete-crons-group }
 
 Delete an entire cron group and its entries.
