@@ -7,3 +7,4 @@
 - [Cron Scheduling](./cron.md)
 - [Querying Job Data](./querying.md)
 - [Modifying Job Data](./modifying.md)
+- [Resetting](./resetting.md)
