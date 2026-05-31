@@ -203,8 +203,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Missed events — re-query full snapshot.
-                            match send_initial_snapshot(&send_state, &mut sender).await {
+                            // Missed events — re-query full snapshot, but
+                            // preserve the client's existing subscriptions
+                            // and detail flag so the resync doesn't silently
+                            // demote them to defaults.
+                            match resync_snapshot(&send_state, &mut sender, &conn).await {
                                 Ok(new_conn) => conn = new_conn,
                                 Err(e) => {
                                     tracing::error!(%e, "admin ws: resync snapshot failed");
@@ -287,7 +290,26 @@ async fn send_initial_snapshot(
         }
     };
 
-    send_snapshot_with_subs(state, sender, make_sub(), make_sub(), make_sub()).await
+    send_snapshot_with_subs(state, sender, make_sub(), make_sub(), make_sub(), false).await
+}
+
+/// Re-send a full snapshot using the existing connection's subscription
+/// windows and detail flag, used to recover from a `broadcast` lag without
+/// losing the client's prior `SetDetailLevel` / `Subscribe` choices.
+async fn resync_snapshot(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    conn: &ConnectionState,
+) -> Result<ConnectionState, String> {
+    send_snapshot_with_subs(
+        state,
+        sender,
+        conn.ready_sub.clone(),
+        conn.in_flight_sub.clone(),
+        conn.scheduled_sub.clone(),
+        conn.detail,
+    )
+    .await
 }
 
 async fn send_snapshot_with_subs(
@@ -296,6 +318,7 @@ async fn send_snapshot_with_subs(
     ready_sub: Subscription,
     in_flight_sub: Subscription,
     scheduled_sub: Subscription,
+    detail: bool,
 ) -> Result<ConnectionState, String> {
     // Build the initial in-flight ID set from a full query.
     let mut in_flight_jobs = state
@@ -329,7 +352,7 @@ async fn send_snapshot_with_subs(
         ready_sub,
         in_flight_sub,
         scheduled_sub,
-        detail: false,
+        detail,
     };
 
     let event = build_snapshot(&state.store, &mut conn).await;
