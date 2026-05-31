@@ -1,0 +1,15 @@
+---
+source: src/commands/top/ui.rs
+assertion_line: 1110
+expression: "render_to_string(&app, 80, 10)"
+---
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: ?, Uptime: ?
+  Queue: 0 in-flight, 0 ready, 0 scheduled
+
+  Depth[                                                               0 jobs]
+
+   In-Flight   Ready   Scheduled
+                         ID   PRIORITY QUEUE              DURATION   ATTEMPTS TY
+ Delete job j_abc123?   y Yes  n No

@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui.rs
-assertion_line: 1444
+assertion_line: 1547
 expression: "render_to_string(&app, 120, 12)"
 ---
   Zizq 0.1.0
@@ -14,4 +14,4 @@ expression: "render_to_string(&app, 120, 12)"
 
                                          Display is currently capped at 10 jobs.
                                        Upgrade to a pro license to see everything.
- Tab Change Tab  i Info  p Pause  q Quit
+ Tab Change Tab  i Info  p Pause  D Delete  q Quit

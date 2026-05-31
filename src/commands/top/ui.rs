@@ -451,6 +451,33 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Help bar.
     let key_style = Style::default();
     let label_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
+
+    // When a delete confirmation is pending, the help bar becomes a modal
+    // prompt — replaces the shortcuts entirely so the user is never in
+    // doubt about what `y` and `n` will do.
+    if let Some(id) = &app.pending_delete {
+        let prompt = Paragraph::new(Line::from(vec![
+            Span::styled(
+                " Delete job ",
+                Style::default().fg(Color::Black).bg(Color::LightRed),
+            ),
+            Span::styled(
+                id.as_str(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("?  ", Style::default().fg(Color::Black).bg(Color::LightRed)),
+            Span::styled(" y ", key_style),
+            Span::styled("Yes", label_style),
+            Span::styled("  n ", key_style),
+            Span::styled("No", label_style),
+        ]));
+        frame.render_widget(prompt, chunks[3]);
+        return;
+    }
+
     // While paused the `i` slot strikes through (rather than vanishing
     // entirely) so it reads as "disabled" without depending on a
     // light/dark terminal theme. We only mark the glyphs themselves with
@@ -475,6 +502,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     help_spans.extend([
         Span::styled("  p ", key_style),
         Span::styled(pause_label, label_style),
+        Span::styled("  D ", key_style),
+        Span::styled("Delete", label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
     ]);
@@ -1051,6 +1080,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         }
     }
@@ -1067,6 +1097,14 @@ mod tests {
         app.status = ConnectionStatus::Connected;
         app.paused = true;
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
+    }
+
+    #[test]
+    fn render_delete_prompt_replaces_help_bar() {
+        let mut app = new_app();
+        app.status = ConnectionStatus::Connected;
+        app.pending_delete = Some("j_abc123".into());
+        assert_ui_snapshot!(render_to_string(&app, 80, 10));
     }
 
     #[test]
@@ -1127,6 +1165,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
@@ -1154,6 +1193,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
@@ -1272,6 +1312,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         }
     }
@@ -1377,6 +1418,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
@@ -1404,6 +1446,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
@@ -1453,6 +1496,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
@@ -1502,6 +1546,7 @@ mod tests {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));

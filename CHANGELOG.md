@@ -28,6 +28,33 @@
   client's prior `SetDetailLevel{detail: true}`. The resync now preserves
   the connection's detail flag and subscription windows so payloads keep
   flowing across all tabs in `zizq top`.
+- Press `D` (Shift+d) on a row in `zizq top` to delete a job. A `[y/N]`
+  confirmation prompt replaces the help bar; `y` confirms, `n`/Esc/`q`
+  cancel. New `delete_job` message type on the admin WebSocket protocol.
+- Fixed `GET /jobs/take`: the heartbeat used `send().await`, which would
+  block when the response body's `mpsc(1)` buffer was full. That parked
+  the take loop's `select!`, swallowing any subsequent `tx.closed()`
+  notification. The result was orphaned in-flight jobs that never got
+  requeued when a worker was killed. Heartbeats now use `try_send`, which
+  treats a full buffer as "the previous heartbeat is still in flight,
+  skip this tick" and keeps the disconnect path live.
+- Fixed `GET /jobs/take`: when a worker disconnected partway through a
+  prefetched batch, only the jobs that had been dispatched so far were
+  tracked in the local in-flight set and requeued on cleanup. The tail
+  of the batch was already InFlight on disk (committed by
+  `take_next_n_jobs`) and had bumped the in-flight counter, but was
+  never seen by cleanup — leaving those jobs stranded InFlight forever
+  and the counter drifting above the actual on-disk count. The handler
+  now records the entire batch in the in-flight set before dispatching,
+  so cleanup requeues every job in the batch.
+- Fixed admin WebSocket: when a job was requeued (worker disconnect
+  cleanup), the `JobCreated` event was treated only as "new ready job"
+  — the handler diffed the ready/scheduled windows but never evicted
+  the id from `in_flight_ids`. `zizq top` therefore kept showing
+  stale rows in the in-flight tab even though the header total had
+  dropped to zero. `JobCreated` now removes the id from the connection's
+  in-flight set if it was there, so the next `diff_in_flight` emits an
+  `in_flight_removed` event.
 
 ## 0.3.1
 

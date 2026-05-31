@@ -1915,8 +1915,19 @@ async fn take_jobs(
                     // next heartbeat or reserve() call.
                     _ = tx.closed() => break,
                     _ = &mut heartbeat_sleep => {
-                        if tx.send(TakeMessage::Heartbeat).await.is_err() {
-                            break;
+                        // `try_send` instead of `send().await`: when the
+                        // channel buffer is full (the previous heartbeat
+                        // hasn't been pulled by the response stream yet)
+                        // an awaited `send` would block here, parking the
+                        // whole `select!` and silently swallowing future
+                        // `tx.closed()` notifications.
+                        //
+                        // `Full` is harmless — the existing pending
+                        // heartbeat will go out when the channel drains, or
+                        // we'll skip a tick and try again.
+                        match tx.try_send(TakeMessage::Heartbeat) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                         heartbeat_sleep
                             .as_mut()
@@ -1986,31 +1997,49 @@ async fn take_jobs(
                                             // send all jobs uniformly via tx.send().
                                             drop(permit);
 
-                                            let mut send_err = false;
+                                            // Decode and add every job from the batch to
+                                            // the in-flight set BEFORE attempting any
+                                            // sends. `take_next_n_jobs` has already
+                                            // committed every job to InFlight on disk
+                                            // and incremented the global counter — if
+                                            // the worker dies mid-dispatch, cleanup
+                                            // needs to see the whole batch so it can
+                                            // requeue everything. Otherwise the taken jobs
+                                            // are stranded InFlight forever and the counter
+                                            // drifts above the actual in-flight count.
+                                            let mut to_send: Vec<Job> = Vec::with_capacity(jobs.len());
                                             for store_job in jobs {
                                                 match Job::try_from(store_job) {
                                                     Ok(job) => {
                                                         in_flight.insert(job.id.clone(), job.attempts);
-                                                        tracing::debug!(
-                                                            job_id = %job.id,
-                                                            job_type = %job.job_type,
-                                                            queue = %job.queue,
-                                                            priority = job.priority,
-                                                            "job dispatched"
-                                                        );
-                                                        if tx.send(TakeMessage::Job(Arc::new(job))).await.is_err() {
-                                                            send_err = true;
-                                                            break;
-                                                        }
+                                                        to_send.push(job);
                                                     }
                                                     Err(e) => {
+                                                        // Corrupt jobs stay InFlight on
+                                                        // disk but aren't tracked here —
+                                                        // skipping them lets the
+                                                        // connection keep going. (This
+                                                        // does leak a counter increment
+                                                        // for each, but it's a real
+                                                        // corruption signal, not a
+                                                        // routine path.)
                                                         tracing::error!(%e, "corrupt job data");
-                                                        // Skip this job — it's marked InFlight
-                                                        // in the store but we can't decode it.
-                                                        // Don't track it in in_flight so the
-                                                        // connection stays healthy.
-                                                        continue;
                                                     }
+                                                }
+                                            }
+
+                                            let mut send_err = false;
+                                            for job in to_send {
+                                                tracing::debug!(
+                                                    job_id = %job.id,
+                                                    job_type = %job.job_type,
+                                                    queue = %job.queue,
+                                                    priority = job.priority,
+                                                    "job dispatched"
+                                                );
+                                                if tx.send(TakeMessage::Job(Arc::new(job))).await.is_err() {
+                                                    send_err = true;
+                                                    break;
                                                 }
                                             }
 
@@ -4866,6 +4895,137 @@ mod tests {
         assert_eq!(
             res.headers().get("content-type").unwrap(),
             "application/x-ndjson"
+        );
+    }
+
+    /// Regression: when `take_next_n_jobs` returned a batch but the
+    /// worker disconnected partway through dispatch, the tail of the
+    /// batch was stranded InFlight on disk (and `in_flight_count` was
+    /// left over-counted). The in-flight HashMap was only populated as
+    /// each job was dispatched, so jobs after the first `tx.send`
+    /// failure were never tracked and never requeued. The handler now
+    /// inserts the whole batch before dispatching.
+    #[tokio::test]
+    async fn take_requeues_entire_batch_when_worker_dies_mid_dispatch() {
+        let (state, app) = test_state_and_app();
+
+        // Enqueue 5 jobs.
+        let mut enqueued_ids = Vec::new();
+        for i in 0..5 {
+            let job = state
+                .store
+                .enqueue(
+                    crate::time::now_millis(),
+                    EnqueueOptions::new("t", "default", serde_json::json!(i)),
+                )
+                .await
+                .unwrap()
+                .into_job();
+            enqueued_ids.push(job.id);
+        }
+
+        // Request all of them in a single batch; only read one line
+        // before disconnecting. That leaves `tx.send` blocked on the
+        // buffer for the next dispatch, and the drop then propagates
+        // a closed-channel error — simulating the worker dying with
+        // most of the batch still in the dispatch loop.
+        let req = empty_request("GET", "/jobs/take?prefetch=5");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let _ = std::str::from_utf8(&bytes).unwrap();
+
+        drop(body);
+
+        // Give the cleanup pass time to run.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Every enqueued job should be requeued (Ready again).
+        let mut ids = Vec::new();
+        while let Some(job) = state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+        {
+            ids.push(job.id);
+        }
+        for id in &enqueued_ids {
+            assert!(
+                ids.contains(id),
+                "expected job {id} to be requeued after mid-batch disconnect"
+            );
+        }
+
+        // The in-flight counter should have come back down to zero now
+        // that the cleanup pass ran for every job.
+        assert_eq!(
+            state.store.in_flight_count(),
+            ids.len(),
+            "in_flight_count must match what we re-took after cleanup"
+        );
+    }
+
+    /// Coverage for the stalled-rx path: the worker isn't reading
+    /// heartbeats off the body for a while (which fills the `mpsc(1)`
+    /// buffer), and then disconnects. With the old `send().await`
+    /// heartbeat path the loop was wedged for the full stall window —
+    /// the response drop happened to unwedge it in this in-process
+    /// test, but in production where hyper was slow to drop `rx` the
+    /// same scenario stranded all in-flight jobs. `try_send` keeps the
+    /// loop responsive across the wedge window.
+    #[tokio::test]
+    async fn take_requeues_when_body_stalled_then_dropped() {
+        let (_clock, mut state) = test_app_state();
+        // Short heartbeats so several fire during the stall window.
+        state.heartbeat_interval_ms = Duration::from_millis(20);
+        let state = Arc::new(state);
+        let app = app(state.clone());
+
+        let enqueued = state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!("stalled")),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let req = empty_request("GET", "/jobs/take?prefetch=2");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        // Read just the job line — leaves any subsequent heartbeats
+        // unread, so the channel buffer will fill.
+        let bytes = next_body_bytes(&mut body).await;
+        let line = std::str::from_utf8(&bytes).unwrap().trim();
+        let job: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(job["id"], enqueued.id);
+
+        // Stall: don't poll the body for several heartbeat intervals.
+        // With the buggy version this leaves the take loop wedged in
+        // `tx.send.await`, so the subsequent drop never triggers the
+        // requeue path.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(body);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut ids = Vec::new();
+        while let Some(job) = state
+            .store
+            .take_next_job(crate::time::now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+        {
+            ids.push(job.id);
+        }
+        assert!(
+            ids.contains(&enqueued.id),
+            "stalled-then-dropped take should still requeue its in-flight job"
         );
     }
 

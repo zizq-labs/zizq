@@ -104,6 +104,10 @@ pub struct App {
     /// fields keep updating; incoming `JobChanged` / `JobSnapshot` events
     /// don't mutate the row buffers. Toggled by `p`.
     pub paused: bool,
+    /// When `Some`, the user has pressed `D` on a row and the help bar
+    /// is showing a `Delete job …? [y/N]` prompt. While set, user input
+    /// is restricted to confirming (`y`) or cancelling (`n` / Esc / `q`).
+    pub pending_delete: Option<String>,
     pub ws_tx: Option<mpsc::Sender<String>>,
 }
 
@@ -129,6 +133,7 @@ impl Clone for App {
             viewport_height: self.viewport_height,
             show_detail: self.show_detail,
             paused: self.paused,
+            pending_delete: self.pending_delete.clone(),
             ws_tx: self.ws_tx.clone(),
         }
     }
@@ -156,6 +161,7 @@ impl App {
             viewport_height: 0,
             show_detail: false,
             paused: false,
+            pending_delete: None,
             ws_tx: None,
         }
     }
@@ -262,6 +268,37 @@ impl App {
         }
     }
 
+    /// Return the id of the job under the cursor in the active tab,
+    /// or `None` if the buffer doesn't cover that row.
+    fn selected_job_id(&self) -> Option<String> {
+        let ls = &self.list_states[self.active_tab.idx()];
+        let idx = ls.cursor.checked_sub(ls.buffer_offset)?;
+        let jobs = match self.active_tab {
+            Tab::Ready => &self.ready_jobs,
+            Tab::InFlight => &self.in_flight_jobs,
+            Tab::Scheduled => &self.scheduled_jobs,
+        };
+        jobs.get(idx).map(|j| j.id.clone())
+    }
+
+    /// Send a delete-job message over WebSocket and remove the row from
+    /// every local buffer. The server will also broadcast a `JobDeleted`
+    /// store event, but applying the removal eagerly keeps the cursor
+    /// behaving sensibly even while paused (when incoming events are
+    /// otherwise ignored).
+    fn confirm_pending_delete(&mut self) {
+        let Some(id) = self.pending_delete.take() else {
+            return;
+        };
+        if let Some(tx) = &self.ws_tx {
+            let msg = events::delete_job_message(id.clone());
+            let _ = tx.try_send(msg);
+        }
+        self.ready_jobs.retain(|j| j.id != id);
+        self.in_flight_jobs.retain(|j| j.id != id);
+        self.scheduled_jobs.retain(|j| j.id != id);
+    }
+
     /// Apply server status fields from any message.
     fn apply_server_status(&mut self, server: ServerStatus) {
         self.status = ConnectionStatus::Connected;
@@ -278,6 +315,22 @@ impl App {
     ///
     /// Returns `true` if the application should quit.
     pub fn handle_event(&mut self, event: Event) -> bool {
+        // While a delete prompt is pending, gate user input down to
+        // confirm/cancel. Server-pushed events still flow through and
+        // update state — only keypresses are restricted. `is_user_input`
+        // and `is_scroll` together cover every keyboard-originated event.
+        if self.pending_delete.is_some() && (event.is_user_input() || event.is_scroll()) {
+            match event {
+                Event::ConfirmDelete => self.confirm_pending_delete(),
+                // Quit while prompting cancels the prompt rather than
+                // exiting; a second `q` (or any other quit gesture) after
+                // cancellation will quit normally.
+                Event::CancelDelete | Event::Quit => self.pending_delete = None,
+                _ => {}
+            }
+            return false;
+        }
+
         match event {
             Event::Quit => return true,
             Event::NextTab => {
@@ -321,6 +374,14 @@ impl App {
                 self.show_detail = !self.show_detail;
                 self.send_detail_level();
             }
+            Event::RequestDelete => {
+                if let Some(id) = self.selected_job_id() {
+                    self.pending_delete = Some(id);
+                }
+            }
+            // Outside of an active prompt these are no-ops — the prompt
+            // path above is the only thing that interprets them.
+            Event::ConfirmDelete | Event::CancelDelete => {}
             Event::TogglePause => {
                 self.paused = !self.paused;
                 if !self.paused {
@@ -1368,5 +1429,108 @@ mod tests {
 
         // Detail level didn't change because the snapshot was frozen.
         assert!(!app.show_detail);
+    }
+
+    // ── Delete prompt ───────────────────────────────────────────────
+
+    /// Seed the app with a ready job, cursor pointing at it.
+    fn seed_ready_with_cursor(id: &str) -> App {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+        app.total_ready = 1;
+        app.ready_jobs = vec![job(id, 0, None)];
+        app.list_states[Tab::Ready.idx()].buffer_offset = 0;
+        app.list_states[Tab::Ready.idx()].cursor = 0;
+        app
+    }
+
+    #[test]
+    fn d_opens_delete_prompt_for_cursor_row() {
+        let mut app = seed_ready_with_cursor("j1");
+        app.handle_event(Event::RequestDelete);
+        assert_eq!(app.pending_delete.as_deref(), Some("j1"));
+    }
+
+    #[test]
+    fn d_on_empty_buffer_does_not_open_prompt() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::RequestDelete);
+        assert!(app.pending_delete.is_none());
+    }
+
+    #[test]
+    fn confirm_outside_prompt_is_noop() {
+        let mut app = seed_ready_with_cursor("j1");
+        app.handle_event(Event::ConfirmDelete);
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+    }
+
+    #[test]
+    fn cancel_clears_pending_delete() {
+        let mut app = seed_ready_with_cursor("j1");
+        app.handle_event(Event::RequestDelete);
+        app.handle_event(Event::CancelDelete);
+        assert!(app.pending_delete.is_none());
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+    }
+
+    #[test]
+    fn quit_during_prompt_cancels_instead_of_quitting() {
+        let mut app = seed_ready_with_cursor("j1");
+        app.handle_event(Event::RequestDelete);
+        let quit = app.handle_event(Event::Quit);
+        assert!(!quit, "Quit during prompt must not exit the app");
+        assert!(app.pending_delete.is_none());
+
+        // Second quit, no prompt active — should now exit.
+        assert!(app.handle_event(Event::Quit));
+    }
+
+    #[test]
+    fn confirm_sends_delete_message_and_removes_row() {
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let mut app = seed_ready_with_cursor("j_to_delete");
+        app.set_ws_tx(tx);
+
+        app.handle_event(Event::RequestDelete);
+        app.handle_event(Event::ConfirmDelete);
+
+        assert!(app.pending_delete.is_none());
+        assert!(app.ready_jobs.is_empty(), "row should be removed locally");
+
+        let msg = rx.try_recv().expect("expected a delete_job message");
+        assert!(
+            msg.contains("\"type\":\"delete_job\"") && msg.contains("j_to_delete"),
+            "expected DeleteJob with id j_to_delete, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn navigation_keys_are_swallowed_while_prompt_pending() {
+        let mut app = seed_ready_with_cursor("j1");
+        // Add a second job so scrolling has somewhere to go.
+        app.ready_jobs.push(job("j2", 0, None));
+        app.total_ready = 2;
+
+        app.handle_event(Event::RequestDelete);
+        let cursor_before = app.list_states[Tab::Ready.idx()].cursor;
+
+        app.handle_event(Event::ScrollDown);
+        app.handle_event(Event::TogglePause);
+
+        assert_eq!(
+            app.list_states[Tab::Ready.idx()].cursor,
+            cursor_before,
+            "navigation should be ignored while prompt is pending"
+        );
+        assert!(
+            !app.paused,
+            "pause toggle should be ignored while prompt is pending"
+        );
+        assert!(
+            app.pending_delete.is_some(),
+            "prompt should still be pending"
+        );
     }
 }
