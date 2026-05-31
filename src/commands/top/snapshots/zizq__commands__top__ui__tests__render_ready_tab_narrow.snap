@@ -1,5 +1,6 @@
 ---
 source: src/commands/top/ui.rs
+assertion_line: 1225
 expression: "render_to_string(&app, 80, 12)"
 ---
   Zizq 0.1.0
@@ -13,4 +14,4 @@ expression: "render_to_string(&app, 80, 12)"
                          ID   PRIORITY QUEUE                 DELAY   ATTEMPTS TY
 70a3cc87a1f0890da08e8b3cc86          0 default                  5s          0 ge
 70a3dd47c2308a1fb09e9c4dd97          5 default                1m2s          2 se
- Tab Change Tab  i Info  q Quit
+ Tab Change Tab  i Info  p Pause  q Quit

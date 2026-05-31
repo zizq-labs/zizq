@@ -1,5 +1,6 @@
 ---
 source: src/commands/top/ui.rs
+assertion_line: 1034
 expression: "render_to_string(&app, 60, 10)"
 ---
   Zizq 0.1.0
@@ -11,4 +12,4 @@ expression: "render_to_string(&app, 60, 10)"
 
    In-Flight   Ready   Scheduled
                          ID   PRIORITY QUEUE              DU
- Tab Change Tab  i Info  q Quit
+ Tab Change Tab  i Info  p Pause  q Quit

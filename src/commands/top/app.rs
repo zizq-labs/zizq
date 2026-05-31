@@ -99,6 +99,11 @@ pub struct App {
     pub list_states: [ListState; 3],
     pub viewport_height: usize,
     pub show_detail: bool,
+    /// When true, the displayed job lists are frozen at the snapshot they
+    /// held at the moment pause was toggled on. Header totals/heartbeat
+    /// fields keep updating; incoming `JobChanged` / `JobSnapshot` events
+    /// don't mutate the row buffers. Toggled by `p`.
+    pub paused: bool,
     pub ws_tx: Option<mpsc::Sender<String>>,
 }
 
@@ -123,6 +128,7 @@ impl Clone for App {
             list_states: self.list_states.clone(),
             viewport_height: self.viewport_height,
             show_detail: self.show_detail,
+            paused: self.paused,
             ws_tx: self.ws_tx.clone(),
         }
     }
@@ -149,6 +155,7 @@ impl App {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         }
     }
@@ -209,6 +216,12 @@ impl App {
     /// Deduplicates: won't re-send the same (offset, limit) for the same tab.
     fn maybe_prefetch(&mut self) {
         if self.subscription_limit.is_some() {
+            return;
+        }
+        // While paused the visible buffer is intentionally frozen — no
+        // prefetching, so scrolling clamps at whatever rows were already
+        // present at the moment of pause.
+        if self.paused {
             return;
         }
         let vh = self.viewport_height;
@@ -300,8 +313,30 @@ impl App {
                 self.go_to_end();
             }
             Event::ToggleDetail => {
+                // Detail level can't be changed while paused — the visible
+                // payloads are whatever was in the frozen snapshot.
+                if self.paused {
+                    return false;
+                }
                 self.show_detail = !self.show_detail;
                 self.send_detail_level();
+            }
+            Event::TogglePause => {
+                self.paused = !self.paused;
+                if !self.paused {
+                    // Resync the active tab on unpause so the visible rows
+                    // reflect current truth. Other tabs will refresh lazily
+                    // on next prefetch or when they become active.
+                    let tab = self.active_tab;
+                    let ls = &self.list_states[tab.idx()];
+                    if let Some((offset, limit)) = ls.last_subscribe {
+                        self.send_subscribe(tab, offset, limit);
+                    } else if self.viewport_height > 0 {
+                        let limit = self.viewport_height * 3;
+                        let offset = ls.cursor.saturating_sub(limit / 2);
+                        self.send_subscribe(tab, offset, limit);
+                    }
+                }
             }
             Event::ServerConnecting => {
                 self.status = ConnectionStatus::Connecting;
@@ -318,6 +353,10 @@ impl App {
             Event::ServerHeartbeat { server } => {
                 self.apply_server_status(server);
                 self.apply_follow_bottom();
+                // The follow-bottom clamp may have moved the cursor outside
+                // the current buffer (e.g. after G during list churn), so
+                // re-check whether we need a fresh window.
+                self.maybe_prefetch();
             }
             Event::ServerJobSnapshot {
                 server,
@@ -326,10 +365,20 @@ impl App {
                 scheduled,
             } => {
                 self.apply_server_status(server);
+                // Header totals/server status always update; the row
+                // windows are held frozen while paused.
+                if self.paused {
+                    return false;
+                }
                 self.apply_job_window(Tab::Ready, ready);
                 self.apply_job_window(Tab::InFlight, in_flight);
                 self.apply_job_window(Tab::Scheduled, scheduled);
                 self.apply_follow_bottom();
+                // A snapshot can land with an offset that pre-dates rapid
+                // server-side churn (jobs were enqueued/drained while the
+                // Subscribe was in flight), leaving the cursor outside the
+                // new buffer. Trigger another prefetch round so we converge.
+                self.maybe_prefetch();
             }
             Event::ServerJobChanged {
                 server,
@@ -338,6 +387,9 @@ impl App {
                 job,
             } => {
                 self.apply_server_status(server);
+                if self.paused {
+                    return false;
+                }
                 match status {
                     JobChangeStatus::Ready => {
                         if let Some(job) = job {
@@ -389,6 +441,9 @@ impl App {
                     }
                 }
                 self.apply_follow_bottom();
+                // Each JobChanged can move the follow-bottom cursor; same
+                // reasoning as the snapshot/heartbeat paths.
+                self.maybe_prefetch();
             }
             Event::ServerDisconnected => {
                 self.status = ConnectionStatus::Disconnected;
@@ -423,8 +478,41 @@ impl App {
         }
     }
 
+    /// Cursor navigation bounds for the active tab.
+    ///
+    /// While live this is the full server-side range. While paused it
+    /// clamps to the rows currently in the buffer so the user can only
+    /// scroll through the frozen snapshot. Returns `None` when there's
+    /// nothing to navigate.
+    fn cursor_bounds(&self) -> Option<(usize, usize)> {
+        if !self.paused {
+            let total = self.effective_total();
+            if total == 0 {
+                return None;
+            }
+            return Some((0, total - 1));
+        }
+        let tab = self.active_tab;
+        let ls = &self.list_states[tab.idx()];
+        let buffer_size = match tab {
+            Tab::Ready => self.ready_jobs.len(),
+            Tab::InFlight => self.in_flight_jobs.len(),
+            Tab::Scheduled => self.scheduled_jobs.len(),
+        };
+        if buffer_size == 0 {
+            return None;
+        }
+        Some((ls.buffer_offset, ls.buffer_offset + buffer_size - 1))
+    }
+
     /// Clamp cursor/scroll positions and apply follow-bottom tracking.
     fn apply_follow_bottom(&mut self) {
+        // While paused, the cursor is bounded to the frozen buffer (see
+        // `cursor_bounds`) — letting `follow_bottom` and the live total
+        // drag it around would break that contract.
+        if self.paused {
+            return;
+        }
         let cap = self.subscription_limit;
         for tab in [Tab::InFlight, Tab::Ready, Tab::Scheduled] {
             let raw_total = match tab {
@@ -466,12 +554,11 @@ impl App {
     }
 
     fn scroll_up(&mut self) {
-        let total = self.effective_total();
-        if total == 0 {
+        let Some((min, _)) = self.cursor_bounds() else {
             return;
-        }
+        };
         let ls = &mut self.list_states[self.active_tab.idx()];
-        if ls.cursor > 0 {
+        if ls.cursor > min {
             ls.cursor -= 1;
         }
         if ls.cursor < ls.scroll_pos {
@@ -482,29 +569,32 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
-        let total = self.effective_total();
-        if total == 0 {
+        let Some((_, max)) = self.cursor_bounds() else {
             return;
-        }
+        };
         let ls = &mut self.list_states[self.active_tab.idx()];
-        if ls.cursor < total - 1 {
+        if ls.cursor < max {
             ls.cursor += 1;
         }
         if self.viewport_height > 0 && ls.cursor >= ls.scroll_pos + self.viewport_height {
             ls.scroll_pos = ls.cursor - self.viewport_height + 1;
         }
-        ls.follow_bottom = ls.cursor == total - 1;
+        // `follow_bottom` only makes sense while live — paused scrolling
+        // never wants the cursor pulled toward the server-side bottom.
+        ls.follow_bottom = !self.paused && ls.cursor == max;
         self.maybe_prefetch();
     }
 
     fn page_up(&mut self) {
-        let total = self.effective_total();
-        if total == 0 || self.viewport_height == 0 {
+        let Some((min, _)) = self.cursor_bounds() else {
+            return;
+        };
+        if self.viewport_height == 0 {
             return;
         }
         let ls = &mut self.list_states[self.active_tab.idx()];
         let jump = self.viewport_height.saturating_sub(1).max(1);
-        ls.cursor = ls.cursor.saturating_sub(jump);
+        ls.cursor = ls.cursor.saturating_sub(jump).max(min);
         if ls.cursor < ls.scroll_pos {
             ls.scroll_pos = ls.cursor;
         }
@@ -513,43 +603,45 @@ impl App {
     }
 
     fn page_down(&mut self) {
-        let total = self.effective_total();
-        if total == 0 || self.viewport_height == 0 {
+        let Some((_, max)) = self.cursor_bounds() else {
+            return;
+        };
+        if self.viewport_height == 0 {
             return;
         }
         let ls = &mut self.list_states[self.active_tab.idx()];
         let jump = self.viewport_height.saturating_sub(1).max(1);
-        ls.cursor = (ls.cursor + jump).min(total - 1);
+        ls.cursor = (ls.cursor + jump).min(max);
         if ls.cursor >= ls.scroll_pos + self.viewport_height {
             ls.scroll_pos = ls.cursor - self.viewport_height + 1;
         }
-        ls.follow_bottom = ls.cursor == total - 1;
+        ls.follow_bottom = !self.paused && ls.cursor == max;
         self.maybe_prefetch();
     }
 
     fn go_to_start(&mut self) {
-        let total = self.effective_total();
-        if total == 0 {
+        let Some((min, _)) = self.cursor_bounds() else {
             return;
-        }
+        };
         let ls = &mut self.list_states[self.active_tab.idx()];
-        ls.cursor = 0;
-        ls.scroll_pos = 0;
+        ls.cursor = min;
+        ls.scroll_pos = min;
         ls.follow_bottom = false;
         self.maybe_prefetch();
     }
 
     fn go_to_end(&mut self) {
-        let total = self.effective_total();
-        if total == 0 {
+        let Some((_, max)) = self.cursor_bounds() else {
             return;
-        }
+        };
         let ls = &mut self.list_states[self.active_tab.idx()];
-        ls.cursor = total - 1;
-        if self.viewport_height > 0 && ls.cursor >= self.viewport_height {
-            ls.scroll_pos = ls.cursor - self.viewport_height + 1;
+        ls.cursor = max;
+        if self.viewport_height > 0 && ls.cursor + 1 >= self.viewport_height {
+            ls.scroll_pos = ls.cursor + 1 - self.viewport_height;
+        } else {
+            ls.scroll_pos = 0;
         }
-        ls.follow_bottom = true;
+        ls.follow_bottom = !self.paused;
         self.maybe_prefetch();
     }
 }
@@ -965,5 +1057,316 @@ mod tests {
         });
 
         assert!(app.scheduled_jobs.is_empty());
+    }
+
+    // ── Stale-snapshot prefetch ─────────────────────────────────────
+
+    /// When a snapshot lands with an offset that no longer covers the
+    /// cursor (because the list shifted while a Subscribe was in flight),
+    /// the app must immediately request another window. Otherwise the
+    /// render falls through to empty until the user keypresses again.
+    /// This is the bug behind G producing a blank list under churn.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_snapshot_triggers_followup_prefetch() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.set_ws_tx(tx);
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+
+        // Pretend the user pressed G with the server reporting 1000 ready
+        // jobs but our local buffer holding rows 100..160.
+        let mut srv = default_server();
+        srv.total_ready = 1000;
+        app.handle_event(Event::ServerHeartbeat {
+            server: srv.clone(),
+        });
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv.clone(),
+            ready: JobWindow {
+                offset: 100,
+                items: (100..160).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+        app.handle_event(Event::GoToEnd);
+
+        // Drain whatever subscribes the events above produced.
+        while rx.try_recv().is_ok() {}
+
+        // Now simulate a stale snapshot landing: server total has dropped
+        // to 500, and the requested window came back as offset=969 with
+        // zero items because that range no longer exists.
+        srv.total_ready = 500;
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv,
+            ready: JobWindow {
+                offset: 969,
+                items: vec![],
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+
+        // The fix should have queued another Subscribe so the buffer can
+        // catch up with the new cursor position (499, the new bottom).
+        let msg = rx.try_recv().expect("expected a follow-up Subscribe");
+        assert!(
+            msg.contains("\"type\":\"subscribe\"") && msg.contains("\"list\":\"ready\""),
+            "expected a Subscribe to the ready list, got: {msg}"
+        );
+    }
+
+    // ── Pause ───────────────────────────────────────────────────────
+
+    #[test]
+    fn toggle_pause_flips_paused_flag() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        assert!(!app.paused);
+
+        app.handle_event(Event::TogglePause);
+        assert!(app.paused);
+
+        app.handle_event(Event::TogglePause);
+        assert!(!app.paused);
+    }
+
+    #[test]
+    fn paused_ignores_job_changed_mutations() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(ready_event("j1", 0));
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+
+        app.handle_event(Event::TogglePause);
+
+        // These should not mutate the ready list.
+        app.handle_event(ready_event("j2", 0));
+        app.handle_event(Event::ServerJobChanged {
+            server: default_server(),
+            id: "j1".into(),
+            status: JobChangeStatus::ReadyRemoved,
+            job: None,
+        });
+
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+    }
+
+    #[test]
+    fn paused_ignores_snapshot_windows_but_keeps_server_status() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(ready_event("j1", 0));
+        app.handle_event(Event::TogglePause);
+
+        let mut srv = default_server();
+        srv.total_ready = 999;
+        srv.uptime_ms = 12345;
+
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv,
+            ready: JobWindow {
+                offset: 0,
+                items: vec![job("snap", 0, None)],
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+
+        // Row list stays frozen.
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+        // Header / totals continue to update.
+        assert_eq!(app.total_ready, 999);
+        assert_eq!(app.server_uptime_ms, Some(12345));
+    }
+
+    #[test]
+    fn paused_heartbeat_still_updates_server_status() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::TogglePause);
+
+        let mut srv = default_server();
+        srv.uptime_ms = 99_999;
+        app.handle_event(Event::ServerHeartbeat { server: srv });
+
+        assert_eq!(app.server_uptime_ms, Some(99_999));
+    }
+
+    /// While paused, navigation must stay inside whatever rows are
+    /// currently in the buffer. The server-side total is irrelevant —
+    /// the user is looking at a frozen subset.
+    #[test]
+    fn paused_g_jumps_to_buffer_end_not_server_total() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+
+        // Server claims 1000 ready jobs but the local buffer holds only
+        // 20 of them, anchored at offset 100.
+        let mut srv = default_server();
+        srv.total_ready = 1000;
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv,
+            ready: JobWindow {
+                offset: 100,
+                items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+
+        app.handle_event(Event::TogglePause);
+        app.handle_event(Event::GoToEnd);
+
+        // Last buffer row is index 119, not 999.
+        let ls = &app.list_states[Tab::Ready.idx()];
+        assert_eq!(ls.cursor, 119);
+        assert!(
+            !ls.follow_bottom,
+            "follow_bottom should not stick when paused"
+        );
+    }
+
+    #[test]
+    fn paused_g_then_g_lower_jumps_to_buffer_start() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+
+        let mut srv = default_server();
+        srv.total_ready = 1000;
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv,
+            ready: JobWindow {
+                offset: 100,
+                items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+
+        app.handle_event(Event::TogglePause);
+        app.handle_event(Event::GoToStart);
+
+        // First buffer row is index 100, not 0.
+        let ls = &app.list_states[Tab::Ready.idx()];
+        assert_eq!(ls.cursor, 100);
+    }
+
+    #[test]
+    fn paused_scroll_down_clamps_at_buffer_end() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+
+        let mut srv = default_server();
+        srv.total_ready = 1000;
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv,
+            ready: JobWindow {
+                offset: 100,
+                items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+
+        // Position cursor at the last buffer row, then pause.
+        app.handle_event(Event::GoToEnd);
+        // GoToEnd while live sets cursor=999; clamp at buffer once we pause.
+        app.handle_event(Event::TogglePause);
+        app.list_states[Tab::Ready.idx()].cursor = 119;
+
+        // j past the buffer must not move the cursor.
+        app.handle_event(Event::ScrollDown);
+        let ls = &app.list_states[Tab::Ready.idx()];
+        assert_eq!(ls.cursor, 119);
+    }
+
+    #[test]
+    fn paused_heartbeat_does_not_drag_cursor_to_server_bottom() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+
+        // Buffer covers 100..120.
+        let mut srv = default_server();
+        srv.total_ready = 1000;
+        app.handle_event(Event::ServerJobSnapshot {
+            server: srv.clone(),
+            ready: JobWindow {
+                offset: 100,
+                items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+            },
+            in_flight: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+            scheduled: JobWindow {
+                offset: 0,
+                items: vec![],
+            },
+        });
+
+        // Press G live (sets follow_bottom = true, cursor near server end).
+        app.handle_event(Event::GoToEnd);
+        app.handle_event(Event::TogglePause);
+        // Snap cursor back inside buffer to simulate the user navigating.
+        app.list_states[Tab::Ready.idx()].cursor = 110;
+
+        // Heartbeat with churn — server now has 2000 ready jobs.
+        srv.total_ready = 2000;
+        app.handle_event(Event::ServerHeartbeat { server: srv });
+
+        // The follow-bottom logic must NOT have fired while paused.
+        let ls = &app.list_states[Tab::Ready.idx()];
+        assert_eq!(ls.cursor, 110);
+    }
+
+    #[test]
+    fn paused_toggle_detail_is_noop() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        assert!(!app.show_detail);
+        app.handle_event(Event::TogglePause);
+
+        app.handle_event(Event::ToggleDetail);
+
+        // Detail level didn't change because the snapshot was frozen.
+        assert!(!app.show_detail);
     }
 }

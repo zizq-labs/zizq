@@ -70,12 +70,23 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         ConnectionStatus::Connecting => Style::default().fg(Color::LightYellow),
         ConnectionStatus::Disconnected => Style::default().fg(Color::LightRed),
     };
-    let status_line = Line::from(vec![
+    let mut status_spans = vec![
         Span::styled("\u{25cf} ", status_style),
         Span::styled(indicator, status_text_style),
         Span::raw(" "),
         Span::styled(&*app.host, cyan),
-    ]);
+    ];
+    if app.paused {
+        status_spans.push(Span::raw("   "));
+        status_spans.push(Span::styled(
+            "PAUSED",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let status_line = Line::from(status_spans);
 
     let server_info_line = if connected {
         let version = app.server_version.as_deref().unwrap_or("?");
@@ -440,14 +451,59 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Help bar.
     let key_style = Style::default();
     let label_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
-    let help = Paragraph::new(Line::from(vec![
+    // While paused the `i` slot strikes through (rather than vanishing
+    // entirely) so it reads as "disabled" without depending on a
+    // light/dark terminal theme. We only mark the glyphs themselves with
+    // CROSSED_OUT so the strike-through line doesn't spill through the
+    // padding spaces and touch the neighbouring labels.
+    let pause_label = if app.paused { "Resume" } else { "Pause" };
+    let mut help_spans: Vec<Span> = vec![
         Span::styled(" Tab ", key_style),
         Span::styled("Change Tab", label_style),
-        Span::styled("  i ", key_style),
-        Span::styled("Info", label_style),
+        Span::raw("  "),
+    ];
+    if app.paused {
+        let crossed = Modifier::CROSSED_OUT;
+        help_spans.push(Span::styled("i", key_style.add_modifier(crossed)));
+        help_spans.push(Span::raw(" "));
+        help_spans.push(Span::styled("Info", label_style.add_modifier(crossed)));
+    } else {
+        help_spans.push(Span::styled("i", key_style));
+        help_spans.push(Span::raw(" "));
+        help_spans.push(Span::styled("Info", label_style));
+    }
+    help_spans.extend([
+        Span::styled("  p ", key_style),
+        Span::styled(pause_label, label_style),
         Span::styled("  q ", key_style),
         Span::styled("Quit", label_style),
-    ]));
+    ]);
+
+    // When paused and the cursor is at the edge of the frozen buffer,
+    // tell the user the only way to scroll further is to resume.
+    if app.paused {
+        let ls = &app.list_states[app.active_tab.idx()];
+        let buffer_size = match app.active_tab {
+            Tab::Ready => app.ready_jobs.len(),
+            Tab::InFlight => app.in_flight_jobs.len(),
+            Tab::Scheduled => app.scheduled_jobs.len(),
+        };
+        if buffer_size > 0 {
+            let buffer_end = ls.buffer_offset + buffer_size - 1;
+            let at_top = ls.cursor == ls.buffer_offset;
+            let at_bottom = ls.cursor == buffer_end;
+            if at_top || at_bottom {
+                let arrow = if at_bottom { "\u{2193}" } else { "\u{2191}" };
+                help_spans.push(Span::raw("   "));
+                help_spans.push(Span::styled(
+                    format!("{arrow} Resume to scroll further"),
+                    Style::default().fg(Color::LightYellow),
+                ));
+            }
+        }
+    }
+
+    let help = Paragraph::new(Line::from(help_spans));
     frame.render_widget(help, chunks[3]);
 }
 
@@ -994,6 +1050,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         }
     }
@@ -1002,6 +1059,50 @@ mod tests {
     fn render_connecting() {
         let app = new_app();
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
+    }
+
+    #[test]
+    fn render_paused_shows_indicator_and_swaps_help_labels() {
+        let mut app = new_app();
+        app.status = ConnectionStatus::Connected;
+        app.paused = true;
+        assert_ui_snapshot!(render_to_string(&app, 60, 10));
+    }
+
+    #[test]
+    fn render_paused_at_buffer_edge_shows_resume_hint() {
+        let mut app = new_app();
+        app.status = ConnectionStatus::Connected;
+        app.paused = true;
+        app.active_tab = Tab::Ready;
+        app.total_ready = 2;
+        app.ready_jobs = vec![
+            job_admin("j1", "queue1", "type1"),
+            job_admin("j2", "queue1", "type1"),
+        ];
+        app.list_states[Tab::Ready.idx()].buffer_offset = 0;
+        // Cursor at last row → bottom edge → "↓ Resume to scroll further".
+        app.list_states[Tab::Ready.idx()].cursor = 1;
+        assert_ui_snapshot!(render_to_string(&app, 90, 12));
+    }
+
+    fn job_admin(id: &str, queue: &str, job_type: &str) -> AdminJob {
+        AdminJob {
+            id: id.into(),
+            queue: queue.into(),
+            job_type: job_type.into(),
+            priority: 0,
+            ready_at: 0,
+            attempts: 0,
+            dequeued_at: None,
+            failed_at: None,
+            payload: None,
+            retry_limit: None,
+            backoff: None,
+            retention: None,
+            unique_key: None,
+            unique_while: None,
+        }
     }
 
     #[test]
@@ -1025,6 +1126,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
@@ -1051,6 +1153,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
@@ -1168,6 +1271,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         }
     }
@@ -1272,6 +1376,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
@@ -1298,6 +1403,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
@@ -1346,6 +1452,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
@@ -1394,6 +1501,7 @@ mod tests {
             list_states: Default::default(),
             viewport_height: 0,
             show_detail: false,
+            paused: false,
             ws_tx: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));

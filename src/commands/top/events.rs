@@ -38,6 +38,8 @@ pub enum Event {
     GoToEnd,
     /// Toggle the detail panel.
     ToggleDetail,
+    /// Toggle paused state — freeze/unfreeze the live job lists.
+    TogglePause,
     /// Suspend the process (Ctrl-Z).
     Suspend,
     /// Server connection attempt in progress.
@@ -75,6 +77,7 @@ impl Event {
                 | Event::ScrollLeft
                 | Event::ScrollRight
                 | Event::ToggleDetail
+                | Event::TogglePause
         )
     }
 
@@ -135,6 +138,9 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                         }
                         (KeyCode::Char('i'), _) => {
                             let _ = tx.blocking_send(Event::ToggleDetail);
+                        }
+                        (KeyCode::Char('p'), _) => {
+                            let _ = tx.blocking_send(Event::TogglePause);
                         }
                         (KeyCode::Char('g'), _) => {
                             let _ = tx.blocking_send(Event::GoToStart);
