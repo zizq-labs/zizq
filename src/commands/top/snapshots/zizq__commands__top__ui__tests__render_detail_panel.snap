@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui.rs
-assertion_line: 1292
+assertion_line: 1391
 expression: "render_to_string(&app, 160, 30)"
 ---
   Zizq 0.1.0
@@ -32,4 +32,4 @@ expression: "render_to_string(&app, 160, 30)"
   Type                    generate_annual_report_email                             "to": "user@example.com",
   Priority                0                                                        "urgent": true
   Status                  in_flight                                              }
- Tab Change Tab  i Info  p Pause  q Quit
+ Tab Change Tab  i Info  p Pause  D Delete  q Quit

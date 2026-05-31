@@ -74,6 +74,12 @@ pub enum ClientMessage {
     SetDetailLevel {
         detail: bool,
     },
+    /// Request deletion of a single job. The server doesn't ack — the
+    /// resulting `JobDeleted` store event flows back through the normal
+    /// admin event stream and removes the row on every connected client.
+    DeleteJob {
+        id: String,
+    },
 }
 
 /// Which job list a subscription targets.

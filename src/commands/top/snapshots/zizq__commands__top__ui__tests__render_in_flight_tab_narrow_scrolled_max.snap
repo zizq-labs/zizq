@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui.rs
-assertion_line: 1251
+assertion_line: 1350
 expression: "render_to_string(&app, 80, 12)"
 ---
   Zizq 0.1.0
@@ -14,4 +14,4 @@ expression: "render_to_string(&app, 80, 12)"
 UEUE              DURATION   ATTEMPTS TYPE
 efault                  3s          1 generate_annual_report_email
 illing               2m30s          3 charge_subscription
- Tab Change Tab  i Info  p Pause  q Quit
+ Tab Change Tab  i Info  p Pause  D Delete  q Quit

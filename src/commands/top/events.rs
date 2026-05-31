@@ -40,6 +40,12 @@ pub enum Event {
     ToggleDetail,
     /// Toggle paused state — freeze/unfreeze the live job lists.
     TogglePause,
+    /// Begin a delete-confirmation prompt for the cursor row.
+    RequestDelete,
+    /// Confirm the pending delete (sends the WS message + removes the row).
+    ConfirmDelete,
+    /// Dismiss the pending delete prompt without doing anything.
+    CancelDelete,
     /// Suspend the process (Ctrl-Z).
     Suspend,
     /// Server connection attempt in progress.
@@ -78,6 +84,9 @@ impl Event {
                 | Event::ScrollRight
                 | Event::ToggleDetail
                 | Event::TogglePause
+                | Event::RequestDelete
+                | Event::ConfirmDelete
+                | Event::CancelDelete
         )
     }
 
@@ -147,6 +156,15 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>) {
                         }
                         (KeyCode::Char('G'), _) => {
                             let _ = tx.blocking_send(Event::GoToEnd);
+                        }
+                        (KeyCode::Char('D'), _) => {
+                            let _ = tx.blocking_send(Event::RequestDelete);
+                        }
+                        (KeyCode::Char('y'), _) => {
+                            let _ = tx.blocking_send(Event::ConfirmDelete);
+                        }
+                        (KeyCode::Char('n'), _) | (KeyCode::Esc, _) => {
+                            let _ = tx.blocking_send(Event::CancelDelete);
                         }
                         (KeyCode::Home, _) => {
                             let _ = tx.blocking_send(Event::GoToStart);
@@ -261,6 +279,12 @@ fn parse_ws_message(text: &str) -> Option<Event> {
 /// Serialize a detail-level message for sending over WebSocket.
 pub fn detail_level_message(detail: bool) -> String {
     serde_json::to_string(&ClientMessage::SetDetailLevel { detail })
+        .expect("ClientMessage serialization cannot fail")
+}
+
+/// Serialize a delete-job message for sending over WebSocket.
+pub fn delete_job_message(id: String) -> String {
+    serde_json::to_string(&ClientMessage::DeleteJob { id })
         .expect("ClientMessage serialization cannot fail")
 }
 

@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui.rs
-assertion_line: 1257
+assertion_line: 1356
 expression: "render_to_string(&app, 160, 12)"
 ---
   Zizq 0.1.0
@@ -14,4 +14,4 @@ expression: "render_to_string(&app, 160, 12)"
                          ID   PRIORITY QUEUE                             DUE   ATTEMPTS TYPE
 70a4ee89f2f09a1eb0af9d5ee80          0 default                         3m52s          0 send_reminder_email
 70a5ff9a03f0ab1fc0b0ae6ff90          0 reports                            1h          1 generate_quarterly_report
- Tab Change Tab  i Info  p Pause  q Quit
+ Tab Change Tab  i Info  p Pause  D Delete  q Quit

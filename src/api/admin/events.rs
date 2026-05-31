@@ -141,6 +141,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 }
                             }
                         }
+                        Some(ClientMessage::DeleteJob { id }) => {
+                            // Fire-and-forget — the deletion's JobDeleted
+                            // store event will fan out through the normal
+                            // event path and remove the row on every
+                            // connected client (including this one).
+                            if let Err(e) = send_state.store.delete_job(&id).await {
+                                tracing::warn!(%e, %id, "admin ws: delete_job failed");
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -381,9 +390,23 @@ async fn process_store_event(
     conn: &mut ConnectionState,
 ) -> Vec<AdminEvent> {
     match event {
-        StoreEvent::JobCreated { .. } => {
+        StoreEvent::JobCreated { ref id, .. } => {
+            // `JobCreated` covers both fresh enqueues and `requeue` calls
+            // (worker disconnect cleanup). For requeues, the job was
+            // previously InFlight from this connection's perspective —
+            // it has to be evicted from `in_flight_ids` so the next
+            // `diff_in_flight` emits an `InFlightRemoved` event. For
+            // fresh enqueues the set never contained the id so this is
+            // a harmless no-op.
+            let was_in_flight = conn.in_flight_ids.iter().any(|(_, wid)| wid == id);
+            if was_in_flight {
+                conn.in_flight_ids.retain(|(_, wid)| wid != id);
+            }
             let mut events = diff_ready(store, conn).await;
             events.extend(diff_scheduled(store, conn).await);
+            if was_in_flight {
+                events.extend(diff_in_flight(store, conn).await);
+            }
             events
         }
         StoreEvent::JobInFlight { id } => {
@@ -1079,6 +1102,58 @@ mod tests {
         assert_eq!(statuses, vec!["in_flight", "ready_removed"]);
     }
 
+    /// Regression: when a worker disconnected, the take handler called
+    /// `store.requeue(id)` for each in-flight job. That emits a
+    /// `JobCreated` event. The admin handler used to handle `JobCreated`
+    /// only as "new ready job" — diffing the ready/scheduled windows but
+    /// never removing the id from `conn.in_flight_ids`. The result was
+    /// stale rows lingering in the `zizq top` in-flight tab even though
+    /// the header total had dropped to zero. The handler now evicts the
+    /// id from `in_flight_ids` on `JobCreated`, so the next
+    /// `diff_in_flight` emits an `in_flight_removed`.
+    #[tokio::test]
+    async fn requeue_emits_in_flight_removed_and_ready() {
+        let state = test_state();
+        let now = now_millis();
+
+        let job = state
+            .store
+            .enqueue(
+                now,
+                EnqueueOptions::new("task", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap();
+
+        let (_addr, mut rx) = connect(state.clone()).await;
+
+        // Consume the initial snapshot (1 in-flight, 0 ready).
+        let snapshot = next_json(&mut rx).await;
+        assert_eq!(snapshot["in_flight"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 0);
+
+        // Requeue — same path the take loop uses for disconnect cleanup.
+        state.store.requeue(&job.id).await.unwrap();
+
+        // Should observe both `in_flight_removed` and `ready` for the
+        // same id (order may vary).
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let msg = next_json(&mut rx).await;
+            assert_eq!(msg["event"], "job_changed");
+            assert_eq!(msg["id"], job.id);
+            statuses.push(msg["status"].as_str().unwrap().to_string());
+        }
+        statuses.sort();
+        assert_eq!(statuses, vec!["in_flight_removed", "ready"]);
+    }
+
     #[tokio::test]
     async fn complete_job_sends_completed_and_in_flight_removed() {
         let state = test_state();
@@ -1318,6 +1393,78 @@ mod tests {
         assert_eq!(msg["event"], "job_changed");
         assert_eq!(msg["status"], "ready");
         assert_eq!(msg["server"]["tier"], "free");
+    }
+
+    #[tokio::test]
+    async fn delete_job_message_deletes_the_job_and_emits_event() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let state = test_state();
+        let now = now_millis();
+
+        // Enqueue a job so there's something to delete.
+        let job = state
+            .store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job();
+
+        // Connect a bidirectional WebSocket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, super::super::app(state_clone))
+                .await
+                .unwrap();
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
+            .await
+            .unwrap();
+        let (mut tx, mut rx) = ws.split();
+
+        // Drain the initial snapshot.
+        let snapshot = next_json(&mut rx).await;
+        assert_eq!(snapshot["event"], "job_snapshot");
+
+        // Send the delete request.
+        let delete_msg = serde_json::json!({
+            "type": "delete_job",
+            "id": job.id,
+        })
+        .to_string();
+        tx.send(Message::Text(delete_msg.into())).await.unwrap();
+
+        // We should observe a `job_changed` event with the deletion.
+        // Status is `completed` or `dead` (existing JobDeleted store path
+        // doesn't use a distinct semantic status — the row simply leaves
+        // every list).
+        let mut got_removal = false;
+        for _ in 0..5 {
+            let msg = next_json(&mut rx).await;
+            if msg["event"] == "job_changed"
+                && (msg["status"] == "ready_removed"
+                    || msg["status"] == "in_flight_removed"
+                    || msg["status"] == "scheduled_removed")
+                && msg["id"] == job.id
+            {
+                got_removal = true;
+                break;
+            }
+        }
+        assert!(
+            got_removal,
+            "expected a *_removed event for the deleted job"
+        );
+
+        // The job should be gone from the store.
+        let gone = state.store.get_job(now_millis(), &job.id).await.unwrap();
+        assert!(
+            gone.is_none(),
+            "job should have been deleted from the store"
+        );
     }
 
     #[tokio::test]
