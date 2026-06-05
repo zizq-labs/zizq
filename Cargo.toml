@@ -10,7 +10,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-fjall = "3.0.2"
+fjall = "3.1.4"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "http2"] }
@@ -40,7 +40,7 @@ tracing-appender = "0.2"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.14.7", features = ["x509-parser"] }
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
 time = "0.3"
 jaq-core = "2.2.1"
 jaq-std = "2.1.2"
@@ -61,7 +61,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
 rand = "0.8"
 insta = { version = "1", features = ["filters"] }
-rcgen = "0.14.7"
+rcgen = "0.14.8"
 
 [profile.release]
 opt-level = 3
