@@ -221,7 +221,7 @@ mod tests {
     use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
     use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
     use jsonwebtoken::{EncodingKey, Header};
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
     use serde::Serialize;
 
     #[derive(Serialize)]

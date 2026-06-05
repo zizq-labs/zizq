@@ -4923,7 +4923,7 @@ dependencies = [
  "jaq-std",
  "jsonwebtoken",
  "libc",
- "rand 0.8.5",
+ "rand_core 0.6.4",
  "ratatui",
  "rcgen",
  "reqwest",
