@@ -1,0 +1,36 @@
+# Dependabot version updates for the zizq server.
+# Security advisories + Dependabot alerts are configured separately
+# in Settings → Code security and analysis.
+#
+# Strategy: weekly grouped patch+minor PRs per ecosystem so noise stays
+# low. Major version bumps come through as individual PRs since they
+# typically deserve a closer look (changelog read, MSRV check, etc.).
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-patch-minor:
+        update-types:
+          - "patch"
+          - "minor"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-patch-minor:
+        update-types:
+          - "patch"
+          - "minor"
