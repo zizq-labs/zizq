@@ -138,7 +138,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.discover-node.outputs.matrix) }}
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: zizq-binary-v${{ needs.release-binary.outputs.version }}
           path: server
@@ -215,7 +215,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.discover-ruby.outputs.matrix) }}
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: zizq-binary-v${{ needs.release-binary.outputs.version }}
           path: server
@@ -292,7 +292,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.discover-rust.outputs.matrix) }}
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: zizq-binary-v${{ needs.release-binary.outputs.version }}
           path: server
@@ -495,7 +495,7 @@ jobs:
         run: echo "version=$(cargo pkgid | sed 's/.*[#@]//')" >> "$GITHUB_OUTPUT"
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: zizq-release-*
           path: artifacts
