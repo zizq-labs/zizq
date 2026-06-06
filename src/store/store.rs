@@ -4926,9 +4926,10 @@ fn cron_next_after(
     now_ms: u64,
     timezone: Option<&str>,
 ) -> Result<Option<u64>, StoreError> {
-    let cron = croner::Cron::new(expression)
-        .with_seconds_optional()
-        .parse()
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Optional)
+        .build()
+        .parse(expression)
         .map_err(|e| StoreError::InvalidOperation(format!("invalid cron expression: {e}")))?;
 
     let now_secs = (now_ms / 1000) as i64;
