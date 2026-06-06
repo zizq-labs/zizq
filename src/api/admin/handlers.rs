@@ -41,6 +41,7 @@ mod tests {
     use crate::time::now_millis;
 
     fn test_state() -> (broadcast::Sender<AdminEvent>, Arc<AppState>) {
+        crate::ensure_test_crypto();
         let (admin_events, _) = broadcast::channel(64);
         let (_, shutdown_rx) = watch::channel(());
         let dir = tempfile::tempdir().unwrap();
