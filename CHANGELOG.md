@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Internal refactoring of the `zizq top` code structure
+- Lots of dependency version bumps
+
 ## 0.4.0
 
 - Force a full LSM compaction after large bulk deletes and bulk patches to
