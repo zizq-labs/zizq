@@ -10,13 +10,13 @@
 //! heterogeneous in the store.
 
 use jaq_core::load::{Arena, File, Loader};
-use jaq_core::{Compiler, Ctx, RcIter};
+use jaq_core::{Compiler, Ctx, Vars, data, unwrap_valr};
 use jaq_json::Val;
 
 /// A compiled jq filter ready for repeated evaluation.
 pub struct PayloadFilter {
     expression: String,
-    filter: jaq_core::Filter<jaq_core::Native<Val>>,
+    filter: jaq_core::Filter<data::JustLut<Val>>,
 }
 
 impl PayloadFilter {
@@ -38,7 +38,16 @@ impl PayloadFilter {
     /// Compile a jq expression. Returns a human-readable error on failure.
     pub fn compile(expression: &str) -> Result<Self, String> {
         let arena = Arena::default();
-        let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs()));
+        // jaq 3 split the bundled filters: core has the primitives
+        // (true/false/select/not), std adds the standard library
+        // (map/range/recurse), json adds JSON-specific helpers
+        // (test/contains). All three are required for parity with
+        // the pre-bump behaviour.
+        let loader = Loader::new(
+            jaq_core::defs()
+                .chain(jaq_std::defs())
+                .chain(jaq_json::defs()),
+        );
 
         let modules = loader
             .load(
@@ -51,7 +60,11 @@ impl PayloadFilter {
             .map_err(|errs| format_load_errors(errs))?;
 
         let filter = Compiler::default()
-            .with_funs(jaq_std::funs().chain(jaq_json::funs()))
+            .with_funs(
+                jaq_core::funs()
+                    .chain(jaq_std::funs())
+                    .chain(jaq_json::funs()),
+            )
             .compile(modules)
             .map_err(|errs| format_compile_errors(errs))?;
 
@@ -66,14 +79,22 @@ impl PayloadFilter {
     /// Returns `true` if the filter produces any truthy output (not `false`,
     /// not `null`). Runtime errors are treated as non-matches.
     pub fn matches(&self, payload: &serde_json::Value) -> bool {
-        let val: Val = payload.clone().into();
-        let inputs = RcIter::new(core::iter::empty());
-        let ctx = Ctx::new([], &inputs);
+        // jaq-json 2 dropped the direct From<serde_json::Value> impl —
+        // round-trip via Val's Deserialize impl (gated on the `serde`
+        // feature in jaq-json's manifest).
+        let Ok(val) = serde_json::from_value::<Val>(payload.clone()) else {
+            return false;
+        };
+        let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new([]));
 
-        self.filter.run((ctx, val)).any(|result| match result {
-            Ok(v) => is_truthy(&v),
-            Err(_) => false,
-        })
+        self.filter
+            .id
+            .run((ctx, val))
+            .map(unwrap_valr)
+            .any(|result| match result {
+                Ok(v) => is_truthy(&v),
+                Err(_) => false,
+            })
     }
 }
 
