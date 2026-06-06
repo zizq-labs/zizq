@@ -17,3 +17,18 @@ pub mod logging;
 pub mod state;
 pub mod store;
 pub mod time;
+
+/// Install ring as the default rustls crypto provider. Production code
+/// does this in `main()`, but unit tests don't run `main` so any test
+/// that constructs a `reqwest::Client` (via `rustls-no-provider`) must
+/// call this first. Safe to call repeatedly — `Once` guards it.
+#[cfg(test)]
+pub fn ensure_test_crypto() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("default crypto provider already installed");
+    });
+}

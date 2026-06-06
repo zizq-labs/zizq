@@ -105,6 +105,14 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Install ring as the default rustls crypto provider. reqwest
+    // (with `rustls-no-provider`) reaches for this on its first TLS
+    // call; without it, the handshake panics. Matches the provider
+    // already used elsewhere in the server-side TLS setup.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("default crypto provider already installed");
+
     let cli = Cli::parse();
 
     // Load the software license if present so it can be provided to each

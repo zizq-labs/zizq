@@ -215,7 +215,7 @@ async fn connect_ws(
     http_client: &reqwest::Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
-    use reqwest_websocket::{Message, RequestBuilderExt};
+    use reqwest_websocket::{Message, Upgrade};
 
     let response = http_client.get(url).upgrade().send().await?;
     let connected_url = response.url().origin().ascii_serialization();
