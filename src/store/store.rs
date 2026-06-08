@@ -39,6 +39,7 @@ use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 
 use super::cron::{CronEntry, CronGroup};
+use super::enqueue_batcher::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
@@ -356,6 +357,13 @@ pub struct Store {
     /// or otherwise change state. Take handlers use this both to wake up
     /// when new work is available and to prune their in-flight tracking.
     event_tx: broadcast::Sender<StoreEvent>,
+
+    /// Server-side auto-batcher for concurrent single-job enqueues.
+    /// Owned in an `Arc` so spawn_blocking tasks can cheaply clone the
+    /// handle without holding a `&Store` borrow across the .await.
+    /// Shut down by dropping (the inner `SyncSender` closes, the worker
+    /// drains queued ops and exits).
+    enqueue_batcher: Arc<EnqueueBatcher>,
 }
 
 /// One-byte tag prefix for records in the `data` keyspace.
@@ -386,7 +394,7 @@ enum IndexKind {
 /// Groups the fjall database handle and all disk keyspaces into a single
 /// cheaply-cloneable unit. Wrapped in `Arc` inside `Store` so that every
 /// async method only bumps one reference count instead of three.
-struct Keyspaces {
+pub(super) struct Keyspaces {
     /// Connection to the underlying database.
     db: SingleWriterTxDatabase,
 
@@ -412,12 +420,12 @@ struct Keyspaces {
 
     /// Commit mode for enqueue operations (resolved at construction;
     /// inherits the default when not overridden).
-    enqueue_commit_mode: CommitMode,
+    pub(super) enqueue_commit_mode: CommitMode,
 }
 
 impl Keyspaces {
     /// Acquire the single-writer transaction lock.
-    fn write_tx(&self) -> fjall::SingleWriterWriteTx<'_> {
+    pub(super) fn write_tx(&self) -> fjall::SingleWriterWriteTx<'_> {
         self.db.write_tx()
     }
 
@@ -426,7 +434,7 @@ impl Keyspaces {
     /// Calls fjall's `tx.commit()` to buffer the write, then sends a sync
     /// request to the group committer and blocks until it completes.
     /// Since this is always called inside `spawn_blocking`, blocking is safe.
-    fn commit(
+    pub(super) fn commit(
         &self,
         tx: fjall::SingleWriterWriteTx<'_>,
         mode: CommitMode,
@@ -1207,6 +1215,13 @@ pub struct StorageConfig {
     /// enqueue inherits `default_commit_mode`.
     pub enqueue_commit_mode: Option<CommitMode>,
 
+    /// Maximum number of single-job enqueues coalesced into one write
+    /// transaction by the server-side auto-batcher. Also the bounded
+    /// channel capacity for in-flight enqueue requests, so it caps both
+    /// per-batch size and total in-flight load. Does NOT apply to
+    /// explicit `enqueue_bulk` calls, which run their own tx.
+    pub enqueue_batch_size: usize,
+
     /// After a bulk mutation affects at least this many records, force a
     /// full LSM compaction to reclaim tombstones. Without this, leveled
     /// compaction can leave large pockets of garbage in the upper levels
@@ -1253,6 +1268,10 @@ pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 /// compaction once they commit.
 pub const DEFAULT_AUTO_COMPACT_THRESHOLD: u64 = 10_000;
 
+/// Default maximum number of concurrent single-job enqueues coalesced
+/// into one auto-batched commit. Also the bounded channel capacity.
+pub const DEFAULT_ENQUEUE_BATCH_SIZE: usize = 1000;
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -1271,6 +1290,7 @@ impl Default for StorageConfig {
             },
             default_commit_mode: CommitMode::default(),
             enqueue_commit_mode: None,
+            enqueue_batch_size: DEFAULT_ENQUEUE_BATCH_SIZE,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
         }
     }
@@ -1290,6 +1310,7 @@ impl StorageConfig {
     /// | `ZIZQ_L0_THRESHOLD`       | `l0_threshold`     |
     /// | `ZIZQ_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
     /// | `ZIZQ_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
+    /// | `ZIZQ_ENQUEUE_BATCH_SIZE` | `enqueue_batch_size` |
     /// | `ZIZQ_AUTO_COMPACT_THRESHOLD` | `auto_compact_threshold` |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
@@ -1326,6 +1347,8 @@ impl StorageConfig {
                     });
                 }
             },
+            enqueue_batch_size: env_parse("ZIZQ_ENQUEUE_BATCH_SIZE")?
+                .unwrap_or(defaults.enqueue_batch_size),
             auto_compact_threshold: env_parse("ZIZQ_AUTO_COMPACT_THRESHOLD")?
                 .unwrap_or(defaults.auto_compact_threshold),
         })
@@ -1423,18 +1446,35 @@ impl Store {
         // SyncSender closes, the thread drains and does a final SyncAll).
         let group_committer = GroupCommitter::start(db.clone(), path.to_path_buf());
 
+        let ks = Arc::new(Keyspaces {
+            db,
+            data,
+            index,
+            group_committer,
+            default_commit_mode,
+            enqueue_commit_mode,
+        });
+        let ready_index = Arc::new(ReadyIndex::new());
+        let scheduled_index = Arc::new(ScheduledIndex::new());
+
+        // Start the enqueue auto-batcher — a dedicated OS thread that
+        // coalesces concurrent single-job enqueues into one tx.commit().
+        // Shuts down when this Store (and any spawn_blocking clones of
+        // the Arc) drops — the inner SyncSender closes, the worker
+        // drains remaining ops and exits.
+        let enqueue_batcher = Arc::new(EnqueueBatcher::start(
+            ks.clone(),
+            ready_index.clone(),
+            scheduled_index.clone(),
+            event_tx.clone(),
+            config.enqueue_batch_size,
+        ));
+
         Ok(Self {
             config: config.clone(),
-            ks: Arc::new(Keyspaces {
-                db,
-                data,
-                index,
-                group_committer,
-                default_commit_mode,
-                enqueue_commit_mode,
-            }),
-            ready_index: Arc::new(ReadyIndex::new()),
-            scheduled_index: Arc::new(ScheduledIndex::new()),
+            ks,
+            ready_index,
+            scheduled_index,
             cron_index: Arc::new(CronScheduleIndex::new()),
             default_completed_retention_ms: config.default_completed_retention_ms,
             default_dead_retention_ms: config.default_dead_retention_ms,
@@ -1443,6 +1483,7 @@ impl Store {
             index_ready: Arc::new(AtomicBool::new(true)),
             in_flight_count: Arc::new(AtomicU64::new(0)),
             event_tx,
+            enqueue_batcher,
         })
     }
 
@@ -1460,28 +1501,28 @@ impl Store {
         now: u64,
         opts: EnqueueOptions,
     ) -> Result<EnqueueResult, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
+        // Singleton enqueue is a Vec-of-1 trip through the same
+        // batcher path as `enqueue_bulk`. The batcher coalesces this
+        // with whatever else is in the channel at mutex-acquire time
+        // and commits the whole coalesced batch atomically.
+        let batcher = self.enqueue_batcher.clone();
 
-        task::spawn_blocking(move || -> Result<_, StoreError> {
+        let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
             let prepared = prepare_enqueue(opts, now)?;
-
-            let mut tx = ks.write_tx();
-            let result = apply_enqueue(&mut tx, &ks, &prepared)?;
-
-            if result.is_duplicate() {
-                drop(tx);
-            } else {
-                ks.commit(tx, ks.enqueue_commit_mode)?;
-            }
-
-            finalize_enqueue(&result, &ready_index, &scheduled_index, &event_tx);
-
-            Ok(result)
+            Ok(batcher.submit(vec![prepared]))
         })
-        .await?
+        .await??;
+
+        let mut results = reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("enqueue auto-batcher channel closed".into()))??;
+
+        // Vec-of-1 contract — the batcher always returns the same number
+        // of results as the input length. `unwrap` is safe in
+        // principle, but we still guard against batcher-side bugs.
+        results.pop().ok_or_else(|| {
+            StoreError::Internal("enqueue auto-batcher returned empty result".into())
+        })
     }
 
     /// Enqueue multiple jobs in a single transaction.
@@ -1489,6 +1530,12 @@ impl Store {
     /// All jobs are serialized and inserted under one write transaction with
     /// a single commit. In-memory indexes are updated after commit succeeds.
     /// Events are broadcast after the sync completes.
+    ///
+    /// Bulk participates in the same auto-batcher as singular enqueue —
+    /// a bulk-of-N counts as one op in the batcher's op-count budget,
+    /// and may share a commit with other concurrent enqueue requests.
+    /// Atomicity is preserved at the commit boundary: if the coalesced
+    /// commit fails, every participating op fails together.
     pub async fn enqueue_bulk(
         &self,
         now: u64,
@@ -1498,28 +1545,20 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
+        let batcher = self.enqueue_batcher.clone();
 
-        task::spawn_blocking(move || -> Result<_, StoreError> {
+        let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
             let prepared: Vec<PreparedEnqueue> = batch
                 .into_iter()
                 .map(|opts| prepare_enqueue(opts, now))
                 .collect::<Result<_, StoreError>>()?;
-
-            let mut tx = ks.write_tx();
-            let results = apply_enqueue_batch(&mut tx, &ks, &prepared)?;
-            ks.commit(tx, ks.enqueue_commit_mode)?;
-
-            for r in &results {
-                finalize_enqueue(r, &ready_index, &scheduled_index, &event_tx);
-            }
-
-            Ok(results)
+            Ok(batcher.submit(prepared))
         })
-        .await?
+        .await??;
+
+        reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("enqueue auto-batcher channel closed".into()))?
     }
 
     /// Take the next job from the priority index.
@@ -5018,7 +5057,7 @@ fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion
 /// `apply_enqueue` inside a write transaction. This separates the pure
 /// computation (serialization, key building) from the transactional writes,
 /// allowing callers to compose enqueue with other operations in the same tx.
-struct PreparedEnqueue {
+pub(super) struct PreparedEnqueue {
     job: Job,
     meta_bytes: Vec<u8>,
     payload_bytes: Vec<u8>,
@@ -5146,7 +5185,7 @@ fn apply_enqueue(
 ///
 /// Does NOT commit the transaction — the caller commits and runs
 /// `finalize_enqueue` per result post-commit.
-fn apply_enqueue_batch(
+pub(super) fn apply_enqueue_batch(
     tx: &mut fjall::SingleWriterWriteTx<'_>,
     ks: &Keyspaces,
     prepared: &[PreparedEnqueue],
@@ -5187,7 +5226,7 @@ fn apply_enqueue_batch(
 ///
 /// Call after the transaction has been committed. Updates the ready or
 /// scheduled index depending on the job's status.
-fn finalize_enqueue(
+pub(super) fn finalize_enqueue(
     result: &EnqueueResult,
     ready_index: &ReadyIndex,
     scheduled_index: &ScheduledIndex,
