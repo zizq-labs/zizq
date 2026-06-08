@@ -1504,42 +1504,13 @@ impl Store {
         let event_tx = self.event_tx.clone();
 
         task::spawn_blocking(move || -> Result<_, StoreError> {
-            use std::collections::HashMap;
-
             let prepared: Vec<PreparedEnqueue> = batch
                 .into_iter()
                 .map(|opts| prepare_enqueue(opts, now))
                 .collect::<Result<_, StoreError>>()?;
 
             let mut tx = ks.write_tx();
-
-            // Maps unique_key -> index in `results` for intra-batch conflicts.
-            let mut batch_unique_keys: HashMap<String, usize> = HashMap::new();
-            let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
-
-            for p in &prepared {
-                // Intra-batch unique conflict check (no DB read needed).
-                if let Some(ref uc) = p.job.unique {
-                    if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
-                        results.push(EnqueueResult::Duplicate(
-                            results[existing_idx].job().clone(),
-                        ));
-                        continue;
-                    }
-                }
-
-                let result = apply_enqueue(&mut tx, &ks, p)?;
-
-                // Track unique keys for intra-batch dedup.
-                if let EnqueueResult::Created(ref job) = result {
-                    if let Some(ref uc) = job.unique {
-                        batch_unique_keys.insert(uc.key.clone(), results.len());
-                    }
-                }
-
-                results.push(result);
-            }
-
+            let results = apply_enqueue_batch(&mut tx, &ks, &prepared)?;
             ks.commit(tx, ks.enqueue_commit_mode)?;
 
             for r in &results {
@@ -5163,6 +5134,53 @@ fn apply_enqueue(
     }
 
     Ok(EnqueueResult::Created(p.job.clone()))
+}
+
+/// Apply a batch of prepared enqueues to an open write transaction with
+/// intra-batch unique-key dedup.
+///
+/// When two prepared jobs in the same batch share a `unique` key, the
+/// second one returns `EnqueueResult::Duplicate(...)` referring to the
+/// first without performing a tx insert. Cross-batch dedup against
+/// already-committed jobs is handled by `apply_enqueue` itself.
+///
+/// Does NOT commit the transaction — the caller commits and runs
+/// `finalize_enqueue` per result post-commit.
+fn apply_enqueue_batch(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    prepared: &[PreparedEnqueue],
+) -> Result<Vec<EnqueueResult>, StoreError> {
+    use std::collections::HashMap;
+
+    // Maps unique_key -> index in `results` for intra-batch conflicts.
+    let mut batch_unique_keys: HashMap<String, usize> = HashMap::new();
+    let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
+
+    for p in prepared {
+        // Intra-batch unique conflict check (no DB read needed).
+        if let Some(ref uc) = p.job.unique {
+            if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
+                results.push(EnqueueResult::Duplicate(
+                    results[existing_idx].job().clone(),
+                ));
+                continue;
+            }
+        }
+
+        let result = apply_enqueue(tx, ks, p)?;
+
+        // Track unique keys for intra-batch dedup.
+        if let EnqueueResult::Created(ref job) = result {
+            if let Some(ref uc) = job.unique {
+                batch_unique_keys.insert(uc.key.clone(), results.len());
+            }
+        }
+
+        results.push(result);
+    }
+
+    Ok(results)
 }
 
 /// Update in-memory indexes for a successfully enqueued job.
