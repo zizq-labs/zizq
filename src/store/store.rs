@@ -1934,178 +1934,50 @@ impl Store {
         let ids: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
         let event_tx = self.event_tx.clone();
 
-        let result =
-            task::spawn_blocking(move || -> Result<_, StoreError> {
-                /// A job that has been pre-read and prepared for completion.
-                struct Prepared {
-                    id: String,
-                    queue: String,
-                    pre_bytes: Slice,
-                    priority: u16,
-                    /// `None` for zero-retention (will be deleted).
-                    updated_bytes: Option<Slice>,
-                    /// `Some` for zero-retention (will be deleted).
-                    deletion: Option<JobDeletion>,
-                    /// Index key updates for non-zero retention jobs.
-                    index_keys: Option<RetentionKeys>,
-                    /// Unique constraint for this job (if any).
-                    unique: Option<UniqueConstraint>,
-                }
+        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
+            // CAS-retry loop: re-read all jobs on conflict and re-attempt
+            // the apply. Conflicts are rare in practice (the most common
+            // cause is a concurrent patch_job on a job being completed),
+            // so the cost of re-reading is amortised across normal runs.
+            loop {
+                let (prepared, not_found) =
+                    pre_read_completes(&ids, now, &ks, default_completed_retention_ms)?;
 
-                /// Pre-computed index keys for a non-zero-retention completion.
-                struct RetentionKeys {
-                    old_status: Vec<u8>,
-                    new_status: Vec<u8>,
-                    purge: Vec<u8>,
-                }
-
-                let mut not_found: Vec<String> = Vec::new();
-
-                loop {
-                    // ---- outside tx: pre-read and prepare ----
-                    let mut prepared: Vec<Prepared> = Vec::new();
-
-                    for id in &ids {
-                        let job_key = make_job_key(id);
-                        let pre_bytes = match ks.data.get(&job_key)? {
-                            Some(bytes) => bytes,
-                            None => {
-                                not_found.push(id.clone());
-                                continue;
-                            }
-                        };
-
-                        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                        if job.status != JobStatus::InFlight as u8 {
-                            not_found.push(id.clone());
-                            continue;
-                        }
-
-                        let retention_ms = job
-                            .retention
-                            .as_ref()
-                            .and_then(|r| r.completed_ms)
-                            .unwrap_or(default_completed_retention_ms);
-
-                        if retention_ms == 0 {
-                            let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-                            prepared.push(Prepared {
-                                id: id.clone(),
-                                queue: job.queue.clone(),
-                                pre_bytes,
-                                priority: job.priority,
-                                updated_bytes: None,
-                                deletion: Some(del),
-                                index_keys: None,
-                                unique: None,
-                            });
-                        } else {
-                            let purge_at = now + retention_ms;
-                            let old_status_key = make_status_key(JobStatus::InFlight, id);
-                            let new_status_key = make_status_key(JobStatus::Completed, id);
-                            let purge_key = make_purge_key(purge_at, id);
-
-                            let unique = job.unique.clone();
-
-                            let queue = job.queue.clone();
-                            job.status = JobStatus::Completed.into();
-                            job.purge_at = Some(purge_at);
-                            job.completed_at = Some(now);
-
-                            let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                            prepared.push(Prepared {
-                                id: id.clone(),
-                                queue,
-                                pre_bytes,
-                                priority: job.priority,
-                                updated_bytes: Some(updated_slice),
-                                deletion: None,
-                                index_keys: Some(RetentionKeys {
-                                    old_status: old_status_key,
-                                    new_status: new_status_key,
-                                    purge: purge_key,
-                                }),
-                                unique,
-                            });
-                        }
-                    }
-
-                    if prepared.is_empty() {
-                        return Ok(BulkCompleteResult {
-                            completed: Vec::new(),
-                            not_found,
-                        });
-                    }
-
-                    // ---- inside tx ----
-                    let mut tx = ks.write_tx();
-                    let mut cas_conflict_detected = false;
-
-                    for p in &prepared {
-                        let job_key = make_job_key(&p.id);
-
-                        if let Some(ref del) = p.deletion {
-                            // Zero-retention: delete via CAS.
-                            let prev = tx.take(&ks.data, &job_key)?;
-                            if prev.as_deref() != Some(&*p.pre_bytes) {
-                                cas_conflict_detected = true;
-                                break;
-                            }
-                            apply_job_deletion(&mut tx, del, &ks);
-                        } else if let Some(ref updated) = p.updated_bytes {
-                            // Non-zero retention: update via CAS.
-                            let prev =
-                                tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
-                            if prev.as_deref() != Some(&*p.pre_bytes) {
-                                cas_conflict_detected = true;
-                                break;
-                            }
-                            let keys = p.index_keys.as_ref().unwrap();
-                            tx.remove(&ks.index, &keys.old_status);
-                            tx.insert(&ks.index, &keys.new_status, b"");
-                            tx.insert(&ks.index, &keys.purge, b"");
-
-                            // Remove unique index for Queued or Active scope,
-                            // but only if it still belongs to this job.
-                            if let Some(ref uc) = p.unique {
-                                let scope = uc.unique_while();
-                                if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
-                                    let job_id = p.id.as_bytes();
-                                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| {
-                                        match v {
-                                            Some(v) if v.as_ref() == job_id => None,
-                                            other => other.cloned(),
-                                        }
-                                    })?;
-                                }
-                            }
-                        }
-                    }
-
-                    if cas_conflict_detected {
-                        drop(tx);
-                        not_found.clear();
-                        continue; // Retry from pre-read.
-                    }
-
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    // Update ready_index for all completed jobs.
-                    for p in &prepared {
-                        ready_index.remove(&p.queue, p.priority, &p.id);
-                    }
-
-                    let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
-
+                if prepared.is_empty() {
                     return Ok(BulkCompleteResult {
-                        completed,
+                        completed: Vec::new(),
                         not_found,
                     });
                 }
-            })
-            .await?;
+
+                let mut tx = ks.write_tx();
+                if !apply_complete_batch(&mut tx, &ks, &prepared)? {
+                    // CAS mismatch on at least one job — drop the tx
+                    // (rolls back any partial writes), then re-read
+                    // everything and try again.
+                    drop(tx);
+                    continue;
+                }
+
+                ks.commit(tx, ks.default_commit_mode)?;
+
+                // Update ready_index for all completed jobs (the
+                // status-transition path; ready_index entries for InFlight
+                // jobs were already removed at take time, but this is the
+                // canonical cleanup for any stragglers).
+                for p in &prepared {
+                    ready_index.remove(&p.queue, p.priority, &p.id);
+                }
+
+                let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
+
+                return Ok(BulkCompleteResult {
+                    completed,
+                    not_found,
+                });
+            }
+        })
+        .await?;
 
         let bulk_result = result?;
 
@@ -5000,7 +4872,7 @@ fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
 ///
 /// Built by `prepare_job_deletion` (no tx required), applied by
 /// `apply_job_deletion` (write-only inside an open tx).
-struct JobDeletion {
+pub(super) struct JobDeletion {
     id: String,
     status_key: Vec<u8>,
     queue_key: Vec<u8>,
@@ -5258,6 +5130,176 @@ pub(super) fn finalize_enqueue(
             }
         }
     }
+}
+
+/// A job that has been pre-read and prepared for completion. Built by
+/// `pre_read_completes` (no tx required), applied by
+/// `apply_complete_batch` inside a write transaction.
+///
+/// Carries the original `pre_bytes` for CAS verification at apply time.
+/// If the job's stored bytes changed between pre-read and tx, the apply
+/// reports a CAS conflict and the caller must retry the pre-read.
+pub(super) struct PreparedComplete {
+    pub id: String,
+    pub queue: String,
+    pub pre_bytes: Slice,
+    pub priority: u16,
+    /// `None` for zero-retention completions (which delete the job).
+    pub updated_bytes: Option<Slice>,
+    /// `Some` for zero-retention completions (delete-paths).
+    pub deletion: Option<JobDeletion>,
+    /// Pre-computed index key updates for non-zero-retention paths.
+    pub index_keys: Option<CompletionRetentionKeys>,
+    /// Unique constraint snapshot for cleaning up the unique index.
+    pub unique: Option<UniqueConstraint>,
+}
+
+/// Pre-computed index keys for a non-zero-retention completion.
+pub(super) struct CompletionRetentionKeys {
+    pub old_status: Vec<u8>,
+    pub new_status: Vec<u8>,
+    pub purge: Vec<u8>,
+}
+
+/// Pre-read the given job ids and build the list of `PreparedComplete`
+/// values for those that are still in `InFlight` state. Jobs that are
+/// missing or in a different status are pushed into `not_found`.
+///
+/// Does NOT open a transaction — reads go directly through the
+/// keyspace, so the returned `pre_bytes` may be invalidated by
+/// concurrent writers. `apply_complete_batch` verifies via CAS and
+/// surfaces conflicts to the caller.
+pub(super) fn pre_read_completes(
+    ids: &[String],
+    now: u64,
+    ks: &Keyspaces,
+    default_completed_retention_ms: u64,
+) -> Result<(Vec<PreparedComplete>, Vec<String>), StoreError> {
+    let mut prepared: Vec<PreparedComplete> = Vec::with_capacity(ids.len());
+    let mut not_found: Vec<String> = Vec::new();
+
+    for id in ids {
+        let job_key = make_job_key(id);
+        let pre_bytes = match ks.data.get(&job_key)? {
+            Some(bytes) => bytes,
+            None => {
+                not_found.push(id.clone());
+                continue;
+            }
+        };
+
+        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+
+        if job.status != JobStatus::InFlight as u8 {
+            not_found.push(id.clone());
+            continue;
+        }
+
+        let retention_ms = job
+            .retention
+            .as_ref()
+            .and_then(|r| r.completed_ms)
+            .unwrap_or(default_completed_retention_ms);
+
+        if retention_ms == 0 {
+            let del = prepare_job_deletion(&job, JobStatus::InFlight, ks);
+            prepared.push(PreparedComplete {
+                id: id.clone(),
+                queue: job.queue.clone(),
+                pre_bytes,
+                priority: job.priority,
+                updated_bytes: None,
+                deletion: Some(del),
+                index_keys: None,
+                unique: None,
+            });
+        } else {
+            let purge_at = now + retention_ms;
+            let old_status_key = make_status_key(JobStatus::InFlight, id);
+            let new_status_key = make_status_key(JobStatus::Completed, id);
+            let purge_key = make_purge_key(purge_at, id);
+
+            let unique = job.unique.clone();
+
+            let queue = job.queue.clone();
+            job.status = JobStatus::Completed.into();
+            job.purge_at = Some(purge_at);
+            job.completed_at = Some(now);
+
+            let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+            prepared.push(PreparedComplete {
+                id: id.clone(),
+                queue,
+                pre_bytes,
+                priority: job.priority,
+                updated_bytes: Some(updated_slice),
+                deletion: None,
+                index_keys: Some(CompletionRetentionKeys {
+                    old_status: old_status_key,
+                    new_status: new_status_key,
+                    purge: purge_key,
+                }),
+                unique,
+            });
+        }
+    }
+
+    Ok((prepared, not_found))
+}
+
+/// Apply a batch of prepared completions to an open write transaction
+/// with optimistic-concurrency CAS verification.
+///
+/// On any CAS mismatch, returns `Ok(false)` immediately without writing
+/// further items. The caller must drop the tx and retry the
+/// pre-read+apply sequence — the returned tx is left in a stale state
+/// (some items may have been written before the conflict was detected).
+///
+/// On success, every item has been applied to the tx; caller commits.
+/// Does NOT commit the transaction.
+pub(super) fn apply_complete_batch(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    prepared: &[PreparedComplete],
+) -> Result<bool, StoreError> {
+    for p in prepared {
+        let job_key = make_job_key(&p.id);
+
+        if let Some(ref del) = p.deletion {
+            // Zero-retention: delete via CAS.
+            let prev = tx.take(&ks.data, &job_key)?;
+            if prev.as_deref() != Some(&*p.pre_bytes) {
+                return Ok(false);
+            }
+            apply_job_deletion(tx, del, ks);
+        } else if let Some(ref updated) = p.updated_bytes {
+            // Non-zero retention: update via CAS.
+            let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
+            if prev.as_deref() != Some(&*p.pre_bytes) {
+                return Ok(false);
+            }
+            let keys = p.index_keys.as_ref().unwrap();
+            tx.remove(&ks.index, &keys.old_status);
+            tx.insert(&ks.index, &keys.new_status, b"");
+            tx.insert(&ks.index, &keys.purge, b"");
+
+            // Remove unique index for Queued or Active scope on
+            // completion, but only if it still belongs to this job.
+            if let Some(ref uc) = p.unique {
+                let scope = uc.unique_while();
+                if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
+                    let job_id = p.id.as_bytes();
+                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                        Some(v) if v.as_ref() == job_id => None,
+                        other => other.cloned(),
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 /// Compute the backoff delay in milliseconds for a given attempt count.
