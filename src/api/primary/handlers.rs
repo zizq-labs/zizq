@@ -1070,7 +1070,14 @@ async fn delete_job(
     Path(id): Path<String>,
 ) -> Response {
     match state.store.delete_job(&id).await {
-        Ok(true) => respond(fmt, StatusCode::NO_CONTENT, &()),
+        // RFC 7230 § 3.3.3: a 204 No Content response MUST NOT have a
+        // message body. `respond()` would serialize `()` to a JSON
+        // `null` (or msgpack equivalent) and attach it as the body,
+        // which HTTP/1.1 clients silently tolerate but HTTP/2 rejects
+        // with NGHTTP2_PROTOCOL_ERROR (any DATA frame after a 204
+        // HEADERS frame is a protocol violation). Use the bodyless
+        // `no_content()` helper instead.
+        Ok(true) => no_content(),
         Ok(false) => respond(
             fmt,
             StatusCode::NOT_FOUND,
@@ -6731,6 +6738,17 @@ mod tests {
         let req = empty_request("DELETE", &format!("/jobs/{}", job.id));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // RFC 7230 § 3.3.3: a 204 must have no body. HTTP/2 enforces
+        // this strictly — a DATA frame after a 204's HEADERS frame
+        // triggers NGHTTP2_PROTOCOL_ERROR on the client side.
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.is_empty(),
+            "204 No Content must have an empty body, got {body:?}"
+        );
     }
 
     #[tokio::test]

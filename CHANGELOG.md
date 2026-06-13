@@ -2,6 +2,15 @@
 
 ## 0.4.2
 
+- Fixed `DELETE /jobs/{id}`: the 204 No Content response was
+  accidentally including a serialized empty-body payload (JSON `null`
+  or its msgpack equivalent). HTTP/1.1 clients silently tolerated the
+  spec violation and ignored the body, but HTTP/2 strictly enforces
+  RFC 7230 § 3.3.3's "204 MUST NOT have a body" — any DATA frame
+  after a 204 HEADERS frame triggers `NGHTTP2_PROTOCOL_ERROR` and
+  closes the stream. Only affected clients negotiating h2 (TLS or
+  h2c); h1.1 clients were unaffected. Other 204 sites in the codebase
+  were already correct.
 - Added server-side opportunistic batching for enqueue requests.
   Singular `enqueue` and bulk `enqueue_bulk` now route through one
   shared channel; a dedicated background thread coalesces whatever
