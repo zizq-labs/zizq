@@ -38,6 +38,7 @@ use super::cron::CronScheduleIndex;
 use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 
+use super::complete_batcher::CompleteBatcher;
 use super::cron::{CronEntry, CronGroup};
 use super::enqueue_batcher::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
@@ -324,9 +325,6 @@ pub struct Store {
     /// In-memory index of cron entries ordered by `next_enqueue_at`.
     cron_index: Arc<CronScheduleIndex>,
 
-    /// Default retention period for completed jobs (milliseconds).
-    default_completed_retention_ms: u64,
-
     /// Default retention period for dead jobs (milliseconds).
     default_dead_retention_ms: u64,
 
@@ -364,6 +362,10 @@ pub struct Store {
     /// Shut down by dropping (the inner `SyncSender` closes, the worker
     /// drains queued ops and exits).
     enqueue_batcher: Arc<EnqueueBatcher>,
+
+    /// Server-side auto-batcher for concurrent completions (acks).
+    /// Mirrors `enqueue_batcher` in structure and lifecycle.
+    complete_batcher: Arc<CompleteBatcher>,
 }
 
 /// One-byte tag prefix for records in the `data` keyspace.
@@ -416,7 +418,7 @@ pub(super) struct Keyspaces {
     group_committer: GroupCommitter,
 
     /// Default commit mode for most operations (dequeue, complete, fail, etc.).
-    default_commit_mode: CommitMode,
+    pub(super) default_commit_mode: CommitMode,
 
     /// Commit mode for enqueue operations (resolved at construction;
     /// inherits the default when not overridden).
@@ -1222,6 +1224,11 @@ pub struct StorageConfig {
     /// explicit `enqueue_bulk` calls, which run their own tx.
     pub enqueue_batch_size: usize,
 
+    /// Maximum number of completion (ack) requests coalesced into one
+    /// write transaction. Op-count bounded — a bulk-ack of N jobs
+    /// still counts as one op. Same shape as `enqueue_batch_size`.
+    pub complete_batch_size: usize,
+
     /// After a bulk mutation affects at least this many records, force a
     /// full LSM compaction to reclaim tombstones. Without this, leveled
     /// compaction can leave large pockets of garbage in the upper levels
@@ -1272,6 +1279,11 @@ pub const DEFAULT_AUTO_COMPACT_THRESHOLD: u64 = 10_000;
 /// into one auto-batched commit. Also the bounded channel capacity.
 pub const DEFAULT_ENQUEUE_BATCH_SIZE: usize = 1000;
 
+/// Default maximum number of concurrent completion (ack) requests
+/// coalesced into one auto-batched commit. Also the bounded channel
+/// capacity.
+pub const DEFAULT_COMPLETE_BATCH_SIZE: usize = 1000;
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -1291,6 +1303,7 @@ impl Default for StorageConfig {
             default_commit_mode: CommitMode::default(),
             enqueue_commit_mode: None,
             enqueue_batch_size: DEFAULT_ENQUEUE_BATCH_SIZE,
+            complete_batch_size: DEFAULT_COMPLETE_BATCH_SIZE,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
         }
     }
@@ -1311,6 +1324,7 @@ impl StorageConfig {
     /// | `ZIZQ_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
     /// | `ZIZQ_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
     /// | `ZIZQ_ENQUEUE_BATCH_SIZE` | `enqueue_batch_size` |
+    /// | `ZIZQ_COMPLETE_BATCH_SIZE` | `complete_batch_size` |
     /// | `ZIZQ_AUTO_COMPACT_THRESHOLD` | `auto_compact_threshold` |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
@@ -1349,6 +1363,8 @@ impl StorageConfig {
             },
             enqueue_batch_size: env_parse("ZIZQ_ENQUEUE_BATCH_SIZE")?
                 .unwrap_or(defaults.enqueue_batch_size),
+            complete_batch_size: env_parse("ZIZQ_COMPLETE_BATCH_SIZE")?
+                .unwrap_or(defaults.complete_batch_size),
             auto_compact_threshold: env_parse("ZIZQ_AUTO_COMPACT_THRESHOLD")?
                 .unwrap_or(defaults.auto_compact_threshold),
         })
@@ -1458,10 +1474,10 @@ impl Store {
         let scheduled_index = Arc::new(ScheduledIndex::new());
 
         // Start the enqueue auto-batcher — a dedicated OS thread that
-        // coalesces concurrent single-job enqueues into one tx.commit().
-        // Shuts down when this Store (and any spawn_blocking clones of
-        // the Arc) drops — the inner SyncSender closes, the worker
-        // drains remaining ops and exits.
+        // coalesces concurrent enqueue requests (singular + bulk) into
+        // one tx.commit(). Shuts down when this Store (and any
+        // spawn_blocking clones of the Arc) drops — the inner
+        // SyncSender closes, the worker drains remaining ops and exits.
         let enqueue_batcher = Arc::new(EnqueueBatcher::start(
             ks.clone(),
             ready_index.clone(),
@@ -1470,20 +1486,33 @@ impl Store {
             config.enqueue_batch_size,
         ));
 
+        let in_flight_count = Arc::new(AtomicU64::new(0));
+
+        // Start the complete auto-batcher — same shape as the enqueue
+        // batcher, coalesces concurrent completion (ack) requests.
+        let complete_batcher = Arc::new(CompleteBatcher::start(
+            ks.clone(),
+            ready_index.clone(),
+            in_flight_count.clone(),
+            event_tx.clone(),
+            config.default_completed_retention_ms,
+            config.complete_batch_size,
+        ));
+
         Ok(Self {
             config: config.clone(),
             ks,
             ready_index,
             scheduled_index,
             cron_index: Arc::new(CronScheduleIndex::new()),
-            default_completed_retention_ms: config.default_completed_retention_ms,
             default_dead_retention_ms: config.default_dead_retention_ms,
             default_retry_limit: config.default_retry_limit,
             default_backoff: config.default_backoff,
             index_ready: Arc::new(AtomicBool::new(true)),
-            in_flight_count: Arc::new(AtomicU64::new(0)),
+            in_flight_count,
             event_tx,
             enqueue_batcher,
+            complete_batcher,
         })
     }
 
@@ -1802,119 +1831,12 @@ impl Store {
     /// reaper will hard-delete it after the retention period. Returns `true`
     /// if the job was found in the in-flight state, `false` if it was not.
     ///
-    /// Subscribers are notified on success.
+    /// Subscribers are notified on success. Routes through the same
+    /// auto-batcher as `mark_completed_bulk` — a singular ack is a
+    /// Vec-of-1 trip through the channel.
     pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let default_completed_retention_ms = self.default_completed_retention_ms;
-        let id = id.to_string();
-        let id_for_event = id.clone();
-
-        let completed = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Retry loop: pre-read and pre-compute changes outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
-            loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(false),
-                };
-
-                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if job.status != JobStatus::InFlight as u8 {
-                    return Ok(false);
-                }
-
-                let retention_ms = job
-                    .retention
-                    .as_ref()
-                    .and_then(|r| r.completed_ms)
-                    .unwrap_or(default_completed_retention_ms);
-
-                if retention_ms == 0 {
-                    // Zero retention: prepare deletion keys outside tx.
-                    let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-
-                    // ---- inside tx ----
-                    let mut tx = ks.write_tx();
-                    let prev = tx.take(&ks.data, &job_key)?;
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue;
-                    }
-                    apply_job_deletion(&mut tx, &del, &ks);
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    ready_index.remove(&job.queue, job.priority, &id);
-
-                    return Ok(true);
-                }
-
-                // Non-zero retention: defer deletion to the reaper.
-                let purge_at = now + retention_ms;
-
-                let old_status_key = make_status_key(JobStatus::InFlight, &id);
-                let new_status_key = make_status_key(JobStatus::Completed, &id);
-                let purge_key = make_purge_key(purge_at, &id);
-
-                job.status = JobStatus::Completed.into();
-                job.purge_at = Some(purge_at);
-                job.completed_at = Some(now);
-
-                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                // ---- inside tx ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-                tx.insert(&ks.index, &purge_key, b"");
-
-                // Remove unique index for Queued or Active scope on completion,
-                // but only if it still belongs to this job.
-                if let Some(ref uc) = job.unique {
-                    let scope = uc.unique_while();
-                    if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
-                        let job_id = id.as_bytes();
-                        tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                            Some(v) if v.as_ref() == job_id => None,
-                            other => other.cloned(),
-                        })?;
-                    }
-                }
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                ready_index.remove(&job.queue, job.priority, &id);
-
-                return Ok(true);
-            }
-        })
-        .await??;
-
-        if completed {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
-            let _ = self
-                .event_tx
-                .send(StoreEvent::JobCompleted { id: id_for_event });
-        }
-
-        Ok(completed)
+        let result = self.mark_completed_bulk(now, &[id.to_string()]).await?;
+        Ok(!result.completed.is_empty())
     }
 
     /// Mark multiple jobs as successfully completed in a single transaction.
@@ -1927,74 +1849,25 @@ impl Store {
         now: u64,
         ids: &[String],
     ) -> Result<BulkCompleteResult, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let default_completed_retention_ms = self.default_completed_retention_ms;
-        let mut seen = HashSet::with_capacity(ids.len());
-        let ids: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
-        let event_tx = self.event_tx.clone();
-
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // CAS-retry loop: re-read all jobs on conflict and re-attempt
-            // the apply. Conflicts are rare in practice (the most common
-            // cause is a concurrent patch_job on a job being completed),
-            // so the cost of re-reading is amortised across normal runs.
-            loop {
-                let (prepared, not_found) =
-                    pre_read_completes(&ids, now, &ks, default_completed_retention_ms)?;
-
-                if prepared.is_empty() {
-                    return Ok(BulkCompleteResult {
-                        completed: Vec::new(),
-                        not_found,
-                    });
-                }
-
-                let mut tx = ks.write_tx();
-                if !apply_complete_batch(&mut tx, &ks, &prepared)? {
-                    // CAS mismatch on at least one job — drop the tx
-                    // (rolls back any partial writes), then re-read
-                    // everything and try again.
-                    drop(tx);
-                    continue;
-                }
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                // Update ready_index for all completed jobs (the
-                // status-transition path; ready_index entries for InFlight
-                // jobs were already removed at take time, but this is the
-                // canonical cleanup for any stragglers).
-                for p in &prepared {
-                    ready_index.remove(&p.queue, p.priority, &p.id);
-                }
-
-                let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
-
-                return Ok(BulkCompleteResult {
-                    completed,
-                    not_found,
-                });
-            }
-        })
-        .await?;
-
-        let bulk_result = result?;
-
-        if !bulk_result.completed.is_empty() {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(bulk_result.completed.len() as u64))
-                });
+        if ids.is_empty() {
+            return Ok(BulkCompleteResult {
+                completed: Vec::new(),
+                not_found: Vec::new(),
+            });
         }
 
-        // Broadcast JobCompleted for each completed job.
-        for id in &bulk_result.completed {
-            let _ = event_tx.send(StoreEvent::JobCompleted { id: id.clone() });
-        }
+        // Route through the auto-batcher. Per-op dedup happens inside
+        // the batcher; ready_index updates, in_flight_count decrement,
+        // and JobCompleted event broadcasts are all performed once per
+        // unique completed job in the batcher thread.
+        let batcher = self.complete_batcher.clone();
+        let ids: Vec<String> = ids.to_vec();
 
-        Ok(bulk_result)
+        let reply_rx = task::spawn_blocking(move || batcher.submit(ids, now)).await?;
+
+        reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("complete auto-batcher channel closed".into()))?
     }
 
     /// Record a job failure and either schedule a retry or kill the job

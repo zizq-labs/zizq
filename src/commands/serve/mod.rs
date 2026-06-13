@@ -184,13 +184,21 @@ pub struct Args {
     #[arg(long, default_value = "256MB", value_name = "SIZE", value_parser = parse_byte_size, env = "ZIZQ_CACHE_SIZE")]
     cache_size: u64,
 
-    /// Maximum number of concurrent single-job enqueues coalesced into
+    /// Maximum number of concurrent enqueue requests coalesced into
     /// one auto-batched commit. Server-side optimization that lets many
-    /// parallel client enqueue requests share one LSM-tree write transaction.
-    /// Does NOT affect explicit bulk-enqueue requests, which run their own
-    /// transaction independently.
+    /// parallel client enqueue requests share one LSM-tree write
+    /// transaction. Op-count bounded — a bulk-enqueue counts as one op
+    /// regardless of how many jobs it carries.
     #[arg(long, default_value_t = store::DEFAULT_ENQUEUE_BATCH_SIZE, value_name = "NUMBER", env = "ZIZQ_ENQUEUE_BATCH_SIZE")]
     enqueue_batch_size: usize,
+
+    /// Maximum number of concurrent completion (ack) requests coalesced
+    /// into one auto-batched commit. Same shape as `--enqueue-batch-size`:
+    /// op-count bounded, with bulk-acks counting as one op regardless of
+    /// job count. Helps under horizontally-scaled workloads where many
+    /// independent worker processes are acking concurrently.
+    #[arg(long, default_value_t = store::DEFAULT_COMPLETE_BATCH_SIZE, value_name = "NUMBER", env = "ZIZQ_COMPLETE_BATCH_SIZE")]
+    complete_batch_size: usize,
 
     /// Address to bind the admin API server to.
     #[arg(long, default_value = "127.0.0.1", env = "ZIZQ_ADMIN_HOST")]
@@ -561,6 +569,7 @@ async fn init_store(
     storage_config.default_commit_mode = args.default_commit_mode;
     storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
     storage_config.enqueue_batch_size = args.enqueue_batch_size;
+    storage_config.complete_batch_size = args.complete_batch_size;
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");
 
