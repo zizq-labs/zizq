@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2
+
+- Added server-side opportunistic batching for enqueue requests.
+  Singular `enqueue` and bulk `enqueue_bulk` now route through one
+  shared channel; a dedicated background thread coalesces whatever
+  arrived at fjall-mutex-acquire time into a single write
+  transaction. Atomicity is preserved at the commit boundary — a
+  bulk's all-or-nothing contract still holds because the coalesced
+  commit succeeds or fails as a unit. Op-count bounded via
+  `--enqueue-batch-size` (`ZIZQ_ENQUEUE_BATCH_SIZE`, default 1000); a
+  bulk request counts as one op regardless of job count. The win
+  materializes when many independent client processes are enqueueing
+  concurrently — local single-client benchmarks see no measurable
+  difference, neither helps nor hurts.
+- Added server-side opportunistic batching for completion (ack)
+  requests, same shape as the enqueue batcher. Composes with the
+  per-worker `AckProcessor`-style batching that clients already do:
+  the client batcher reduces HTTP framing per-request; the server
+  batcher reduces `tx.commit()` cost when many independent workers
+  ack concurrently. Configurable via `--complete-batch-size`
+  (`ZIZQ_COMPLETE_BATCH_SIZE`, default 1000).
+
 ## 0.4.1
 
 - Internal refactoring of the `zizq top` code structure

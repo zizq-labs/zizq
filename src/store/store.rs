@@ -38,7 +38,9 @@ use super::cron::CronScheduleIndex;
 use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 
+use super::complete_batcher::CompleteBatcher;
 use super::cron::{CronEntry, CronGroup};
+use super::enqueue_batcher::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
@@ -323,9 +325,6 @@ pub struct Store {
     /// In-memory index of cron entries ordered by `next_enqueue_at`.
     cron_index: Arc<CronScheduleIndex>,
 
-    /// Default retention period for completed jobs (milliseconds).
-    default_completed_retention_ms: u64,
-
     /// Default retention period for dead jobs (milliseconds).
     default_dead_retention_ms: u64,
 
@@ -356,6 +355,17 @@ pub struct Store {
     /// or otherwise change state. Take handlers use this both to wake up
     /// when new work is available and to prune their in-flight tracking.
     event_tx: broadcast::Sender<StoreEvent>,
+
+    /// Server-side auto-batcher for concurrent single-job enqueues.
+    /// Owned in an `Arc` so spawn_blocking tasks can cheaply clone the
+    /// handle without holding a `&Store` borrow across the .await.
+    /// Shut down by dropping (the inner `SyncSender` closes, the worker
+    /// drains queued ops and exits).
+    enqueue_batcher: Arc<EnqueueBatcher>,
+
+    /// Server-side auto-batcher for concurrent completions (acks).
+    /// Mirrors `enqueue_batcher` in structure and lifecycle.
+    complete_batcher: Arc<CompleteBatcher>,
 }
 
 /// One-byte tag prefix for records in the `data` keyspace.
@@ -386,7 +396,7 @@ enum IndexKind {
 /// Groups the fjall database handle and all disk keyspaces into a single
 /// cheaply-cloneable unit. Wrapped in `Arc` inside `Store` so that every
 /// async method only bumps one reference count instead of three.
-struct Keyspaces {
+pub(super) struct Keyspaces {
     /// Connection to the underlying database.
     db: SingleWriterTxDatabase,
 
@@ -408,16 +418,16 @@ struct Keyspaces {
     group_committer: GroupCommitter,
 
     /// Default commit mode for most operations (dequeue, complete, fail, etc.).
-    default_commit_mode: CommitMode,
+    pub(super) default_commit_mode: CommitMode,
 
     /// Commit mode for enqueue operations (resolved at construction;
     /// inherits the default when not overridden).
-    enqueue_commit_mode: CommitMode,
+    pub(super) enqueue_commit_mode: CommitMode,
 }
 
 impl Keyspaces {
     /// Acquire the single-writer transaction lock.
-    fn write_tx(&self) -> fjall::SingleWriterWriteTx<'_> {
+    pub(super) fn write_tx(&self) -> fjall::SingleWriterWriteTx<'_> {
         self.db.write_tx()
     }
 
@@ -426,7 +436,7 @@ impl Keyspaces {
     /// Calls fjall's `tx.commit()` to buffer the write, then sends a sync
     /// request to the group committer and blocks until it completes.
     /// Since this is always called inside `spawn_blocking`, blocking is safe.
-    fn commit(
+    pub(super) fn commit(
         &self,
         tx: fjall::SingleWriterWriteTx<'_>,
         mode: CommitMode,
@@ -1207,6 +1217,18 @@ pub struct StorageConfig {
     /// enqueue inherits `default_commit_mode`.
     pub enqueue_commit_mode: Option<CommitMode>,
 
+    /// Maximum number of single-job enqueues coalesced into one write
+    /// transaction by the server-side auto-batcher. Also the bounded
+    /// channel capacity for in-flight enqueue requests, so it caps both
+    /// per-batch size and total in-flight load. Does NOT apply to
+    /// explicit `enqueue_bulk` calls, which run their own tx.
+    pub enqueue_batch_size: usize,
+
+    /// Maximum number of completion (ack) requests coalesced into one
+    /// write transaction. Op-count bounded — a bulk-ack of N jobs
+    /// still counts as one op. Same shape as `enqueue_batch_size`.
+    pub complete_batch_size: usize,
+
     /// After a bulk mutation affects at least this many records, force a
     /// full LSM compaction to reclaim tombstones. Without this, leveled
     /// compaction can leave large pockets of garbage in the upper levels
@@ -1253,6 +1275,15 @@ pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 /// compaction once they commit.
 pub const DEFAULT_AUTO_COMPACT_THRESHOLD: u64 = 10_000;
 
+/// Default maximum number of concurrent single-job enqueues coalesced
+/// into one auto-batched commit. Also the bounded channel capacity.
+pub const DEFAULT_ENQUEUE_BATCH_SIZE: usize = 1000;
+
+/// Default maximum number of concurrent completion (ack) requests
+/// coalesced into one auto-batched commit. Also the bounded channel
+/// capacity.
+pub const DEFAULT_COMPLETE_BATCH_SIZE: usize = 1000;
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -1271,6 +1302,8 @@ impl Default for StorageConfig {
             },
             default_commit_mode: CommitMode::default(),
             enqueue_commit_mode: None,
+            enqueue_batch_size: DEFAULT_ENQUEUE_BATCH_SIZE,
+            complete_batch_size: DEFAULT_COMPLETE_BATCH_SIZE,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
         }
     }
@@ -1290,6 +1323,8 @@ impl StorageConfig {
     /// | `ZIZQ_L0_THRESHOLD`       | `l0_threshold`     |
     /// | `ZIZQ_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
     /// | `ZIZQ_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
+    /// | `ZIZQ_ENQUEUE_BATCH_SIZE` | `enqueue_batch_size` |
+    /// | `ZIZQ_COMPLETE_BATCH_SIZE` | `complete_batch_size` |
     /// | `ZIZQ_AUTO_COMPACT_THRESHOLD` | `auto_compact_threshold` |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
@@ -1326,6 +1361,10 @@ impl StorageConfig {
                     });
                 }
             },
+            enqueue_batch_size: env_parse("ZIZQ_ENQUEUE_BATCH_SIZE")?
+                .unwrap_or(defaults.enqueue_batch_size),
+            complete_batch_size: env_parse("ZIZQ_COMPLETE_BATCH_SIZE")?
+                .unwrap_or(defaults.complete_batch_size),
             auto_compact_threshold: env_parse("ZIZQ_AUTO_COMPACT_THRESHOLD")?
                 .unwrap_or(defaults.auto_compact_threshold),
         })
@@ -1423,26 +1462,57 @@ impl Store {
         // SyncSender closes, the thread drains and does a final SyncAll).
         let group_committer = GroupCommitter::start(db.clone(), path.to_path_buf());
 
+        let ks = Arc::new(Keyspaces {
+            db,
+            data,
+            index,
+            group_committer,
+            default_commit_mode,
+            enqueue_commit_mode,
+        });
+        let ready_index = Arc::new(ReadyIndex::new());
+        let scheduled_index = Arc::new(ScheduledIndex::new());
+
+        // Start the enqueue auto-batcher — a dedicated OS thread that
+        // coalesces concurrent enqueue requests (singular + bulk) into
+        // one tx.commit(). Shuts down when this Store (and any
+        // spawn_blocking clones of the Arc) drops — the inner
+        // SyncSender closes, the worker drains remaining ops and exits.
+        let enqueue_batcher = Arc::new(EnqueueBatcher::start(
+            ks.clone(),
+            ready_index.clone(),
+            scheduled_index.clone(),
+            event_tx.clone(),
+            config.enqueue_batch_size,
+        ));
+
+        let in_flight_count = Arc::new(AtomicU64::new(0));
+
+        // Start the complete auto-batcher — same shape as the enqueue
+        // batcher, coalesces concurrent completion (ack) requests.
+        let complete_batcher = Arc::new(CompleteBatcher::start(
+            ks.clone(),
+            ready_index.clone(),
+            in_flight_count.clone(),
+            event_tx.clone(),
+            config.default_completed_retention_ms,
+            config.complete_batch_size,
+        ));
+
         Ok(Self {
             config: config.clone(),
-            ks: Arc::new(Keyspaces {
-                db,
-                data,
-                index,
-                group_committer,
-                default_commit_mode,
-                enqueue_commit_mode,
-            }),
-            ready_index: Arc::new(ReadyIndex::new()),
-            scheduled_index: Arc::new(ScheduledIndex::new()),
+            ks,
+            ready_index,
+            scheduled_index,
             cron_index: Arc::new(CronScheduleIndex::new()),
-            default_completed_retention_ms: config.default_completed_retention_ms,
             default_dead_retention_ms: config.default_dead_retention_ms,
             default_retry_limit: config.default_retry_limit,
             default_backoff: config.default_backoff,
             index_ready: Arc::new(AtomicBool::new(true)),
-            in_flight_count: Arc::new(AtomicU64::new(0)),
+            in_flight_count,
             event_tx,
+            enqueue_batcher,
+            complete_batcher,
         })
     }
 
@@ -1460,28 +1530,28 @@ impl Store {
         now: u64,
         opts: EnqueueOptions,
     ) -> Result<EnqueueResult, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
+        // Singleton enqueue is a Vec-of-1 trip through the same
+        // batcher path as `enqueue_bulk`. The batcher coalesces this
+        // with whatever else is in the channel at mutex-acquire time
+        // and commits the whole coalesced batch atomically.
+        let batcher = self.enqueue_batcher.clone();
 
-        task::spawn_blocking(move || -> Result<_, StoreError> {
+        let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
             let prepared = prepare_enqueue(opts, now)?;
-
-            let mut tx = ks.write_tx();
-            let result = apply_enqueue(&mut tx, &ks, &prepared)?;
-
-            if result.is_duplicate() {
-                drop(tx);
-            } else {
-                ks.commit(tx, ks.enqueue_commit_mode)?;
-            }
-
-            finalize_enqueue(&result, &ready_index, &scheduled_index, &event_tx);
-
-            Ok(result)
+            Ok(batcher.submit(vec![prepared]))
         })
-        .await?
+        .await??;
+
+        let mut results = reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("enqueue auto-batcher channel closed".into()))??;
+
+        // Vec-of-1 contract — the batcher always returns the same number
+        // of results as the input length. `unwrap` is safe in
+        // principle, but we still guard against batcher-side bugs.
+        results.pop().ok_or_else(|| {
+            StoreError::Internal("enqueue auto-batcher returned empty result".into())
+        })
     }
 
     /// Enqueue multiple jobs in a single transaction.
@@ -1489,6 +1559,12 @@ impl Store {
     /// All jobs are serialized and inserted under one write transaction with
     /// a single commit. In-memory indexes are updated after commit succeeds.
     /// Events are broadcast after the sync completes.
+    ///
+    /// Bulk participates in the same auto-batcher as singular enqueue —
+    /// a bulk-of-N counts as one op in the batcher's op-count budget,
+    /// and may share a commit with other concurrent enqueue requests.
+    /// Atomicity is preserved at the commit boundary: if the coalesced
+    /// commit fails, every participating op fails together.
     pub async fn enqueue_bulk(
         &self,
         now: u64,
@@ -1498,57 +1574,20 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
+        let batcher = self.enqueue_batcher.clone();
 
-        task::spawn_blocking(move || -> Result<_, StoreError> {
-            use std::collections::HashMap;
-
+        let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
             let prepared: Vec<PreparedEnqueue> = batch
                 .into_iter()
                 .map(|opts| prepare_enqueue(opts, now))
                 .collect::<Result<_, StoreError>>()?;
-
-            let mut tx = ks.write_tx();
-
-            // Maps unique_key -> index in `results` for intra-batch conflicts.
-            let mut batch_unique_keys: HashMap<String, usize> = HashMap::new();
-            let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
-
-            for p in &prepared {
-                // Intra-batch unique conflict check (no DB read needed).
-                if let Some(ref uc) = p.job.unique {
-                    if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
-                        results.push(EnqueueResult::Duplicate(
-                            results[existing_idx].job().clone(),
-                        ));
-                        continue;
-                    }
-                }
-
-                let result = apply_enqueue(&mut tx, &ks, p)?;
-
-                // Track unique keys for intra-batch dedup.
-                if let EnqueueResult::Created(ref job) = result {
-                    if let Some(ref uc) = job.unique {
-                        batch_unique_keys.insert(uc.key.clone(), results.len());
-                    }
-                }
-
-                results.push(result);
-            }
-
-            ks.commit(tx, ks.enqueue_commit_mode)?;
-
-            for r in &results {
-                finalize_enqueue(r, &ready_index, &scheduled_index, &event_tx);
-            }
-
-            Ok(results)
+            Ok(batcher.submit(prepared))
         })
-        .await?
+        .await??;
+
+        reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("enqueue auto-batcher channel closed".into()))?
     }
 
     /// Take the next job from the priority index.
@@ -1792,119 +1831,12 @@ impl Store {
     /// reaper will hard-delete it after the retention period. Returns `true`
     /// if the job was found in the in-flight state, `false` if it was not.
     ///
-    /// Subscribers are notified on success.
+    /// Subscribers are notified on success. Routes through the same
+    /// auto-batcher as `mark_completed_bulk` — a singular ack is a
+    /// Vec-of-1 trip through the channel.
     pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let default_completed_retention_ms = self.default_completed_retention_ms;
-        let id = id.to_string();
-        let id_for_event = id.clone();
-
-        let completed = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Retry loop: pre-read and pre-compute changes outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
-            loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(false),
-                };
-
-                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if job.status != JobStatus::InFlight as u8 {
-                    return Ok(false);
-                }
-
-                let retention_ms = job
-                    .retention
-                    .as_ref()
-                    .and_then(|r| r.completed_ms)
-                    .unwrap_or(default_completed_retention_ms);
-
-                if retention_ms == 0 {
-                    // Zero retention: prepare deletion keys outside tx.
-                    let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-
-                    // ---- inside tx ----
-                    let mut tx = ks.write_tx();
-                    let prev = tx.take(&ks.data, &job_key)?;
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue;
-                    }
-                    apply_job_deletion(&mut tx, &del, &ks);
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    ready_index.remove(&job.queue, job.priority, &id);
-
-                    return Ok(true);
-                }
-
-                // Non-zero retention: defer deletion to the reaper.
-                let purge_at = now + retention_ms;
-
-                let old_status_key = make_status_key(JobStatus::InFlight, &id);
-                let new_status_key = make_status_key(JobStatus::Completed, &id);
-                let purge_key = make_purge_key(purge_at, &id);
-
-                job.status = JobStatus::Completed.into();
-                job.purge_at = Some(purge_at);
-                job.completed_at = Some(now);
-
-                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                // ---- inside tx ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-                tx.insert(&ks.index, &purge_key, b"");
-
-                // Remove unique index for Queued or Active scope on completion,
-                // but only if it still belongs to this job.
-                if let Some(ref uc) = job.unique {
-                    let scope = uc.unique_while();
-                    if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
-                        let job_id = id.as_bytes();
-                        tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                            Some(v) if v.as_ref() == job_id => None,
-                            other => other.cloned(),
-                        })?;
-                    }
-                }
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                ready_index.remove(&job.queue, job.priority, &id);
-
-                return Ok(true);
-            }
-        })
-        .await??;
-
-        if completed {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
-            let _ = self
-                .event_tx
-                .send(StoreEvent::JobCompleted { id: id_for_event });
-        }
-
-        Ok(completed)
+        let result = self.mark_completed_bulk(now, &[id.to_string()]).await?;
+        Ok(!result.completed.is_empty())
     }
 
     /// Mark multiple jobs as successfully completed in a single transaction.
@@ -1917,202 +1849,25 @@ impl Store {
         now: u64,
         ids: &[String],
     ) -> Result<BulkCompleteResult, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let default_completed_retention_ms = self.default_completed_retention_ms;
-        let mut seen = HashSet::with_capacity(ids.len());
-        let ids: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
-        let event_tx = self.event_tx.clone();
-
-        let result =
-            task::spawn_blocking(move || -> Result<_, StoreError> {
-                /// A job that has been pre-read and prepared for completion.
-                struct Prepared {
-                    id: String,
-                    queue: String,
-                    pre_bytes: Slice,
-                    priority: u16,
-                    /// `None` for zero-retention (will be deleted).
-                    updated_bytes: Option<Slice>,
-                    /// `Some` for zero-retention (will be deleted).
-                    deletion: Option<JobDeletion>,
-                    /// Index key updates for non-zero retention jobs.
-                    index_keys: Option<RetentionKeys>,
-                    /// Unique constraint for this job (if any).
-                    unique: Option<UniqueConstraint>,
-                }
-
-                /// Pre-computed index keys for a non-zero-retention completion.
-                struct RetentionKeys {
-                    old_status: Vec<u8>,
-                    new_status: Vec<u8>,
-                    purge: Vec<u8>,
-                }
-
-                let mut not_found: Vec<String> = Vec::new();
-
-                loop {
-                    // ---- outside tx: pre-read and prepare ----
-                    let mut prepared: Vec<Prepared> = Vec::new();
-
-                    for id in &ids {
-                        let job_key = make_job_key(id);
-                        let pre_bytes = match ks.data.get(&job_key)? {
-                            Some(bytes) => bytes,
-                            None => {
-                                not_found.push(id.clone());
-                                continue;
-                            }
-                        };
-
-                        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                        if job.status != JobStatus::InFlight as u8 {
-                            not_found.push(id.clone());
-                            continue;
-                        }
-
-                        let retention_ms = job
-                            .retention
-                            .as_ref()
-                            .and_then(|r| r.completed_ms)
-                            .unwrap_or(default_completed_retention_ms);
-
-                        if retention_ms == 0 {
-                            let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-                            prepared.push(Prepared {
-                                id: id.clone(),
-                                queue: job.queue.clone(),
-                                pre_bytes,
-                                priority: job.priority,
-                                updated_bytes: None,
-                                deletion: Some(del),
-                                index_keys: None,
-                                unique: None,
-                            });
-                        } else {
-                            let purge_at = now + retention_ms;
-                            let old_status_key = make_status_key(JobStatus::InFlight, id);
-                            let new_status_key = make_status_key(JobStatus::Completed, id);
-                            let purge_key = make_purge_key(purge_at, id);
-
-                            let unique = job.unique.clone();
-
-                            let queue = job.queue.clone();
-                            job.status = JobStatus::Completed.into();
-                            job.purge_at = Some(purge_at);
-                            job.completed_at = Some(now);
-
-                            let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                            prepared.push(Prepared {
-                                id: id.clone(),
-                                queue,
-                                pre_bytes,
-                                priority: job.priority,
-                                updated_bytes: Some(updated_slice),
-                                deletion: None,
-                                index_keys: Some(RetentionKeys {
-                                    old_status: old_status_key,
-                                    new_status: new_status_key,
-                                    purge: purge_key,
-                                }),
-                                unique,
-                            });
-                        }
-                    }
-
-                    if prepared.is_empty() {
-                        return Ok(BulkCompleteResult {
-                            completed: Vec::new(),
-                            not_found,
-                        });
-                    }
-
-                    // ---- inside tx ----
-                    let mut tx = ks.write_tx();
-                    let mut cas_conflict_detected = false;
-
-                    for p in &prepared {
-                        let job_key = make_job_key(&p.id);
-
-                        if let Some(ref del) = p.deletion {
-                            // Zero-retention: delete via CAS.
-                            let prev = tx.take(&ks.data, &job_key)?;
-                            if prev.as_deref() != Some(&*p.pre_bytes) {
-                                cas_conflict_detected = true;
-                                break;
-                            }
-                            apply_job_deletion(&mut tx, del, &ks);
-                        } else if let Some(ref updated) = p.updated_bytes {
-                            // Non-zero retention: update via CAS.
-                            let prev =
-                                tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
-                            if prev.as_deref() != Some(&*p.pre_bytes) {
-                                cas_conflict_detected = true;
-                                break;
-                            }
-                            let keys = p.index_keys.as_ref().unwrap();
-                            tx.remove(&ks.index, &keys.old_status);
-                            tx.insert(&ks.index, &keys.new_status, b"");
-                            tx.insert(&ks.index, &keys.purge, b"");
-
-                            // Remove unique index for Queued or Active scope,
-                            // but only if it still belongs to this job.
-                            if let Some(ref uc) = p.unique {
-                                let scope = uc.unique_while();
-                                if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
-                                    let job_id = p.id.as_bytes();
-                                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| {
-                                        match v {
-                                            Some(v) if v.as_ref() == job_id => None,
-                                            other => other.cloned(),
-                                        }
-                                    })?;
-                                }
-                            }
-                        }
-                    }
-
-                    if cas_conflict_detected {
-                        drop(tx);
-                        not_found.clear();
-                        continue; // Retry from pre-read.
-                    }
-
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    // Update ready_index for all completed jobs.
-                    for p in &prepared {
-                        ready_index.remove(&p.queue, p.priority, &p.id);
-                    }
-
-                    let completed: Vec<String> = prepared.into_iter().map(|p| p.id).collect();
-
-                    return Ok(BulkCompleteResult {
-                        completed,
-                        not_found,
-                    });
-                }
-            })
-            .await?;
-
-        let bulk_result = result?;
-
-        if !bulk_result.completed.is_empty() {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(bulk_result.completed.len() as u64))
-                });
+        if ids.is_empty() {
+            return Ok(BulkCompleteResult {
+                completed: Vec::new(),
+                not_found: Vec::new(),
+            });
         }
 
-        // Broadcast JobCompleted for each completed job.
-        for id in &bulk_result.completed {
-            let _ = event_tx.send(StoreEvent::JobCompleted { id: id.clone() });
-        }
+        // Route through the auto-batcher. Per-op dedup happens inside
+        // the batcher; ready_index updates, in_flight_count decrement,
+        // and JobCompleted event broadcasts are all performed once per
+        // unique completed job in the batcher thread.
+        let batcher = self.complete_batcher.clone();
+        let ids: Vec<String> = ids.to_vec();
 
-        Ok(bulk_result)
+        let reply_rx = task::spawn_blocking(move || batcher.submit(ids, now)).await?;
+
+        reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("complete auto-batcher channel closed".into()))?
     }
 
     /// Record a job failure and either schedule a retry or kill the job
@@ -4990,7 +4745,7 @@ fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
 ///
 /// Built by `prepare_job_deletion` (no tx required), applied by
 /// `apply_job_deletion` (write-only inside an open tx).
-struct JobDeletion {
+pub(super) struct JobDeletion {
     id: String,
     status_key: Vec<u8>,
     queue_key: Vec<u8>,
@@ -5047,7 +4802,7 @@ fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion
 /// `apply_enqueue` inside a write transaction. This separates the pure
 /// computation (serialization, key building) from the transactional writes,
 /// allowing callers to compose enqueue with other operations in the same tx.
-struct PreparedEnqueue {
+pub(super) struct PreparedEnqueue {
     job: Job,
     meta_bytes: Vec<u8>,
     payload_bytes: Vec<u8>,
@@ -5165,11 +4920,58 @@ fn apply_enqueue(
     Ok(EnqueueResult::Created(p.job.clone()))
 }
 
+/// Apply a batch of prepared enqueues to an open write transaction with
+/// intra-batch unique-key dedup.
+///
+/// When two prepared jobs in the same batch share a `unique` key, the
+/// second one returns `EnqueueResult::Duplicate(...)` referring to the
+/// first without performing a tx insert. Cross-batch dedup against
+/// already-committed jobs is handled by `apply_enqueue` itself.
+///
+/// Does NOT commit the transaction — the caller commits and runs
+/// `finalize_enqueue` per result post-commit.
+pub(super) fn apply_enqueue_batch(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    prepared: &[PreparedEnqueue],
+) -> Result<Vec<EnqueueResult>, StoreError> {
+    use std::collections::HashMap;
+
+    // Maps unique_key -> index in `results` for intra-batch conflicts.
+    let mut batch_unique_keys: HashMap<String, usize> = HashMap::new();
+    let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
+
+    for p in prepared {
+        // Intra-batch unique conflict check (no DB read needed).
+        if let Some(ref uc) = p.job.unique {
+            if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
+                results.push(EnqueueResult::Duplicate(
+                    results[existing_idx].job().clone(),
+                ));
+                continue;
+            }
+        }
+
+        let result = apply_enqueue(tx, ks, p)?;
+
+        // Track unique keys for intra-batch dedup.
+        if let EnqueueResult::Created(ref job) = result {
+            if let Some(ref uc) = job.unique {
+                batch_unique_keys.insert(uc.key.clone(), results.len());
+            }
+        }
+
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
 /// Update in-memory indexes for a successfully enqueued job.
 ///
 /// Call after the transaction has been committed. Updates the ready or
 /// scheduled index depending on the job's status.
-fn finalize_enqueue(
+pub(super) fn finalize_enqueue(
     result: &EnqueueResult,
     ready_index: &ReadyIndex,
     scheduled_index: &ScheduledIndex,
@@ -5201,6 +5003,176 @@ fn finalize_enqueue(
             }
         }
     }
+}
+
+/// A job that has been pre-read and prepared for completion. Built by
+/// `pre_read_completes` (no tx required), applied by
+/// `apply_complete_batch` inside a write transaction.
+///
+/// Carries the original `pre_bytes` for CAS verification at apply time.
+/// If the job's stored bytes changed between pre-read and tx, the apply
+/// reports a CAS conflict and the caller must retry the pre-read.
+pub(super) struct PreparedComplete {
+    pub id: String,
+    pub queue: String,
+    pub pre_bytes: Slice,
+    pub priority: u16,
+    /// `None` for zero-retention completions (which delete the job).
+    pub updated_bytes: Option<Slice>,
+    /// `Some` for zero-retention completions (delete-paths).
+    pub deletion: Option<JobDeletion>,
+    /// Pre-computed index key updates for non-zero-retention paths.
+    pub index_keys: Option<CompletionRetentionKeys>,
+    /// Unique constraint snapshot for cleaning up the unique index.
+    pub unique: Option<UniqueConstraint>,
+}
+
+/// Pre-computed index keys for a non-zero-retention completion.
+pub(super) struct CompletionRetentionKeys {
+    pub old_status: Vec<u8>,
+    pub new_status: Vec<u8>,
+    pub purge: Vec<u8>,
+}
+
+/// Pre-read the given job ids and build the list of `PreparedComplete`
+/// values for those that are still in `InFlight` state. Jobs that are
+/// missing or in a different status are pushed into `not_found`.
+///
+/// Does NOT open a transaction — reads go directly through the
+/// keyspace, so the returned `pre_bytes` may be invalidated by
+/// concurrent writers. `apply_complete_batch` verifies via CAS and
+/// surfaces conflicts to the caller.
+pub(super) fn pre_read_completes(
+    ids: &[String],
+    now: u64,
+    ks: &Keyspaces,
+    default_completed_retention_ms: u64,
+) -> Result<(Vec<PreparedComplete>, Vec<String>), StoreError> {
+    let mut prepared: Vec<PreparedComplete> = Vec::with_capacity(ids.len());
+    let mut not_found: Vec<String> = Vec::new();
+
+    for id in ids {
+        let job_key = make_job_key(id);
+        let pre_bytes = match ks.data.get(&job_key)? {
+            Some(bytes) => bytes,
+            None => {
+                not_found.push(id.clone());
+                continue;
+            }
+        };
+
+        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+
+        if job.status != JobStatus::InFlight as u8 {
+            not_found.push(id.clone());
+            continue;
+        }
+
+        let retention_ms = job
+            .retention
+            .as_ref()
+            .and_then(|r| r.completed_ms)
+            .unwrap_or(default_completed_retention_ms);
+
+        if retention_ms == 0 {
+            let del = prepare_job_deletion(&job, JobStatus::InFlight, ks);
+            prepared.push(PreparedComplete {
+                id: id.clone(),
+                queue: job.queue.clone(),
+                pre_bytes,
+                priority: job.priority,
+                updated_bytes: None,
+                deletion: Some(del),
+                index_keys: None,
+                unique: None,
+            });
+        } else {
+            let purge_at = now + retention_ms;
+            let old_status_key = make_status_key(JobStatus::InFlight, id);
+            let new_status_key = make_status_key(JobStatus::Completed, id);
+            let purge_key = make_purge_key(purge_at, id);
+
+            let unique = job.unique.clone();
+
+            let queue = job.queue.clone();
+            job.status = JobStatus::Completed.into();
+            job.purge_at = Some(purge_at);
+            job.completed_at = Some(now);
+
+            let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+
+            prepared.push(PreparedComplete {
+                id: id.clone(),
+                queue,
+                pre_bytes,
+                priority: job.priority,
+                updated_bytes: Some(updated_slice),
+                deletion: None,
+                index_keys: Some(CompletionRetentionKeys {
+                    old_status: old_status_key,
+                    new_status: new_status_key,
+                    purge: purge_key,
+                }),
+                unique,
+            });
+        }
+    }
+
+    Ok((prepared, not_found))
+}
+
+/// Apply a batch of prepared completions to an open write transaction
+/// with optimistic-concurrency CAS verification.
+///
+/// On any CAS mismatch, returns `Ok(false)` immediately without writing
+/// further items. The caller must drop the tx and retry the
+/// pre-read+apply sequence — the returned tx is left in a stale state
+/// (some items may have been written before the conflict was detected).
+///
+/// On success, every item has been applied to the tx; caller commits.
+/// Does NOT commit the transaction.
+pub(super) fn apply_complete_batch(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    prepared: &[PreparedComplete],
+) -> Result<bool, StoreError> {
+    for p in prepared {
+        let job_key = make_job_key(&p.id);
+
+        if let Some(ref del) = p.deletion {
+            // Zero-retention: delete via CAS.
+            let prev = tx.take(&ks.data, &job_key)?;
+            if prev.as_deref() != Some(&*p.pre_bytes) {
+                return Ok(false);
+            }
+            apply_job_deletion(tx, del, ks);
+        } else if let Some(ref updated) = p.updated_bytes {
+            // Non-zero retention: update via CAS.
+            let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
+            if prev.as_deref() != Some(&*p.pre_bytes) {
+                return Ok(false);
+            }
+            let keys = p.index_keys.as_ref().unwrap();
+            tx.remove(&ks.index, &keys.old_status);
+            tx.insert(&ks.index, &keys.new_status, b"");
+            tx.insert(&ks.index, &keys.purge, b"");
+
+            // Remove unique index for Queued or Active scope on
+            // completion, but only if it still belongs to this job.
+            if let Some(ref uc) = p.unique {
+                let scope = uc.unique_while();
+                if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
+                    let job_id = p.id.as_bytes();
+                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                        Some(v) if v.as_ref() == job_id => None,
+                        other => other.cloned(),
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 /// Compute the backoff delay in milliseconds for a given attempt count.
