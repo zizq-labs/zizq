@@ -43,8 +43,8 @@ use super::cron::{CronEntry, CronGroup};
 use super::enqueue_batcher::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::options::{
-    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
-    ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
+    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, ListErrorsOptions,
+    ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
 };
 use super::results::{EnqueueResult, ListErrorsPage, ListJobsPage};
 use super::types::{
@@ -313,26 +313,26 @@ pub struct Store {
     ///
     /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
     /// no external mutex needed.
-    ready_index: Arc<ReadyIndex>,
+    pub(super) ready_index: Arc<ReadyIndex>,
 
     /// In-memory chronological index of scheduled jobs.
     ///
     /// Ordered by `(ready_at, job_id)`. Only jobs in the `Scheduled` state
     /// appear here. A background task scans this index to promote jobs to
     /// `Ready` once their time arrives.
-    scheduled_index: Arc<ScheduledIndex>,
+    pub(super) scheduled_index: Arc<ScheduledIndex>,
 
     /// In-memory index of cron entries ordered by `next_enqueue_at`.
     cron_index: Arc<CronScheduleIndex>,
 
     /// Default retention period for dead jobs (milliseconds).
-    default_dead_retention_ms: u64,
+    pub(super) default_dead_retention_ms: u64,
 
     /// Default maximum retries before a failed job is killed.
-    default_retry_limit: u32,
+    pub(super) default_retry_limit: u32,
 
     /// Default backoff config applied to jobs that don't specify one.
-    default_backoff: BackoffConfig,
+    pub(super) default_backoff: BackoffConfig,
 
     /// Whether the in-memory indexes have been fully rebuilt.
     ///
@@ -347,14 +347,14 @@ pub struct Store {
     /// Incremented when jobs are taken (`take_next_n_jobs`), decremented
     /// when jobs complete, fail, or are requeued. Used by the HTTP layer
     /// to enforce `global_in_flight_limit` without hitting disk.
-    in_flight_count: Arc<AtomicU64>,
+    pub(super) in_flight_count: Arc<AtomicU64>,
 
     /// Broadcast channel for store events.
     ///
     /// Subscribers receive notifications when jobs are enqueued, completed,
     /// or otherwise change state. Take handlers use this both to wake up
     /// when new work is available and to prune their in-flight tracking.
-    event_tx: broadcast::Sender<StoreEvent>,
+    pub(super) event_tx: broadcast::Sender<StoreEvent>,
 
     /// Server-side auto-batcher for concurrent single-job enqueues.
     /// Owned in an `Arc` so spawn_blocking tasks can cheaply clone the
@@ -403,12 +403,12 @@ pub(super) struct Keyspaces {
     /// Data keyspace — stores jobs (`J` tag), payloads (`P` tag), and
     /// error records (`E` tag). Uses bloom filters and a larger memtable.
     /// See `RecordKind` for the tag layout.
-    data: SingleWriterTxKeyspace,
+    pub(super) data: SingleWriterTxKeyspace,
 
     /// Index keyspace — stores status (`S` tag), queue (`Q` tag), type
     /// (`T` tag), and purge-at (`A` tag) secondary indexes. No bloom
     /// filters, smaller memtable. See `IndexKind` for the tag layout.
-    index: SingleWriterTxKeyspace,
+    pub(super) index: SingleWriterTxKeyspace,
 
     /// Group committer for batching journal persists.
     ///
@@ -1825,238 +1825,6 @@ impl Store {
         Ok(jobs)
     }
 
-    /// Record a job failure and either schedule a retry or kill the job
-    /// depending on the backoff policy.
-    ///
-    /// Returns `Some(job)` with metadata-only fields if the job was found in
-    /// the InFlight state. The returned job's status will be either `Scheduled`
-    /// in the retry scenario or `Dead` if the retry limit has been reached.
-    /// Returns `None` if the job wasn't found or wasn't in the InFlight state.
-    ///
-    /// Dead jobs are transitioned to Dead status with a `purge_at` timestamp
-    /// so the reaper can hard-delete them after the retention period.
-    pub async fn record_failure(
-        &self,
-        now: u64,
-        id: &str,
-        opts: FailureOptions,
-    ) -> Result<Option<Job>, StoreError> {
-        let ks = self.ks.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let ready_index = self.ready_index.clone();
-        let default_dead_retention_ms = self.default_dead_retention_ms;
-        let default_retry_limit = self.default_retry_limit;
-        let default_backoff = self.default_backoff.clone();
-
-        let id = id.to_string();
-        let id_for_event = id.clone();
-
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Extract fields from opts before the retry loop so they can
-            // be cloned on each iteration.
-            let kill = opts.kill;
-            let retry_at = opts.retry_at;
-            let error_message = opts.message;
-            let error_type_opt = opts.error_type;
-            let error_backtrace = opts.backtrace;
-
-            // Retry loop: pre-read and pre-compute updates outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
-            let job = loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None),
-                };
-
-                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if job.status != JobStatus::InFlight as u8 {
-                    return Ok(None);
-                }
-
-                job.attempts += 1;
-                job.failed_at = Some(now);
-
-                let error_key = make_error_key(&id, job.attempts);
-
-                let error_record = ErrorRecord {
-                    message: error_message.clone(),
-                    error_type: error_type_opt.clone(),
-                    backtrace: error_backtrace.clone(),
-                    dequeued_at: job.dequeued_at.unwrap_or(0),
-                    failed_at: now,
-                    attempt: job.attempts,
-                };
-
-                let error_bytes = rmp_serde::to_vec_named(&error_record)?;
-
-                let retry_limit = job.retry_limit.unwrap_or(default_retry_limit);
-
-                if kill {
-                    job.status = JobStatus::Dead.into();
-                } else if let Some(ra) = retry_at {
-                    job.status = JobStatus::Scheduled.into();
-                    job.ready_at = ra;
-                } else if job.attempts > retry_limit {
-                    job.status = JobStatus::Dead.into();
-                } else {
-                    let backoff = job.backoff.as_ref().unwrap_or(&default_backoff);
-                    let delay_ms = compute_backoff(job.attempts, backoff);
-                    job.status = JobStatus::Scheduled.into();
-                    job.ready_at = now + delay_ms;
-                };
-
-                let old_status_key = make_status_key(JobStatus::InFlight, &id);
-
-                if job.status == JobStatus::Scheduled as u8 {
-                    let new_status_key = make_status_key(JobStatus::Scheduled, &id);
-                    let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                    // ---- inside tx (writes only, plus one compare) ----
-                    let mut tx = ks.write_tx();
-
-                    let prev =
-                        tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue;
-                    }
-
-                    tx.insert(&ks.data, &error_key, &error_bytes);
-                    tx.remove(&ks.index, &old_status_key);
-                    tx.insert(&ks.index, &new_status_key, b"");
-
-                    // If unique_while == Queued, restore the unique index now
-                    // that the job is re-entering the queue. Only insert if no
-                    // other job has claimed the key while this one was in-flight.
-                    if let Some(ref uc) = job.unique {
-                        if uc.unique_while() == UniqueWhile::Queued {
-                            let id_bytes: Slice = id.as_bytes().into();
-                            tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                                Some(existing) => Some(existing.clone()),
-                                None => Some(id_bytes.clone()),
-                            })?;
-                        }
-                    }
-
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    scheduled_index.insert(job.ready_at, id.clone());
-
-                    break job;
-                }
-
-                // Dead: check retention to decide sync delete vs deferred.
-                let retention_ms = job
-                    .retention
-                    .as_ref()
-                    .and_then(|r| r.dead_ms)
-                    .unwrap_or(default_dead_retention_ms);
-
-                if retention_ms == 0 {
-                    // Zero retention: prepare deletion keys outside tx.
-                    let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-
-                    // ---- inside tx ----
-                    let mut tx = ks.write_tx();
-                    let prev = tx.take(&ks.data, &job_key)?;
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue;
-                    }
-                    apply_job_deletion(&mut tx, &del, &ks);
-                    job.status = JobStatus::Dead.into();
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    ready_index.remove(&job.queue, job.priority, &id);
-
-                    break job;
-                }
-
-                // Non-zero retention: defer deletion to the reaper.
-                let purge_at = now + retention_ms;
-                let new_status_key = make_status_key(JobStatus::Dead, &id);
-                let purge_key = make_purge_key(purge_at, &id);
-
-                job.purge_at = Some(purge_at);
-                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                // ---- inside tx ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                tx.insert(&ks.data, &error_key, &error_bytes);
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-                tx.insert(&ks.index, &purge_key, b"");
-
-                // Remove unique index for Queued or Active scope on death,
-                // but only if it still belongs to this job.
-                if let Some(ref uc) = job.unique {
-                    let scope = uc.unique_while();
-                    if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
-                        let job_id = id.as_bytes();
-                        tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                            Some(v) if v.as_ref() == job_id => None,
-                            other => other.cloned(),
-                        })?;
-                    }
-                }
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                ready_index.remove(&job.queue, job.priority, &id);
-
-                break job;
-            };
-
-            Ok(Some(job))
-        })
-        .await??;
-
-        // Emit events outside spawn_blocking due to &self.event_tx.
-        if let Some(ref job) = result {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
-
-            // Always emit JobFailed first so workers prune their
-            // in-flight set before any downstream events arrive.
-            //
-            // The attempts count must match what the worker stored when
-            // it took the job — that's the pre-increment value, since
-            // record_failure bumps attempts by 1 inside the closure.
-            let _ = self.event_tx.send(StoreEvent::JobFailed {
-                id: id_for_event,
-                attempts: job.attempts - 1,
-            });
-
-            if job.status == JobStatus::Scheduled as u8 {
-                // Rescheduled for retry — tell the scheduler to wake up
-                // at the new ready_at.
-                let _ = self.event_tx.send(StoreEvent::JobScheduled {
-                    id: job.id.clone(),
-                    ready_at: job.ready_at,
-                });
-            }
-        }
-
-        Ok(result)
-    }
-
     /// Look up a job by ID.
     ///
     /// Returns `None` if the job does not exist, or if its `purge_at`
@@ -2107,89 +1875,6 @@ impl Store {
     /// Total number of scheduled jobs.
     pub fn scheduled_count(&self) -> usize {
         self.scheduled_index.len()
-    }
-
-    /// Atomically move a in-flight job back to the priority queue.
-    ///
-    /// Looks up the job from the `jobs` keyspace to reconstruct its
-    /// prioritised queue keys.
-    ///
-    /// Returns `true` if the job was actually requeued, `false` if it was
-    /// already acked (no longer in the in-flight state).
-    ///
-    /// Subscribers are notified.
-    pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
-        let id = id.to_string();
-        let event_id = id.clone();
-
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Retry loop: pre-read and pre-compute updates outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
-            loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None),
-                };
-
-                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if job.status != JobStatus::InFlight as u8 {
-                    return Ok(None);
-                }
-
-                let old_status_key = make_status_key(JobStatus::InFlight, &id);
-                let new_status_key = make_status_key(JobStatus::Ready, &id);
-
-                let queue = job.queue.clone();
-                let priority = job.priority;
-                job.status = JobStatus::Ready.into();
-
-                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                // ---- inside tx (writes only, plus one compare) ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                // Insert into the in-memory ready index after commit succeeds.
-                ready_index.insert(&queue, priority, id.clone());
-
-                return Ok(Some(queue));
-            }
-        })
-        .await??;
-
-        if let Some(queue) = result {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
-            let _ = self.event_tx.send(StoreEvent::JobCreated {
-                id: event_id,
-                queue,
-                token: Arc::new(AtomicBool::new(false)),
-            });
-            return Ok(true);
-        }
-
-        Ok(false)
     }
 
     /// List jobs with cursor-based pagination.
@@ -4465,7 +4150,7 @@ impl Store {
 }
 
 /// Build a job metadata key: `J\0{job_id}`.
-fn make_job_key(job_id: &str) -> Vec<u8> {
+pub(super) fn make_job_key(job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + job_id.len());
     key.push(RecordKind::Job as u8);
     key.push(0);
@@ -4474,7 +4159,7 @@ fn make_job_key(job_id: &str) -> Vec<u8> {
 }
 
 /// Build a payload key: `P\0{job_id}`.
-fn make_payload_key(job_id: &str) -> Vec<u8> {
+pub(super) fn make_payload_key(job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + job_id.len());
     key.push(RecordKind::Payload as u8);
     key.push(0);
@@ -4483,7 +4168,7 @@ fn make_payload_key(job_id: &str) -> Vec<u8> {
 }
 
 /// Build a status index key: `S\0{status_byte}\0{job_id}`.
-fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
+pub(super) fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + job_id.len());
     key.push(IndexKind::Status as u8);
     key.push(0);
@@ -4519,7 +4204,7 @@ fn make_type_key(job_type: &str, job_id: &str) -> Vec<u8> {
 ///
 /// Big-endian encoding gives chronological ordering so the reaper can
 /// range-scan from the start to find expired entries.
-fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
+pub(super) fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + 3 + job_id.len());
     key.push(IndexKind::PurgeAt as u8);
     key.push(0);
@@ -4530,7 +4215,7 @@ fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
 }
 
 /// Build a unique deduplication index key: `U\0{unique_key}`.
-fn make_unique_key(unique_key: &str) -> Vec<u8> {
+pub(super) fn make_unique_key(unique_key: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + unique_key.len());
     key.push(IndexKind::Unique as u8);
     key.push(0);
@@ -4668,7 +4353,7 @@ fn cron_next_after(
 ///
 /// The null separator lets us prefix-scan all errors for a given job,
 /// and the big-endian attempt number gives chronological ordering.
-fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
+pub(super) fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(job_id.len() + 3 + 4);
     key.push(RecordKind::Error as u8);
     key.push(0);
@@ -4711,7 +4396,7 @@ pub(super) struct JobDeletion {
 }
 
 /// Collect all keys needed to delete a job. No tx required.
-fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDeletion {
+pub(super) fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDeletion {
     let id = &job.id;
     JobDeletion {
         id: id.clone(),
@@ -4725,7 +4410,11 @@ fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDele
 }
 
 /// Apply pre-computed deletion inside an open tx.
-fn apply_job_deletion(tx: &mut fjall::SingleWriterWriteTx<'_>, del: &JobDeletion, ks: &Keyspaces) {
+pub(super) fn apply_job_deletion(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    del: &JobDeletion,
+    ks: &Keyspaces,
+) {
     tx.remove(&ks.data, &make_job_key(&del.id));
     tx.remove_weak(&ks.data, &make_payload_key(&del.id));
     tx.remove(&ks.index, &del.status_key);
@@ -5137,7 +4826,7 @@ pub(super) fn apply_complete_batch(
 /// The jitter component scales linearly with the attempt count so that
 /// later retries spread further apart, reducing collision likelihood when
 /// many jobs fail at similar times.
-fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
+pub(super) fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
 
@@ -5157,7 +4846,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use crate::store::options::{CronEntryOptions, RetentionConfigPatch};
+    use crate::store::options::{CronEntryOptions, FailureOptions, RetentionConfigPatch};
     use crate::store::test_support::{
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retention,
     };
@@ -5948,104 +5637,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_returns_job_to_queue() {
-        let store = test_store();
-        let job = store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        let taken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(taken.id, job.id);
-
-        assert!(store.requeue(&taken.id).await.unwrap());
-
-        let retaken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retaken.id, job.id);
-    }
-
-    #[tokio::test]
-    async fn requeue_preserves_priority() {
-        let store = test_store();
-        let high = store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("high")).priority(1),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("low")).priority(10),
-            )
-            .await
-            .unwrap()
-            .into_job();
-
-        let taken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(taken.id, high.id);
-
-        assert!(store.requeue(&taken.id).await.unwrap());
-
-        // Should get the high-priority job again, not the low-priority one.
-        let retaken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retaken.id, high.id);
-        assert_eq!(retaken.priority, 1);
-        assert_eq!(retaken.status, u8::from(JobStatus::InFlight));
-    }
-
-    #[tokio::test]
-    async fn requeue_skips_already_acked_job() {
-        let store = test_store();
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        let taken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.mark_completed(now_millis(), &taken.id).await.unwrap());
-
-        assert!(!store.requeue(&taken.id).await.unwrap());
-
-        // Queue should remain empty.
-        assert!(
-            store
-                .take_next_job(now_millis(), &HashSet::new())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
     async fn enqueue_broadcasts_job_created() {
         let store = test_store();
         let mut rx = store.subscribe();
@@ -6058,32 +5649,6 @@ mod tests {
             .await
             .unwrap()
             .into_job();
-
-        match rx.recv().await.unwrap() {
-            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
-            other => panic!("expected JobCreated, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn requeue_broadcasts_job_created() {
-        let store = test_store();
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        let taken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let mut rx = store.subscribe();
-        store.requeue(&taken.id).await.unwrap();
 
         match rx.recv().await.unwrap() {
             StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
@@ -8507,400 +8072,6 @@ mod tests {
         assert_eq!(fetched.status, JobStatus::Scheduled as u8);
     }
 
-    // --- record_failure tests ---
-
-    /// Create a test store with a specific retry limit and zero-jitter backoff.
-    fn test_store_with_retry_limit(retry_limit: u32) -> Store {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = StorageConfig::default();
-        config.default_retry_limit = retry_limit;
-        config.default_backoff = BackoffConfig {
-            exponent: 2.0,
-            base_ms: 100,
-            jitter_ms: 0, // deterministic
-        };
-        let store = Store::open(dir.path().join("data"), config).unwrap();
-        std::mem::forget(dir);
-        store
-    }
-
-    #[tokio::test]
-    async fn record_failure_retries_under_limit() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let result = store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, JobStatus::Scheduled as u8);
-        assert_eq!(result.attempts, 1);
-        assert!(result.failed_at.is_some());
-        // ready_at should be in the future (backoff from the store's default config).
-        assert!(result.ready_at > 0);
-    }
-
-    #[tokio::test]
-    async fn record_failure_kills_when_retries_exhausted() {
-        // retry_limit=0 means the first failure kills.
-        let store = test_store_with_retry_limit(0);
-        let job = enqueue_and_take(&store).await;
-
-        let opts = test_failure_opts();
-
-        let result = store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, JobStatus::Dead as u8);
-        assert_eq!(result.attempts, 1);
-
-        // Dead job is still visible during its retention period.
-        let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
-        assert_eq!(fetched.status, JobStatus::Dead as u8);
-    }
-
-    #[tokio::test]
-    async fn record_failure_kills_when_kill_flag_set() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let mut opts = test_failure_opts();
-        opts.kill = true;
-
-        let result = store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, JobStatus::Dead as u8);
-
-        // Dead job is still visible during its retention period.
-        let fetched = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
-        assert_eq!(fetched.status, JobStatus::Dead as u8);
-    }
-
-    #[tokio::test]
-    async fn record_failure_kill_overrides_remaining_retries() {
-        // retry_limit=100, but kill=true should still kill.
-        let store = test_store_with_retry_limit(100);
-        let job = enqueue_and_take(&store).await;
-
-        let mut opts = test_failure_opts();
-        opts.kill = true;
-
-        let result = store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, JobStatus::Dead as u8);
-    }
-
-    #[tokio::test]
-    async fn record_failure_retry_at_overrides_backoff() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let mut opts = test_failure_opts();
-        opts.retry_at = Some(999_999);
-
-        let result = store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, JobStatus::Scheduled as u8);
-        assert_eq!(result.ready_at, 999_999);
-    }
-
-    #[tokio::test]
-    async fn record_failure_retry_at_overrides_exhausted_limit() {
-        // retry_limit=0, but retry_at should force a retry anyway.
-        let store = test_store_with_retry_limit(0);
-        let job = enqueue_and_take(&store).await;
-
-        let mut opts = test_failure_opts();
-        opts.retry_at = Some(123_456);
-
-        let result = store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, JobStatus::Scheduled as u8);
-        assert_eq!(result.ready_at, 123_456);
-    }
-
-    #[tokio::test]
-    async fn record_failure_returns_none_for_unknown_id() {
-        let store = test_store();
-        let result = store
-            .record_failure(now_millis(), "nonexistent", test_failure_opts())
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn record_failure_returns_none_for_ready_job() {
-        let store = test_store();
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-
-        // Don't take it — job is still Ready.
-        let job = store
-            .list_jobs(ListJobsOptions::new())
-            .await
-            .unwrap()
-            .jobs
-            .pop()
-            .unwrap();
-
-        let result = store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn record_failure_increments_attempts_across_retries() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        // First failure: attempts goes from 0 -> 1.
-        store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // The job is now Scheduled. Promote it and take it again.
-        let scheduled = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
-        store.promote_scheduled(&scheduled).await.unwrap();
-        let retaken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Second failure: attempts goes from 1 -> 2.
-        let result = store
-            .record_failure(now_millis(), &retaken.id, test_failure_opts())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.attempts, 2);
-    }
-
-    #[tokio::test]
-    async fn record_failure_writes_error_record() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let mut opts = test_failure_opts();
-        opts.message = "connection timeout".into();
-        opts.error_type = Some("TimeoutError".into());
-        opts.backtrace = Some("at line 42".into());
-
-        store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Read the error record from the data keyspace.
-        let key = make_error_key(&job.id, 1);
-        let raw = store.ks.data.inner().get(&key).unwrap().unwrap();
-        let err: ErrorRecord = rmp_serde::from_slice(&raw).unwrap();
-
-        assert_eq!(err.message, "connection timeout");
-        assert_eq!(err.error_type.as_deref(), Some("TimeoutError"));
-        assert_eq!(err.backtrace.as_deref(), Some("at line 42"));
-        assert!(err.failed_at > 0);
-    }
-
-    #[tokio::test]
-    async fn record_failure_dead_retains_error_records_for_reaper() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        // Kill immediately — error records are now retained until the
-        // reaper purges the job.
-        let mut opts = test_failure_opts();
-        opts.kill = true;
-
-        store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Error records should still exist (cleanup deferred to reaper).
-        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
-        assert!(!keys.is_empty());
-
-        // purge_job should clean them up.
-        store.purge_job(&job.id).await.unwrap();
-        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
-        assert!(keys.is_empty());
-    }
-
-    #[tokio::test]
-    async fn record_failure_dead_retains_payload_for_reaper() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        // Verify payload exists before kill.
-        let payload_key = make_payload_key(&job.id);
-        assert!(store.ks.data.inner().get(&payload_key).unwrap().is_some());
-
-        let mut opts = test_failure_opts();
-        opts.kill = true;
-
-        store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Payload should still exist (cleanup deferred to reaper).
-        assert!(store.ks.data.inner().get(&payload_key).unwrap().is_some());
-
-        // purge_job should clean it up.
-        store.purge_job(&job.id).await.unwrap();
-        assert!(store.ks.data.inner().get(&payload_key).unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn record_failure_retry_broadcasts_job_failed_then_scheduled() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let mut rx = store.subscribe();
-        store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap();
-
-        // First event: JobFailed so workers prune their in-flight set.
-        match rx.recv().await.unwrap() {
-            StoreEvent::JobFailed { id, attempts } => {
-                assert_eq!(id, job.id);
-                // attempts=0: the pre-increment value that matches what
-                // the worker stored when it took the job.
-                assert_eq!(attempts, 0);
-            }
-            other => panic!("expected JobFailed, got {other:?}"),
-        }
-
-        // Second event: JobScheduled so the scheduler wakes up.
-        match rx.recv().await.unwrap() {
-            StoreEvent::JobScheduled { ready_at, .. } => assert!(ready_at > 0),
-            other => panic!("expected JobScheduled, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn record_failure_dead_broadcasts_job_failed() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let mut rx = store.subscribe();
-        let mut opts = test_failure_opts();
-        opts.kill = true;
-        store
-            .record_failure(now_millis(), &job.id, opts)
-            .await
-            .unwrap();
-
-        // Even for killed jobs, the event is JobFailed — workers don't
-        // need to distinguish retry from kill; they just prune in-flight.
-        match rx.recv().await.unwrap() {
-            StoreEvent::JobFailed { id, attempts } => {
-                assert_eq!(id, job.id);
-                assert_eq!(attempts, 0);
-            }
-            other => panic!("expected JobFailed, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn record_failure_does_not_hydrate_payload() {
-        let store = test_store();
-        let job = enqueue_and_take(&store).await;
-
-        let result = store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Payload should be None (not hydrated), not the stored value.
-        assert_eq!(result.payload, None);
-    }
-
-    #[tokio::test]
-    async fn record_failure_uses_job_retry_limit_over_default() {
-        let store = test_store();
-
-        // Enqueue with per-job retry_limit=1.
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")).retry_limit(1),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        let job = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // First failure (attempts 0->1): should retry (1 <= 1).
-        let result = store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.status, JobStatus::Scheduled as u8);
-
-        // Promote and take again.
-        let scheduled = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
-        store.promote_scheduled(&scheduled).await.unwrap();
-        let retaken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Second failure (attempts 1->2): should die (2 > 1).
-        let result = store
-            .record_failure(now_millis(), &retaken.id, test_failure_opts())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.status, JobStatus::Dead as u8);
-    }
-
     // --- compute_backoff tests ---
 
     #[test]
@@ -9704,85 +8875,6 @@ mod tests {
             .into_job();
 
         assert_eq!(store.scheduled_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn in_flight_count_tracks_take_and_complete() {
-        let store = test_store();
-        let now = now_millis();
-
-        assert_eq!(store.in_flight_count(), 0);
-
-        // Enqueue two jobs and take both.
-        store
-            .enqueue(
-                now,
-                EnqueueOptions::new("test", "default", serde_json::json!(null)),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        let job = store
-            .enqueue(
-                now,
-                EnqueueOptions::new("test", "default", serde_json::json!(null)),
-            )
-            .await
-            .unwrap()
-            .into_job();
-
-        store.take_next_job(now, &HashSet::new()).await.unwrap();
-        store.take_next_job(now, &HashSet::new()).await.unwrap();
-        assert_eq!(store.in_flight_count(), 2);
-
-        // Completing a job should decrement.
-        store.mark_completed(now, &job.id).await.unwrap();
-        assert_eq!(store.in_flight_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn in_flight_count_tracks_failure_and_requeue() {
-        let store = test_store();
-        let now = now_millis();
-
-        let job = store
-            .enqueue(
-                now,
-                EnqueueOptions::new("test", "default", serde_json::json!(null)),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        store.take_next_job(now, &HashSet::new()).await.unwrap();
-        assert_eq!(store.in_flight_count(), 1);
-
-        // Failing a job should decrement.
-        store
-            .record_failure(now, &job.id, test_failure_opts())
-            .await
-            .unwrap();
-        assert_eq!(store.in_flight_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn in_flight_count_tracks_requeue() {
-        let store = test_store();
-        let now = now_millis();
-
-        let job = store
-            .enqueue(
-                now,
-                EnqueueOptions::new("test", "default", serde_json::json!(null)),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        store.take_next_job(now, &HashSet::new()).await.unwrap();
-        assert_eq!(store.in_flight_count(), 1);
-
-        // Requeuing should decrement.
-        store.requeue(&job.id).await.unwrap();
-        assert_eq!(store.in_flight_count(), 0);
     }
 
     // --- enqueue_bulk tests ---
