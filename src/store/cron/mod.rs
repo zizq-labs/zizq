@@ -5,6 +5,12 @@
 //!
 //! Cron groups are named collections of entries, each with a cron expression
 //! and a job template. The scheduler enqueues jobs when entries become due.
+//!
+//! The `impl Store { ... }` methods for the cron API (replace/add/put/patch/
+//! delete groups and entries, plus `promote_cron_entry` and
+//! `rebuild_cron_index`) live in the sibling `ops` submodule.
+
+mod ops;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
