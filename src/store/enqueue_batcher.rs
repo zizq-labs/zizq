@@ -55,10 +55,11 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use super::enqueue::{PreparedEnqueue, apply_enqueue_batch, finalize_enqueue};
 use super::ready_index::ReadyIndex;
 use super::results::EnqueueResult;
 use super::scheduled_index::ScheduledIndex;
-use super::store::{Keyspaces, PreparedEnqueue, StoreEvent, apply_enqueue_batch, finalize_enqueue};
+use super::store::{Keyspaces, StoreEvent};
 use super::types::StoreError;
 
 /// A single enqueue request in flight: the prepared jobs plus a
