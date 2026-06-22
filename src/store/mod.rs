@@ -9,6 +9,7 @@ mod enqueue_batcher;
 mod fail;
 mod group_committer;
 mod options;
+mod patch;
 mod ready_index;
 mod requeue;
 mod results;
