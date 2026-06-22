@@ -13,6 +13,7 @@ mod options;
 mod patch;
 mod read;
 mod ready_index;
+mod recover;
 mod requeue;
 mod results;
 mod scheduled;
