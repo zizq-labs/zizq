@@ -17,6 +17,7 @@ mod results;
 mod scheduled;
 mod scheduled_index;
 mod store;
+mod take;
 mod types;
 
 #[cfg(test)]
