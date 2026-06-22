@@ -11,6 +11,7 @@ mod fail;
 mod group_committer;
 mod options;
 mod patch;
+mod read;
 mod ready_index;
 mod requeue;
 mod results;
