@@ -12,6 +12,7 @@ mod options;
 mod ready_index;
 mod requeue;
 mod results;
+mod scheduled;
 mod scheduled_index;
 mod store;
 mod types;
