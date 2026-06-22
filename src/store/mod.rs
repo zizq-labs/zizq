@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
+mod complete;
 mod complete_batcher;
 mod cron;
 mod enqueue_batcher;
@@ -11,6 +12,9 @@ mod results;
 mod scheduled_index;
 mod store;
 mod types;
+
+#[cfg(test)]
+mod test_support;
 
 pub use options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,

@@ -46,7 +46,7 @@ use super::options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
     ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
 };
-use super::results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
+use super::results::{EnqueueResult, ListErrorsPage, ListJobsPage};
 use super::types::{
     BackoffConfig, CommitMode, EnvConfigError, ErrorRecord, Job, JobStatus, ScanDirection,
     StoreError, UniqueConstraint, UniqueWhile,
@@ -307,7 +307,7 @@ pub struct Store {
     /// Database handle and all disk keyspaces, shared via `Arc` so that
     /// cloning the `Store` (or moving into `spawn_blocking`) is a single
     /// reference-count bump instead of eight.
-    ks: Arc<Keyspaces>,
+    pub(super) ks: Arc<Keyspaces>,
 
     /// In-memory priority index for ready jobs (lock-free).
     ///
@@ -365,7 +365,7 @@ pub struct Store {
 
     /// Server-side auto-batcher for concurrent completions (acks).
     /// Mirrors `enqueue_batcher` in structure and lifecycle.
-    complete_batcher: Arc<CompleteBatcher>,
+    pub(super) complete_batcher: Arc<CompleteBatcher>,
 }
 
 /// One-byte tag prefix for records in the `data` keyspace.
@@ -1823,51 +1823,6 @@ impl Store {
         }
 
         Ok(jobs)
-    }
-
-    /// Mark a job as successfully completed.
-    ///
-    /// Transitions the job to Completed status and sets `purge_at` so the
-    /// reaper will hard-delete it after the retention period. Returns `true`
-    /// if the job was found in the in-flight state, `false` if it was not.
-    ///
-    /// Subscribers are notified on success. Routes through the same
-    /// auto-batcher as `mark_completed_bulk` — a singular ack is a
-    /// Vec-of-1 trip through the channel.
-    pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
-        let result = self.mark_completed_bulk(now, &[id.to_string()]).await?;
-        Ok(!result.completed.is_empty())
-    }
-
-    /// Mark multiple jobs as successfully completed in a single transaction.
-    ///
-    /// Jobs not found in the in-flight set are collected in `not_found` but
-    /// do not prevent valid jobs from being committed. Returns a
-    /// `BulkCompleteResult` with both lists.
-    pub async fn mark_completed_bulk(
-        &self,
-        now: u64,
-        ids: &[String],
-    ) -> Result<BulkCompleteResult, StoreError> {
-        if ids.is_empty() {
-            return Ok(BulkCompleteResult {
-                completed: Vec::new(),
-                not_found: Vec::new(),
-            });
-        }
-
-        // Route through the auto-batcher. Per-op dedup happens inside
-        // the batcher; ready_index updates, in_flight_count decrement,
-        // and JobCompleted event broadcasts are all performed once per
-        // unique completed job in the batcher thread.
-        let batcher = self.complete_batcher.clone();
-        let ids: Vec<String> = ids.to_vec();
-
-        let reply_rx = task::spawn_blocking(move || batcher.submit(ids, now)).await?;
-
-        reply_rx
-            .await
-            .map_err(|_| StoreError::Internal("complete auto-batcher channel closed".into()))?
     }
 
     /// Record a job failure and either schedule a retry or kill the job
@@ -4728,7 +4683,7 @@ fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
 /// The returned iterator yields owned key bytes that the caller can pass
 /// to `tx.remove`. The fjall `Iter` is an owned value (no borrow on the
 /// keyspace), so it's safe to interleave iteration with mutable tx ops.
-fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
+pub(super) fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
     let mut prefix = Vec::with_capacity(job_id.len() + 3);
     prefix.push(RecordKind::Error as u8);
     prefix.push(0);
@@ -5203,25 +5158,11 @@ mod tests {
     use std::time::SystemTime;
 
     use crate::store::options::{CronEntryOptions, RetentionConfigPatch};
+    use crate::store::test_support::{
+        enqueue_and_take, test_failure_opts, test_store, test_store_with_retention,
+    };
     use crate::store::types::RetentionConfig;
     use crate::time::now_millis;
-
-    fn test_store() -> Store {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
-        std::mem::forget(dir);
-        store
-    }
-
-    fn test_store_with_retention(completed_ms: u64, dead_ms: u64) -> Store {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = StorageConfig::default();
-        config.default_completed_retention_ms = completed_ms;
-        config.default_dead_retention_ms = dead_ms;
-        let store = Store::open(dir.path().join("data"), config).unwrap();
-        std::mem::forget(dir);
-        store
-    }
 
     #[tokio::test]
     async fn enqueue_returns_job_with_id() {
@@ -5417,68 +5358,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn mark_completed_removes_job() {
-        let store = test_store();
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-
-        let job = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.mark_completed(now_millis(), &job.id).await.unwrap());
-
-        // Job should no longer be dequeue-able even if re-enqueue were attempted
-        // via crash recovery — it's gone from the jobs keyspace entirely.
-        assert!(
-            store
-                .take_next_job(now_millis(), &HashSet::new())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_completed_returns_false_for_unknown_id() {
-        let store = test_store();
-        assert!(
-            !store
-                .mark_completed(now_millis(), "nonexistent")
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn mark_completed_returns_false_on_double_ack() {
-        let store = test_store();
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-
-        let job = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(store.mark_completed(now_millis(), &job.id).await.unwrap());
-        assert!(!store.mark_completed(now_millis(), &job.id).await.unwrap());
     }
 
     #[tokio::test]
@@ -6183,32 +6062,6 @@ mod tests {
         match rx.recv().await.unwrap() {
             StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
             other => panic!("expected JobCreated, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn mark_completed_broadcasts_job_completed() {
-        let store = test_store();
-        let job = store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("a")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        let taken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let mut rx = store.subscribe();
-        store.mark_completed(now_millis(), &taken.id).await.unwrap();
-
-        match rx.recv().await.unwrap() {
-            StoreEvent::JobCompleted { id } => assert_eq!(id, job.id),
-            other => panic!("expected JobCompleted, got {other:?}"),
         }
     }
 
@@ -8656,17 +8509,6 @@ mod tests {
 
     // --- record_failure tests ---
 
-    /// Build a FailureOptions with sensible defaults for testing.
-    fn test_failure_opts() -> FailureOptions {
-        FailureOptions {
-            message: "something broke".into(),
-            error_type: None,
-            backtrace: None,
-            retry_at: None,
-            kill: false,
-        }
-    }
-
     /// Create a test store with a specific retry limit and zero-jitter backoff.
     fn test_store_with_retry_limit(retry_limit: u32) -> Store {
         let dir = tempfile::tempdir().unwrap();
@@ -8680,23 +8522,6 @@ mod tests {
         let store = Store::open(dir.path().join("data"), config).unwrap();
         std::mem::forget(dir);
         store
-    }
-
-    /// Enqueue a job and take it so it's in the InFlight state.
-    async fn enqueue_and_take(store: &Store) -> Job {
-        store
-            .enqueue(
-                now_millis(),
-                EnqueueOptions::new("test", "default", serde_json::json!("payload")),
-            )
-            .await
-            .unwrap()
-            .into_job();
-        store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap()
     }
 
     #[tokio::test]
@@ -9074,41 +8899,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.status, JobStatus::Dead as u8);
-    }
-
-    #[tokio::test]
-    async fn mark_completed_retains_error_records_for_reaper() {
-        // Use non-zero retention so mark_completed defers to the reaper
-        // instead of synchronously deleting.
-        let store = test_store_with_retention(60_000, 60_000);
-        let job = enqueue_and_take(&store).await;
-
-        // Fail once (retry), then promote, take, and complete.
-        store
-            .record_failure(now_millis(), &job.id, test_failure_opts())
-            .await
-            .unwrap();
-
-        let scheduled = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
-        store.promote_scheduled(&scheduled).await.unwrap();
-        let retaken = store
-            .take_next_job(now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-            .unwrap();
-        store
-            .mark_completed(now_millis(), &retaken.id)
-            .await
-            .unwrap();
-
-        // Error records are now retained until the reaper purges the job.
-        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
-        assert!(!keys.is_empty());
-
-        // purge_job should clean them up.
-        store.purge_job(&job.id).await.unwrap();
-        let keys: Vec<_> = error_keys(&store.ks, &job.id).collect();
-        assert!(keys.is_empty());
     }
 
     // --- compute_backoff tests ---
