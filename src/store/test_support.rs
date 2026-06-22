@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use super::options::{EnqueueOptions, FailureOptions};
 use super::store::{StorageConfig, Store};
-use super::types::Job;
+use super::types::{BackoffConfig, Job};
 use crate::time::now_millis;
 
 /// Open a fresh store in a tempdir with default config.
@@ -33,6 +33,21 @@ pub(super) fn test_store_with_retention(completed_ms: u64, dead_ms: u64) -> Stor
     let mut config = StorageConfig::default();
     config.default_completed_retention_ms = completed_ms;
     config.default_dead_retention_ms = dead_ms;
+    let store = Store::open(dir.path().join("data"), config).unwrap();
+    std::mem::forget(dir);
+    store
+}
+
+/// Open a fresh store with a specific retry limit and zero-jitter backoff.
+pub(super) fn test_store_with_retry_limit(retry_limit: u32) -> Store {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::default();
+    config.default_retry_limit = retry_limit;
+    config.default_backoff = BackoffConfig {
+        exponent: 2.0,
+        base_ms: 100,
+        jitter_ms: 0, // deterministic
+    };
     let store = Store::open(dir.path().join("data"), config).unwrap();
     std::mem::forget(dir);
     store
