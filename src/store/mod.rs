@@ -5,6 +5,7 @@ mod complete;
 mod complete_batcher;
 mod cron;
 mod delete;
+mod enqueue;
 mod enqueue_batcher;
 mod fail;
 mod group_committer;
