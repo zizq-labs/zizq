@@ -5,10 +5,9 @@
 //! and error listings, queue enumeration, and direct scans of the
 //! in-memory ready/scheduled indexes.
 //!
-//! The scan plumbing (`JobStream`, `IdStream`, `PayloadFilteredIter`,
-//! `build_id_stream`) still lives in `store.rs` for now since
-//! `delete::delete_jobs` and `patch::patch_jobs` also use it; it can
-//! move alongside these read methods in a subsequent pass.
+//! The shared scan scaffolding (`JobStream`, `IdStream`,
+//! `PayloadFilteredIter`, `build_id_stream`) lives in `store::scan` —
+//! also used by `delete::delete_jobs` and `patch::patch_jobs`.
 
 use std::ops::Bound;
 use std::sync::atomic::Ordering;
@@ -18,10 +17,8 @@ use tokio::task;
 
 use super::options::{ListErrorsOptions, ListJobsOptions};
 use super::results::{ListErrorsPage, ListJobsPage};
-use super::store::{
-    IndexKind, JobStream, PayloadFilteredIter, RecordKind, Store, build_id_stream, make_error_key,
-    make_job_key, make_payload_key,
-};
+use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
+use super::store::{IndexKind, RecordKind, Store, make_error_key, make_job_key, make_payload_key};
 use super::types::{ErrorRecord, Job, ScanDirection, StoreError};
 
 impl Store {
