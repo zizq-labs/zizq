@@ -16,9 +16,9 @@ use std::sync::atomic::Ordering;
 use tokio::task;
 
 use super::options::BulkDeleteOptions;
+use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
 use super::store::{
-    JobDeletion, JobStream, PayloadFilteredIter, Store, StoreEvent, apply_job_deletion,
-    build_id_stream, make_job_key, prepare_job_deletion,
+    JobDeletion, Store, StoreEvent, apply_job_deletion, make_job_key, prepare_job_deletion,
 };
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 

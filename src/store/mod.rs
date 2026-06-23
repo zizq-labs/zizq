@@ -16,6 +16,7 @@ mod ready_index;
 mod recover;
 mod requeue;
 mod results;
+mod scan;
 mod scheduled;
 mod scheduled_index;
 mod store;

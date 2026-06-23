@@ -17,11 +17,9 @@ use tokio::task;
 
 use super::options::{BulkPatchOptions, PatchJobOptions};
 use super::ready_index::ReadyIndex;
+use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
 use super::scheduled_index::ScheduledIndex;
-use super::store::{
-    JobStream, Keyspaces, PayloadFilteredIter, Store, StoreEvent, build_id_stream, make_job_key,
-    make_queue_key, make_status_key,
-};
+use super::store::{Keyspaces, Store, StoreEvent, make_job_key, make_queue_key, make_status_key};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
 impl PatchJobOptions {
