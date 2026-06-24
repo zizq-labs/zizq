@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fjall::Slice;
 use tokio::task;
 
-use super::store::{Store, StoreEvent, make_job_key, make_status_key};
+use super::keys::{make_job_key, make_status_key};
+use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError};
 
 impl Store {

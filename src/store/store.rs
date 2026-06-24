@@ -25,20 +25,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fjall::config::{FilterPolicy, PinningPolicy};
-use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace, Slice};
+use fjall::{Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use tokio::sync::broadcast;
 use tokio::task;
 
-use super::complete_batcher::CompleteBatcher;
+use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
-use super::enqueue_batcher::EnqueueBatcher;
+use super::enqueue::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 use super::storage_config::StorageConfig;
-use super::types::{
-    BackoffConfig, CommitMode, Job, JobStatus, StoreError, UniqueConstraint, UniqueWhile,
-};
+use super::types::{BackoffConfig, CommitMode, StoreError};
 
 /// Events broadcast by the store when job state changes.
 ///
@@ -191,31 +189,6 @@ pub struct Store {
     /// Server-side auto-batcher for concurrent completions (acks).
     /// Mirrors `enqueue_batcher` in structure and lifecycle.
     pub(super) complete_batcher: Arc<CompleteBatcher>,
-}
-
-/// One-byte tag prefix for records in the `data` keyspace.
-///
-/// Each record kind occupies a disjoint prefix range so that jobs, payloads,
-/// and errors coexist in the same fjall keyspace without collision.
-#[repr(u8)]
-pub(super) enum RecordKind {
-    Cron = b'C',
-    Error = b'E',
-    Job = b'J',
-    Payload = b'P',
-}
-
-/// One-byte tag prefix for entries in the `index` keyspace.
-///
-/// Each index kind occupies a disjoint prefix range so that all secondary
-/// indexes coexist in the same fjall keyspace without collision.
-#[repr(u8)]
-pub(super) enum IndexKind {
-    PurgeAt = b'A',
-    Queue = b'Q',
-    Status = b'S',
-    Type = b'T',
-    Unique = b'U',
 }
 
 /// Groups the fjall database handle and all disk keyspaces into a single
@@ -538,341 +511,6 @@ impl Store {
     }
 }
 
-/// Build a job metadata key: `J\0{job_id}`.
-pub(super) fn make_job_key(job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + job_id.len());
-    key.push(RecordKind::Job as u8);
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a payload key: `P\0{job_id}`.
-pub(super) fn make_payload_key(job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + job_id.len());
-    key.push(RecordKind::Payload as u8);
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a status index key: `S\0{status_byte}\0{job_id}`.
-pub(super) fn make_status_key(status: JobStatus, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(4 + job_id.len());
-    key.push(IndexKind::Status as u8);
-    key.push(0);
-    key.push(status as u8);
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a queue membership index key: `Q\0{queue_name}\0{job_id}`.
-pub(super) fn make_queue_key(queue_name: &str, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(queue_name.len() + 3 + job_id.len());
-    key.push(IndexKind::Queue as u8);
-    key.push(0);
-    key.extend_from_slice(queue_name.as_bytes());
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a type membership index key: `T\0{job_type}\0{job_id}`.
-pub(super) fn make_type_key(job_type: &str, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(job_type.len() + 3 + job_id.len());
-    key.push(IndexKind::Type as u8);
-    key.push(0);
-    key.extend_from_slice(job_type.as_bytes());
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a purge-at index key: `A\0{purge_at_be_u64}\0{job_id}`.
-///
-/// Big-endian encoding gives chronological ordering so the reaper can
-/// range-scan from the start to find expired entries.
-pub(super) fn make_purge_key(purge_at: u64, job_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(8 + 3 + job_id.len());
-    key.push(IndexKind::PurgeAt as u8);
-    key.push(0);
-    key.extend_from_slice(&purge_at.to_be_bytes());
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key
-}
-
-/// Build a unique deduplication index key: `U\0{unique_key}`.
-pub(super) fn make_unique_key(unique_key: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + unique_key.len());
-    key.push(IndexKind::Unique as u8);
-    key.push(0);
-    key.extend_from_slice(unique_key.as_bytes());
-    key
-}
-
-/// Build an error record key: `E\0{job_id}\0{attempt_be_u32}`.
-///
-/// The null separator lets us prefix-scan all errors for a given job,
-/// and the big-endian attempt number gives chronological ordering.
-pub(super) fn make_error_key(job_id: &str, attempt: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(job_id.len() + 3 + 4);
-    key.push(RecordKind::Error as u8);
-    key.push(0);
-    key.extend_from_slice(job_id.as_bytes());
-    key.push(0);
-    key.extend_from_slice(&attempt.to_be_bytes());
-    key
-}
-
-/// Iterate all error record keys for a job via prefix scan.
-///
-/// The returned iterator yields owned key bytes that the caller can pass
-/// to `tx.remove`. The fjall `Iter` is an owned value (no borrow on the
-/// keyspace), so it's safe to interleave iteration with mutable tx ops.
-pub(super) fn error_keys(ks: &Keyspaces, job_id: &str) -> impl Iterator<Item = Vec<u8>> {
-    let mut prefix = Vec::with_capacity(job_id.len() + 3);
-    prefix.push(RecordKind::Error as u8);
-    prefix.push(0);
-    prefix.extend_from_slice(job_id.as_bytes());
-    prefix.push(0);
-
-    ks.data
-        .inner()
-        .prefix(&prefix)
-        .filter_map(|guard| guard.key().ok().map(|k| k.to_vec()))
-}
-
-/// Pre-computed keys for deleting all data associated with a job.
-///
-/// Built by `prepare_job_deletion` (no tx required), applied by
-/// `apply_job_deletion` (write-only inside an open tx).
-pub(super) struct JobDeletion {
-    pub(super) id: String,
-    status_key: Vec<u8>,
-    queue_key: Vec<u8>,
-    type_key: Vec<u8>,
-    purge_key: Option<Vec<u8>>,
-    error_keys: Vec<Vec<u8>>,
-    unique_idx_key: Option<Vec<u8>>,
-}
-
-/// Collect all keys needed to delete a job. No tx required.
-pub(super) fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDeletion {
-    let id = &job.id;
-    JobDeletion {
-        id: id.clone(),
-        status_key: make_status_key(status, id),
-        queue_key: make_queue_key(&job.queue, id),
-        type_key: make_type_key(&job.job_type, id),
-        purge_key: job.purge_at.map(|purge_at| make_purge_key(purge_at, id)),
-        error_keys: error_keys(ks, id).collect(),
-        unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
-    }
-}
-
-/// Apply pre-computed deletion inside an open tx.
-pub(super) fn apply_job_deletion(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
-    del: &JobDeletion,
-    ks: &Keyspaces,
-) {
-    tx.remove(&ks.data, &make_job_key(&del.id));
-    tx.remove_weak(&ks.data, &make_payload_key(&del.id));
-    tx.remove(&ks.index, &del.status_key);
-    tx.remove_weak(&ks.index, &del.queue_key);
-    tx.remove_weak(&ks.index, &del.type_key);
-
-    if let Some(ref purge_key) = del.purge_key {
-        tx.remove(&ks.index, purge_key);
-    }
-
-    // Only remove the unique index entry if it still belongs to this job.
-    // Another job may have already claimed the same key.
-    if let Some(ref unique_key) = del.unique_idx_key {
-        let job_id = del.id.as_bytes();
-        let _ = tx.fetch_update(&ks.index, unique_key, |v| match v {
-            Some(v) if v.as_ref() == job_id => None,
-            other => other.cloned(),
-        });
-    }
-
-    for key in &del.error_keys {
-        tx.remove_weak(&ks.data, key);
-    }
-}
-
-/// A job that has been pre-read and prepared for completion. Built by
-/// `pre_read_completes` (no tx required), applied by
-/// `apply_complete_batch` inside a write transaction.
-///
-/// Carries the original `pre_bytes` for CAS verification at apply time.
-/// If the job's stored bytes changed between pre-read and tx, the apply
-/// reports a CAS conflict and the caller must retry the pre-read.
-pub(super) struct PreparedComplete {
-    pub id: String,
-    pub queue: String,
-    pub pre_bytes: Slice,
-    pub priority: u16,
-    /// `None` for zero-retention completions (which delete the job).
-    pub updated_bytes: Option<Slice>,
-    /// `Some` for zero-retention completions (delete-paths).
-    pub deletion: Option<JobDeletion>,
-    /// Pre-computed index key updates for non-zero-retention paths.
-    pub index_keys: Option<CompletionRetentionKeys>,
-    /// Unique constraint snapshot for cleaning up the unique index.
-    pub unique: Option<UniqueConstraint>,
-}
-
-/// Pre-computed index keys for a non-zero-retention completion.
-pub(super) struct CompletionRetentionKeys {
-    pub old_status: Vec<u8>,
-    pub new_status: Vec<u8>,
-    pub purge: Vec<u8>,
-}
-
-/// Pre-read the given job ids and build the list of `PreparedComplete`
-/// values for those that are still in `InFlight` state. Jobs that are
-/// missing or in a different status are pushed into `not_found`.
-///
-/// Does NOT open a transaction — reads go directly through the
-/// keyspace, so the returned `pre_bytes` may be invalidated by
-/// concurrent writers. `apply_complete_batch` verifies via CAS and
-/// surfaces conflicts to the caller.
-pub(super) fn pre_read_completes(
-    ids: &[String],
-    now: u64,
-    ks: &Keyspaces,
-    default_completed_retention_ms: u64,
-) -> Result<(Vec<PreparedComplete>, Vec<String>), StoreError> {
-    let mut prepared: Vec<PreparedComplete> = Vec::with_capacity(ids.len());
-    let mut not_found: Vec<String> = Vec::new();
-
-    for id in ids {
-        let job_key = make_job_key(id);
-        let pre_bytes = match ks.data.get(&job_key)? {
-            Some(bytes) => bytes,
-            None => {
-                not_found.push(id.clone());
-                continue;
-            }
-        };
-
-        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-        if job.status != JobStatus::InFlight as u8 {
-            not_found.push(id.clone());
-            continue;
-        }
-
-        let retention_ms = job
-            .retention
-            .as_ref()
-            .and_then(|r| r.completed_ms)
-            .unwrap_or(default_completed_retention_ms);
-
-        if retention_ms == 0 {
-            let del = prepare_job_deletion(&job, JobStatus::InFlight, ks);
-            prepared.push(PreparedComplete {
-                id: id.clone(),
-                queue: job.queue.clone(),
-                pre_bytes,
-                priority: job.priority,
-                updated_bytes: None,
-                deletion: Some(del),
-                index_keys: None,
-                unique: None,
-            });
-        } else {
-            let purge_at = now + retention_ms;
-            let old_status_key = make_status_key(JobStatus::InFlight, id);
-            let new_status_key = make_status_key(JobStatus::Completed, id);
-            let purge_key = make_purge_key(purge_at, id);
-
-            let unique = job.unique.clone();
-
-            let queue = job.queue.clone();
-            job.status = JobStatus::Completed.into();
-            job.purge_at = Some(purge_at);
-            job.completed_at = Some(now);
-
-            let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-            prepared.push(PreparedComplete {
-                id: id.clone(),
-                queue,
-                pre_bytes,
-                priority: job.priority,
-                updated_bytes: Some(updated_slice),
-                deletion: None,
-                index_keys: Some(CompletionRetentionKeys {
-                    old_status: old_status_key,
-                    new_status: new_status_key,
-                    purge: purge_key,
-                }),
-                unique,
-            });
-        }
-    }
-
-    Ok((prepared, not_found))
-}
-
-/// Apply a batch of prepared completions to an open write transaction
-/// with optimistic-concurrency CAS verification.
-///
-/// On any CAS mismatch, returns `Ok(false)` immediately without writing
-/// further items. The caller must drop the tx and retry the
-/// pre-read+apply sequence — the returned tx is left in a stale state
-/// (some items may have been written before the conflict was detected).
-///
-/// On success, every item has been applied to the tx; caller commits.
-/// Does NOT commit the transaction.
-pub(super) fn apply_complete_batch(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
-    ks: &Keyspaces,
-    prepared: &[PreparedComplete],
-) -> Result<bool, StoreError> {
-    for p in prepared {
-        let job_key = make_job_key(&p.id);
-
-        if let Some(ref del) = p.deletion {
-            // Zero-retention: delete via CAS.
-            let prev = tx.take(&ks.data, &job_key)?;
-            if prev.as_deref() != Some(&*p.pre_bytes) {
-                return Ok(false);
-            }
-            apply_job_deletion(tx, del, ks);
-        } else if let Some(ref updated) = p.updated_bytes {
-            // Non-zero retention: update via CAS.
-            let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
-            if prev.as_deref() != Some(&*p.pre_bytes) {
-                return Ok(false);
-            }
-            let keys = p.index_keys.as_ref().unwrap();
-            tx.remove(&ks.index, &keys.old_status);
-            tx.insert(&ks.index, &keys.new_status, b"");
-            tx.insert(&ks.index, &keys.purge, b"");
-
-            // Remove unique index for Queued or Active scope on
-            // completion, but only if it still belongs to this job.
-            if let Some(ref uc) = p.unique {
-                let scope = uc.unique_while();
-                if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
-                    let job_id = p.id.as_bytes();
-                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                        Some(v) if v.as_ref() == job_id => None,
-                        other => other.cloned(),
-                    })?;
-                }
-            }
-        }
-    }
-
-    Ok(true)
-}
-
 /// Compute the backoff delay in milliseconds for a given attempt count.
 ///
 /// Formula: `delay_ms = attempts^exponent + base_ms + rand(0..jitter_ms) * (attempts + 1)`
@@ -902,6 +540,7 @@ mod tests {
     use crate::store::options::{BulkDeleteOptions, EnqueueOptions, ListJobsOptions};
     use crate::store::storage_config::StorageConfig;
     use crate::store::test_support::test_store;
+    use crate::store::types::JobStatus;
     use crate::time::now_millis;
 
     // --- compute_backoff tests ---

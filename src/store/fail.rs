@@ -8,11 +8,10 @@ use std::sync::atomic::Ordering;
 use fjall::Slice;
 use tokio::task;
 
+use super::delete::{apply_job_deletion, prepare_job_deletion};
+use super::keys::{make_error_key, make_job_key, make_purge_key, make_status_key, make_unique_key};
 use super::options::FailureOptions;
-use super::store::{
-    Store, StoreEvent, apply_job_deletion, compute_backoff, make_error_key, make_job_key,
-    make_purge_key, make_status_key, make_unique_key, prepare_job_deletion,
-};
+use super::store::{Store, StoreEvent, compute_backoff};
 use super::types::{ErrorRecord, Job, JobStatus, StoreError, UniqueWhile};
 
 impl Store {
@@ -253,8 +252,9 @@ impl Store {
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::keys::{error_keys, make_error_key, make_payload_key};
     use super::super::options::{EnqueueOptions, ListJobsOptions};
-    use super::super::store::{StoreEvent, error_keys, make_error_key, make_payload_key};
+    use super::super::store::StoreEvent;
     use super::super::test_support::{
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retry_limit,
     };

@@ -55,12 +55,12 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use super::enqueue::{PreparedEnqueue, apply_enqueue_batch, finalize_enqueue};
-use super::ready_index::ReadyIndex;
-use super::results::EnqueueResult;
-use super::scheduled_index::ScheduledIndex;
-use super::store::{Keyspaces, StoreEvent};
-use super::types::StoreError;
+use super::super::ready_index::ReadyIndex;
+use super::super::results::EnqueueResult;
+use super::super::scheduled_index::ScheduledIndex;
+use super::super::store::{Keyspaces, StoreEvent};
+use super::super::types::StoreError;
+use super::{PreparedEnqueue, apply_enqueue_batch, finalize_enqueue};
 
 /// A single enqueue request in flight: the prepared jobs plus a
 /// oneshot slot for the per-request results. `prepared.len() == 1`
@@ -73,7 +73,7 @@ pub(super) struct EnqueueOp {
 /// Auto-batcher for enqueue ops (singular + bulk). Owns the channel
 /// sender; the batcher thread runs detached and exits naturally when
 /// the sender drops.
-pub(super) struct EnqueueBatcher {
+pub(in crate::store) struct EnqueueBatcher {
     tx: std::sync::mpsc::SyncSender<EnqueueOp>,
 }
 
@@ -86,7 +86,7 @@ impl EnqueueBatcher {
     /// flight) and the max ops drained into a single `tx.commit()`.
     /// Counts ops (i.e. requests), not jobs — a bulk request counts as
     /// one op regardless of how many jobs it carries.
-    pub(super) fn start(
+    pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
         ready_index: Arc<ReadyIndex>,
         scheduled_index: Arc<ScheduledIndex>,

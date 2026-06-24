@@ -10,20 +10,24 @@
 //! → finalize trio below; the methods here are thin async wrappers that
 //! hand off through `spawn_blocking`.
 
+mod batcher;
+
+pub(super) use batcher::EnqueueBatcher;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use tokio::sync::broadcast;
 use tokio::task;
 
+use super::keys::{
+    make_job_key, make_payload_key, make_queue_key, make_status_key, make_type_key, make_unique_key,
+};
 use super::options::EnqueueOptions;
 use super::ready_index::ReadyIndex;
 use super::results::EnqueueResult;
 use super::scheduled_index::ScheduledIndex;
-use super::store::{
-    Keyspaces, Store, StoreEvent, make_job_key, make_payload_key, make_queue_key, make_status_key,
-    make_type_key, make_unique_key,
-};
+use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueConstraint, UniqueWhile};
 
 impl Store {
