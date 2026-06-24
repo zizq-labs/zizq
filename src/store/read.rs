@@ -15,10 +15,11 @@ use std::sync::atomic::Ordering;
 use fjall::Readable;
 use tokio::task;
 
+use super::keys::{IndexKind, RecordKind, make_error_key, make_job_key, make_payload_key};
 use super::options::{ListErrorsOptions, ListJobsOptions};
 use super::results::{ListErrorsPage, ListJobsPage};
 use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
-use super::store::{IndexKind, RecordKind, Store, make_error_key, make_job_key, make_payload_key};
+use super::store::Store;
 use super::types::{ErrorRecord, Job, ScanDirection, StoreError};
 
 impl Store {

@@ -7,6 +7,7 @@ mod delete;
 mod enqueue;
 mod fail;
 mod group_committer;
+mod keys;
 mod options;
 mod patch;
 mod read;

@@ -19,10 +19,9 @@ use fjall::Slice;
 use tokio::task;
 
 use super::delete::{JobDeletion, apply_job_deletion, prepare_job_deletion};
+use super::keys::{make_job_key, make_purge_key, make_status_key, make_unique_key};
 use super::results::BulkCompleteResult;
-use super::store::{
-    Keyspaces, Store, make_job_key, make_purge_key, make_status_key, make_unique_key,
-};
+use super::store::{Keyspaces, Store};
 use super::types::{Job, JobStatus, StoreError, UniqueConstraint, UniqueWhile};
 
 impl Store {
@@ -246,8 +245,9 @@ pub(super) fn apply_complete_batch(
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::keys::error_keys;
     use super::super::options::EnqueueOptions;
-    use super::super::store::{StoreEvent, error_keys};
+    use super::super::store::StoreEvent;
     use super::super::test_support::{
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retention,
     };

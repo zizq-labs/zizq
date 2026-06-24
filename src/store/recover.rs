@@ -15,7 +15,8 @@ use std::sync::atomic::Ordering;
 use fjall::{Readable, Slice};
 use tokio::task;
 
-use super::store::{IndexKind, Store, StoreEvent, make_job_key, make_status_key, make_unique_key};
+use super::keys::{IndexKind, make_job_key, make_status_key, make_unique_key};
+use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueWhile};
 
 impl Store {

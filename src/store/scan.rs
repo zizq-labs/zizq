@@ -30,10 +30,11 @@ use fjall::{Readable, SingleWriterTxKeyspace};
 
 use crate::filter::PayloadFilter;
 
-use super::store::{
-    IndexKind, Keyspaces, RecordKind, make_job_key, make_payload_key, make_queue_key,
-    make_status_key, make_type_key,
+use super::keys::{
+    IndexKind, RecordKind, make_job_key, make_payload_key, make_queue_key, make_status_key,
+    make_type_key,
 };
+use super::store::Keyspaces;
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
 // --- K-way merge helpers ---

@@ -15,12 +15,13 @@ use std::sync::atomic::Ordering;
 
 use tokio::task;
 
+use super::keys::{
+    error_keys, make_job_key, make_payload_key, make_purge_key, make_queue_key, make_status_key,
+    make_type_key, make_unique_key,
+};
 use super::options::BulkDeleteOptions;
 use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
-use super::store::{
-    Keyspaces, Store, StoreEvent, error_keys, make_job_key, make_payload_key, make_purge_key,
-    make_queue_key, make_status_key, make_type_key, make_unique_key,
-};
+use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
 impl Store {
