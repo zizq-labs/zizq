@@ -46,10 +46,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
 
-use super::ready_index::ReadyIndex;
-use super::results::BulkCompleteResult;
-use super::store::{Keyspaces, StoreEvent, apply_complete_batch, pre_read_completes};
-use super::types::StoreError;
+use super::super::ready_index::ReadyIndex;
+use super::super::results::BulkCompleteResult;
+use super::super::store::{Keyspaces, StoreEvent};
+use super::super::types::StoreError;
+use super::{apply_complete_batch, pre_read_completes};
 
 /// A single completion request in flight: ids to ack, the caller's
 /// `now` timestamp, and a oneshot for the per-op `BulkCompleteResult`.
@@ -62,14 +63,14 @@ pub(super) struct CompleteOp {
 /// Auto-batcher for completion ops (singular + bulk). Owns the
 /// channel sender; the batcher thread runs detached and exits
 /// naturally when the sender drops.
-pub(super) struct CompleteBatcher {
+pub(in crate::store) struct CompleteBatcher {
     tx: std::sync::mpsc::SyncSender<CompleteOp>,
 }
 
 impl CompleteBatcher {
     /// Spawn the batcher's background thread. The thread holds clones
     /// of the store internals it needs to apply + finalize batches.
-    pub(super) fn start(
+    pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
         ready_index: Arc<ReadyIndex>,
         in_flight_count: Arc<AtomicU64>,

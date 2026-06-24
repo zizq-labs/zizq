@@ -8,10 +8,11 @@ use std::sync::atomic::Ordering;
 use fjall::Slice;
 use tokio::task;
 
+use super::delete::{apply_job_deletion, prepare_job_deletion};
 use super::options::FailureOptions;
 use super::store::{
-    Store, StoreEvent, apply_job_deletion, compute_backoff, make_error_key, make_job_key,
-    make_purge_key, make_status_key, make_unique_key, prepare_job_deletion,
+    Store, StoreEvent, compute_backoff, make_error_key, make_job_key, make_purge_key,
+    make_status_key, make_unique_key,
 };
 use super::types::{ErrorRecord, Job, JobStatus, StoreError, UniqueWhile};
 

@@ -18,7 +18,8 @@ use tokio::task;
 use super::options::BulkDeleteOptions;
 use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
 use super::store::{
-    JobDeletion, Store, StoreEvent, apply_job_deletion, make_job_key, prepare_job_deletion,
+    Keyspaces, Store, StoreEvent, error_keys, make_job_key, make_payload_key, make_purge_key,
+    make_queue_key, make_status_key, make_type_key, make_unique_key,
 };
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
@@ -295,6 +296,65 @@ impl Store {
         .await??;
 
         Ok(result)
+    }
+}
+
+/// Pre-computed keys for deleting all data associated with a job.
+///
+/// Built by `prepare_job_deletion` (no tx required), applied by
+/// `apply_job_deletion` (write-only inside an open tx).
+pub(super) struct JobDeletion {
+    id: String,
+    status_key: Vec<u8>,
+    queue_key: Vec<u8>,
+    type_key: Vec<u8>,
+    purge_key: Option<Vec<u8>>,
+    error_keys: Vec<Vec<u8>>,
+    unique_idx_key: Option<Vec<u8>>,
+}
+
+/// Collect all keys needed to delete a job. No tx required.
+pub(super) fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces) -> JobDeletion {
+    let id = &job.id;
+    JobDeletion {
+        id: id.clone(),
+        status_key: make_status_key(status, id),
+        queue_key: make_queue_key(&job.queue, id),
+        type_key: make_type_key(&job.job_type, id),
+        purge_key: job.purge_at.map(|purge_at| make_purge_key(purge_at, id)),
+        error_keys: error_keys(ks, id).collect(),
+        unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
+    }
+}
+
+/// Apply pre-computed deletion inside an open tx.
+pub(super) fn apply_job_deletion(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    del: &JobDeletion,
+    ks: &Keyspaces,
+) {
+    tx.remove(&ks.data, &make_job_key(&del.id));
+    tx.remove_weak(&ks.data, &make_payload_key(&del.id));
+    tx.remove(&ks.index, &del.status_key);
+    tx.remove_weak(&ks.index, &del.queue_key);
+    tx.remove_weak(&ks.index, &del.type_key);
+
+    if let Some(ref purge_key) = del.purge_key {
+        tx.remove(&ks.index, purge_key);
+    }
+
+    // Only remove the unique index entry if it still belongs to this job.
+    // Another job may have already claimed the same key.
+    if let Some(ref unique_key) = del.unique_idx_key {
+        let job_id = del.id.as_bytes();
+        let _ = tx.fetch_update(&ks.index, unique_key, |v| match v {
+            Some(v) if v.as_ref() == job_id => None,
+            other => other.cloned(),
+        });
+    }
+
+    for key in &del.error_keys {
+        tx.remove_weak(&ks.data, key);
     }
 }
 

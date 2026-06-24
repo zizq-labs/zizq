@@ -10,6 +10,10 @@
 //! → finalize trio below; the methods here are thin async wrappers that
 //! hand off through `spawn_blocking`.
 
+mod batcher;
+
+pub(super) use batcher::EnqueueBatcher;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
