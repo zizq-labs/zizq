@@ -19,6 +19,7 @@ mod results;
 mod scan;
 mod scheduled;
 mod scheduled_index;
+mod storage_config;
 mod store;
 mod take;
 mod types;
@@ -34,13 +35,14 @@ pub use options::{
 
 pub use results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
 
-pub use store::{
+pub use storage_config::{
     DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
     DEFAULT_CACHE_SIZE, DEFAULT_COMPLETE_BATCH_SIZE, DEFAULT_COMPLETED_RETENTION_MS,
     DEFAULT_DATA_TABLE_SIZE, DEFAULT_DEAD_RETENTION_MS, DEFAULT_ENQUEUE_BATCH_SIZE,
     DEFAULT_INDEX_TABLE_SIZE, DEFAULT_JOURNAL_SIZE, DEFAULT_L0_THRESHOLD, DEFAULT_RETRY_LIMIT,
-    StorageConfig, Store, StoreEvent,
+    StorageConfig,
 };
+pub use store::{Store, StoreEvent};
 
 pub use cron::{CronEntry, CronGroup};
 

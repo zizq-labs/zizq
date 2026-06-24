@@ -306,7 +306,8 @@ mod tests {
     use crate::filter::PayloadFilter;
 
     use super::super::options::{BulkDeleteOptions, EnqueueOptions, ListJobsOptions};
-    use super::super::store::{StorageConfig, Store, StoreEvent};
+    use super::super::storage_config::StorageConfig;
+    use super::super::store::{Store, StoreEvent};
     use super::super::test_support::{enqueue_and_take, test_store, test_store_with_retention};
     use super::super::types::JobStatus;
     use crate::time::now_millis;

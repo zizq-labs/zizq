@@ -12,7 +12,8 @@
 use std::collections::HashSet;
 
 use super::options::{EnqueueOptions, FailureOptions};
-use super::store::{StorageConfig, Store};
+use super::storage_config::StorageConfig;
+use super::store::Store;
 use super::types::{BackoffConfig, Job};
 use crate::time::now_millis;
 
