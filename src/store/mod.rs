@@ -8,6 +8,7 @@ mod enqueue;
 mod fail;
 mod group_committer;
 mod keys;
+mod maintenance;
 mod options;
 mod patch;
 mod read;

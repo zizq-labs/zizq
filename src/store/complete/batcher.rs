@@ -50,7 +50,8 @@ use super::super::ready_index::ReadyIndex;
 use super::super::results::BulkCompleteResult;
 use super::super::store::{Keyspaces, StoreEvent};
 use super::super::types::StoreError;
-use super::{apply_complete_batch, pre_read_completes};
+use super::apply::apply_complete_batch;
+use super::pre_read::pre_read_completes;
 
 /// A single completion request in flight: ids to ack, the caller's
 /// `now` timestamp, and a oneshot for the per-op `BulkCompleteResult`.
