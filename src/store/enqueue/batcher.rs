@@ -60,7 +60,9 @@ use super::super::results::EnqueueResult;
 use super::super::scheduled_index::ScheduledIndex;
 use super::super::store::{Keyspaces, StoreEvent};
 use super::super::types::StoreError;
-use super::{PreparedEnqueue, apply_enqueue_batch, finalize_enqueue};
+use super::apply::apply_enqueue_batch;
+use super::finalize::finalize_enqueue;
+use super::prepare::PreparedEnqueue;
 
 /// A single enqueue request in flight: the prepared jobs plus a
 /// oneshot slot for the per-request results. `prepared.len() == 1`

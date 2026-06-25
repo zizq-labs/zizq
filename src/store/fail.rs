@@ -11,8 +11,8 @@ use tokio::task;
 use super::delete::{apply_job_deletion, prepare_job_deletion};
 use super::keys::{make_error_key, make_job_key, make_purge_key, make_status_key, make_unique_key};
 use super::options::FailureOptions;
-use super::store::{Store, StoreEvent, compute_backoff};
-use super::types::{ErrorRecord, Job, JobStatus, StoreError, UniqueWhile};
+use super::store::{Store, StoreEvent};
+use super::types::{BackoffConfig, ErrorRecord, Job, JobStatus, StoreError, UniqueWhile};
 
 impl Store {
     /// Record a job failure and either schedule a retry or kill the job
@@ -248,6 +248,27 @@ impl Store {
     }
 }
 
+/// Compute the backoff delay in milliseconds for a given attempt count.
+///
+/// Formula: `delay_ms = attempts^exponent + base_ms + rand(0..jitter_ms) * (attempts + 1)`
+///
+/// The jitter component scales linearly with the attempt count so that
+/// later retries spread further apart, reducing collision likelihood when
+/// many jobs fail at similar times.
+fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let base_delay = (attempts as f32).powf(backoff.exponent) + backoff.base_ms as f32;
+
+    // Cheap random value using the same approach as rand_id() in http.rs.
+    let rand_frac = (RandomState::new().build_hasher().finish() as f64) / (u64::MAX as f64); // 0.0..1.0
+
+    let jitter = rand_frac * backoff.jitter_ms as f64 * (attempts as f64 + 1.0);
+
+    (base_delay as f64 + jitter) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -258,8 +279,66 @@ mod tests {
     use super::super::test_support::{
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retry_limit,
     };
-    use super::super::types::{ErrorRecord, JobStatus};
+    use super::super::types::{BackoffConfig, ErrorRecord, JobStatus};
+    use super::compute_backoff;
     use crate::time::now_millis;
+
+    // --- compute_backoff tests ---
+
+    #[test]
+    fn compute_backoff_zero_jitter_is_deterministic() {
+        let backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100,
+            jitter_ms: 0,
+        };
+
+        // attempts=1: 1^2 + 100 = 101
+        assert_eq!(compute_backoff(1, &backoff), 101);
+        // attempts=2: 2^2 + 100 = 104
+        assert_eq!(compute_backoff(2, &backoff), 104);
+        // attempts=3: 3^2 + 100 = 109
+        assert_eq!(compute_backoff(3, &backoff), 109);
+    }
+
+    #[test]
+    fn compute_backoff_with_jitter_stays_in_range() {
+        let backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100,
+            jitter_ms: 50,
+        };
+
+        // Run many times to exercise randomness.
+        for attempts in 1..=10 {
+            let delay = compute_backoff(attempts, &backoff);
+            let base = (attempts as f64).powf(2.0) + 100.0;
+            let max_jitter = 50.0 * (attempts as f64 + 1.0);
+            assert!(
+                delay >= base as u64,
+                "delay {delay} below base {base} for attempt {attempts}"
+            );
+            assert!(
+                delay <= (base + max_jitter) as u64,
+                "delay {delay} above max {} for attempt {attempts}",
+                base + max_jitter
+            );
+        }
+    }
+
+    #[test]
+    fn compute_backoff_zero_attempts() {
+        let backoff = BackoffConfig {
+            exponent: 2.0,
+            base_ms: 100,
+            jitter_ms: 0,
+        };
+
+        // attempts=0: 0^2 + 100 = 100
+        assert_eq!(compute_backoff(0, &backoff), 100);
+    }
+
+    // --- record_failure tests ---
 
     #[tokio::test]
     async fn record_failure_retries_under_limit() {
