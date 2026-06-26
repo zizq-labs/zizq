@@ -3378,4 +3378,52 @@ mod tests {
             .unwrap();
         assert_eq!(count, 3);
     }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_attempts_range() {
+        use super::super::test_support::test_failure_opts;
+
+        let store = test_store();
+        let now = now_millis();
+
+        // Three jobs on separate queues so we can address each by queue.
+        let mut ids: Vec<String> = Vec::new();
+        for q in ["a", "b", "c"] {
+            let id = store
+                .enqueue(now, EnqueueOptions::new("t", q, serde_json::json!(null)))
+                .await
+                .unwrap()
+                .into_job()
+                .id;
+            ids.push(id);
+        }
+
+        // Take and fail "a" once → attempts=1. Leave "b" and "c" untouched.
+        let taken = store
+            .take_next_job(now, &["a".into()].into())
+            .await
+            .unwrap()
+            .expect("ready job");
+        store
+            .record_failure(now, &taken.id, test_failure_opts())
+            .await
+            .unwrap();
+
+        // attempts=1..=1 selects exactly the failed job.
+        let page = store
+            .list_jobs(ListJobsOptions::new().attempts(1..=1))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].queue, "a");
+        assert_eq!(page.jobs[0].attempts, 1);
+
+        // attempts=0..=0 selects the other two.
+        let page = store
+            .list_jobs(ListJobsOptions::new().attempts(0..=0))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
+        assert!(page.jobs.iter().all(|j| j.attempts == 0));
+    }
 }

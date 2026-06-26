@@ -51,6 +51,12 @@ pub struct JobFilter {
     /// epoch). Applied as a post-hydration check on each candidate job.
     pub ready_at: Option<RangeInclusive<u64>>,
 
+    /// Optional `attempts` range filter (inclusive on both ends). Counts
+    /// the number of failures so far — `0..=0` selects jobs that have
+    /// never failed, `1..` selects anything that has failed at least once.
+    /// Applied as a post-hydration check on each candidate job.
+    pub attempts: Option<RangeInclusive<u32>>,
+
     /// Optional jq-style payload filter. When provided, only jobs whose
     /// payload matches the filter are returned. Payloads are hydrated and
     /// checked after the index scan narrows the candidate set.
@@ -99,6 +105,12 @@ impl JobFilter {
     /// Filter by `ready_at` range (inclusive, ms since epoch) and return `self`.
     pub fn ready_at(mut self, range: impl Into<Option<RangeInclusive<u64>>>) -> Self {
         self.ready_at = range.into();
+        self
+    }
+
+    /// Filter by `attempts` range (inclusive) and return `self`.
+    pub fn attempts(mut self, range: impl Into<Option<RangeInclusive<u32>>>) -> Self {
+        self.attempts = range.into();
         self
     }
 
@@ -207,6 +219,12 @@ impl ListJobsOptions {
     /// Filter by `ready_at` range (inclusive) and return `self`.
     pub fn ready_at(mut self, range: impl Into<Option<RangeInclusive<u64>>>) -> Self {
         self.filter.ready_at = range.into();
+        self
+    }
+
+    /// Filter by `attempts` range (inclusive) and return `self`.
+    pub fn attempts(mut self, range: impl Into<Option<RangeInclusive<u32>>>) -> Self {
+        self.filter.attempts = range.into();
         self
     }
 

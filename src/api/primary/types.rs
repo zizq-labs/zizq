@@ -168,6 +168,11 @@ impl QueryBounded for u16 {
     const MAX: Self = u16::MAX;
 }
 
+impl QueryBounded for u32 {
+    const MIN: Self = u32::MIN;
+    const MAX: Self = u32::MAX;
+}
+
 impl QueryBounded for u64 {
     const MIN: Self = u64::MIN;
     const MAX: Self = u64::MAX;
@@ -681,6 +686,10 @@ pub struct ListJobsParams {
     #[serde(default)]
     pub ready_at: RangeQuery<u64>,
 
+    /// `attempts` range (inclusive). Same syntax as `priority`.
+    #[serde(default)]
+    pub attempts: RangeQuery<u32>,
+
     /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
     pub filter: Option<String>,
 }
@@ -712,6 +721,10 @@ pub struct CountJobsParams {
     /// `ready_at` range (inclusive, ms since epoch). Same syntax as `priority`.
     #[serde(default)]
     pub ready_at: RangeQuery<u64>,
+
+    /// `attempts` range (inclusive). Same syntax as `priority`.
+    #[serde(default)]
+    pub attempts: RangeQuery<u32>,
 
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
@@ -745,6 +758,10 @@ pub struct DeleteJobsParams {
     #[serde(default)]
     pub ready_at: RangeQuery<u64>,
 
+    /// `attempts` range (inclusive). Same syntax as `priority`.
+    #[serde(default)]
+    pub attempts: RangeQuery<u32>,
+
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
 }
@@ -776,6 +793,10 @@ pub struct PatchJobsParams {
     /// `ready_at` range (inclusive, ms since epoch). Same syntax as `priority`.
     #[serde(default)]
     pub ready_at: RangeQuery<u64>,
+
+    /// `attempts` range (inclusive). Same syntax as `priority`.
+    #[serde(default)]
+    pub attempts: RangeQuery<u32>,
 
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,

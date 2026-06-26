@@ -648,8 +648,8 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
     }
 }
 
-/// Wraps a job iterator and skips jobs whose `priority` or `ready_at`
-/// falls outside the supplied inclusive range(s).
+/// Wraps a job iterator and skips jobs whose numeric fields fall outside
+/// the supplied inclusive range(s).
 ///
 /// Both bounds are checked off the already-hydrated `Job` record, so no
 /// extra disk reads are required. Cheap integer comparisons — chain this
@@ -659,6 +659,7 @@ pub(super) struct RangeFilteredIter<I> {
     pub(super) inner: I,
     pub(super) priority: Option<RangeInclusive<u16>>,
     pub(super) ready_at: Option<RangeInclusive<u64>>,
+    pub(super) attempts: Option<RangeInclusive<u32>>,
 }
 
 impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for RangeFilteredIter<I> {
@@ -678,6 +679,11 @@ impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for RangeFilteredIter
             }
             if let Some(range) = &self.ready_at {
                 if !range.contains(&job.ready_at) {
+                    continue;
+                }
+            }
+            if let Some(range) = &self.attempts {
+                if !range.contains(&job.attempts) {
                     continue;
                 }
             }
@@ -795,11 +801,12 @@ pub(super) fn apply_filters<'a, R: Readable + 'a>(
     filter: &JobFilter,
 ) -> Box<dyn Iterator<Item = Result<Job, StoreError>> + 'a> {
     let stream: Box<dyn Iterator<Item = Result<Job, StoreError>> + 'a> =
-        if filter.priority.is_some() || filter.ready_at.is_some() {
+        if filter.priority.is_some() || filter.ready_at.is_some() || filter.attempts.is_some() {
             Box::new(RangeFilteredIter {
                 inner,
                 priority: filter.priority.clone(),
                 ready_at: filter.ready_at.clone(),
+                attempts: filter.attempts.clone(),
             })
         } else {
             Box::new(inner)
