@@ -23,7 +23,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use std::ops::Bound;
+use std::ops::{Bound, RangeInclusive};
 use std::sync::Arc;
 
 use fjall::{Readable, SingleWriterTxKeyspace};
@@ -643,6 +643,45 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
 
                 return Some(Ok(job));
             },
+        }
+    }
+}
+
+/// Wraps a job iterator and skips jobs whose `priority` or `ready_at`
+/// falls outside the supplied inclusive range(s).
+///
+/// Both bounds are checked off the already-hydrated `Job` record, so no
+/// extra disk reads are required. Cheap integer comparisons — chain this
+/// before `PayloadFilteredIter` so the payload filter only runs for rows
+/// that already passed the range check.
+pub(super) struct RangeFilteredIter<I> {
+    pub(super) inner: I,
+    pub(super) priority: Option<RangeInclusive<u16>>,
+    pub(super) ready_at: Option<RangeInclusive<u64>>,
+}
+
+impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for RangeFilteredIter<I> {
+    type Item = Result<Job, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let job = match self.inner.next()? {
+                Ok(j) => j,
+                Err(e) => return Some(Err(e)),
+            };
+
+            if let Some(range) = &self.priority {
+                if !range.contains(&job.priority) {
+                    continue;
+                }
+            }
+            if let Some(range) = &self.ready_at {
+                if !range.contains(&job.ready_at) {
+                    continue;
+                }
+            }
+
+            return Some(Ok(job));
         }
     }
 }

@@ -18,7 +18,7 @@ use tokio::task;
 use super::keys::{make_job_key, make_queue_key, make_status_key};
 use super::options::{BulkPatchOptions, PatchJobOptions};
 use super::ready_index::ReadyIndex;
-use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
+use super::scan::{JobStream, PayloadFilteredIter, RangeFilteredIter, build_id_stream};
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
@@ -346,6 +346,17 @@ impl Store {
                         None,
                         has_payload_filter,
                     ))
+                };
+
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if opts.priority.is_some() || opts.ready_at.is_some() {
+                    Box::new(RangeFilteredIter {
+                        inner: jobs,
+                        priority: opts.priority.clone(),
+                        ready_at: opts.ready_at.clone(),
+                    })
+                } else {
+                    jobs
                 };
 
             let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
@@ -1210,6 +1221,8 @@ mod tests {
             statuses: HashSet::new(),
             queues: ["q1".into()].into(),
             types: HashSet::new(),
+            priority: None,
+            ready_at: None,
             filter: None,
             patch: PatchJobOptions {
                 queue: Some("q2".into()),
@@ -1251,6 +1264,8 @@ mod tests {
             statuses: HashSet::new(),
             queues: HashSet::new(),
             types: HashSet::new(),
+            priority: None,
+            ready_at: None,
             filter: None,
             patch: PatchJobOptions {
                 priority: Some(99),
@@ -1282,6 +1297,8 @@ mod tests {
             statuses: HashSet::new(),
             queues: HashSet::new(),
             types: HashSet::new(),
+            priority: None,
+            ready_at: None,
             filter: None,
             patch: PatchJobOptions {
                 ready_at: Some(Some(future)),
@@ -1324,6 +1341,8 @@ mod tests {
             statuses: HashSet::new(),
             queues: HashSet::new(),
             types: HashSet::new(),
+            priority: None,
+            ready_at: None,
             filter: None,
             patch: PatchJobOptions {
                 priority: Some(99),
@@ -1347,6 +1366,8 @@ mod tests {
             statuses: HashSet::new(),
             queues: ["nonexistent".into()].into(),
             types: HashSet::new(),
+            priority: None,
+            ready_at: None,
             filter: None,
             patch: PatchJobOptions {
                 priority: Some(99),
@@ -1356,5 +1377,92 @@ mod tests {
 
         let count = store.patch_jobs(opts).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn patch_jobs_by_priority_range() {
+        let store = test_store();
+        let now = now_millis();
+
+        for p in [0u16, 5, 50, 200] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let opts = BulkPatchOptions {
+            ids: HashSet::new(),
+            statuses: HashSet::new(),
+            queues: HashSet::new(),
+            types: HashSet::new(),
+            priority: Some(5..=100),
+            ready_at: None,
+            filter: None,
+            patch: PatchJobOptions {
+                priority: Some(7),
+                ..Default::default()
+            },
+        };
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        let page = store.list_jobs(ListJobsOptions::new()).await.unwrap();
+        let mut got: Vec<u16> = page.jobs.iter().map(|j| j.priority).collect();
+        got.sort();
+        assert_eq!(got, vec![0, 7, 7, 200]);
+    }
+
+    #[tokio::test]
+    async fn patch_jobs_by_ready_at_range_intersected_with_queue() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Queue "a" — two scheduled jobs, one inside the window.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "a", serde_json::json!(null)).ready_at(now + 10_000),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "a", serde_json::json!(null)).ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+        // Queue "b" — one scheduled job in the window, must not be touched.
+        let untouched = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "b", serde_json::json!(null)).ready_at(now + 10_000),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let opts = BulkPatchOptions {
+            ids: HashSet::new(),
+            statuses: HashSet::new(),
+            queues: ["a".into()].into(),
+            types: HashSet::new(),
+            priority: None,
+            ready_at: Some((now + 5_000)..=(now + 20_000)),
+            filter: None,
+            patch: PatchJobOptions {
+                priority: Some(42),
+                ..Default::default()
+            },
+        };
+        let count = store.patch_jobs(opts).await.unwrap();
+        assert_eq!(count, 1);
+
+        let untouched_after = store.get_job(now, &untouched.id).await.unwrap().unwrap();
+        assert_eq!(untouched_after.priority, 0);
     }
 }
