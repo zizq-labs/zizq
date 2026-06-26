@@ -18,7 +18,7 @@ use tokio::task;
 use super::keys::{IndexKind, RecordKind, make_error_key, make_job_key, make_payload_key};
 use super::options::{ListErrorsOptions, ListJobsOptions};
 use super::results::{ListErrorsPage, ListJobsPage};
-use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
+use super::scan::{JobStream, PayloadFilteredIter, RangeFilteredIter, build_id_stream};
 use super::store::Store;
 use super::types::{ErrorRecord, Job, ScanDirection, StoreError};
 
@@ -87,16 +87,28 @@ impl Store {
                 }
             };
 
-            let mut rows: Vec<Job> = if let Some(filter) = opts.filter.clone() {
-                PayloadFilteredIter {
-                    inner: job_stream,
-                    filter,
-                }
-                .take(fetch)
-                .collect::<Result<Vec<_>, _>>()?
-            } else {
-                job_stream.take(fetch).collect::<Result<Vec<_>, _>>()?
-            };
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if opts.priority.is_some() || opts.ready_at.is_some() {
+                    Box::new(RangeFilteredIter {
+                        inner: job_stream,
+                        priority: opts.priority.clone(),
+                        ready_at: opts.ready_at.clone(),
+                    })
+                } else {
+                    Box::new(job_stream)
+                };
+
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if let Some(filter) = opts.filter.clone() {
+                    Box::new(PayloadFilteredIter {
+                        inner: jobs,
+                        filter,
+                    })
+                } else {
+                    jobs
+                };
+
+            let mut rows: Vec<Job> = jobs.take(fetch).collect::<Result<Vec<_>, _>>()?;
 
             // If we got more rows than the requested limit, we know there's a
             // next page, and we can just discard that extra row now.
@@ -116,6 +128,8 @@ impl Store {
                     .queues(opts.queues.clone())
                     .types(opts.types.clone())
                     .now(opts.now)
+                    .priority(opts.priority.clone())
+                    .ready_at(opts.ready_at.clone())
                     .filter(opts.filter.clone())
             };
 
@@ -169,7 +183,7 @@ impl Store {
 
             let needs_payload = opts.filter.is_some();
 
-            let mut job_stream = match id_stream_opt {
+            let job_stream = match id_stream_opt {
                 Some((ids, source, _has_id_filter)) => {
                     JobStream::by_id(ids, &snapshot, &ks.data, opts.now, needs_payload, source)
                 }
@@ -183,15 +197,28 @@ impl Store {
                 ),
             };
 
-            let count = if let Some(filter) = opts.filter.clone() {
-                PayloadFilteredIter {
-                    inner: job_stream,
-                    filter,
-                }
-                .try_fold(0, |acc, r| r.map(|_| acc + 1))?
-            } else {
-                job_stream.try_fold(0, |acc, r| r.map(|_| acc + 1))?
-            };
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if opts.priority.is_some() || opts.ready_at.is_some() {
+                    Box::new(RangeFilteredIter {
+                        inner: job_stream,
+                        priority: opts.priority.clone(),
+                        ready_at: opts.ready_at.clone(),
+                    })
+                } else {
+                    Box::new(job_stream)
+                };
+
+            let mut jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if let Some(filter) = opts.filter.clone() {
+                    Box::new(PayloadFilteredIter {
+                        inner: jobs,
+                        filter,
+                    })
+                } else {
+                    jobs
+                };
+
+            let count = jobs.try_fold(0, |acc, r| r.map(|_| acc + 1))?;
 
             Ok(count)
         })
@@ -3186,5 +3213,208 @@ mod tests {
         let store = test_store();
         let queues = store.list_queues().await.unwrap();
         assert!(queues.is_empty());
+    }
+
+    // --- list_jobs / count_jobs range filter tests ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_priority_range_inclusive() {
+        let store = test_store();
+        let now = now_millis();
+
+        let mut by_priority: Vec<(u16, String)> = Vec::new();
+        for p in [0u16, 5, 10, 50, 100, 200] {
+            let id = store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap()
+                .into_job()
+                .id;
+            by_priority.push((p, id));
+        }
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().priority(5..=100))
+            .await
+            .unwrap();
+
+        let got: HashSet<u16> = page.jobs.iter().map(|j| j.priority).collect();
+        assert_eq!(got, HashSet::from([5, 10, 50, 100]));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_priority_range_with_single_value() {
+        let store = test_store();
+        let now = now_millis();
+
+        for p in [0u16, 7, 7, 9] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().priority(7..=7))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 2);
+        assert!(page.jobs.iter().all(|j| j.priority == 7));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_ready_at_range() {
+        let store = test_store();
+        let now = now_millis();
+
+        for offset_secs in [10u64, 30, 60, 120, 300] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null))
+                        .ready_at(now + offset_secs * 1_000),
+                )
+                .await
+                .unwrap();
+        }
+
+        let lo = now + 30_000;
+        let hi = now + 120_000;
+        let page = store
+            .list_jobs(ListJobsOptions::new().ready_at(lo..=hi))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 3);
+        assert!(
+            page.jobs
+                .iter()
+                .all(|j| j.ready_at >= lo && j.ready_at <= hi)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_jobs_priority_range_intersects_with_queue_filter() {
+        let store = test_store();
+        let now = now_millis();
+
+        for (queue, p) in [("a", 5u16), ("a", 50), ("b", 5), ("b", 50)] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", queue, serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let page = store
+            .list_jobs(
+                ListJobsOptions::new()
+                    .queues(["a".into()].into())
+                    .priority(40..=100),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].queue, "a");
+        assert_eq!(page.jobs[0].priority, 50);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_priority_range_combines_with_payload_filter() {
+        let store = test_store();
+        let now = now_millis();
+
+        for (p, uid) in [(5u16, 1), (50, 1), (5, 2), (50, 2)] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!({ "u": uid })).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let filter = Arc::new(PayloadFilter::compile(".u == 1").unwrap());
+        let page = store
+            .list_jobs(ListJobsOptions::new().priority(40..=100).filter(filter))
+            .await
+            .unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].priority, 50);
+        assert_eq!(page.jobs[0].payload, Some(serde_json::json!({"u": 1})));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_paginates_across_skipped_priority_rows() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Interleave matching (priority 10) and non-matching (priority 200)
+        // jobs. The cursor must advance across the skipped 200s when
+        // collecting a page of matches. 5 matches with limit 2 → 3 pages.
+        for p in [10u16, 200, 10, 200, 10, 200, 10, 200, 10] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let page1 = store
+            .list_jobs(ListJobsOptions::new().priority(10..=10).limit(2))
+            .await
+            .unwrap();
+        assert_eq!(page1.jobs.len(), 2);
+        assert!(page1.jobs.iter().all(|j| j.priority == 10));
+
+        let page2 = store
+            .list_jobs(page1.next.expect("expected page 2"))
+            .await
+            .unwrap();
+        assert_eq!(page2.jobs.len(), 2);
+        assert!(page2.jobs.iter().all(|j| j.priority == 10));
+
+        let page3 = store
+            .list_jobs(page2.next.expect("expected page 3"))
+            .await
+            .unwrap();
+        assert_eq!(page3.jobs.len(), 1);
+        assert_eq!(page3.jobs[0].priority, 10);
+        assert!(page3.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn count_jobs_filters_by_priority_range() {
+        let store = test_store();
+        let now = now_millis();
+
+        for p in [0u16, 5, 50, 100, 200] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let count = store
+            .count_jobs(ListJobsOptions::new().priority(5..=100))
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
     }
 }

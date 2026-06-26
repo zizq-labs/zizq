@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::hash::Hash;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,112 @@ where
             set.insert(value);
         }
         Ok(Self(set))
+    }
+}
+
+// --- RangeQuery ---
+
+/// Min/max bounds used to fill in an unbounded side of a range query.
+///
+/// Implemented for the unsigned integer types that range-filterable
+/// job fields use (`priority: u16`, `ready_at: u64`).
+pub trait QueryBounded: Sized {
+    const MIN: Self;
+    const MAX: Self;
+}
+
+impl QueryBounded for u16 {
+    const MIN: Self = u16::MIN;
+    const MAX: Self = u16::MAX;
+}
+
+impl QueryBounded for u64 {
+    const MIN: Self = u64::MIN;
+    const MAX: Self = u64::MAX;
+}
+
+/// A range deserialized from a query parameter, with **inclusive** bounds
+/// on both sides.
+///
+/// Four accepted shapes:
+///
+/// - `"100"` → `100..=100` (single value)
+/// - `"100..200"` → `100..=200`
+/// - `"..200"` → `T::MIN..=200`
+/// - `"100.."` → `100..=T::MAX`
+///
+/// An absent or empty parameter deserializes as `None` (no range filter).
+/// A range where the lower bound exceeds the upper bound is a deserialize
+/// error.
+#[derive(Debug, Clone, Default)]
+pub struct RangeQuery<T>(pub Option<RangeInclusive<T>>);
+
+impl<T> RangeQuery<T> {
+    /// Return `true` when no range is set (treated as "match anything").
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl<T> fmt::Display for RangeQuery<T>
+where
+    T: fmt::Display + PartialEq + QueryBounded,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(range) = &self.0 else {
+            return Ok(());
+        };
+        let (lo, hi) = (range.start(), range.end());
+        if lo == hi {
+            write!(f, "{lo}")
+        } else if *lo == T::MIN {
+            write!(f, "..{hi}")
+        } else if *hi == T::MAX {
+            write!(f, "{lo}..")
+        } else {
+            write!(f, "{lo}..{hi}")
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for RangeQuery<T>
+where
+    T: FromStr + Ord + Clone + QueryBounded,
+    T::Err: fmt::Display,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            return Ok(Self(None));
+        }
+
+        let (lo, hi) = if let Some((lo_str, hi_str)) = s.split_once("..") {
+            let lo = if lo_str.is_empty() {
+                T::MIN
+            } else {
+                lo_str.parse().map_err(serde::de::Error::custom)?
+            };
+            let hi = if hi_str.is_empty() {
+                T::MAX
+            } else {
+                hi_str.parse().map_err(serde::de::Error::custom)?
+            };
+            (lo, hi)
+        } else {
+            let v: T = s.parse().map_err(serde::de::Error::custom)?;
+            (v.clone(), v)
+        };
+
+        if lo > hi {
+            return Err(serde::de::Error::custom(
+                "range lower bound exceeds upper bound",
+            ));
+        }
+
+        Ok(Self(Some(lo..=hi)))
     }
 }
 
@@ -566,6 +673,14 @@ pub struct ListJobsParams {
     #[serde(default)]
     pub id: CommaSet<String>,
 
+    /// Priority range (inclusive). Accepts `N`, `A..B`, `..B`, or `A..`.
+    #[serde(default)]
+    pub priority: RangeQuery<u16>,
+
+    /// `ready_at` range (inclusive, ms since epoch). Same syntax as `priority`.
+    #[serde(default)]
+    pub ready_at: RangeQuery<u64>,
+
     /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
     pub filter: Option<String>,
 }
@@ -589,6 +704,14 @@ pub struct CountJobsParams {
     /// Type filter, comma-delimited.
     #[serde(default, rename = "type")]
     pub job_type: CommaSet<String>,
+
+    /// Priority range (inclusive). Accepts `N`, `A..B`, `..B`, or `A..`.
+    #[serde(default)]
+    pub priority: RangeQuery<u16>,
+
+    /// `ready_at` range (inclusive, ms since epoch). Same syntax as `priority`.
+    #[serde(default)]
+    pub ready_at: RangeQuery<u64>,
 
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
@@ -614,6 +737,14 @@ pub struct DeleteJobsParams {
     #[serde(default, rename = "type")]
     pub job_type: CommaSet<String>,
 
+    /// Priority range (inclusive). Accepts `N`, `A..B`, `..B`, or `A..`.
+    #[serde(default)]
+    pub priority: RangeQuery<u16>,
+
+    /// `ready_at` range (inclusive, ms since epoch). Same syntax as `priority`.
+    #[serde(default)]
+    pub ready_at: RangeQuery<u64>,
+
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
 }
@@ -637,6 +768,14 @@ pub struct PatchJobsParams {
     /// Type filter, comma-delimited.
     #[serde(default, rename = "type")]
     pub job_type: CommaSet<String>,
+
+    /// Priority range (inclusive). Accepts `N`, `A..B`, `..B`, or `A..`.
+    #[serde(default)]
+    pub priority: RangeQuery<u16>,
+
+    /// `ready_at` range (inclusive, ms since epoch). Same syntax as `priority`.
+    #[serde(default)]
+    pub ready_at: RangeQuery<u64>,
 
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
@@ -1001,5 +1140,103 @@ impl CronEntryResponse {
             next_enqueue_at: entry.next_enqueue_at,
             last_enqueue_at: entry.last_enqueue_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The RangeQuery Deserialize impl reads a string, so we can exercise it
+    // by deserializing a JSON string literal. This avoids pulling in a URL
+    // parser just for tests.
+    fn parse_u16(s: &str) -> Result<RangeQuery<u16>, String> {
+        let json = serde_json::to_string(s).unwrap();
+        serde_json::from_str::<RangeQuery<u16>>(&json).map_err(|e| e.to_string())
+    }
+
+    fn parse_u64(s: &str) -> Result<RangeQuery<u64>, String> {
+        let json = serde_json::to_string(s).unwrap();
+        serde_json::from_str::<RangeQuery<u64>>(&json).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn range_query_single_value() {
+        let r = parse_u16("42").unwrap();
+        assert_eq!(r.0, Some(42..=42));
+    }
+
+    #[test]
+    fn range_query_bounded_both_sides() {
+        let r = parse_u16("10..200").unwrap();
+        assert_eq!(r.0, Some(10..=200));
+    }
+
+    #[test]
+    fn range_query_unbounded_lower() {
+        let r = parse_u16("..200").unwrap();
+        assert_eq!(r.0, Some(0..=200));
+    }
+
+    #[test]
+    fn range_query_unbounded_upper() {
+        let r = parse_u16("100..").unwrap();
+        assert_eq!(r.0, Some(100..=u16::MAX));
+    }
+
+    #[test]
+    fn range_query_unbounded_both_sides() {
+        let r = parse_u16("..").unwrap();
+        assert_eq!(r.0, Some(0..=u16::MAX));
+    }
+
+    #[test]
+    fn range_query_empty_string_is_none() {
+        let r = parse_u16("").unwrap();
+        assert_eq!(r.0, None);
+    }
+
+    #[test]
+    fn range_query_rejects_lo_greater_than_hi() {
+        let err = parse_u16("200..100").unwrap_err();
+        assert!(err.contains("lower bound exceeds"), "got: {err}");
+    }
+
+    #[test]
+    fn range_query_rejects_non_numeric() {
+        let err = parse_u16("abc").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn range_query_rejects_negative() {
+        let err = parse_u16("-5..10").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn range_query_u64_full_range() {
+        let r = parse_u64("1700000000000..1800000000000").unwrap();
+        assert_eq!(r.0, Some(1_700_000_000_000..=1_800_000_000_000));
+    }
+
+    #[test]
+    fn range_query_display_round_trip() {
+        // Each shape must format back to a string the deserializer accepts.
+        for input in ["42", "10..200", "..200", "100..", ".."] {
+            let parsed = parse_u16(input).unwrap();
+            let rendered = parsed.to_string();
+            let reparsed = parse_u16(&rendered).unwrap();
+            assert_eq!(
+                parsed.0, reparsed.0,
+                "round-trip failed: {input} -> {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_query_display_empty_is_blank() {
+        let r: RangeQuery<u16> = RangeQuery::default();
+        assert_eq!(r.to_string(), "");
     }
 }

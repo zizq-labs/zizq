@@ -37,7 +37,7 @@ use super::types::{
     CronGroupResponse, DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse,
     FailureRequest, HealthResponse, Job, JobStatus, ListCronGroupsResponse, ListErrorsPages,
     ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse,
-    ListQueuesResponse, Order, PatchCronGroupRequest, PatchJobBody, PatchJobsParams,
+    ListQueuesResponse, Order, PatchCronGroupRequest, PatchJobBody, PatchJobsParams, RangeQuery,
     ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse, VersionResponse,
     parse_unique_while,
 };
@@ -1165,6 +1165,8 @@ async fn bulk_delete_jobs(
     if !params.job_type.is_empty() {
         opts.types = params.job_type.0;
     }
+    opts.priority = params.priority.0;
+    opts.ready_at = params.ready_at.0;
     opts.filter = filter;
 
     match state.store.delete_jobs(opts).await {
@@ -1333,6 +1335,8 @@ async fn bulk_patch_jobs(
         } else {
             params.job_type.0
         },
+        priority: params.priority.0,
+        ready_at: params.ready_at.0,
         filter,
         patch,
     };
@@ -1425,6 +1429,8 @@ async fn list_jobs(
         }
         opts = opts.ids(params.id.0.clone());
     }
+    opts = opts.priority(params.priority.0.clone());
+    opts = opts.ready_at(params.ready_at.0.clone());
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
             Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
@@ -1451,6 +1457,8 @@ async fn list_jobs(
                 &params.queue,
                 &params.job_type,
                 &params.id,
+                &params.priority,
+                &params.ready_at,
                 filter_expr,
             );
             let next = page.next.map(|o| {
@@ -1462,6 +1470,8 @@ async fn list_jobs(
                     &params.queue,
                     &params.job_type,
                     &params.id,
+                    &params.priority,
+                    &params.ready_at,
                     filter_expr,
                 )
             });
@@ -1474,6 +1484,8 @@ async fn list_jobs(
                     &params.queue,
                     &params.job_type,
                     &params.id,
+                    &params.priority,
+                    &params.ready_at,
                     filter_expr,
                 )
             });
@@ -1527,6 +1539,8 @@ fn build_page_url(
     queues: &CommaSet<String>,
     types: &CommaSet<String>,
     ids: &CommaSet<String>,
+    priority: &RangeQuery<u16>,
+    ready_at: &RangeQuery<u64>,
     filter: Option<&str>,
 ) -> String {
     let mut url = String::from("/jobs?");
@@ -1546,6 +1560,12 @@ fn build_page_url(
     }
     if !ids.is_empty() {
         url.push_str(&format!("&id={ids}"));
+    }
+    if !priority.is_empty() {
+        url.push_str(&format!("&priority={priority}"));
+    }
+    if !ready_at.is_empty() {
+        url.push_str(&format!("&ready_at={ready_at}"));
     }
     if let Some(expr) = filter {
         url.push_str(&format!("&filter={}", urlencoding::encode(expr)));
@@ -1614,6 +1634,8 @@ async fn count_jobs(
         }
         opts = opts.ids(params.id.0.clone());
     }
+    opts = opts.priority(params.priority.0.clone());
+    opts = opts.ready_at(params.ready_at.0.clone());
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
             Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
@@ -7318,6 +7340,283 @@ mod tests {
         let text = response_body(res).await;
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["patched"], 0);
+    }
+
+    // --- range filter tests (priority + ready_at) ---
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_priority_range() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for p in [0u16, 5, 50, 100, 200] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs?priority=5..100");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let priorities: Vec<u64> = body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["priority"].as_u64().unwrap())
+            .collect();
+        assert_eq!(priorities, vec![5, 50, 100]);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_unbounded_upper_priority() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for p in [0u16, 50, 100] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs?priority=50..");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j["priority"].as_u64().unwrap() >= 50));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_ready_at_range() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for offset_secs in [10u64, 30, 60, 120] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null))
+                        .ready_at(now + offset_secs * 1_000),
+                )
+                .await
+                .unwrap();
+        }
+
+        let lo = now + 30_000;
+        let hi = now + 90_000;
+        let req = empty_request("GET", &format!("/jobs?ready_at={lo}..{hi}"));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        for j in jobs {
+            let ra = j["ready_at"].as_u64().unwrap();
+            assert!(ra >= lo && ra <= hi);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_jobs_priority_filter_preserves_in_pagination() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Three matches at priority 50, plus noise outside the range.
+        for p in [50u16, 50, 50, 0, 200] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs?priority=50&limit=2");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        // The next URL must carry the priority parameter forward.
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        assert!(next_url.contains("priority=50"), "next_url: {next_url}");
+
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["priority"], 50);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_ready_at_range_preserves_in_pagination() {
+        // A bounded ready_at range like "1000..2000" must survive the
+        // Display/Deserialize round-trip on the next-page URL.
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for offset_secs in [30u64, 40, 50, 5, 1000] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null))
+                        .ready_at(now + offset_secs * 1_000),
+                )
+                .await
+                .unwrap();
+        }
+
+        let lo = now + 20_000;
+        let hi = now + 60_000;
+        let req = empty_request("GET", &format!("/jobs?ready_at={lo}..{hi}&limit=2"));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        let next_url = body["pages"]["next"].as_str().unwrap();
+        assert!(
+            next_url.contains(&format!("ready_at={lo}..{hi}")),
+            "next_url: {next_url}"
+        );
+
+        let req = empty_request("GET", next_url);
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_lo_greater_than_hi() {
+        let req = empty_request("GET", "/jobs?priority=200..100");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("invalid query"));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_rejects_non_numeric_priority() {
+        let req = empty_request("GET", "/jobs?priority=abc");
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_by_priority_range() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for p in [0u16, 5, 50, 200] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("DELETE", "/jobs?priority=5..100");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 2);
+
+        let req = empty_request("GET", "/jobs");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let priorities: Vec<u64> = body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["priority"].as_u64().unwrap())
+            .collect();
+        assert_eq!(priorities, vec![0, 200]);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_by_priority_range() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for p in [0u16, 5, 50, 200] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = json_request(
+            "PATCH",
+            "/jobs?priority=5..100",
+            &serde_json::json!({"priority": 7}),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["patched"], 2);
+
+        let req = empty_request("GET", "/jobs");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let mut priorities: Vec<u64> = body["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["priority"].as_u64().unwrap())
+            .collect();
+        priorities.sort();
+        assert_eq!(priorities, vec![0, 7, 7, 200]);
+    }
+
+    #[tokio::test]
+    async fn count_jobs_by_priority_range() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        for p in [0u16, 5, 50, 100, 200] {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let req = empty_request("GET", "/jobs/count?priority=5..100");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 3);
     }
 
     #[tokio::test]

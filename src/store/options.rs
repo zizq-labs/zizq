@@ -7,6 +7,7 @@
 //! queries, enqueue operations, patches, and failure handling.
 
 use std::collections::HashSet;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,14 @@ pub struct ListJobsOptions {
     /// When `Some`, jobs past their purge_at are skipped.
     pub now: Option<u64>,
 
+    /// Optional priority range filter (inclusive on both ends).
+    /// Applied as a post-hydration check on each candidate job.
+    pub priority: Option<RangeInclusive<u16>>,
+
+    /// Optional `ready_at` range filter (inclusive on both ends, ms since
+    /// epoch). Applied as a post-hydration check on each candidate job.
+    pub ready_at: Option<RangeInclusive<u64>>,
+
     /// Optional jq-style payload filter. When provided, only jobs whose
     /// payload matches the filter are returned. Payloads are hydrated and
     /// checked after the index scan narrows the candidate set.
@@ -69,6 +78,8 @@ impl ListJobsOptions {
             queues: HashSet::new(),
             types: HashSet::new(),
             now: None,
+            priority: None,
+            ready_at: None,
             filter: None,
         }
     }
@@ -130,6 +141,18 @@ impl ListJobsOptions {
         self
     }
 
+    /// Filter by priority range (inclusive) and return `self`.
+    pub fn priority(mut self, range: impl Into<Option<RangeInclusive<u16>>>) -> Self {
+        self.priority = range.into();
+        self
+    }
+
+    /// Filter by `ready_at` range (inclusive, ms since epoch) and return `self`.
+    pub fn ready_at(mut self, range: impl Into<Option<RangeInclusive<u64>>>) -> Self {
+        self.ready_at = range.into();
+        self
+    }
+
     /// Set the payload filter and return `self`.
     pub fn filter(mut self, filter: impl Into<Option<Arc<PayloadFilter>>>) -> Self {
         self.filter = filter.into();
@@ -152,6 +175,12 @@ pub struct BulkDeleteOptions {
     /// Optional type filter.
     pub types: HashSet<String>,
 
+    /// Optional priority range (inclusive on both ends).
+    pub priority: Option<RangeInclusive<u16>>,
+
+    /// Optional `ready_at` range (inclusive on both ends, ms since epoch).
+    pub ready_at: Option<RangeInclusive<u64>>,
+
     /// Optional jq payload filter.
     pub filter: Option<Arc<PayloadFilter>>,
 }
@@ -163,6 +192,8 @@ impl BulkDeleteOptions {
             statuses: HashSet::new(),
             queues: HashSet::new(),
             types: HashSet::new(),
+            priority: None,
+            ready_at: None,
             filter: None,
         }
     }
@@ -184,6 +215,12 @@ pub struct BulkPatchOptions {
 
     /// Optional type filter.
     pub types: HashSet<String>,
+
+    /// Optional priority range (inclusive on both ends).
+    pub priority: Option<RangeInclusive<u16>>,
+
+    /// Optional `ready_at` range (inclusive on both ends, ms since epoch).
+    pub ready_at: Option<RangeInclusive<u64>>,
 
     /// Optional jq payload filter.
     pub filter: Option<Arc<PayloadFilter>>,

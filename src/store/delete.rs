@@ -20,7 +20,7 @@ use super::keys::{
     make_type_key, make_unique_key,
 };
 use super::options::BulkDeleteOptions;
-use super::scan::{JobStream, PayloadFilteredIter, build_id_stream};
+use super::scan::{JobStream, PayloadFilteredIter, RangeFilteredIter, build_id_stream};
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
@@ -150,6 +150,17 @@ impl Store {
                         has_payload_filter,
                     );
                     Box::new(stream) as Box<dyn Iterator<Item = Result<Job, StoreError>> + '_>
+                };
+
+            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
+                if opts.priority.is_some() || opts.ready_at.is_some() {
+                    Box::new(RangeFilteredIter {
+                        inner: jobs,
+                        priority: opts.priority.clone(),
+                        ready_at: opts.ready_at.clone(),
+                    })
+                } else {
+                    jobs
                 };
 
             let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
@@ -812,5 +823,75 @@ mod tests {
         }
         let count = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_by_priority_range() {
+        let store = test_store();
+        let now = now_millis();
+
+        for p in [0u16, 5, 50, 200] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)).priority(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut opts = BulkDeleteOptions::new();
+        opts.priority = Some(5..=100);
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 2);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        let remaining: Vec<u16> = page.jobs.iter().map(|j| j.priority).collect();
+        assert_eq!(remaining, vec![0, 200]);
+    }
+
+    #[tokio::test]
+    async fn delete_jobs_by_ready_at_range_intersected_with_queue() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Queue "a" — two scheduled, one in range.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "a", serde_json::json!(null)).ready_at(now + 10_000),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "a", serde_json::json!(null)).ready_at(now + 60_000),
+            )
+            .await
+            .unwrap();
+        // Queue "b" — one scheduled in range, must not be deleted.
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("t", "b", serde_json::json!(null)).ready_at(now + 10_000),
+            )
+            .await
+            .unwrap();
+
+        let mut opts = BulkDeleteOptions::new();
+        opts.queues = ["a".into()].into();
+        opts.ready_at = Some((now + 5_000)..=(now + 20_000));
+        let count = store.delete_jobs(opts).await.unwrap();
+        assert_eq!(count, 1);
+
+        let page = store
+            .list_jobs(ListJobsOptions::new().now(now))
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 2);
     }
 }
