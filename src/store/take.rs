@@ -1035,7 +1035,7 @@ mod tests {
             .unwrap();
 
         let mut delete_opts = BulkDeleteOptions::new();
-        delete_opts.queues = ["myqueue".to_string()].into();
+        delete_opts.filter.queues = ["myqueue".to_string()].into();
         let deleted = store.delete_jobs(delete_opts).await.unwrap();
         assert_eq!(deleted, 1);
 

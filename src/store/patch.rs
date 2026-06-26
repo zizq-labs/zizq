@@ -18,7 +18,7 @@ use tokio::task;
 use super::keys::{make_job_key, make_queue_key, make_status_key};
 use super::options::{BulkPatchOptions, PatchJobOptions};
 use super::ready_index::ReadyIndex;
-use super::scan::{JobStream, PayloadFilteredIter, RangeFilteredIter, build_id_stream};
+use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
@@ -315,58 +315,33 @@ impl Store {
             let mut tx = ks.write_tx();
             let snapshot = ks.db.read_tx();
 
-            let has_payload_filter = opts.filter.is_some();
+            let needs_payload = filter_needs_payload(&opts.filter);
             let now = crate::time::now_millis();
 
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if let Some((id_stream, source, _)) = build_id_stream(
-                    &snapshot,
-                    &ks,
-                    &opts.ids,
-                    &opts.statuses,
-                    &opts.queues,
-                    &opts.types,
-                    &None,
-                    ScanDirection::Asc,
-                ) {
-                    Box::new(JobStream::by_id(
-                        id_stream,
-                        &snapshot,
-                        &ks.data,
-                        None,
-                        has_payload_filter,
-                        source,
-                    ))
-                } else {
-                    Box::new(JobStream::full_scan(
-                        &snapshot,
-                        &ks,
-                        &None,
-                        ScanDirection::Asc,
-                        None,
-                        has_payload_filter,
-                    ))
-                };
-
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if opts.priority.is_some() || opts.ready_at.is_some() {
-                    Box::new(RangeFilteredIter {
-                        inner: jobs,
-                        priority: opts.priority.clone(),
-                        ready_at: opts.ready_at.clone(),
-                    })
-                } else {
-                    jobs
-                };
-
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if let Some(ref filter) = opts.filter {
-                    Box::new(PayloadFilteredIter {
-                        inner: jobs,
-                        filter: Arc::clone(filter),
-                    })
-                } else {
-                    jobs
+            let jobs =
+                match build_id_stream(&snapshot, &ks, &opts.filter, &None, ScanDirection::Asc) {
+                    Some((id_stream, source, _)) => apply_filters(
+                        JobStream::by_id(
+                            id_stream,
+                            &snapshot,
+                            &ks.data,
+                            None,
+                            needs_payload,
+                            source,
+                        ),
+                        &opts.filter,
+                    ),
+                    None => apply_filters(
+                        JobStream::full_scan(
+                            &snapshot,
+                            &ks,
+                            &None,
+                            ScanDirection::Asc,
+                            None,
+                            needs_payload,
+                        ),
+                        &opts.filter,
+                    ),
                 };
 
             let mut diffs: Vec<PatchDiff> = Vec::new();
@@ -428,7 +403,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::options::{
-        BulkPatchOptions, EnqueueOptions, ListJobsOptions, PatchJobOptions, RetentionConfigPatch,
+        BulkPatchOptions, EnqueueOptions, JobFilter, ListJobsOptions, PatchJobOptions,
+        RetentionConfigPatch,
     };
     use super::super::store::StoreEvent;
     use super::super::test_support::{test_store, test_store_with_retention};
@@ -1217,13 +1193,10 @@ mod tests {
         }
 
         let opts = BulkPatchOptions {
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: ["q1".into()].into(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: None,
-            filter: None,
+            filter: JobFilter {
+                queues: ["q1".into()].into(),
+                ..Default::default()
+            },
             patch: PatchJobOptions {
                 queue: Some("q2".into()),
                 ..Default::default()
@@ -1260,13 +1233,10 @@ mod tests {
         store.mark_completed(now, &job.id).await.unwrap();
 
         let opts = BulkPatchOptions {
-            ids: [job.id.clone()].into(),
-            statuses: HashSet::new(),
-            queues: HashSet::new(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: None,
-            filter: None,
+            filter: JobFilter {
+                ids: [job.id.clone()].into(),
+                ..Default::default()
+            },
             patch: PatchJobOptions {
                 priority: Some(99),
                 ..Default::default()
@@ -1293,13 +1263,7 @@ mod tests {
 
         // Patch them all to scheduled.
         let opts = BulkPatchOptions {
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: HashSet::new(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: None,
-            filter: None,
+            filter: JobFilter::default(),
             patch: PatchJobOptions {
                 ready_at: Some(Some(future)),
                 ..Default::default()
@@ -1337,13 +1301,10 @@ mod tests {
 
         // Only patch job_a.
         let opts = BulkPatchOptions {
-            ids: [job_a.id.clone()].into(),
-            statuses: HashSet::new(),
-            queues: HashSet::new(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: None,
-            filter: None,
+            filter: JobFilter {
+                ids: [job_a.id.clone()].into(),
+                ..Default::default()
+            },
             patch: PatchJobOptions {
                 priority: Some(99),
                 ..Default::default()
@@ -1362,13 +1323,10 @@ mod tests {
         let store = test_store();
 
         let opts = BulkPatchOptions {
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: ["nonexistent".into()].into(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: None,
-            filter: None,
+            filter: JobFilter {
+                queues: ["nonexistent".into()].into(),
+                ..Default::default()
+            },
             patch: PatchJobOptions {
                 priority: Some(99),
                 ..Default::default()
@@ -1395,13 +1353,10 @@ mod tests {
         }
 
         let opts = BulkPatchOptions {
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: HashSet::new(),
-            types: HashSet::new(),
-            priority: Some(5..=100),
-            ready_at: None,
-            filter: None,
+            filter: JobFilter {
+                priority: Some(5..=100),
+                ..Default::default()
+            },
             patch: PatchJobOptions {
                 priority: Some(7),
                 ..Default::default()
@@ -1447,13 +1402,11 @@ mod tests {
             .into_job();
 
         let opts = BulkPatchOptions {
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: ["a".into()].into(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: Some((now + 5_000)..=(now + 20_000)),
-            filter: None,
+            filter: JobFilter {
+                queues: ["a".into()].into(),
+                ready_at: Some((now + 5_000)..=(now + 20_000)),
+                ..Default::default()
+            },
             patch: PatchJobOptions {
                 priority: Some(42),
                 ..Default::default()

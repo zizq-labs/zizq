@@ -10,7 +10,6 @@
 //!   events so workers can release capacity for in-flight jobs deleted
 //!   out from under them.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tokio::task;
@@ -20,7 +19,7 @@ use super::keys::{
     make_type_key, make_unique_key,
 };
 use super::options::BulkDeleteOptions;
-use super::scan::{JobStream, PayloadFilteredIter, RangeFilteredIter, build_id_stream};
+use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
@@ -117,60 +116,34 @@ impl Store {
             let mut tx = ks.write_tx();
             let snapshot = ks.db.read_tx();
 
-            let has_payload_filter = opts.filter.is_some();
+            let needs_payload = filter_needs_payload(&opts.filter);
 
             // Build the job stream: filtered by indexes, or full scan.
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if let Some((id_stream, source, _)) = build_id_stream(
-                    &snapshot,
-                    &ks,
-                    &opts.ids,
-                    &opts.statuses,
-                    &opts.queues,
-                    &opts.types,
-                    &None,
-                    ScanDirection::Asc,
-                ) {
-                    let stream = JobStream::by_id(
-                        id_stream,
-                        &snapshot,
-                        &ks.data,
-                        None,               // no expiry filtering for deletion
-                        has_payload_filter, // only hydrate if filter needs it
-                        source,
-                    );
-                    Box::new(stream) as Box<dyn Iterator<Item = Result<Job, StoreError>> + '_>
-                } else {
-                    let stream = JobStream::full_scan(
-                        &snapshot,
-                        &ks,
-                        &None,
-                        ScanDirection::Asc,
-                        None,
-                        has_payload_filter,
-                    );
-                    Box::new(stream) as Box<dyn Iterator<Item = Result<Job, StoreError>> + '_>
-                };
-
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if opts.priority.is_some() || opts.ready_at.is_some() {
-                    Box::new(RangeFilteredIter {
-                        inner: jobs,
-                        priority: opts.priority.clone(),
-                        ready_at: opts.ready_at.clone(),
-                    })
-                } else {
-                    jobs
-                };
-
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if let Some(ref filter) = opts.filter {
-                    Box::new(PayloadFilteredIter {
-                        inner: jobs,
-                        filter: Arc::clone(filter),
-                    })
-                } else {
-                    jobs
+            // Then apply range and payload filters as post-hydration checks.
+            let jobs =
+                match build_id_stream(&snapshot, &ks, &opts.filter, &None, ScanDirection::Asc) {
+                    Some((id_stream, source, _)) => apply_filters(
+                        JobStream::by_id(
+                            id_stream,
+                            &snapshot,
+                            &ks.data,
+                            None, // no expiry filtering for deletion
+                            needs_payload,
+                            source,
+                        ),
+                        &opts.filter,
+                    ),
+                    None => apply_filters(
+                        JobStream::full_scan(
+                            &snapshot,
+                            &ks,
+                            &None,
+                            ScanDirection::Asc,
+                            None,
+                            needs_payload,
+                        ),
+                        &opts.filter,
+                    ),
                 };
 
             // Track deleted jobs for post-commit cleanup.
@@ -538,7 +511,7 @@ mod tests {
         store.mark_completed(now, &taken.id).await.unwrap();
 
         let mut opts = BulkDeleteOptions::new();
-        opts.statuses = [JobStatus::Ready].into();
+        opts.filter.statuses = [JobStatus::Ready].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
 
@@ -579,7 +552,7 @@ mod tests {
             .unwrap();
 
         let mut opts = BulkDeleteOptions::new();
-        opts.queues = ["delete_me".into()].into();
+        opts.filter.queues = ["delete_me".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
 
@@ -613,7 +586,7 @@ mod tests {
             .into_job();
 
         let mut opts = BulkDeleteOptions::new();
-        opts.ids = [j1.id.clone(), j3.id.clone()].into();
+        opts.filter.ids = [j1.id.clone(), j3.id.clone()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
 
@@ -653,7 +626,7 @@ mod tests {
             .unwrap();
 
         let mut opts = BulkDeleteOptions::new();
-        opts.filter = Some(Arc::new(PayloadFilter::compile(".x > 1").unwrap()));
+        opts.filter.payload_filter = Some(Arc::new(PayloadFilter::compile(".x > 1").unwrap()));
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
 
@@ -716,8 +689,8 @@ mod tests {
 
         // Delete ready jobs in queue "a" only.
         let mut opts = BulkDeleteOptions::new();
-        opts.queues = ["a".into()].into();
-        opts.statuses = [JobStatus::Ready].into();
+        opts.filter.queues = ["a".into()].into();
+        opts.filter.statuses = [JobStatus::Ready].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 1);
 
@@ -760,7 +733,7 @@ mod tests {
     async fn delete_jobs_returns_zero_for_no_matches() {
         let store = test_store();
         let mut opts = BulkDeleteOptions::new();
-        opts.queues = ["nonexistent".into()].into();
+        opts.filter.queues = ["nonexistent".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 0);
     }
@@ -777,7 +750,7 @@ mod tests {
             .into_job();
 
         let mut opts = BulkDeleteOptions::new();
-        opts.ids = [j1.id, "0000000000000000000000000".into()].into();
+        opts.filter.ids = [j1.id, "0000000000000000000000000".into()].into();
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 1);
     }
@@ -841,7 +814,7 @@ mod tests {
         }
 
         let mut opts = BulkDeleteOptions::new();
-        opts.priority = Some(5..=100);
+        opts.filter.priority = Some(5..=100);
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 2);
 
@@ -883,8 +856,8 @@ mod tests {
             .unwrap();
 
         let mut opts = BulkDeleteOptions::new();
-        opts.queues = ["a".into()].into();
-        opts.ready_at = Some((now + 5_000)..=(now + 20_000));
+        opts.filter.queues = ["a".into()].into();
+        opts.filter.ready_at = Some((now + 5_000)..=(now + 20_000));
         let count = store.delete_jobs(opts).await.unwrap();
         assert_eq!(count, 1);
 

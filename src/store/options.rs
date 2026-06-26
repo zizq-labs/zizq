@@ -16,38 +16,32 @@ use crate::filter::PayloadFilter;
 
 use super::types::{BackoffConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile};
 
-/// Options for listing jobs with cursor-based pagination in `Store::list_jobs`.
-#[derive(Debug, Clone)]
-pub struct ListJobsOptions {
-    /// Cursor: start after this job ID (exclusive). `None` means start from
-    /// the beginning (asc) or end (desc).
-    pub from: Option<String>,
-
-    /// Scan direction.
-    pub direction: ScanDirection,
-
-    /// Maximum number of jobs to return.
-    pub limit: usize,
-
+/// Predicate that selects which jobs an operation acts on.
+///
+/// Every store operation that narrows a job set (list, count, bulk delete,
+/// bulk patch) accepts a `JobFilter`. Adding a new way to match jobs means
+/// adding one field here — the scan machinery, the iterator chain, and
+/// every operation that takes a filter pick it up automatically. This
+/// also makes the API hard to use wrong: a new filter is impossible to
+/// "forget to add" to an endpoint, because there is no per-endpoint copy.
+///
+/// All fields are `AND`-ed together. Set-shaped fields (`ids`, `statuses`,
+/// etc.) treat an empty set as "match anything"; range fields treat
+/// `None` the same way.
+#[derive(Debug, Default, Clone)]
+pub struct JobFilter {
     /// Optional ID filter. When non-empty, only jobs with one of these
     /// IDs are returned. Intersected with other filters when combined.
     pub ids: HashSet<String>,
 
-    /// Optional status filter. When non-empty, only jobs with one of these
-    /// statuses are returned, using the status index for efficient lookup.
+    /// Optional status filter, served by the status index.
     pub statuses: HashSet<JobStatus>,
 
-    /// Optional queue filter. When non-empty, only jobs belonging to one of
-    /// these queues are returned, using the queue index.
+    /// Optional queue filter, served by the queue index.
     pub queues: HashSet<String>,
 
-    /// Optional type filter. When non-empty, only jobs with one of these
-    /// types are returned, using the type index.
+    /// Optional type filter, served by the type index.
     pub types: HashSet<String>,
-
-    /// Current time for filtering out expired jobs (purge_at <= now).
-    /// When `Some`, jobs past their purge_at are skipped.
-    pub now: Option<u64>,
 
     /// Optional priority range filter (inclusive on both ends).
     /// Applied as a post-hydration check on each candidate job.
@@ -61,9 +55,79 @@ pub struct ListJobsOptions {
     /// payload matches the filter are returned. Payloads are hydrated and
     /// checked after the index scan narrows the candidate set.
     ///
-    /// Wrapped in `Arc` because `ListJobsOptions` must be `Clone` for
+    /// Wrapped in `Arc` because options structs must be `Clone` for
     /// pagination, but `PayloadFilter` contains compiled state.
-    pub filter: Option<Arc<PayloadFilter>>,
+    pub payload_filter: Option<Arc<PayloadFilter>>,
+}
+
+impl JobFilter {
+    /// Create an empty filter (matches every job).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter by job IDs and return `self`.
+    pub fn ids(mut self, ids: HashSet<String>) -> Self {
+        self.ids = ids;
+        self
+    }
+
+    /// Filter by job status and return `self`.
+    pub fn statuses(mut self, statuses: HashSet<JobStatus>) -> Self {
+        self.statuses = statuses;
+        self
+    }
+
+    /// Filter by queue membership and return `self`.
+    pub fn queues(mut self, queues: HashSet<String>) -> Self {
+        self.queues = queues;
+        self
+    }
+
+    /// Filter by job type and return `self`.
+    pub fn types(mut self, types: HashSet<String>) -> Self {
+        self.types = types;
+        self
+    }
+
+    /// Filter by priority range (inclusive) and return `self`.
+    pub fn priority(mut self, range: impl Into<Option<RangeInclusive<u16>>>) -> Self {
+        self.priority = range.into();
+        self
+    }
+
+    /// Filter by `ready_at` range (inclusive, ms since epoch) and return `self`.
+    pub fn ready_at(mut self, range: impl Into<Option<RangeInclusive<u64>>>) -> Self {
+        self.ready_at = range.into();
+        self
+    }
+
+    /// Set the jq payload filter and return `self`.
+    pub fn payload_filter(mut self, filter: impl Into<Option<Arc<PayloadFilter>>>) -> Self {
+        self.payload_filter = filter.into();
+        self
+    }
+}
+
+/// Options for listing jobs with cursor-based pagination in `Store::list_jobs`.
+#[derive(Debug, Clone)]
+pub struct ListJobsOptions {
+    /// Cursor: start after this job ID (exclusive). `None` means start from
+    /// the beginning (asc) or end (desc).
+    pub from: Option<String>,
+
+    /// Scan direction.
+    pub direction: ScanDirection,
+
+    /// Maximum number of jobs to return.
+    pub limit: usize,
+
+    /// Current time for filtering out expired jobs (purge_at <= now).
+    /// When `Some`, jobs past their purge_at are skipped.
+    pub now: Option<u64>,
+
+    /// Predicate selecting which jobs are returned.
+    pub filter: JobFilter,
 }
 
 impl ListJobsOptions {
@@ -73,14 +137,8 @@ impl ListJobsOptions {
             from: None,
             direction: ScanDirection::Asc,
             limit: 50,
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: HashSet::new(),
-            types: HashSet::new(),
             now: None,
-            priority: None,
-            ready_at: None,
-            filter: None,
+            filter: JobFilter::new(),
         }
     }
 
@@ -102,128 +160,81 @@ impl ListJobsOptions {
         self
     }
 
-    /// Filter by job IDs and return `self`.
-    ///
-    /// An empty set means "all jobs". When combined with other filters,
-    /// the result is the intersection.
-    pub fn ids(mut self, ids: HashSet<String>) -> Self {
-        self.ids = ids;
-        self
-    }
-
-    /// Filter by job status and return `self`.
-    ///
-    /// An empty set means "all statuses".
-    pub fn statuses(mut self, statuses: HashSet<JobStatus>) -> Self {
-        self.statuses = statuses;
-        self
-    }
-
-    /// Filter by queue membership and return `self`.
-    ///
-    /// An empty set means "all queues".
-    pub fn queues(mut self, queues: HashSet<String>) -> Self {
-        self.queues = queues;
-        self
-    }
-
-    /// Filter by job type and return `self`.
-    ///
-    /// An empty set means "all types".
-    pub fn types(mut self, types: HashSet<String>) -> Self {
-        self.types = types;
-        self
-    }
-
     /// Set the current time for filtering expired jobs and return `self`.
     pub fn now(mut self, now: impl Into<Option<u64>>) -> Self {
         self.now = now.into();
         self
     }
 
+    /// Set the underlying job filter and return `self`.
+    pub fn filter(mut self, filter: JobFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    // --- Delegating builders for the inner JobFilter ---
+
+    /// Filter by job IDs and return `self`.
+    pub fn ids(mut self, ids: HashSet<String>) -> Self {
+        self.filter.ids = ids;
+        self
+    }
+
+    /// Filter by job status and return `self`.
+    pub fn statuses(mut self, statuses: HashSet<JobStatus>) -> Self {
+        self.filter.statuses = statuses;
+        self
+    }
+
+    /// Filter by queue membership and return `self`.
+    pub fn queues(mut self, queues: HashSet<String>) -> Self {
+        self.filter.queues = queues;
+        self
+    }
+
+    /// Filter by job type and return `self`.
+    pub fn types(mut self, types: HashSet<String>) -> Self {
+        self.filter.types = types;
+        self
+    }
+
     /// Filter by priority range (inclusive) and return `self`.
     pub fn priority(mut self, range: impl Into<Option<RangeInclusive<u16>>>) -> Self {
-        self.priority = range.into();
+        self.filter.priority = range.into();
         self
     }
 
-    /// Filter by `ready_at` range (inclusive, ms since epoch) and return `self`.
+    /// Filter by `ready_at` range (inclusive) and return `self`.
     pub fn ready_at(mut self, range: impl Into<Option<RangeInclusive<u64>>>) -> Self {
-        self.ready_at = range.into();
+        self.filter.ready_at = range.into();
         self
     }
 
-    /// Set the payload filter and return `self`.
-    pub fn filter(mut self, filter: impl Into<Option<Arc<PayloadFilter>>>) -> Self {
-        self.filter = filter.into();
+    /// Set the jq payload filter and return `self`.
+    pub fn payload_filter(mut self, filter: impl Into<Option<Arc<PayloadFilter>>>) -> Self {
+        self.filter.payload_filter = filter.into();
         self
     }
 }
 
 /// Options for bulk-deleting jobs in `Store::delete_jobs`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BulkDeleteOptions {
-    /// Optional ID filter. When non-empty, only these IDs are candidates.
-    pub ids: HashSet<String>,
-
-    /// Optional status filter.
-    pub statuses: HashSet<JobStatus>,
-
-    /// Optional queue filter.
-    pub queues: HashSet<String>,
-
-    /// Optional type filter.
-    pub types: HashSet<String>,
-
-    /// Optional priority range (inclusive on both ends).
-    pub priority: Option<RangeInclusive<u16>>,
-
-    /// Optional `ready_at` range (inclusive on both ends, ms since epoch).
-    pub ready_at: Option<RangeInclusive<u64>>,
-
-    /// Optional jq payload filter.
-    pub filter: Option<Arc<PayloadFilter>>,
+    /// Predicate selecting which jobs are deleted.
+    pub filter: JobFilter,
 }
 
 impl BulkDeleteOptions {
     pub fn new() -> Self {
-        Self {
-            ids: HashSet::new(),
-            statuses: HashSet::new(),
-            queues: HashSet::new(),
-            types: HashSet::new(),
-            priority: None,
-            ready_at: None,
-            filter: None,
-        }
+        Self::default()
     }
 }
 
 /// Options for bulk-patching jobs matching a set of filters.
-///
-/// Combines the same filter fields as `BulkDeleteOptions` with the
-/// patch fields from `PatchJobOptions`.
+#[derive(Debug, Default)]
 pub struct BulkPatchOptions {
-    /// Optional ID filter. When non-empty, only these IDs are candidates.
-    pub ids: HashSet<String>,
-
-    /// Optional status filter.
-    pub statuses: HashSet<JobStatus>,
-
-    /// Optional queue filter.
-    pub queues: HashSet<String>,
-
-    /// Optional type filter.
-    pub types: HashSet<String>,
-
-    /// Optional priority range (inclusive on both ends).
-    pub priority: Option<RangeInclusive<u16>>,
-
-    /// Optional `ready_at` range (inclusive on both ends, ms since epoch).
-    pub ready_at: Option<RangeInclusive<u64>>,
-
-    /// Optional jq payload filter.
-    pub filter: Option<Arc<PayloadFilter>>,
+    /// Predicate selecting which jobs are patched.
+    pub filter: JobFilter,
 
     /// The patch to apply to each matching job.
     pub patch: PatchJobOptions,
