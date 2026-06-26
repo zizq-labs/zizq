@@ -34,6 +34,7 @@ use super::keys::{
     IndexKind, RecordKind, make_job_key, make_payload_key, make_queue_key, make_status_key,
     make_type_key,
 };
+use super::options::JobFilter;
 use super::store::Keyspaces;
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
 
@@ -712,57 +713,57 @@ impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for PayloadFilteredIt
     }
 }
 
-/// Build an `IdStream` from index filters and/or ID filters.
+/// Build an `IdStream` from a `JobFilter`'s index-backed fields.
 ///
-/// Returns `None` when no index filters are active (caller should use a
-/// full-scan `JobStream` instead). Returns `Some((stream, source, has_ids))`
-/// when at least one filter is active.
+/// Returns `None` when no index-backed filter is active (caller should use
+/// a full-scan `JobStream` instead). Returns `Some((stream, source,
+/// has_ids))` when at least one filter is active.
+///
+/// Range and payload fields are NOT consulted here — they are applied as
+/// post-hydration filters by [`apply_filters`].
 pub(super) fn build_id_stream<'a>(
     snapshot: &'a impl Readable,
     ks: &'a Keyspaces,
-    ids: &HashSet<String>,
-    statuses: &HashSet<JobStatus>,
-    queues: &HashSet<String>,
-    types: &HashSet<String>,
+    filter: &JobFilter,
     from: &Option<String>,
     direction: ScanDirection,
 ) -> Option<(IdStream<'a>, String, bool)> {
     let mut filters: Vec<(&str, IdStream<'a>)> = Vec::new();
 
-    if !queues.is_empty() {
+    if !filter.queues.is_empty() {
         filters.push((
             "jobs_by_queue",
             merge_sources(
-                queue_scan_sources(snapshot, ks, queues, from, direction),
+                queue_scan_sources(snapshot, ks, &filter.queues, from, direction),
                 direction,
             ),
         ));
     }
 
-    if !statuses.is_empty() {
+    if !filter.statuses.is_empty() {
         filters.push((
             "jobs_by_status",
             merge_sources(
-                status_scan_sources(snapshot, ks, statuses, from, direction),
+                status_scan_sources(snapshot, ks, &filter.statuses, from, direction),
                 direction,
             ),
         ));
     }
 
-    if !types.is_empty() {
+    if !filter.types.is_empty() {
         filters.push((
             "jobs_by_type",
             merge_sources(
-                type_scan_sources(snapshot, ks, types, from, direction),
+                type_scan_sources(snapshot, ks, &filter.types, from, direction),
                 direction,
             ),
         ));
     }
 
-    let has_id_filter = !ids.is_empty();
+    let has_id_filter = !filter.ids.is_empty();
 
     if has_id_filter {
-        filters.push(("jobs_by_id", id_stream(ids, from, direction)));
+        filters.push(("jobs_by_id", id_stream(&filter.ids, from, direction)));
     }
 
     if filters.is_empty() {
@@ -781,4 +782,43 @@ pub(super) fn build_id_stream<'a>(
     let combined = iter.fold(first, |acc, s| intersect_streams(acc, s, direction));
 
     Some((combined, source_desc, has_id_filter))
+}
+
+/// Wrap a `JobStream` with the post-hydration filters from a `JobFilter`
+/// (range, then payload) and return as a boxed iterator.
+///
+/// Range checks are O(1) integer comparisons, so they run first to
+/// short-circuit the more expensive jq payload evaluation. Range checks
+/// don't need a hydrated payload — only the payload filter does.
+pub(super) fn apply_filters<'a, R: Readable + 'a>(
+    inner: JobStream<'a, R>,
+    filter: &JobFilter,
+) -> Box<dyn Iterator<Item = Result<Job, StoreError>> + 'a> {
+    let stream: Box<dyn Iterator<Item = Result<Job, StoreError>> + 'a> =
+        if filter.priority.is_some() || filter.ready_at.is_some() {
+            Box::new(RangeFilteredIter {
+                inner,
+                priority: filter.priority.clone(),
+                ready_at: filter.ready_at.clone(),
+            })
+        } else {
+            Box::new(inner)
+        };
+
+    if let Some(payload_filter) = &filter.payload_filter {
+        Box::new(PayloadFilteredIter {
+            inner: stream,
+            filter: Arc::clone(payload_filter),
+        })
+    } else {
+        stream
+    }
+}
+
+/// Does `filter` need each candidate job's payload hydrated?
+///
+/// Range filters operate on top-level `Job` fields, so they don't require
+/// payload hydration. Only a jq payload filter does.
+pub(super) fn filter_needs_payload(filter: &JobFilter) -> bool {
+    filter.payload_filter.is_some()
 }

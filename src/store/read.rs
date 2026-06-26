@@ -18,7 +18,7 @@ use tokio::task;
 use super::keys::{IndexKind, RecordKind, make_error_key, make_job_key, make_payload_key};
 use super::options::{ListErrorsOptions, ListJobsOptions};
 use super::results::{ListErrorsPage, ListJobsPage};
-use super::scan::{JobStream, PayloadFilteredIter, RangeFilteredIter, build_id_stream};
+use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::store::Store;
 use super::types::{ErrorRecord, Job, ScanDirection, StoreError};
 
@@ -67,16 +67,8 @@ impl Store {
             let snapshot = ks.db.read_tx();
             let fetch = opts.limit.saturating_add(1);
 
-            let id_stream_opt = build_id_stream(
-                &snapshot,
-                &ks,
-                &opts.ids,
-                &opts.statuses,
-                &opts.queues,
-                &opts.types,
-                &opts.from,
-                opts.direction,
-            );
+            let id_stream_opt =
+                build_id_stream(&snapshot, &ks, &opts.filter, &opts.from, opts.direction);
 
             let job_stream = match id_stream_opt {
                 Some((ids, source, _has_id_filter)) => {
@@ -87,27 +79,7 @@ impl Store {
                 }
             };
 
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if opts.priority.is_some() || opts.ready_at.is_some() {
-                    Box::new(RangeFilteredIter {
-                        inner: job_stream,
-                        priority: opts.priority.clone(),
-                        ready_at: opts.ready_at.clone(),
-                    })
-                } else {
-                    Box::new(job_stream)
-                };
-
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if let Some(filter) = opts.filter.clone() {
-                    Box::new(PayloadFilteredIter {
-                        inner: jobs,
-                        filter,
-                    })
-                } else {
-                    jobs
-                };
-
+            let jobs = apply_filters(job_stream, &opts.filter);
             let mut rows: Vec<Job> = jobs.take(fetch).collect::<Result<Vec<_>, _>>()?;
 
             // If we got more rows than the requested limit, we know there's a
@@ -123,13 +95,7 @@ impl Store {
                     .from(cursor.to_string())
                     .direction(direction)
                     .limit(opts.limit)
-                    .ids(opts.ids.clone())
-                    .statuses(opts.statuses.clone())
-                    .queues(opts.queues.clone())
-                    .types(opts.types.clone())
                     .now(opts.now)
-                    .priority(opts.priority.clone())
-                    .ready_at(opts.ready_at.clone())
                     .filter(opts.filter.clone())
             };
 
@@ -173,15 +139,12 @@ impl Store {
             let id_stream_opt = build_id_stream(
                 &snapshot,
                 &ks,
-                &opts.ids,
-                &opts.statuses,
-                &opts.queues,
-                &opts.types,
+                &opts.filter,
                 &None,              // no cursor for count
                 ScanDirection::Asc, // direction doesn't matter for count
             );
 
-            let needs_payload = opts.filter.is_some();
+            let needs_payload = filter_needs_payload(&opts.filter);
 
             let job_stream = match id_stream_opt {
                 Some((ids, source, _has_id_filter)) => {
@@ -197,28 +160,8 @@ impl Store {
                 ),
             };
 
-            let jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if opts.priority.is_some() || opts.ready_at.is_some() {
-                    Box::new(RangeFilteredIter {
-                        inner: job_stream,
-                        priority: opts.priority.clone(),
-                        ready_at: opts.ready_at.clone(),
-                    })
-                } else {
-                    Box::new(job_stream)
-                };
-
-            let mut jobs: Box<dyn Iterator<Item = Result<Job, StoreError>> + '_> =
-                if let Some(filter) = opts.filter.clone() {
-                    Box::new(PayloadFilteredIter {
-                        inner: jobs,
-                        filter,
-                    })
-                } else {
-                    jobs
-                };
-
-            let count = jobs.try_fold(0, |acc, r| r.map(|_| acc + 1))?;
+            let count =
+                apply_filters(job_stream, &opts.filter).try_fold(0, |acc, r| r.map(|_| acc + 1))?;
 
             Ok(count)
         })
@@ -1855,8 +1798,8 @@ mod tests {
 
         // Follow next — should preserve both queue and status filters.
         let next = page.next.unwrap();
-        assert!(!next.queues.is_empty());
-        assert!(!next.statuses.is_empty());
+        assert!(!next.filter.queues.is_empty());
+        assert!(!next.filter.statuses.is_empty());
 
         let page2 = store.list_jobs(next).await.unwrap();
         assert_eq!(page2.jobs.len(), 1);
@@ -2944,7 +2887,11 @@ mod tests {
 
         let filter = crate::filter::PayloadFilter::compile(".score > 20").unwrap();
         let count = store
-            .count_jobs(ListJobsOptions::new().now(now).filter(Arc::new(filter)))
+            .count_jobs(
+                ListJobsOptions::new()
+                    .now(now)
+                    .payload_filter(Arc::new(filter)),
+            )
             .await
             .unwrap();
         assert_eq!(count, 2);
@@ -3109,7 +3056,12 @@ mod tests {
         let ids: HashSet<String> = [j1.id.clone(), j2.id.clone()].into();
         let filter = Arc::new(PayloadFilter::compile(".x == 1").unwrap());
         let page = store
-            .list_jobs(ListJobsOptions::new().ids(ids).filter(filter).now(now))
+            .list_jobs(
+                ListJobsOptions::new()
+                    .ids(ids)
+                    .payload_filter(filter)
+                    .now(now),
+            )
             .await
             .unwrap();
 
@@ -3137,7 +3089,12 @@ mod tests {
         .into();
         let filter = Arc::new(PayloadFilter::compile(".").unwrap());
         let page = store
-            .list_jobs(ListJobsOptions::new().ids(ids).filter(filter).now(now))
+            .list_jobs(
+                ListJobsOptions::new()
+                    .ids(ids)
+                    .payload_filter(filter)
+                    .now(now),
+            )
             .await
             .unwrap();
 
@@ -3346,7 +3303,11 @@ mod tests {
 
         let filter = Arc::new(PayloadFilter::compile(".u == 1").unwrap());
         let page = store
-            .list_jobs(ListJobsOptions::new().priority(40..=100).filter(filter))
+            .list_jobs(
+                ListJobsOptions::new()
+                    .priority(40..=100)
+                    .payload_filter(filter),
+            )
             .await
             .unwrap();
 

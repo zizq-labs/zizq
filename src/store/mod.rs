@@ -29,7 +29,7 @@ mod test_support;
 
 pub use options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
-    ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
+    JobFilter, ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
     RetentionConfigPatch,
 };
 

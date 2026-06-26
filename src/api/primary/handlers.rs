@@ -1150,24 +1150,24 @@ async fn bulk_delete_jobs(
 
     let mut opts = store::BulkDeleteOptions::new();
     if !params.id.is_empty() {
-        opts.ids = params.id.0;
+        opts.filter.ids = params.id.0;
     }
     if !params.status.is_empty() {
-        opts.statuses = params
+        opts.filter.statuses = params
             .status
             .iter()
             .map(|s| store::JobStatus::from(*s))
             .collect();
     }
     if !params.queue.is_empty() {
-        opts.queues = params.queue.0;
+        opts.filter.queues = params.queue.0;
     }
     if !params.job_type.is_empty() {
-        opts.types = params.job_type.0;
+        opts.filter.types = params.job_type.0;
     }
-    opts.priority = params.priority.0;
-    opts.ready_at = params.ready_at.0;
-    opts.filter = filter;
+    opts.filter.priority = params.priority.0;
+    opts.filter.ready_at = params.ready_at.0;
+    opts.filter.payload_filter = filter;
 
     match state.store.delete_jobs(opts).await {
         Ok(count) => {
@@ -1311,33 +1311,35 @@ async fn bulk_patch_jobs(
     }
 
     let opts = store::BulkPatchOptions {
-        ids: if params.id.is_empty() {
-            HashSet::new()
-        } else {
-            params.id.0
+        filter: store::JobFilter {
+            ids: if params.id.is_empty() {
+                HashSet::new()
+            } else {
+                params.id.0
+            },
+            statuses: if params.status.is_empty() {
+                HashSet::new()
+            } else {
+                params
+                    .status
+                    .iter()
+                    .map(|s| store::JobStatus::from(*s))
+                    .collect()
+            },
+            queues: if params.queue.is_empty() {
+                HashSet::new()
+            } else {
+                params.queue.0
+            },
+            types: if params.job_type.is_empty() {
+                HashSet::new()
+            } else {
+                params.job_type.0
+            },
+            priority: params.priority.0,
+            ready_at: params.ready_at.0,
+            payload_filter: filter,
         },
-        statuses: if params.status.is_empty() {
-            HashSet::new()
-        } else {
-            params
-                .status
-                .iter()
-                .map(|s| store::JobStatus::from(*s))
-                .collect()
-        },
-        queues: if params.queue.is_empty() {
-            HashSet::new()
-        } else {
-            params.queue.0
-        },
-        types: if params.job_type.is_empty() {
-            HashSet::new()
-        } else {
-            params.job_type.0
-        },
-        priority: params.priority.0,
-        ready_at: params.ready_at.0,
-        filter,
         patch,
     };
 
@@ -1433,7 +1435,7 @@ async fn list_jobs(
     opts = opts.ready_at(params.ready_at.0.clone());
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
-            Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
+            Ok(f) => opts.filter.payload_filter = Some(std::sync::Arc::new(f)),
             Err(e) => {
                 return respond(
                     fmt,
@@ -1638,7 +1640,7 @@ async fn count_jobs(
     opts = opts.ready_at(params.ready_at.0.clone());
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
-            Ok(f) => opts.filter = Some(std::sync::Arc::new(f)),
+            Ok(f) => opts.filter.payload_filter = Some(std::sync::Arc::new(f)),
             Err(e) => {
                 return respond(
                     fmt,
