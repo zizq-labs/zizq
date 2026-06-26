@@ -61,6 +61,8 @@ order by default (i.e. ordered by the job ID, not necessarily prioritised).
 > [jaq website](https://gedenkt.at/jaq/manual/#corelang) or on
 > [jq](https://jqlang.org/manual/#basic-filters).
 
+{{#include ./range-syntax.md}}
+
 ### Parameters { #get-jobs-list-parameters }
 
 All options are additive.
@@ -112,6 +114,7 @@ All options are additive.
                 jobs. Defaults to <em>all statuses</em>.
             </td>
         </tr>
+        {{#include ./range-params.md}}
         <tr>
             <td>
                 <div><code>filter</code> <em>query</em></div>
@@ -265,6 +268,8 @@ See [Common Job Type](#job-type).
 
 Get the total number of jobs matching the given parameters.
 
+{{#include ./range-syntax.md}}
+
 ### Parameters { #get-jobs-count-parameters }
 
 All options are additive.
@@ -313,6 +318,7 @@ All options are additive.
                 Optional comma-separated list of job statuses to filter by.
             </td>
         </tr>
+        {{#include ./range-params.md}}
         <tr>
             <td>
                 <div><code>filter</code> <em>query</em></div>

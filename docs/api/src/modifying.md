@@ -66,6 +66,8 @@ are deleted.
 > [jaq website](https://gedenkt.at/jaq/manual/#corelang) or on
 > [jq](https://jqlang.org/manual/#basic-filters).
 
+{{#include ./range-syntax.md}}
+
 ### Parameters { #delete-jobs-bulk-parameters }
 
 All options are additive.
@@ -114,6 +116,7 @@ All options are additive.
                 Optional comma-separated list of job statuses to filter by.
             </td>
         </tr>
+        {{#include ./range-params.md}}
         <tr>
             <td>
                 <div><code>filter</code> <em>query</em></div>
@@ -313,6 +316,8 @@ explicitly requested via `?status=`, in which case the server returns
 > [jaq website](https://gedenkt.at/jaq/manual/#corelang) or on
 > [jq](https://jqlang.org/manual/#basic-filters).
 
+{{#include ./range-syntax.md}}
+
 ### Parameters { #patch-jobs-bulk-parameters }
 
 All filter options are additive.
@@ -362,6 +367,7 @@ All filter options are additive.
                 Must not include <code>completed</code> or <code>dead</code>.
             </td>
         </tr>
+        {{#include ./range-params.md}}
         <tr>
             <td>
                 <div><code>filter</code> <em>query</em></div>

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+- Added `priority`, `ready_at`, and `attempts` range filters to
+  `GET /jobs`, `GET /jobs/count`, `DELETE /jobs`, and `PATCH /jobs`.
+  Each accepts four shapes — `N` (single value), `A..B` (bounded),
+  `..B` (unbounded lower), and `A..` (unbounded upper) — with inclusive
+  bounds on both ends. The lower bound must not exceed the upper bound
+  or the request is rejected with 400. Examples:
+  `?priority=100..200`, `?ready_at=..1735689600000`,
+  `?attempts=1..` (anything that has failed at least once). Range
+  parameters compose with `status`, `queue`, `type`, `id`, and the jq
+  `filter` via intersection, and are preserved across paginated
+  responses. There are no dedicated indexes for these fields: the
+  scan applies them as a post-hydration check after the
+  status/queue/type/id intersection narrows the candidate set, so for
+  efficient narrowing on large stores combine each range with at least
+  one indexed filter.
+
 ## 0.4.2
 
 - Fixed `DELETE /jobs/{id}`: the 204 No Content response was
