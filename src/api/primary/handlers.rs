@@ -1167,6 +1167,7 @@ async fn bulk_delete_jobs(
     }
     opts.filter.priority = params.priority.0;
     opts.filter.ready_at = params.ready_at.0;
+    opts.filter.attempts = params.attempts.0;
     opts.filter.payload_filter = filter;
 
     match state.store.delete_jobs(opts).await {
@@ -1338,6 +1339,7 @@ async fn bulk_patch_jobs(
             },
             priority: params.priority.0,
             ready_at: params.ready_at.0,
+            attempts: params.attempts.0,
             payload_filter: filter,
         },
         patch,
@@ -1433,6 +1435,7 @@ async fn list_jobs(
     }
     opts = opts.priority(params.priority.0.clone());
     opts = opts.ready_at(params.ready_at.0.clone());
+    opts = opts.attempts(params.attempts.0.clone());
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
             Ok(f) => opts.filter.payload_filter = Some(std::sync::Arc::new(f)),
@@ -1461,6 +1464,7 @@ async fn list_jobs(
                 &params.id,
                 &params.priority,
                 &params.ready_at,
+                &params.attempts,
                 filter_expr,
             );
             let next = page.next.map(|o| {
@@ -1474,6 +1478,7 @@ async fn list_jobs(
                     &params.id,
                     &params.priority,
                     &params.ready_at,
+                    &params.attempts,
                     filter_expr,
                 )
             });
@@ -1488,6 +1493,7 @@ async fn list_jobs(
                     &params.id,
                     &params.priority,
                     &params.ready_at,
+                    &params.attempts,
                     filter_expr,
                 )
             });
@@ -1543,6 +1549,7 @@ fn build_page_url(
     ids: &CommaSet<String>,
     priority: &RangeQuery<u16>,
     ready_at: &RangeQuery<u64>,
+    attempts: &RangeQuery<u32>,
     filter: Option<&str>,
 ) -> String {
     let mut url = String::from("/jobs?");
@@ -1568,6 +1575,9 @@ fn build_page_url(
     }
     if !ready_at.is_empty() {
         url.push_str(&format!("&ready_at={ready_at}"));
+    }
+    if !attempts.is_empty() {
+        url.push_str(&format!("&attempts={attempts}"));
     }
     if let Some(expr) = filter {
         url.push_str(&format!("&filter={}", urlencoding::encode(expr)));
@@ -1638,6 +1648,7 @@ async fn count_jobs(
     }
     opts = opts.priority(params.priority.0.clone());
     opts = opts.ready_at(params.ready_at.0.clone());
+    opts = opts.attempts(params.attempts.0.clone());
     if let Some(ref expr) = params.filter {
         match PayloadFilter::compile(expr) {
             Ok(f) => opts.filter.payload_filter = Some(std::sync::Arc::new(f)),
@@ -7619,6 +7630,57 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["count"], 3);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_attempts_range() {
+        let (state, app) = test_state_and_app();
+        let now = crate::time::now_millis();
+
+        // Three jobs on separate queues so we can fail them selectively.
+        let mut ids: Vec<String> = Vec::new();
+        for q in ["a", "b", "c"] {
+            let id = state
+                .store
+                .enqueue(now, EnqueueOptions::new("t", q, serde_json::json!(null)))
+                .await
+                .unwrap()
+                .into_job()
+                .id;
+            ids.push(id);
+        }
+
+        // Fail queue "a" once → attempts=1.
+        let taken = state
+            .store
+            .take_next_job(now, &["a".into()].into())
+            .await
+            .unwrap()
+            .expect("ready job");
+        state
+            .store
+            .record_failure(
+                now,
+                &taken.id,
+                store::FailureOptions {
+                    message: "boom".into(),
+                    error_type: None,
+                    backtrace: None,
+                    retry_at: None,
+                    kill: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let req = empty_request("GET", "/jobs?attempts=1..");
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["attempts"], 1);
+        assert_eq!(jobs[0]["queue"], "a");
     }
 
     #[tokio::test]
