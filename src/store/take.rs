@@ -244,12 +244,10 @@ impl Store {
         })
         .await??;
 
-        // Update the in-flight counter and broadcast events.
-        if !jobs.is_empty() {
-            self.in_flight_count
-                .fetch_add(jobs.len() as u64, Ordering::Relaxed);
-        }
+        // Insert into the in-flight index and broadcast events.
         for job in &jobs {
+            self.in_flight_index
+                .insert(job.dequeued_at.unwrap_or(now), job.id.clone());
             let _ = self
                 .event_tx
                 .send(StoreEvent::JobInFlight { id: job.id.clone() });

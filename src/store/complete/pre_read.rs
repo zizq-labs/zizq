@@ -24,6 +24,9 @@ pub(super) struct PreparedComplete {
     pub(super) queue: String,
     pub(super) pre_bytes: Slice,
     pub(super) priority: u16,
+    /// Dequeue timestamp from the in-flight record, used to remove the
+    /// matching entry from the `InFlightIndex` after commit.
+    pub(super) dequeued_at: u64,
     /// `None` for zero-retention completions (which delete the job).
     pub(super) updated_bytes: Option<Slice>,
     /// `Some` for zero-retention completions (delete-paths).
@@ -81,6 +84,8 @@ pub(super) fn pre_read_completes(
             .and_then(|r| r.completed_ms)
             .unwrap_or(default_completed_retention_ms);
 
+        let dequeued_at = job.dequeued_at.unwrap_or(0);
+
         if retention_ms == 0 {
             let del = prepare_job_deletion(&job, JobStatus::InFlight, ks);
             prepared.push(PreparedComplete {
@@ -88,6 +93,7 @@ pub(super) fn pre_read_completes(
                 queue: job.queue.clone(),
                 pre_bytes,
                 priority: job.priority,
+                dequeued_at,
                 updated_bytes: None,
                 deletion: Some(del),
                 index_keys: None,
@@ -113,6 +119,7 @@ pub(super) fn pre_read_completes(
                 queue,
                 pre_bytes,
                 priority: job.priority,
+                dequeued_at,
                 updated_bytes: Some(updated_slice),
                 deletion: None,
                 index_keys: Some(CompletionRetentionKeys {

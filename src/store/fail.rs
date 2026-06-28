@@ -3,8 +3,6 @@
 
 //! Job failure handling: retry vs kill, backoff, error record persistence.
 
-use std::sync::atomic::Ordering;
-
 use fjall::Slice;
 use tokio::task;
 
@@ -217,11 +215,8 @@ impl Store {
 
         // Emit events outside spawn_blocking due to &self.event_tx.
         if let Some(ref job) = result {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
+            self.in_flight_index
+                .remove(job.dequeued_at.unwrap_or(0), &id_for_event);
 
             // Always emit JobFailed first so workers prune their
             // in-flight set before any downstream events arrive.

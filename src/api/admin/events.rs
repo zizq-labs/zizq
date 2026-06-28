@@ -16,7 +16,6 @@
 //! previous window to produce add/remove events. Only genuinely new IDs
 //! trigger a `get_job` disk read.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -60,12 +59,8 @@ struct ConnectionState {
     /// Previous ready window: sorted `(priority, id)` keys.
     prev_ready: Vec<(u16, String)>,
 
-    /// Full ordered set of in-flight jobs: `(dequeued_at, id)`.
-    /// Maintained from `StoreEvent`s — append on `JobInFlight`,
-    /// remove on `JobCompleted`/`JobFailed`.
-    in_flight_ids: BTreeSet<(u64, String)>,
-
-    /// Previous in-flight window entries from `in_flight_ids`.
+    /// Previous in-flight window: sorted `(dequeued_at, id)` keys, read
+    /// from the server-side `InFlightIndex` via `scan_in_flight_ids`.
     prev_in_flight: Vec<(u64, String)>,
 
     /// Previous scheduled window: sorted `(ready_at, id)` keys.
@@ -329,33 +324,12 @@ async fn send_snapshot_with_subs(
     scheduled_sub: Subscription,
     detail: bool,
 ) -> Result<ConnectionState, String> {
-    // Build the initial in-flight ID set from a full query.
-    let mut in_flight_jobs = state
-        .store
-        .list_jobs(
-            store::ListJobsOptions::new()
-                .statuses([store::JobStatus::InFlight].into())
-                .limit(usize::MAX),
-        )
-        .await
-        .map(|page| page.jobs)
-        .unwrap_or_else(|e| {
-            tracing::error!(%e, "admin ws: failed to list in-flight jobs for snapshot");
-            Vec::new()
-        });
-
-    in_flight_jobs.sort_by_key(|j| j.dequeued_at.unwrap_or(0));
-
-    let in_flight_ids: BTreeSet<(u64, String)> = in_flight_jobs
-        .iter()
-        .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
-        .collect();
-
-    // Seed a ConnectionState with empty baselines — build_snapshot will
-    // populate them and return the snapshot event.
+    // Seed a ConnectionState with empty diff baselines — build_snapshot
+    // will populate them and return the snapshot event. The in-flight
+    // source of truth lives in the server-side `InFlightIndex`, so there
+    // is no per-connection set to pre-populate.
     let mut conn = ConnectionState {
         prev_ready: Vec::new(),
-        in_flight_ids,
         prev_in_flight: Vec::new(),
         prev_scheduled: Vec::new(),
         ready_sub,
@@ -390,63 +364,42 @@ async fn process_store_event(
     conn: &mut ConnectionState,
 ) -> Vec<AdminEvent> {
     match event {
-        StoreEvent::JobCreated { ref id, .. } => {
-            // `JobCreated` covers both fresh enqueues and `requeue` calls
-            // (worker disconnect cleanup). For requeues, the job was
-            // previously InFlight from this connection's perspective —
-            // it has to be evicted from `in_flight_ids` so the next
-            // `diff_in_flight` emits an `InFlightRemoved` event. For
-            // fresh enqueues the set never contained the id so this is
-            // a harmless no-op.
-            let was_in_flight = conn.in_flight_ids.iter().any(|(_, wid)| wid == id);
-            if was_in_flight {
-                conn.in_flight_ids.retain(|(_, wid)| wid != id);
-            }
+        StoreEvent::JobCreated { .. } => {
+            // Covers both fresh enqueues and `requeue` calls. A requeue
+            // also dropped an entry from the server-side InFlightIndex,
+            // so we re-diff all three windows. Fresh enqueues will see
+            // an unchanged in-flight scan, so the diff is a cheap no-op.
             let mut events = diff_ready(store, conn).await;
+            events.extend(diff_in_flight(store, conn).await);
             events.extend(diff_scheduled(store, conn).await);
-            if was_in_flight {
-                events.extend(diff_in_flight(store, conn).await);
-            }
             events
         }
-        StoreEvent::JobInFlight { id } => {
-            let mut events = Vec::new();
-            // Insert into in-flight set.
-            if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
-                conn.in_flight_ids
-                    .insert((job.dequeued_at.unwrap_or(0), id.clone()));
-            }
-            // Diff in-flight window (new entry may appear).
-            events.extend(diff_in_flight(store, conn).await);
-            // Diff ready window (job left ready, backfill may be needed).
+        StoreEvent::JobInFlight { .. } => {
+            // The store already inserted into InFlightIndex; re-diff
+            // the in-flight window to pick up the new entry, and the
+            // ready window since the job left it.
+            let mut events = diff_in_flight(store, conn).await;
             events.extend(diff_ready(store, conn).await);
             events
         }
         StoreEvent::JobCompleted { id } => {
-            let mut events = Vec::new();
-            // Remove from in-flight set.
-            conn.in_flight_ids.retain(|(_, wid)| wid != &id);
-            // Emit semantic "completed" event.
-            events.push(AdminEvent::JobChanged {
+            // Emit semantic "completed" event, then re-diff in-flight
+            // for the removal + any backfill. The server-side index
+            // already removed this id.
+            let mut events = vec![AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::Completed,
                 job: None,
-            });
-            // Diff in-flight window for backfill.
+            }];
             events.extend(diff_in_flight(store, conn).await);
             events
         }
         StoreEvent::JobFailed { id, .. } => {
-            let mut events = Vec::new();
-            // Remove from in-flight set.
-            conn.in_flight_ids.retain(|(_, wid)| wid != &id);
-            // Emit semantic "dead" event.
-            events.push(AdminEvent::JobChanged {
+            let mut events = vec![AdminEvent::JobChanged {
                 id,
                 status: JobChangeStatus::Dead,
                 job: None,
-            });
-            // Diff in-flight window for backfill.
+            }];
             events.extend(diff_in_flight(store, conn).await);
             events
         }
@@ -457,10 +410,8 @@ async fn process_store_event(
             // visible window. Send a fresh snapshot instead.
             vec![build_snapshot(store, conn).await]
         }
-        StoreEvent::JobDeleted { id } => {
-            let mut events = Vec::new();
-            conn.in_flight_ids.retain(|(_, wid)| wid != &id);
-            events.extend(diff_ready(store, conn).await);
+        StoreEvent::JobDeleted { .. } => {
+            let mut events = diff_ready(store, conn).await;
             events.extend(diff_in_flight(store, conn).await);
             events.extend(diff_scheduled(store, conn).await);
             events
@@ -524,30 +475,17 @@ async fn handle_subscribe(
         items: to_admin_jobs(store, ready_jobs, conn.detail).await,
     };
 
-    let in_flight_items: Vec<store::Job> = {
-        let mut jobs = Vec::new();
-        for (_dequeued_at, id) in conn
-            .in_flight_ids
-            .iter()
-            .skip(conn.in_flight_sub.offset)
-            .take(conn.in_flight_sub.limit)
-        {
-            if let Ok(Some(job)) = store.get_job(now_millis(), id).await {
-                jobs.push(job);
-            }
-        }
-        jobs
-    };
+    let in_flight_items = store
+        .list_in_flight_jobs(conn.in_flight_sub.offset, conn.in_flight_sub.limit)
+        .await
+        .unwrap_or_default();
     conn.prev_in_flight = in_flight_items
         .iter()
         .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
         .collect();
     let in_flight_window = JobWindow {
         offset: conn.in_flight_sub.offset,
-        items: in_flight_items
-            .into_iter()
-            .map(|j| AdminJob::from_store(j, conn.detail))
-            .collect(),
+        items: to_admin_jobs(store, in_flight_items, conn.detail).await,
     };
 
     let scheduled_jobs = store
@@ -610,16 +548,12 @@ async fn diff_ready(store: &store::Store, conn: &mut ConnectionState) -> Vec<Adm
     events
 }
 
-/// Diff the in-flight window: take entries from `in_flight_ids` using
+/// Diff the in-flight window: scan IDs from the InFlightIndex using
 /// subscription offset/limit, compare against `prev_in_flight`, emit adds/removes.
 async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current: Vec<(u64, String)> = conn
-        .in_flight_ids
-        .iter()
-        .skip(conn.in_flight_sub.offset)
-        .take(conn.in_flight_sub.limit)
-        .cloned()
-        .collect();
+    let current = store
+        .scan_in_flight_ids(conn.in_flight_sub.offset, conn.in_flight_sub.limit)
+        .await;
     let (adds, removes) = diff_sorted(&current, &conn.prev_in_flight);
     let mut events = Vec::with_capacity(adds.len() + removes.len());
 
@@ -711,40 +645,32 @@ async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> Adm
         .await
         .unwrap_or_default();
 
+    let capped_in_flight = store
+        .list_in_flight_jobs(conn.in_flight_sub.offset, conn.in_flight_sub.limit)
+        .await
+        .unwrap_or_default();
+
     let capped_scheduled = store
         .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
         .await
         .unwrap_or_default();
-
-    // In-flight: re-read from the connection's in_flight_ids set
-    // (maintained by JobInFlight/JobCompleted/JobFailed/JobDeleted events).
-    let in_flight_window: Vec<(u64, String)> = conn
-        .in_flight_ids
-        .iter()
-        .skip(conn.in_flight_sub.offset)
-        .take(conn.in_flight_sub.limit)
-        .cloned()
-        .collect();
-
-    let mut in_flight_jobs = Vec::with_capacity(in_flight_window.len());
-    for (_, id) in &in_flight_window {
-        if let Ok(Some(job)) = store.get_job(now_millis(), id).await {
-            in_flight_jobs.push(AdminJob::from_store(job, conn.detail));
-        }
-    }
 
     // Reset diff baselines.
     conn.prev_ready = capped_ready
         .iter()
         .map(|j| (j.priority, j.id.clone()))
         .collect();
-    conn.prev_in_flight = in_flight_window;
+    conn.prev_in_flight = capped_in_flight
+        .iter()
+        .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
+        .collect();
     conn.prev_scheduled = capped_scheduled
         .iter()
         .map(|j| (j.ready_at, j.id.clone()))
         .collect();
 
     let ready_items = to_admin_jobs(store, capped_ready, conn.detail).await;
+    let in_flight_items = to_admin_jobs(store, capped_in_flight, conn.detail).await;
     let scheduled_items = to_admin_jobs(store, capped_scheduled, conn.detail).await;
 
     AdminEvent::JobSnapshot {
@@ -754,7 +680,7 @@ async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> Adm
         },
         in_flight: JobWindow {
             offset: conn.in_flight_sub.offset,
-            items: in_flight_jobs,
+            items: in_flight_items,
         },
         scheduled: JobWindow {
             offset: conn.scheduled_sub.offset,
@@ -1102,15 +1028,14 @@ mod tests {
         assert_eq!(statuses, vec!["in_flight", "ready_removed"]);
     }
 
-    /// Regression: when a worker disconnected, the take handler called
-    /// `store.requeue(id)` for each in-flight job. That emits a
-    /// `JobCreated` event. The admin handler used to handle `JobCreated`
-    /// only as "new ready job" — diffing the ready/scheduled windows but
-    /// never removing the id from `conn.in_flight_ids`. The result was
-    /// stale rows lingering in the `zizq top` in-flight tab even though
-    /// the header total had dropped to zero. The handler now evicts the
-    /// id from `in_flight_ids` on `JobCreated`, so the next
-    /// `diff_in_flight` emits an `in_flight_removed`.
+    /// Regression: when a worker disconnects, the take handler calls
+    /// `store.requeue(id)` for each in-flight job, which emits a
+    /// `JobCreated` event. The admin handler used to only diff ready and
+    /// scheduled on `JobCreated`, leaving stale in-flight rows in the
+    /// `zizq top` tab even though `store.requeue` had removed them from
+    /// the server-side `InFlightIndex`. The handler now always re-runs
+    /// `diff_in_flight` on `JobCreated`, so the removal surfaces as an
+    /// `in_flight_removed` event.
     #[tokio::test]
     async fn requeue_emits_in_flight_removed_and_ready() {
         let state = test_state();
