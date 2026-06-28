@@ -7,6 +7,7 @@ mod delete;
 mod enqueue;
 mod fail;
 mod group_committer;
+mod in_flight_index;
 mod keys;
 mod maintenance;
 mod options;

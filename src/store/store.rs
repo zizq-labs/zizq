@@ -21,7 +21,7 @@
 //! use sorted stream intersection across the tag-prefixed ranges.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use fjall::config::{FilterPolicy, PinningPolicy};
 use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
@@ -31,6 +31,7 @@ use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
 use super::enqueue::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
+use super::in_flight_index::InFlightIndex;
 use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 use super::storage_config::StorageConfig;
@@ -143,6 +144,16 @@ pub struct Store {
     /// `Ready` once their time arrives.
     pub(super) scheduled_index: Arc<ScheduledIndex>,
 
+    /// In-memory chronological index of in-flight jobs.
+    ///
+    /// Ordered by `(dequeued_at, job_id)`. Starts empty on every process
+    /// start — `recover_in_flight` ensures no orphaned InFlight rows
+    /// remain on disk before traffic is accepted. Maintained by
+    /// `take_next_n_jobs` (insert), `mark_completed` (remove via complete
+    /// batcher), `record_failure` (remove), `requeue` (remove),
+    /// `delete_job`/`delete_jobs`/`purge_job` (remove if currently InFlight).
+    pub(super) in_flight_index: Arc<InFlightIndex>,
+
     /// In-memory index of cron entries ordered by `next_enqueue_at`.
     pub(super) cron_index: Arc<CronScheduleIndex>,
 
@@ -162,13 +173,6 @@ pub struct Store {
     /// Guards on `take_next_job`, `list_ready_jobs`, and `scan_ready_ids`
     /// return empty results while `false`.
     pub(super) index_ready: Arc<AtomicBool>,
-
-    /// Current number of in-flight jobs across all connections.
-    ///
-    /// Incremented when jobs are taken (`take_next_n_jobs`), decremented
-    /// when jobs complete, fail, or are requeued. Used by the HTTP layer
-    /// to enforce `global_in_flight_limit` without hitting disk.
-    pub(super) in_flight_count: Arc<AtomicU64>,
 
     /// Broadcast channel for store events.
     ///
@@ -326,6 +330,7 @@ impl Store {
         });
         let ready_index = Arc::new(ReadyIndex::new());
         let scheduled_index = Arc::new(ScheduledIndex::new());
+        let in_flight_index = Arc::new(InFlightIndex::new());
 
         // Start the enqueue auto-batcher — a dedicated OS thread that
         // coalesces concurrent enqueue requests (singular + bulk) into
@@ -340,14 +345,12 @@ impl Store {
             config.enqueue_batch_size,
         ));
 
-        let in_flight_count = Arc::new(AtomicU64::new(0));
-
         // Start the complete auto-batcher — same shape as the enqueue
         // batcher, coalesces concurrent completion (ack) requests.
         let complete_batcher = Arc::new(CompleteBatcher::start(
             ks.clone(),
             ready_index.clone(),
-            in_flight_count.clone(),
+            in_flight_index.clone(),
             event_tx.clone(),
             config.default_completed_retention_ms,
             config.complete_batch_size,
@@ -358,12 +361,12 @@ impl Store {
             ks,
             ready_index,
             scheduled_index,
+            in_flight_index,
             cron_index: Arc::new(CronScheduleIndex::new()),
             default_dead_retention_ms: config.default_dead_retention_ms,
             default_retry_limit: config.default_retry_limit,
             default_backoff: config.default_backoff,
             index_ready: Arc::new(AtomicBool::new(true)),
-            in_flight_count,
             event_tx,
             enqueue_batcher,
             complete_batcher,
@@ -382,7 +385,7 @@ impl Store {
 
     /// Total number of in-flight jobs across all connections.
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight_count.load(Ordering::Relaxed) as usize
+        self.in_flight_index.len()
     }
 
     /// Total number of scheduled jobs.

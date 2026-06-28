@@ -4,7 +4,7 @@
 //! Requeue: return an in-flight job to the ready queue.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use fjall::Slice;
 use tokio::task;
@@ -50,6 +50,7 @@ impl Store {
 
                 let queue = job.queue.clone();
                 let priority = job.priority;
+                let dequeued_at = job.dequeued_at.unwrap_or(0);
                 job.status = JobStatus::Ready.into();
 
                 let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
@@ -72,17 +73,13 @@ impl Store {
                 // Insert into the in-memory ready index after commit succeeds.
                 ready_index.insert(&queue, priority, id.clone());
 
-                return Ok(Some(queue));
+                return Ok(Some((queue, dequeued_at)));
             }
         })
         .await??;
 
-        if let Some(queue) = result {
-            let _ = self
-                .in_flight_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
+        if let Some((queue, dequeued_at)) = result {
+            self.in_flight_index.remove(dequeued_at, &event_id);
             let _ = self.event_tx.send(StoreEvent::JobCreated {
                 id: event_id,
                 queue,

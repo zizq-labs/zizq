@@ -10,8 +10,6 @@
 //!   events so workers can release capacity for in-flight jobs deleted
 //!   out from under them.
 
-use std::sync::atomic::Ordering;
-
 use tokio::task;
 
 use super::keys::{
@@ -32,7 +30,7 @@ impl Store {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let in_flight_count = self.in_flight_count.clone();
+        let in_flight_index = self.in_flight_index.clone();
         let id = id.to_string();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
@@ -64,11 +62,7 @@ impl Store {
                     scheduled_index.remove(job.ready_at, &id);
                 }
                 JobStatus::InFlight => {
-                    in_flight_count
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(1))
-                        })
-                        .ok();
+                    in_flight_index.remove(job.dequeued_at.unwrap_or(0), &id);
                 }
                 _ => {}
             }
@@ -106,7 +100,7 @@ impl Store {
         let ks = self.ks.clone();
         let ready_index = self.ready_index.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let in_flight_count = self.in_flight_count.clone();
+        let in_flight_index = self.in_flight_index.clone();
         let event_tx = self.event_tx.clone();
 
         let deleted_ids = task::spawn_blocking(move || -> Result<_, StoreError> {
@@ -153,6 +147,7 @@ impl Store {
                 status: JobStatus,
                 priority: u16,
                 ready_at: u64,
+                dequeued_at: u64,
             }
 
             let mut deleted: Vec<Deleted> = Vec::new();
@@ -175,6 +170,7 @@ impl Store {
                     status,
                     priority: job.priority,
                     ready_at: job.ready_at,
+                    dequeued_at: job.dequeued_at.unwrap_or(0),
                 });
             }
 
@@ -185,7 +181,6 @@ impl Store {
             ks.commit(tx, ks.default_commit_mode)?;
 
             // Post-commit: clean up in-memory indexes.
-            let mut in_flight_removed: u64 = 0;
             for d in &deleted {
                 match d.status {
                     JobStatus::Ready => {
@@ -195,18 +190,10 @@ impl Store {
                         scheduled_index.remove(d.ready_at, &d.id);
                     }
                     JobStatus::InFlight => {
-                        in_flight_removed += 1;
+                        in_flight_index.remove(d.dequeued_at, &d.id);
                     }
                     _ => {}
                 }
-            }
-
-            if in_flight_removed > 0 {
-                in_flight_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(in_flight_removed))
-                    })
-                    .ok();
             }
 
             let deleted_ids: Vec<String> = deleted.into_iter().map(|d| d.id).collect();

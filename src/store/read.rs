@@ -322,6 +322,49 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// List in-flight jobs in dequeue-time order from the in-memory index.
+    ///
+    /// Iterates the `InFlightIndex` SkipSet and hydrates job metadata from
+    /// the `jobs` keyspace. Skips jobs whose metadata is missing. Does NOT
+    /// hydrate payloads.
+    pub async fn list_in_flight_jobs(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Job>, StoreError> {
+        let in_flight_index = self.in_flight_index.clone();
+        let ks = self.ks.clone();
+
+        task::spawn_blocking(move || {
+            let mut jobs = Vec::with_capacity(limit);
+            for (_dequeued_at, job_id) in in_flight_index.iter().skip(offset) {
+                if jobs.len() >= limit {
+                    break;
+                }
+                let job_key = make_job_key(&job_id);
+                if let Some(bytes) = ks.data.get(&job_key)? {
+                    let job: Job = rmp_serde::from_slice(&bytes)?;
+                    jobs.push(job);
+                }
+            }
+            Ok(jobs)
+        })
+        .await?
+    }
+
+    /// Scan the in-memory InFlightIndex and return up to `limit` keys.
+    ///
+    /// Returns `Vec<(dequeued_at, job_id)>` in dequeue-time order — zero
+    /// disk I/O. Used by the admin event handler to diff capped in-flight
+    /// windows.
+    pub async fn scan_in_flight_ids(&self, offset: usize, limit: usize) -> Vec<(u64, String)> {
+        let in_flight_index = self.in_flight_index.clone();
+
+        task::spawn_blocking(move || in_flight_index.iter().skip(offset).take(limit).collect())
+            .await
+            .unwrap_or_default()
+    }
+
     /// Get a single error record by job ID and attempt number.
     ///
     /// Returns `None` if the job or attempt doesn't exist.

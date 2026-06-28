@@ -42,10 +42,10 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
 
+use super::super::in_flight_index::InFlightIndex;
 use super::super::ready_index::ReadyIndex;
 use super::super::results::BulkCompleteResult;
 use super::super::store::{Keyspaces, StoreEvent};
@@ -74,7 +74,7 @@ impl CompleteBatcher {
     pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
         ready_index: Arc<ReadyIndex>,
-        in_flight_count: Arc<AtomicU64>,
+        in_flight_index: Arc<InFlightIndex>,
         event_tx: broadcast::Sender<StoreEvent>,
         default_completed_retention_ms: u64,
         batch_size: usize,
@@ -99,7 +99,7 @@ impl CompleteBatcher {
                     process_batch(
                         &ks,
                         &ready_index,
-                        &in_flight_count,
+                        &in_flight_index,
                         &event_tx,
                         default_completed_retention_ms,
                         batch,
@@ -135,7 +135,7 @@ impl CompleteBatcher {
 fn process_batch(
     ks: &Keyspaces,
     ready_index: &ReadyIndex,
-    in_flight_count: &AtomicU64,
+    in_flight_index: &InFlightIndex,
     event_tx: &broadcast::Sender<StoreEvent>,
     default_completed_retention_ms: u64,
     batch: Vec<CompleteOp>,
@@ -253,23 +253,21 @@ fn process_batch(
         break (prepared, not_found_set);
     };
 
-    // Update ready_index once per unique completed id.
+    // Update ready_index and remove from in_flight_index once per id.
+    // `prepared` is already dedup'd: `flat_ids` is built via `global_seen`
+    // above, and `pre_read_completes` preserves that uniqueness.
+    let mut completed_set: HashSet<String> = HashSet::with_capacity(prepared.len());
     for p in &prepared {
         ready_index.remove(&p.queue, p.priority, &p.id);
+        in_flight_index.remove(p.dequeued_at, &p.id);
+        completed_set.insert(p.id.clone());
     }
 
-    // Broadcast JobCompleted + decrement in_flight_count once per
-    // unique completed id (not per occurrence across ops).
-    let completed_set: HashSet<String> = prepared.into_iter().map(|p| p.id).collect();
+    // Broadcast JobCompleted once per completed id.
     for id in &completed_set {
         let _ = event_tx.send(StoreEvent::JobCompleted { id: id.clone() });
     }
-    let unique_completed = completed_set.len() as u64;
-    if unique_completed > 0 {
-        let _ = in_flight_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(unique_completed))
-        });
-    }
+    let unique_completed = completed_set.len();
 
     tracing::debug!(
         ops = ops_count,
