@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.1
+
+- Added `/` search to `zizq top`. Two labeled fields — Type and Queue
+  — with `Tab` to switch between them. Each field supports the standard
+  editing keys (Left/Right, Home/End, Delete, Backspace) via the
+  `tui-input` crate. `n` steps to the next match, `N` to the previous,
+  Esc unpins. Comma- or space-separate multiple values in a field to
+  OR them. Values match as substrings (`audit` matches `audit.create`,
+  `payment.audit`); the two fields AND together. Reopening `/` while
+  a search is active prefills the current query. `/` and `n`/`N` walk
+  forward from the cursor's current row rather than restarting at the
+  top of the list — `g` then `n` searches from the beginning.
+- Reworked list navigation in `zizq top` around an anchor-based
+  subscription model. The client only holds a buffer of rows around
+  the cursor and requests more as you scroll; the cursor is
+  identified by job id when tracking a search match (so it stays on
+  the same row through queue churn), and by depth when free-scrolling
+  (so the viewport row you're on stays stable while items shift
+  underneath). Scrolling past the loaded edge stops at the edge and
+  waits for a prefetch instead of blanking the viewport. Prefetch
+  subscribes are rate-limited to at most one per 100 ms per tab so
+  a held arrow key or `JobChanged` burst doesn't spam the server.
+- Reformatted the `zizq top` help bar in htop's key-and-label style
+  (no space between key and label; color contrast marks the boundary)
+  and added a `/Find` entry.
+- Added an in-memory `InFlightIndex` to the store, mirroring the
+  existing `ReadyIndex` and `ScheduledIndex`. Powers the in-flight
+  view in the admin API without walking the LSM tree.
+
 ## 0.5.0
 
 - Added `priority`, `ready_at`, and `attempts` range filters to
