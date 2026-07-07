@@ -65,8 +65,15 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // input mode when the user opens the `/` prompt.
     let search_mode = Arc::new(AtomicBool::new(false));
 
+    // Shared flag telling the reader that a modal prompt (currently
+    // just the delete confirmation) is open — while set, the reader
+    // still forwards `q` as `Event::Quit` but doesn't self-terminate.
+    // The app interprets Quit-in-modal as "cancel the modal"; killing
+    // the reader here would strand the user with no keyboard input.
+    let modal_mode = Arc::new(AtomicBool::new(false));
+
     // Spawn terminal input reader (blocking, runs in a thread).
-    events::read_terminal_events(tx.clone(), search_mode.clone());
+    events::read_terminal_events(tx.clone(), search_mode.clone(), modal_mode.clone());
 
     let host = args.admin.url.clone();
 
@@ -76,6 +83,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(host);
     app.set_ws_tx(ws_out_tx);
     app.set_search_mode_flag(search_mode);
+    app.set_modal_mode_flag(modal_mode);
 
     // Main event loop — process events as they arrive, redraw on tick.
     let mut tick = tokio::time::interval(Duration::from_millis(args.refresh_rate));

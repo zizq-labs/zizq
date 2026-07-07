@@ -158,7 +158,11 @@ pub type InputModeFlag = Arc<AtomicBool>;
 /// them to the event channel. `search_mode` is toggled by the App when
 /// entering / leaving the `/` search input prompt — the reader routes
 /// keystrokes accordingly.
-pub fn read_terminal_events(tx: mpsc::Sender<Event>, search_mode: InputModeFlag) {
+pub fn read_terminal_events(
+    tx: mpsc::Sender<Event>,
+    search_mode: InputModeFlag,
+    modal_mode: InputModeFlag,
+) {
     tokio::task::spawn_blocking(move || {
         use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -201,7 +205,16 @@ pub fn read_terminal_events(tx: mpsc::Sender<Event>, search_mode: InputModeFlag)
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         let _ = tx.blocking_send(Event::Quit);
-                        break;
+                        // In modal states (e.g. the delete confirmation
+                        // prompt) the app interprets Quit as "cancel
+                        // the modal", not "exit the app". Self-
+                        // terminating the reader here would kill key
+                        // input for the rest of the session. Stay alive
+                        // and let the app decide — the next non-modal
+                        // Quit will fall through and break as normal.
+                        if !modal_mode.load(Ordering::Acquire) {
+                            break;
+                        }
                     }
                     (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                         let _ = tx.blocking_send(Event::Suspend);

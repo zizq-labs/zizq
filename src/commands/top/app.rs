@@ -254,6 +254,13 @@ pub struct App {
     /// prompt is open so the reader forwards raw characters instead
     /// of interpreting shortcut keys.
     pub search_mode_flag: Option<InputModeFlag>,
+    /// Shared with the terminal input reader — set while a modal prompt
+    /// (currently just the delete confirmation) is open so the reader
+    /// forwards `q` as `Event::Quit` without self-terminating. The app
+    /// interprets Quit-in-modal as "cancel the modal" rather than
+    /// "exit the app", and killing the reader would strand the user
+    /// with no keyboard input for the rest of the session.
+    pub modal_mode_flag: Option<InputModeFlag>,
 }
 
 impl Clone for App {
@@ -285,6 +292,7 @@ impl Clone for App {
             pinned_job_id: self.pinned_job_id.clone(),
             pinned_locate_pending: self.pinned_locate_pending,
             search_mode_flag: self.search_mode_flag.clone(),
+            modal_mode_flag: self.modal_mode_flag.clone(),
         }
     }
 }
@@ -318,6 +326,7 @@ impl App {
             pinned_job_id: None,
             pinned_locate_pending: false,
             search_mode_flag: None,
+            modal_mode_flag: None,
         }
     }
 
@@ -329,8 +338,18 @@ impl App {
         self.search_mode_flag = Some(flag);
     }
 
+    pub fn set_modal_mode_flag(&mut self, flag: InputModeFlag) {
+        self.modal_mode_flag = Some(flag);
+    }
+
     fn set_search_mode(&self, on: bool) {
         if let Some(flag) = &self.search_mode_flag {
+            flag.store(on, Ordering::Release);
+        }
+    }
+
+    fn set_modal_mode(&self, on: bool) {
+        if let Some(flag) = &self.modal_mode_flag {
             flag.store(on, Ordering::Release);
         }
     }
@@ -580,6 +599,7 @@ impl App {
         let Some(id) = self.pending_delete.take() else {
             return;
         };
+        self.set_modal_mode(false);
         if let Some(tx) = &self.ws_tx {
             let msg = events::delete_job_message(id.clone());
             let _ = tx.try_send(msg);
@@ -587,6 +607,13 @@ impl App {
         self.ready_jobs.retain(|j| j.id != id);
         self.in_flight_jobs.retain(|j| j.id != id);
         self.scheduled_jobs.retain(|j| j.id != id);
+    }
+
+    /// Cancel the pending delete prompt and drop out of modal mode so
+    /// the terminal reader stops deferring `q` back to the app.
+    fn close_delete_prompt(&mut self) {
+        self.pending_delete = None;
+        self.set_modal_mode(false);
     }
 
     /// Apply server status fields from any message.
@@ -615,7 +642,12 @@ impl App {
                 // Quit while prompting cancels the prompt rather than
                 // exiting; a second `q` (or any other quit gesture) after
                 // cancellation will quit normally.
-                Event::CancelDelete | Event::Quit => self.pending_delete = None,
+                Event::CancelDelete | Event::Quit => self.close_delete_prompt(),
+                // `n` cancels the prompt (the help bar advertises "n No").
+                // The terminal reader unconditionally maps `n` to
+                // `SearchNext`, so we intercept it here. `N`
+                // (`SearchPrev`) gets the same treatment for symmetry.
+                Event::SearchNext | Event::SearchPrev => self.close_delete_prompt(),
                 _ => {}
             }
             return false;
@@ -703,6 +735,7 @@ impl App {
             Event::RequestDelete => {
                 if let Some(id) = self.selected_job_id() {
                     self.pending_delete = Some(id);
+                    self.set_modal_mode(true);
                 }
             }
             // Outside of an active prompt these are no-ops — the prompt
@@ -2087,6 +2120,59 @@ mod tests {
         let mut app = seed_ready_with_cursor("j1");
         app.handle_event(Event::RequestDelete);
         app.handle_event(Event::CancelDelete);
+        assert!(app.pending_delete.is_none());
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+    }
+
+    #[test]
+    fn opening_delete_prompt_sets_modal_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut app = seed_ready_with_cursor("j1");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.set_modal_mode_flag(flag.clone());
+        app.handle_event(Event::RequestDelete);
+        assert!(flag.load(Ordering::Acquire), "modal flag must be set");
+    }
+
+    #[test]
+    fn cancelling_delete_prompt_clears_modal_flag() {
+        // The whole point of the flag is that the terminal reader can
+        // tell whether a `q` should self-terminate. Clearing it on
+        // every close path (Cancel, Quit, n/N, confirm) is what stops
+        // the reader from staying alive forever.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut app = seed_ready_with_cursor("j1");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.set_modal_mode_flag(flag.clone());
+        app.handle_event(Event::RequestDelete);
+        app.handle_event(Event::Quit);
+        assert!(!flag.load(Ordering::Acquire), "modal flag must be cleared");
+        assert!(app.pending_delete.is_none());
+    }
+
+    #[test]
+    fn confirming_delete_clears_modal_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut app = seed_ready_with_cursor("j1");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.set_modal_mode_flag(flag.clone());
+        app.handle_event(Event::RequestDelete);
+        app.handle_event(Event::ConfirmDelete);
+        assert!(!flag.load(Ordering::Acquire), "modal flag must be cleared");
+    }
+
+    #[test]
+    fn n_during_prompt_cancels_delete() {
+        // The terminal reader maps `n` unconditionally to SearchNext.
+        // The delete prompt must intercept that as a "No" gesture —
+        // otherwise the help bar's "n No" hint would silently lie.
+        let mut app = seed_ready_with_cursor("j1");
+        app.handle_event(Event::RequestDelete);
+        assert!(app.pending_delete.is_some());
+        app.handle_event(Event::SearchNext);
         assert!(app.pending_delete.is_none());
         assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
     }

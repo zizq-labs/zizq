@@ -30,23 +30,18 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
     // prompt — replaces the shortcuts entirely so the user is never in
     // doubt about what `y` and `n` will do.
     if let Some(id) = &app.pending_delete {
+        // Full red bar, white text. Keys (y / n) are bold; the job id
+        // is bold; everything else is regular white on red.
+        let base = Style::default().fg(Color::White).bg(Color::Red);
+        let strong = base.add_modifier(Modifier::BOLD);
         let prompt = Paragraph::new(Line::from(vec![
-            Span::styled(
-                " Delete job ",
-                Style::default().fg(Color::Black).bg(Color::LightRed),
-            ),
-            Span::styled(
-                id.as_str(),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::LightRed)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("? ", Style::default().fg(Color::Black).bg(Color::LightRed)),
-            Span::styled("y", key_style),
-            Span::styled("Yes", label_style),
-            Span::styled(" n", key_style),
-            Span::styled("No", label_style),
+            Span::styled(" Delete job ", base),
+            Span::styled(id.as_str(), strong),
+            Span::styled("? ", base),
+            Span::styled("y", strong),
+            Span::styled(" Yes  ", base),
+            Span::styled("n", strong),
+            Span::styled(" No ", base),
         ]));
         frame.render_widget(prompt, area);
         return;
