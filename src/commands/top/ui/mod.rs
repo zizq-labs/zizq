@@ -204,6 +204,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         }
     }
 
@@ -226,6 +232,38 @@ mod tests {
         let mut app = new_app();
         app.status = ConnectionStatus::Connected;
         app.pending_delete = Some("j_abc123".into());
+        assert_ui_snapshot!(render_to_string(&app, 80, 10));
+    }
+
+    #[test]
+    fn render_search_prompt_empty() {
+        let mut app = new_app();
+        app.status = ConnectionStatus::Connected;
+        app.search_input = Some(crate::commands::top::app::SearchPrompt::default());
+        assert_ui_snapshot!(render_to_string(&app, 80, 10));
+    }
+
+    #[test]
+    fn render_search_prompt_with_typed_type_field() {
+        use crate::commands::top::app::SearchPrompt;
+        let mut app = new_app();
+        app.status = ConnectionStatus::Connected;
+        let mut prompt = SearchPrompt::default();
+        prompt.type_input = "send_welcome".into();
+        app.search_input = Some(prompt);
+        assert_ui_snapshot!(render_to_string(&app, 80, 10));
+    }
+
+    #[test]
+    fn render_search_prompt_active_queue_field() {
+        use crate::commands::top::app::{SearchField, SearchPrompt};
+        let mut app = new_app();
+        app.status = ConnectionStatus::Connected;
+        let mut prompt = SearchPrompt::default();
+        prompt.type_input = "send_welcome".into();
+        prompt.queue_input = "emails".into();
+        prompt.active = SearchField::Queue;
+        app.search_input = Some(prompt);
         assert_ui_snapshot!(render_to_string(&app, 80, 10));
     }
 
@@ -289,6 +327,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -317,6 +361,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -436,6 +486,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         }
     }
 
@@ -542,6 +598,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -570,6 +632,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -620,6 +688,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
     }
@@ -670,6 +744,12 @@ mod tests {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));
     }

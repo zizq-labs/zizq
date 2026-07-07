@@ -1,6 +1,5 @@
 ---
-source: src/commands/top/ui.rs
-assertion_line: 1119
+source: src/commands/top/ui/mod.rs
 expression: "render_to_string(&app, 90, 12)"
 ---
   Zizq 0.1.0
@@ -14,4 +13,4 @@ expression: "render_to_string(&app, 90, 12)"
                          ID   PRIORITY QUEUE                 DELAY   ATTEMPTS TYPE
                          j1          0 queue1                    -          0 type1
                          j2          0 queue1                    -          0 type1
- Tab Change Tab  i Info  p Resume  D Delete  q Quit   ↓ Resume to scroll further
+ TabChange Tab iInfo pResume /Find DDelete qQuit   ↓ Resume to scroll further

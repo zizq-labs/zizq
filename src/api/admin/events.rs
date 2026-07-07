@@ -25,12 +25,11 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
 use super::{
-    AdminEvent, AdminJob, AdminMessage, ClientMessage, JobChangeStatus, JobWindow, ListName,
-    ServerStatus,
+    AdminEvent, AdminJob, AdminMessage, ClientMessage, Direction, Fallback, FindAnchor,
+    JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus, SubscribeAnchor,
 };
 use crate::state::AppState;
 use crate::store::{self, StoreEvent};
-use crate::time::now_millis;
 
 /// Default subscription window size.
 const DEFAULT_LIMIT: usize = 200;
@@ -38,33 +37,35 @@ const DEFAULT_LIMIT: usize = 200;
 /// Maximum subscription window for free-tier connections.
 const FREE_TIER_CAP: usize = 10;
 
-/// Per-list subscription parameters.
+/// Per-list subscription parameters. The dashboard addresses rows by
+/// job id, not by numeric offset — see `store::WindowAnchor` docs.
 #[derive(Clone)]
 struct Subscription {
-    offset: usize,
+    anchor: store::WindowAnchor,
+    fallback: store::WindowFallback,
     limit: usize,
 }
 
 impl Default for Subscription {
     fn default() -> Self {
         Self {
-            offset: 0,
+            anchor: store::WindowAnchor::Head,
+            fallback: store::WindowFallback::Head,
             limit: DEFAULT_LIMIT,
         }
     }
 }
 
-/// Per-connection state tracking the previous capped windows.
+/// Per-connection state tracking the set of ids currently in each
+/// list's window. Position is irrelevant for change detection under
+/// anchor-based addressing — we just diff id sets.
 struct ConnectionState {
-    /// Previous ready window: sorted `(priority, id)` keys.
-    prev_ready: Vec<(u16, String)>,
-
-    /// Previous in-flight window: sorted `(dequeued_at, id)` keys, read
-    /// from the server-side `InFlightIndex` via `scan_in_flight_ids`.
-    prev_in_flight: Vec<(u64, String)>,
-
-    /// Previous scheduled window: sorted `(ready_at, id)` keys.
-    prev_scheduled: Vec<(u64, String)>,
+    /// IDs currently in the ready window (sorted by priority).
+    prev_ready: Vec<String>,
+    /// IDs currently in the in-flight window (sorted by dequeued_at).
+    prev_in_flight: Vec<String>,
+    /// IDs currently in the scheduled window (sorted by ready_at).
+    prev_scheduled: Vec<String>,
 
     /// Per-list subscription state.
     ready_sub: Subscription,
@@ -110,14 +111,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 // Client subscribe messages.
                 client_msg = client_rx.recv() => {
                     match client_msg {
-                        Some(ClientMessage::Subscribe { list, offset, limit }) => {
+                        Some(ClientMessage::Subscribe {
+                            list,
+                            anchor,
+                            limit,
+                        }) => {
                             handle_subscribe(
                                 &send_state,
                                 store,
                                 &mut conn,
                                 &mut sender,
                                 list,
-                                offset,
+                                anchor,
                                 limit,
                             )
                             .await;
@@ -143,6 +148,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             // connected client (including this one).
                             if let Err(e) = send_state.store.delete_job(&id).await {
                                 tracing::warn!(%e, %id, "admin ws: delete_job failed");
+                            }
+                        }
+                        Some(ClientMessage::Find {
+                            list,
+                            anchor,
+                            direction,
+                            query,
+                            limit,
+                        }) => {
+                            let event =
+                                handle_find(&send_state, list, anchor, direction, query, limit)
+                                    .await;
+                            let msg = AdminMessage {
+                                server: server_status(&send_state),
+                                event,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                         None => break,
@@ -273,11 +298,12 @@ fn can_show_live_queue(state: &AppState) -> bool {
         .is_ok()
 }
 
-/// Query each set: ready, in-flight, scheduled jobs, send a `JobSnapshot`, and
-/// return initial `ConnectionState`.
+/// Send the initial `JobSnapshot` covering all three lists (each
+/// anchored at `Head` by default) and build the connection state.
 ///
-/// When the license does not permit live queue detail, job lists are empty —
-/// the header totals are still populated via `ServerStatus`.
+/// When the license does not permit live queue detail, the connection
+/// still exists but every list request comes back with the free-tier
+/// capped limit.
 async fn send_initial_snapshot(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -288,7 +314,8 @@ async fn send_initial_snapshot(
             Subscription::default()
         } else {
             Subscription {
-                offset: 0,
+                anchor: store::WindowAnchor::Head,
+                fallback: store::WindowFallback::Head,
                 limit: FREE_TIER_CAP,
             }
         }
@@ -298,8 +325,9 @@ async fn send_initial_snapshot(
 }
 
 /// Re-send a full snapshot using the existing connection's subscription
-/// windows and detail flag, used to recover from a `broadcast` lag without
-/// losing the client's prior `SetDetailLevel` / `Subscribe` choices.
+/// windows and detail flag, used to recover from a `broadcast` lag
+/// without losing the client's prior `SetDetailLevel` / `Subscribe`
+/// choices.
 async fn resync_snapshot(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -325,9 +353,7 @@ async fn send_snapshot_with_subs(
     detail: bool,
 ) -> Result<ConnectionState, String> {
     // Seed a ConnectionState with empty diff baselines — build_snapshot
-    // will populate them and return the snapshot event. The in-flight
-    // source of truth lives in the server-side `InFlightIndex`, so there
-    // is no per-connection set to pre-populate.
+    // will populate them from the initial `list_window_*` responses.
     let mut conn = ConnectionState {
         prev_ready: Vec::new(),
         prev_in_flight: Vec::new(),
@@ -428,23 +454,31 @@ async fn process_store_event(
     }
 }
 
-/// Handle a subscribe message: update subscription, reset diff state, re-send snapshot.
+/// Handle a subscribe message: update the per-list subscription and
+/// re-emit a snapshot for all three lists.
+///
+/// Only the list named in the request has its anchor swapped — the
+/// other two lists' subs are preserved and re-scanned so the client
+/// receives a fully-consistent snapshot.
 async fn handle_subscribe(
     state: &AppState,
     store: &store::Store,
     conn: &mut ConnectionState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     list: ListName,
-    offset: usize,
+    anchor: SubscribeAnchor,
     limit: usize,
 ) {
-    let sub = if can_show_live_queue(state) {
-        Subscription { offset, limit }
+    let (store_anchor, store_fallback) = to_store_anchor(anchor);
+    let limit = if can_show_live_queue(state) {
+        limit
     } else {
-        Subscription {
-            offset: 0,
-            limit: FREE_TIER_CAP,
-        }
+        FREE_TIER_CAP
+    };
+    let sub = Subscription {
+        anchor: store_anchor,
+        fallback: store_fallback,
+        limit,
     };
     match list {
         ListName::Ready => {
@@ -461,242 +495,383 @@ async fn handle_subscribe(
         }
     }
 
-    // Re-send a full snapshot at the new window.
-    let ready_jobs = store
-        .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
-        .await
-        .unwrap_or_default();
-    conn.prev_ready = ready_jobs
-        .iter()
-        .map(|j| (j.priority, j.id.clone()))
-        .collect();
-    let ready_window = JobWindow {
-        offset: conn.ready_sub.offset,
-        items: to_admin_jobs(store, ready_jobs, conn.detail).await,
-    };
-
-    let in_flight_items = store
-        .list_in_flight_jobs(conn.in_flight_sub.offset, conn.in_flight_sub.limit)
-        .await
-        .unwrap_or_default();
-    conn.prev_in_flight = in_flight_items
-        .iter()
-        .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
-        .collect();
-    let in_flight_window = JobWindow {
-        offset: conn.in_flight_sub.offset,
-        items: to_admin_jobs(store, in_flight_items, conn.detail).await,
-    };
-
-    let scheduled_jobs = store
-        .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
-        .await
-        .unwrap_or_default();
-    conn.prev_scheduled = scheduled_jobs
-        .iter()
-        .map(|j| (j.ready_at, j.id.clone()))
-        .collect();
-    let scheduled_window = JobWindow {
-        offset: conn.scheduled_sub.offset,
-        items: to_admin_jobs(store, scheduled_jobs, conn.detail).await,
-    };
-
+    let event = build_snapshot(store, conn).await;
     let snapshot = AdminMessage {
         server: server_status(state),
-        event: AdminEvent::JobSnapshot {
-            ready: ready_window,
-            in_flight: in_flight_window,
-            scheduled: scheduled_window,
-        },
+        event,
     };
-
     if let Ok(json) = serde_json::to_string(&snapshot) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
 }
 
-/// Diff the ready window: scan IDs from the ReadyIndex using subscription
-/// offset/limit, compare against `prev_ready`, emit adds/removes.
+/// Translate the wire `SubscribeAnchor` into the store's
+/// `(WindowAnchor, WindowFallback)` pair. `Head` and `Tail` don't have
+/// a meaningful fallback — the value we pick is only consulted when
+/// the anchor's job id is missing, and neither of these can miss.
+fn to_store_anchor(anchor: SubscribeAnchor) -> (store::WindowAnchor, store::WindowFallback) {
+    match anchor {
+        SubscribeAnchor::Head => (store::WindowAnchor::Head, store::WindowFallback::Head),
+        SubscribeAnchor::Tail => (store::WindowAnchor::Tail, store::WindowFallback::Tail),
+        SubscribeAnchor::Offset { offset } => (
+            store::WindowAnchor::Offset(offset),
+            store::WindowFallback::Tail,
+        ),
+        SubscribeAnchor::Around { id, fallback } => {
+            let f = match fallback {
+                Fallback::Head => store::WindowFallback::Head,
+                Fallback::Tail => store::WindowFallback::Tail,
+                Fallback::Nowhere => store::WindowFallback::Nowhere,
+            };
+            (store::WindowAnchor::Around(id), f)
+        }
+    }
+}
+
+/// Handle a `Find` client message: translate the wire enums into the
+/// store's shape, dispatch to the appropriate `Store::find_*`, and
+/// build a `FindResult` event. See `store::find` module docs for the
+/// walk semantics and race-free rationale.
+async fn handle_find(
+    state: &AppState,
+    list: ListName,
+    anchor: FindAnchor,
+    direction: Direction,
+    query: SearchQuery,
+    limit: usize,
+) -> AdminEvent {
+    // Nonsense direction/anchor combos short-circuit to a null result:
+    // `Start + Backward` and `End + Forward` have nothing to search.
+    let nonsense = matches!(
+        (&anchor, direction),
+        (FindAnchor::Start, Direction::Backward) | (FindAnchor::End, Direction::Forward)
+    );
+    if nonsense {
+        return AdminEvent::FindResult {
+            list,
+            matched_position: None,
+            window: empty_window(),
+        };
+    }
+
+    let anchor_id = match anchor {
+        FindAnchor::JobId { id } => Some(id),
+        FindAnchor::Start | FindAnchor::End => None,
+    };
+    let store_direction = match direction {
+        Direction::Forward => store::FindDirection::Forward,
+        Direction::Backward => store::FindDirection::Backward,
+        Direction::Locate => store::FindDirection::Locate,
+    };
+
+    let outcome = match list {
+        ListName::Ready => {
+            state
+                .store
+                .find_ready(anchor_id, store_direction, query.queues, query.types, limit)
+                .await
+        }
+        ListName::InFlight => {
+            state
+                .store
+                .find_in_flight(anchor_id, store_direction, query.queues, query.types, limit)
+                .await
+        }
+        ListName::Scheduled => {
+            state
+                .store
+                .find_scheduled(anchor_id, store_direction, query.queues, query.types, limit)
+                .await
+        }
+    };
+
+    // Look up the list's total so the client can render its depth-bar
+    // marker. Under the anchor-based Subscribe model the depth-bar is
+    // decoupled from the window shape, so we consult the index length
+    // here rather than piggybacking on `FindOutcome`.
+    let total = match list {
+        ListName::Ready => state.store.ready_count(),
+        ListName::InFlight => state.store.in_flight_count(),
+        ListName::Scheduled => state.store.scheduled_count(),
+    };
+
+    match outcome {
+        Ok(Some(outcome)) => {
+            let matched_id = outcome
+                .window_items
+                .get(
+                    outcome
+                        .matched_position
+                        .saturating_sub(outcome.window_offset),
+                )
+                .map(|j| j.id.clone());
+            AdminEvent::FindResult {
+                list,
+                matched_position: Some(outcome.matched_position),
+                window: JobWindow {
+                    items: outcome
+                        .window_items
+                        .into_iter()
+                        .map(|j| AdminJob::from_store(j, false))
+                        .collect(),
+                    first_position: outcome.window_offset,
+                    total,
+                    resolved_anchor: matched_id,
+                },
+            }
+        }
+        Ok(None) => AdminEvent::FindResult {
+            list,
+            matched_position: None,
+            window: empty_window(),
+        },
+        Err(e) => {
+            tracing::error!(%e, "admin ws: find failed");
+            AdminEvent::FindResult {
+                list,
+                matched_position: None,
+                window: empty_window(),
+            }
+        }
+    }
+}
+
+/// Build an empty `JobWindow` for "no match" / error paths.
+fn empty_window() -> JobWindow {
+    JobWindow {
+        items: Vec::new(),
+        first_position: 0,
+        total: 0,
+        resolved_anchor: None,
+    }
+}
+
+/// Diff the ready window: re-fetch it via the subscription's anchor
+/// and emit `JobChanged` events for ids that entered or left the
+/// window since last diff.
 async fn diff_ready(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current = store
-        .scan_ready_ids(conn.ready_sub.offset, conn.ready_sub.limit)
-        .await;
-    let (adds, removes) = diff_sorted(&current, &conn.prev_ready);
-    let mut events = Vec::with_capacity(adds.len() + removes.len());
-
-    // Emit removals first so the TUI frees space before inserts.
-    for (_priority, id) in removes {
-        events.push(AdminEvent::JobChanged {
-            id,
-            status: JobChangeStatus::ReadyRemoved,
-            job: None,
+    let outcome = store
+        .list_window_ready(
+            conn.ready_sub.anchor.clone(),
+            conn.ready_sub.fallback,
+            conn.ready_sub.limit,
+        )
+        .await
+        .unwrap_or_else(|_| store::WindowOutcome {
+            items: Vec::new(),
+            first_position: 0,
+            total: 0,
+            resolved_anchor: None,
         });
-    }
-
-    // Emit additions — fetch metadata only for genuinely new IDs.
-    for (_priority, id) in adds {
-        if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
-            events.push(AdminEvent::JobChanged {
-                id,
-                status: JobChangeStatus::Ready,
-                job: Some(AdminJob::from_store(job, conn.detail)),
-            });
-        }
-    }
-
-    conn.prev_ready = current;
-    events
+    diff_list_window(
+        conn,
+        outcome,
+        ListSelector::Ready,
+        JobChangeStatus::Ready,
+        JobChangeStatus::ReadyRemoved,
+    )
+    .await
 }
 
-/// Diff the in-flight window: scan IDs from the InFlightIndex using
-/// subscription offset/limit, compare against `prev_in_flight`, emit adds/removes.
+/// Diff the in-flight window.
 async fn diff_in_flight(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current = store
-        .scan_in_flight_ids(conn.in_flight_sub.offset, conn.in_flight_sub.limit)
-        .await;
-    let (adds, removes) = diff_sorted(&current, &conn.prev_in_flight);
-    let mut events = Vec::with_capacity(adds.len() + removes.len());
-
-    // Emit removals.
-    for (_dequeued_at, id) in removes {
-        events.push(AdminEvent::JobChanged {
-            id,
-            status: JobChangeStatus::InFlightRemoved,
-            job: None,
+    let outcome = store
+        .list_window_in_flight(
+            conn.in_flight_sub.anchor.clone(),
+            conn.in_flight_sub.fallback,
+            conn.in_flight_sub.limit,
+        )
+        .await
+        .unwrap_or_else(|_| store::WindowOutcome {
+            items: Vec::new(),
+            first_position: 0,
+            total: 0,
+            resolved_anchor: None,
         });
-    }
-
-    // Emit additions — fetch metadata for new IDs.
-    for (_dequeued_at, id) in adds {
-        if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
-            events.push(AdminEvent::JobChanged {
-                id,
-                status: JobChangeStatus::InFlight,
-                job: Some(AdminJob::from_store(job, conn.detail)),
-            });
-        }
-    }
-
-    conn.prev_in_flight = current;
-    events
+    diff_list_window(
+        conn,
+        outcome,
+        ListSelector::InFlight,
+        JobChangeStatus::InFlight,
+        JobChangeStatus::InFlightRemoved,
+    )
+    .await
 }
 
-/// Diff the scheduled window: scan IDs from the ScheduledIndex using
-/// subscription offset/limit, compare against `prev_scheduled`, emit adds/removes.
+/// Diff the scheduled window.
 async fn diff_scheduled(store: &store::Store, conn: &mut ConnectionState) -> Vec<AdminEvent> {
-    let current = store
-        .scan_scheduled_ids(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
-        .await;
-    let (adds, removes) = diff_sorted(&current, &conn.prev_scheduled);
-    let mut events = Vec::with_capacity(adds.len() + removes.len());
+    let outcome = store
+        .list_window_scheduled(
+            conn.scheduled_sub.anchor.clone(),
+            conn.scheduled_sub.fallback,
+            conn.scheduled_sub.limit,
+        )
+        .await
+        .unwrap_or_else(|_| store::WindowOutcome {
+            items: Vec::new(),
+            first_position: 0,
+            total: 0,
+            resolved_anchor: None,
+        });
+    diff_list_window(
+        conn,
+        outcome,
+        ListSelector::Scheduled,
+        JobChangeStatus::Scheduled,
+        JobChangeStatus::ScheduledRemoved,
+    )
+    .await
+}
 
+/// Which of the three list buffers a diff/refresh operates over.
+#[derive(Copy, Clone)]
+enum ListSelector {
+    Ready,
+    InFlight,
+    Scheduled,
+}
+
+/// Shared diff body. Given a freshly-scanned window and a selector
+/// for which `prev_*` list to compare/update, emits `JobChanged`
+/// events for the added and removed ids.
+async fn diff_list_window(
+    conn: &mut ConnectionState,
+    outcome: store::WindowOutcome,
+    selector: ListSelector,
+    added_status: JobChangeStatus,
+    removed_status: JobChangeStatus,
+) -> Vec<AdminEvent> {
+    let current_ids: Vec<String> = outcome.items.iter().map(|j| j.id.clone()).collect();
+    let prev = match selector {
+        ListSelector::Ready => &mut conn.prev_ready,
+        ListSelector::InFlight => &mut conn.prev_in_flight,
+        ListSelector::Scheduled => &mut conn.prev_scheduled,
+    };
+    let (added_ids, removed_ids) = diff_ids(&current_ids, prev);
+    *prev = current_ids;
+
+    let mut events = Vec::with_capacity(added_ids.len() + removed_ids.len());
     // Emit removals first so the TUI frees space before inserts.
-    for (_ready_at, id) in removes {
+    for id in removed_ids {
         events.push(AdminEvent::JobChanged {
             id,
-            status: JobChangeStatus::ScheduledRemoved,
+            status: removed_status,
             job: None,
         });
     }
-
-    // Emit additions — fetch metadata only for genuinely new IDs.
-    for (_ready_at, id) in adds {
-        if let Ok(Some(job)) = store.get_job(now_millis(), &id).await {
+    for id in added_ids {
+        // The `WindowOutcome` already contains the hydrated job, so no
+        // extra `get_job` round-trip is needed.
+        if let Some(job) = outcome.items.iter().find(|j| j.id == id) {
             events.push(AdminEvent::JobChanged {
-                id,
-                status: JobChangeStatus::Scheduled,
-                job: Some(AdminJob::from_store(job, conn.detail)),
+                id: id.clone(),
+                status: added_status,
+                job: Some(AdminJob::from_store(job.clone(), conn.detail)),
             });
         }
     }
-
-    conn.prev_scheduled = current;
     events
 }
 
-/// Convert a list of store jobs to admin jobs, hydrating payloads when detail
-/// mode is active. The list functions (`list_ready_jobs`, etc.) don't read
-/// payloads from disk, so when detail is on we re-fetch each job via `get_job`.
-async fn to_admin_jobs(store: &store::Store, jobs: Vec<store::Job>, detail: bool) -> Vec<AdminJob> {
-    if !detail {
-        return jobs
-            .into_iter()
-            .map(|j| AdminJob::from_store(j, false))
-            .collect();
-    }
-    let mut result = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let hydrated = store.get_job(now_millis(), &job.id).await;
-        match hydrated {
-            Ok(Some(j)) => result.push(AdminJob::from_store(j, true)),
-            _ => result.push(AdminJob::from_store(job, true)),
-        }
-    }
-    result
-}
-
-/// Build a fresh `JobSnapshot` event and reset the connection's diff baseline.
-///
-/// Used when incremental diffs can't capture the change (e.g. field-level
-/// patches that don't alter the ID set).
+/// Build a fresh `JobSnapshot` event and reset the connection's diff
+/// baseline. Called after connect, resubscribe, and `SetDetailLevel`.
 async fn build_snapshot(store: &store::Store, conn: &mut ConnectionState) -> AdminEvent {
-    let capped_ready = store
-        .list_ready_jobs(conn.ready_sub.offset, conn.ready_sub.limit)
-        .await
-        .unwrap_or_default();
-
-    let capped_in_flight = store
-        .list_in_flight_jobs(conn.in_flight_sub.offset, conn.in_flight_sub.limit)
-        .await
-        .unwrap_or_default();
-
-    let capped_scheduled = store
-        .list_scheduled_jobs(conn.scheduled_sub.offset, conn.scheduled_sub.limit)
-        .await
-        .unwrap_or_default();
-
-    // Reset diff baselines.
-    conn.prev_ready = capped_ready
-        .iter()
-        .map(|j| (j.priority, j.id.clone()))
-        .collect();
-    conn.prev_in_flight = capped_in_flight
-        .iter()
-        .map(|j| (j.dequeued_at.unwrap_or(0), j.id.clone()))
-        .collect();
-    conn.prev_scheduled = capped_scheduled
-        .iter()
-        .map(|j| (j.ready_at, j.id.clone()))
-        .collect();
-
-    let ready_items = to_admin_jobs(store, capped_ready, conn.detail).await;
-    let in_flight_items = to_admin_jobs(store, capped_in_flight, conn.detail).await;
-    let scheduled_items = to_admin_jobs(store, capped_scheduled, conn.detail).await;
+    let ready = fetch_window(store, conn, ListSelector::Ready).await;
+    let in_flight = fetch_window(store, conn, ListSelector::InFlight).await;
+    let scheduled = fetch_window(store, conn, ListSelector::Scheduled).await;
 
     AdminEvent::JobSnapshot {
-        ready: JobWindow {
-            offset: conn.ready_sub.offset,
-            items: ready_items,
-        },
-        in_flight: JobWindow {
-            offset: conn.in_flight_sub.offset,
-            items: in_flight_items,
-        },
-        scheduled: JobWindow {
-            offset: conn.scheduled_sub.offset,
-            items: scheduled_items,
-        },
+        ready,
+        in_flight,
+        scheduled,
     }
 }
 
-/// Diff two sorted slices, returning `(added, removed)` elements.
-///
-/// Both slices must be sorted by their natural `Ord`. Elements present
-/// in `current` but not `previous` are "added"; elements in `previous`
-/// but not `current` are "removed".
-///
-/// Used by both `diff_ready` and `diff_in_flight` to compare capped
-/// windows against their previous state.
+/// Fetch a `JobWindow` for one list and update the connection's
+/// `prev_*` baseline to match. Shared by `build_snapshot` (all three
+/// lists) and `handle_subscribe` (one list at a time via
+/// `build_snapshot` too).
+async fn fetch_window(
+    store: &store::Store,
+    conn: &mut ConnectionState,
+    selector: ListSelector,
+) -> JobWindow {
+    let (outcome, prev) = match selector {
+        ListSelector::Ready => (
+            store
+                .list_window_ready(
+                    conn.ready_sub.anchor.clone(),
+                    conn.ready_sub.fallback,
+                    conn.ready_sub.limit,
+                )
+                .await,
+            &mut conn.prev_ready,
+        ),
+        ListSelector::InFlight => (
+            store
+                .list_window_in_flight(
+                    conn.in_flight_sub.anchor.clone(),
+                    conn.in_flight_sub.fallback,
+                    conn.in_flight_sub.limit,
+                )
+                .await,
+            &mut conn.prev_in_flight,
+        ),
+        ListSelector::Scheduled => (
+            store
+                .list_window_scheduled(
+                    conn.scheduled_sub.anchor.clone(),
+                    conn.scheduled_sub.fallback,
+                    conn.scheduled_sub.limit,
+                )
+                .await,
+            &mut conn.prev_scheduled,
+        ),
+    };
+    let outcome = outcome.unwrap_or_else(|_| store::WindowOutcome {
+        items: Vec::new(),
+        first_position: 0,
+        total: 0,
+        resolved_anchor: None,
+    });
+    *prev = outcome.items.iter().map(|j| j.id.clone()).collect();
+
+    let admin_items: Vec<AdminJob> = outcome
+        .items
+        .into_iter()
+        .map(|j| AdminJob::from_store(j, conn.detail))
+        .collect();
+    JobWindow {
+        items: admin_items,
+        first_position: outcome.first_position,
+        total: outcome.total,
+        resolved_anchor: outcome.resolved_anchor,
+    }
+}
+
+/// Diff two id lists (each sorted per the list's ordering key),
+/// returning `(added, removed)` ids.
+fn diff_ids(current: &[String], previous: &[String]) -> (Vec<String>, Vec<String>) {
+    let prev_set: std::collections::HashSet<&String> = previous.iter().collect();
+    let curr_set: std::collections::HashSet<&String> = current.iter().collect();
+    let added: Vec<String> = current
+        .iter()
+        .filter(|id| !prev_set.contains(id))
+        .cloned()
+        .collect();
+    let removed: Vec<String> = previous
+        .iter()
+        .filter(|id| !curr_set.contains(id))
+        .cloned()
+        .collect();
+    (added, removed)
+}
+
+/// Legacy sorted-slice diff (unused by the new anchor-based flow but
+/// retained for the tests that touched it directly). Elements
+/// present in `current` but not `previous` are "added"; elements in
+/// `previous` but not `current` are "removed".
+#[allow(dead_code)]
 fn diff_sorted<K: Ord + Clone>(
     current: &[(K, String)],
     previous: &[(K, String)],

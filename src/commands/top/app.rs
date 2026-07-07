@@ -3,12 +3,99 @@
 
 //! TUI application state model.
 
-use tokio::sync::mpsc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
-use crate::api::admin::{AdminJob, JobChangeStatus, JobWindow, ServerStatus};
+use tokio::sync::mpsc;
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
+
+use crate::api::admin::{
+    AdminJob, Direction, Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery,
+    ServerStatus, SubscribeAnchor,
+};
 use crate::license::Tier;
 
-use super::events::{self, Event};
+use super::events::{self, Event, InputModeFlag};
+
+/// Which of the two search prompt fields currently receives input.
+/// Type takes focus first — it's the more common initial filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchField {
+    #[default]
+    Type,
+    Queue,
+}
+
+impl SearchField {
+    fn toggle(self) -> Self {
+        match self {
+            SearchField::Type => SearchField::Queue,
+            SearchField::Queue => SearchField::Type,
+        }
+    }
+}
+
+/// State of the `/` search prompt: two independent single-line input
+/// fields (Type and Queue) plus which one is currently focused. Enter
+/// combines both into a `SearchQuery`; Tab switches fields.
+#[derive(Clone, Default)]
+pub struct SearchPrompt {
+    pub type_input: Input,
+    pub queue_input: Input,
+    pub active: SearchField,
+}
+
+impl SearchPrompt {
+    pub fn active_input(&self) -> &Input {
+        match self.active {
+            SearchField::Type => &self.type_input,
+            SearchField::Queue => &self.queue_input,
+        }
+    }
+
+    fn active_input_mut(&mut self) -> &mut Input {
+        match self.active {
+            SearchField::Type => &mut self.type_input,
+            SearchField::Queue => &mut self.queue_input,
+        }
+    }
+
+    fn switch_field(&mut self) {
+        self.active = self.active.toggle();
+    }
+
+    /// Split a field's value on commas or whitespace into non-empty
+    /// tokens. Lets users filter by multiple queues or types from a
+    /// single field (e.g. `emails, billing`).
+    fn tokens(value: &str) -> Vec<String> {
+        value
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    pub fn to_query(&self) -> SearchQuery {
+        SearchQuery {
+            queues: Self::tokens(self.queue_input.value()),
+            types: Self::tokens(self.type_input.value()),
+        }
+    }
+
+    /// Build a prompt pre-filled from a previously-submitted query.
+    /// Used when `/` is pressed with an active search so the user can
+    /// tweak the existing filters instead of retyping from scratch.
+    /// Multi-value fields are joined with `, ` (the same delimiter
+    /// `to_query` accepts on the way back in).
+    pub fn from_query(query: &SearchQuery) -> Self {
+        Self {
+            type_input: query.types.join(", ").into(),
+            queue_input: query.queues.join(", ").into(),
+            active: SearchField::default(),
+        }
+    }
+}
 
 /// Active tab in the TUI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,31 +140,67 @@ pub enum ConnectionStatus {
 }
 
 /// Per-list scroll and buffering state.
+///
+/// Hybrid model: the *authoritative* cursor is `cursor_id` (a job id),
+/// but a numeric mirror (`cursor`) is derived from it on each buffer
+/// update. Scroll math still works numerically — moves compute a
+/// new numeric position, look up the id at that position, and re-pin
+/// `cursor_id`. When the queue churns underneath us, `cursor_id`
+/// stays anchored to the same *job*; on the next diff/snapshot we
+/// recompute the numeric `cursor` from wherever that job now sits.
+/// If the job leaves the buffer entirely we fire a `Find { Locate }`
+/// to relocate — same mechanism as the pinned-search path.
 #[derive(Clone)]
 pub struct ListState {
-    /// Selected row index in the full (server-side) list.
+    /// Job id of the selected row — authoritative. `None` when there
+    /// is no selection (empty list or transient "cursor lost" state).
+    pub cursor_id: Option<String>,
+    /// Numeric mirror of `cursor_id`, re-derived on every buffer
+    /// update. Kept for the existing scroll math + rendering paths.
     pub cursor: usize,
-    /// First visible row in the viewport.
+    /// First visible row in the viewport (numeric position).
     pub scroll_pos: usize,
-    /// Offset of buffered data from server.
+    /// Position of `items[0]` in the underlying sorted list, as of
+    /// the last received `JobWindow`. Zero when there is no buffer.
     pub buffer_offset: usize,
-    /// Whether the cursor should follow the bottom of the list.
+    /// Total items in the list, as of the last received `JobWindow`.
+    /// Server's `ServerStatus.total_*` counters are the same value in
+    /// steady state but land via a different code path.
+    pub total: usize,
+    /// Whether the cursor should track the bottom of the list.
     pub follow_bottom: bool,
-    /// Last subscribe (offset, limit) sent — used to avoid duplicate requests.
-    last_subscribe: Option<(usize, usize)>,
+    /// Last `(SubscribeAnchor, limit)` sent — used to avoid duplicate
+    /// requests when `maybe_prefetch` fires repeatedly on the same
+    /// underlying state.
+    last_subscribe: Option<(SubscribeAnchor, usize)>,
+    /// When the last `maybe_prefetch` subscribe was sent for this tab.
+    /// Used to rate-limit prefetches so held-down arrow keys and
+    /// drain-driven `JobChanged` bursts don't spam the server with
+    /// near-identical subscribes at key-repeat / event-arrival cadence.
+    last_prefetch_at: Option<Instant>,
 }
 
 impl Default for ListState {
     fn default() -> Self {
         Self {
+            cursor_id: None,
             cursor: 0,
             scroll_pos: 0,
             buffer_offset: 0,
+            total: 0,
             follow_bottom: false,
             last_subscribe: None,
+            last_prefetch_at: None,
         }
     }
 }
+
+/// Minimum interval between prefetch subscribes for a single tab.
+/// The key-based dedup handles held-down arrows while the cursor is
+/// stuck at the buffer edge, but once responses start arriving (or
+/// drain events start eating into the buffer) the anchor moves and
+/// dedup no longer helps. This throttle covers those cases.
+const PREFETCH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Top-level application state for the TUI.
 pub struct App {
@@ -109,6 +232,35 @@ pub struct App {
     /// is restricted to confirming (`y`) or cancelling (`n` / Esc / `q`).
     pub pending_delete: Option<String>,
     pub ws_tx: Option<mpsc::Sender<String>>,
+    /// Current search state:
+    /// - `search_input`: `Some(text)` while the `/` prompt is open,
+    ///   holding the in-progress query string.
+    /// - `search_query`: the last query submitted, remembered so `n`
+    ///   and `N` can step through subsequent matches.
+    /// - `pinned_job_id`: id of the job the cursor is following. When
+    ///   set, the cursor tracks this specific job's row wherever it
+    ///   moves in the list; on each buffer update we re-locate its
+    ///   local index. Cleared when the user presses Esc, when the
+    ///   server reports the job no longer exists, or when the user
+    ///   opens a fresh search.
+    pub search_input: Option<SearchPrompt>,
+    pub search_query: Option<SearchQuery>,
+    pub pinned_job_id: Option<String>,
+    /// True while a `Locate` request for the pinned job is in flight —
+    /// suppresses duplicate follow-up requests when a burst of
+    /// `JobChanged` events lands before the response.
+    pub pinned_locate_pending: bool,
+    /// Shared with the terminal input reader — set while the search
+    /// prompt is open so the reader forwards raw characters instead
+    /// of interpreting shortcut keys.
+    pub search_mode_flag: Option<InputModeFlag>,
+    /// Shared with the terminal input reader — set while a modal prompt
+    /// (currently just the delete confirmation) is open so the reader
+    /// forwards `q` as `Event::Quit` without self-terminating. The app
+    /// interprets Quit-in-modal as "cancel the modal" rather than
+    /// "exit the app", and killing the reader would strand the user
+    /// with no keyboard input for the rest of the session.
+    pub modal_mode_flag: Option<InputModeFlag>,
 }
 
 impl Clone for App {
@@ -135,6 +287,12 @@ impl Clone for App {
             paused: self.paused,
             pending_delete: self.pending_delete.clone(),
             ws_tx: self.ws_tx.clone(),
+            search_input: self.search_input.clone(),
+            search_query: self.search_query.clone(),
+            pinned_job_id: self.pinned_job_id.clone(),
+            pinned_locate_pending: self.pinned_locate_pending,
+            search_mode_flag: self.search_mode_flag.clone(),
+            modal_mode_flag: self.modal_mode_flag.clone(),
         }
     }
 }
@@ -163,11 +321,37 @@ impl App {
             paused: false,
             pending_delete: None,
             ws_tx: None,
+            search_input: None,
+            search_query: None,
+            pinned_job_id: None,
+            pinned_locate_pending: false,
+            search_mode_flag: None,
+            modal_mode_flag: None,
         }
     }
 
     pub fn set_ws_tx(&mut self, tx: mpsc::Sender<String>) {
         self.ws_tx = Some(tx);
+    }
+
+    pub fn set_search_mode_flag(&mut self, flag: InputModeFlag) {
+        self.search_mode_flag = Some(flag);
+    }
+
+    pub fn set_modal_mode_flag(&mut self, flag: InputModeFlag) {
+        self.modal_mode_flag = Some(flag);
+    }
+
+    fn set_search_mode(&self, on: bool) {
+        if let Some(flag) = &self.search_mode_flag {
+            flag.store(on, Ordering::Release);
+        }
+    }
+
+    fn set_modal_mode(&self, on: bool) {
+        if let Some(flag) = &self.modal_mode_flag {
+            flag.store(on, Ordering::Release);
+        }
     }
 
     /// Get the total count for the active tab.
@@ -188,16 +372,16 @@ impl App {
         }
     }
 
-    /// Send a subscribe message over WebSocket.
-    fn send_subscribe(&self, tab: Tab, offset: usize, limit: usize) {
+    /// Send a subscribe message over WebSocket with the given anchor.
+    fn send_subscribe(&self, tab: Tab, anchor: SubscribeAnchor, limit: usize) {
         if let Some(tx) = &self.ws_tx {
-            let msg = events::subscribe_message(tab.list_name(), offset, limit);
+            let msg = events::subscribe_message(tab.list_name(), anchor, limit);
             let _ = tx.try_send(msg);
         }
     }
 
-    /// Re-subscribe all tabs with a window sized to the current viewport.
-    /// Called when the terminal is resized.
+    /// Re-subscribe all tabs with a fresh window centered on each
+    /// tab's cursor. Called when the terminal is resized.
     pub fn resubscribe_all(&mut self) {
         if self.subscription_limit.is_some() {
             return;
@@ -208,25 +392,49 @@ impl App {
         }
         let limit = vh * 3;
         for tab in [Tab::InFlight, Tab::Ready, Tab::Scheduled] {
-            let ls = &mut self.list_states[tab.idx()];
-            let offset = ls.cursor.saturating_sub(limit / 2);
-            ls.last_subscribe = Some((offset, limit));
-            if let Some(tx) = &self.ws_tx {
-                let msg = events::subscribe_message(tab.list_name(), offset, limit);
-                let _ = tx.try_send(msg);
-            }
+            let anchor = self.anchor_for_prefetch(tab);
+            self.list_states[tab.idx()].last_subscribe = Some((anchor.clone(), limit));
+            self.send_subscribe(tab, anchor, limit);
         }
     }
 
+    /// Choose the anchor to use for a `Subscribe` prefetch on `tab`.
+    ///
+    /// Two navigation intents map to two anchor kinds:
+    ///
+    /// - **Pinned / following a specific job** (search, `n`/`N`): use
+    ///   `Around(pinned_id, Nowhere)` so the cursor tracks that job as
+    ///   the queue churns. If the job has been processed the server
+    ///   returns an empty window and the client unpins.
+    /// - **Depth-based navigation** (arrow keys, page down, plain
+    ///   scrolling): use `Offset(cursor_depth - vh)` so the returned
+    ///   window sits roughly around the cursor's current depth. Under
+    ///   drain the server clamps to the current tail rather than
+    ///   returning an empty window — no dead space, no teleporting
+    ///   to Head because a specific job vanished.
+    ///
+    /// `G` and `g` are handled outside this helper: they send `Tail`
+    /// and `Head` directly.
+    fn anchor_for_prefetch(&self, tab: Tab) -> SubscribeAnchor {
+        if let Some(id) = &self.pinned_job_id {
+            return SubscribeAnchor::Around {
+                id: id.clone(),
+                fallback: Fallback::Nowhere,
+            };
+        }
+        let ls = &self.list_states[tab.idx()];
+        // Center the requested window on the cursor's depth.
+        let half = self.viewport_height.saturating_mul(3) / 2;
+        let offset = ls.cursor.saturating_sub(half);
+        SubscribeAnchor::Offset { offset }
+    }
+
     /// Check if prefetch is needed and send subscribe if so.
-    /// Deduplicates: won't re-send the same (offset, limit) for the same tab.
+    /// Deduplicates: won't re-send the same anchor + limit for the same tab.
     fn maybe_prefetch(&mut self) {
         if self.subscription_limit.is_some() {
             return;
         }
-        // While paused the visible buffer is intentionally frozen — no
-        // prefetching, so scrolling clamps at whatever rows were already
-        // present at the moment of pause.
         if self.paused {
             return;
         }
@@ -243,21 +451,39 @@ impl App {
         };
         let buffer_end = ls.buffer_offset + buffer_size;
 
-        // Prefetch when cursor is within one viewport of buffer edges.
+        // Prefetch when cursor is within one viewport of a buffer edge
+        // *and* there are more items to fetch in that direction.
         let near_top = ls.cursor < ls.buffer_offset + vh;
         let near_bottom = ls.cursor + vh >= buffer_end;
+        let needs_top = near_top && ls.buffer_offset > 0;
+        let needs_bottom = near_bottom && buffer_end < self.active_total();
 
-        if (near_top && ls.buffer_offset > 0) || (near_bottom && buffer_end < self.active_total()) {
-            let new_limit = vh * 3;
-            let new_offset = ls.cursor.saturating_sub(new_limit / 2);
-            let key = (new_offset, new_limit);
-
-            if self.list_states[tab.idx()].last_subscribe == Some(key) {
-                return;
-            }
-            self.list_states[tab.idx()].last_subscribe = Some(key);
-            self.send_subscribe(tab, new_offset, new_limit);
+        if !(needs_top || needs_bottom) {
+            return;
         }
+
+        let new_limit = vh * 3;
+        let anchor = self.anchor_for_prefetch(tab);
+        let key = (anchor.clone(), new_limit);
+        if self.list_states[tab.idx()].last_subscribe == Some(key.clone()) {
+            return;
+        }
+        // Time-based throttle: even when the anchor has shifted (held
+        // arrow key, or drain events chewing the buffer edge), don't
+        // fire more than one prefetch per `PREFETCH_MIN_INTERVAL`. The
+        // skipped subscribe isn't queued — the next `maybe_prefetch`
+        // call after the window elapses will recompute with the
+        // current cursor and send a fresh, up-to-date anchor.
+        let now = Instant::now();
+        if let Some(last) = self.list_states[tab.idx()].last_prefetch_at
+            && now.duration_since(last) < PREFETCH_MIN_INTERVAL
+        {
+            return;
+        }
+        let ls = &mut self.list_states[tab.idx()];
+        ls.last_subscribe = Some(key);
+        ls.last_prefetch_at = Some(now);
+        self.send_subscribe(tab, anchor, new_limit);
     }
 
     /// Send the current detail level to the server.
@@ -266,6 +492,89 @@ impl App {
             let msg = events::detail_level_message(self.show_detail);
             let _ = tx.try_send(msg);
         }
+    }
+
+    /// Send a `Find` over the WebSocket. `limit` is derived from the
+    /// current viewport so the returned window fills the visible area.
+    fn send_find(&self, tab: Tab, anchor: FindAnchor, direction: Direction, query: SearchQuery) {
+        let Some(tx) = &self.ws_tx else {
+            return;
+        };
+        let limit = if self.viewport_height > 0 {
+            self.viewport_height * 3
+        } else {
+            60
+        };
+        let msg = events::find_message(tab.list_name(), anchor, direction, query, limit);
+        let _ = tx.try_send(msg);
+    }
+
+    /// Anchor to use for a fresh `/` search, and the fallback anchor
+    /// for `n`/`N` when there's no pin.
+    ///
+    /// Prefers the cursor row's job id — so `/` and `n` continue the
+    /// walk forward from wherever the user's eye is, rather than
+    /// snapping back to the top of the list. This is what makes
+    /// `scroll down → n` feel natural instead of jarring.
+    ///
+    /// Falls back to `Start` when the cursor row's id isn't known —
+    /// initial launch (no data / no scroll yet) and after `g`. That
+    /// last case is the escape hatch: `g` then `n` searches from the
+    /// beginning of the list.
+    fn anchor_for_initial_search(&self) -> FindAnchor {
+        if let Some(id) = &self.list_states[self.active_tab.idx()].cursor_id {
+            return FindAnchor::JobId { id: id.clone() };
+        }
+        FindAnchor::Start
+    }
+
+    /// Anchor to use for `n`/`N` stepping: the pinned job (so we skip
+    /// it), falling back to the cursor's row if the pin is missing.
+    fn anchor_for_step(&self) -> FindAnchor {
+        if let Some(id) = &self.pinned_job_id {
+            return FindAnchor::JobId { id: id.clone() };
+        }
+        self.anchor_for_initial_search()
+    }
+
+    /// Re-anchor the cursor to the currently pinned job (if any). Called
+    /// after any buffer mutation (JobSnapshot, JobChanged) so the
+    /// cursor "follows" the pinned row as the queue churns around it.
+    ///
+    /// If the pinned job is in the local buffer, we simply update the
+    /// cursor's numeric position to its current local index. If it's
+    /// no longer in the buffer, we ask the server to `Locate` it and
+    /// send back a fresh window centered on it — cursor and buffer
+    /// re-anchor when that response arrives. The `Locate` request is
+    /// gated by `pinned_locate_pending` so we don't spam duplicate
+    /// requests while one is already in flight.
+    fn follow_pinned_job(&mut self) {
+        let Some(pinned) = self.pinned_job_id.clone() else {
+            return;
+        };
+        let tab = self.active_tab;
+        let jobs = match tab {
+            Tab::Ready => &self.ready_jobs,
+            Tab::InFlight => &self.in_flight_jobs,
+            Tab::Scheduled => &self.scheduled_jobs,
+        };
+        let buffer_offset = self.list_states[tab.idx()].buffer_offset;
+        if let Some(local) = jobs.iter().position(|j| j.id == pinned) {
+            let ls = &mut self.list_states[tab.idx()];
+            ls.cursor = buffer_offset + local;
+            return;
+        }
+        // Pinned job left the buffer — ask the server where it is now.
+        if self.pinned_locate_pending {
+            return;
+        }
+        self.pinned_locate_pending = true;
+        self.send_find(
+            tab,
+            FindAnchor::JobId { id: pinned },
+            Direction::Locate,
+            SearchQuery::default(),
+        );
     }
 
     /// Return the id of the job under the cursor in the active tab,
@@ -290,6 +599,7 @@ impl App {
         let Some(id) = self.pending_delete.take() else {
             return;
         };
+        self.set_modal_mode(false);
         if let Some(tx) = &self.ws_tx {
             let msg = events::delete_job_message(id.clone());
             let _ = tx.try_send(msg);
@@ -297,6 +607,13 @@ impl App {
         self.ready_jobs.retain(|j| j.id != id);
         self.in_flight_jobs.retain(|j| j.id != id);
         self.scheduled_jobs.retain(|j| j.id != id);
+    }
+
+    /// Cancel the pending delete prompt and drop out of modal mode so
+    /// the terminal reader stops deferring `q` back to the app.
+    fn close_delete_prompt(&mut self) {
+        self.pending_delete = None;
+        self.set_modal_mode(false);
     }
 
     /// Apply server status fields from any message.
@@ -325,7 +642,48 @@ impl App {
                 // Quit while prompting cancels the prompt rather than
                 // exiting; a second `q` (or any other quit gesture) after
                 // cancellation will quit normally.
-                Event::CancelDelete | Event::Quit => self.pending_delete = None,
+                Event::CancelDelete | Event::Quit => self.close_delete_prompt(),
+                // `n` cancels the prompt (the help bar advertises "n No").
+                // The terminal reader unconditionally maps `n` to
+                // `SearchNext`, so we intercept it here. `N`
+                // (`SearchPrev`) gets the same treatment for symmetry.
+                Event::SearchNext | Event::SearchPrev => self.close_delete_prompt(),
+                _ => {}
+            }
+            return false;
+        }
+
+        // Same gating pattern for the `/` search prompt.
+        if self.search_input.is_some() {
+            match event {
+                Event::SearchKey(key) => {
+                    if let Some(prompt) = self.search_input.as_mut() {
+                        prompt
+                            .active_input_mut()
+                            .handle_event(&crossterm::event::Event::Key(key));
+                    }
+                }
+                Event::SearchFieldSwitch => {
+                    if let Some(prompt) = self.search_input.as_mut() {
+                        prompt.switch_field();
+                    }
+                }
+                Event::SearchSubmit => {
+                    let prompt = self.search_input.take().unwrap_or_default();
+                    self.set_search_mode(false);
+                    let query = prompt.to_query();
+                    self.search_query = Some(query.clone());
+                    self.send_find(
+                        self.active_tab,
+                        self.anchor_for_initial_search(),
+                        Direction::Forward,
+                        query,
+                    );
+                }
+                Event::SearchCancel | Event::Quit => {
+                    self.search_input = None;
+                    self.set_search_mode(false);
+                }
                 _ => {}
             }
             return false;
@@ -377,11 +735,54 @@ impl App {
             Event::RequestDelete => {
                 if let Some(id) = self.selected_job_id() {
                     self.pending_delete = Some(id);
+                    self.set_modal_mode(true);
                 }
             }
             // Outside of an active prompt these are no-ops — the prompt
             // path above is the only thing that interprets them.
             Event::ConfirmDelete | Event::CancelDelete => {}
+            Event::SearchOpen => {
+                // Prefill from the currently-active query if there is
+                // one — lets the user tweak an existing filter instead
+                // of retyping. A fresh prompt (no prior query) starts
+                // empty.
+                self.search_input = Some(
+                    self.search_query
+                        .as_ref()
+                        .map(SearchPrompt::from_query)
+                        .unwrap_or_default(),
+                );
+                self.set_search_mode(true);
+            }
+            // Outside the search prompt these are no-ops; the prompt
+            // path above interprets them.
+            Event::SearchKey(_)
+            | Event::SearchFieldSwitch
+            | Event::SearchSubmit
+            | Event::SearchCancel => {}
+            Event::SearchNext => {
+                if let Some(query) = self.search_query.clone() {
+                    self.send_find(
+                        self.active_tab,
+                        self.anchor_for_step(),
+                        Direction::Forward,
+                        query,
+                    );
+                }
+            }
+            Event::SearchPrev => {
+                if let Some(query) = self.search_query.clone() {
+                    self.send_find(
+                        self.active_tab,
+                        self.anchor_for_step(),
+                        Direction::Backward,
+                        query,
+                    );
+                }
+            }
+            Event::Unpin => {
+                self.pinned_job_id = None;
+            }
             Event::TogglePause => {
                 self.paused = !self.paused;
                 if !self.paused {
@@ -390,12 +791,12 @@ impl App {
                     // on next prefetch or when they become active.
                     let tab = self.active_tab;
                     let ls = &self.list_states[tab.idx()];
-                    if let Some((offset, limit)) = ls.last_subscribe {
-                        self.send_subscribe(tab, offset, limit);
+                    if let Some((anchor, limit)) = ls.last_subscribe.clone() {
+                        self.send_subscribe(tab, anchor, limit);
                     } else if self.viewport_height > 0 {
                         let limit = self.viewport_height * 3;
-                        let offset = ls.cursor.saturating_sub(limit / 2);
-                        self.send_subscribe(tab, offset, limit);
+                        let anchor = self.anchor_for_prefetch(tab);
+                        self.send_subscribe(tab, anchor, limit);
                     }
                 }
             }
@@ -435,6 +836,7 @@ impl App {
                 self.apply_job_window(Tab::InFlight, in_flight);
                 self.apply_job_window(Tab::Scheduled, scheduled);
                 self.apply_follow_bottom();
+                self.follow_pinned_job();
                 // A snapshot can land with an offset that pre-dates rapid
                 // server-side churn (jobs were enqueued/drained while the
                 // Subscribe was in flight), leaving the cursor outside the
@@ -502,9 +904,57 @@ impl App {
                     }
                 }
                 self.apply_follow_bottom();
+                self.follow_pinned_job();
                 // Each JobChanged can move the follow-bottom cursor; same
                 // reasoning as the snapshot/heartbeat paths.
                 self.maybe_prefetch();
+            }
+            Event::ServerFindResult {
+                server,
+                list,
+                matched_position,
+                window,
+            } => {
+                self.apply_server_status(server);
+                // Any FindResult clears the "waiting for locate" gate —
+                // even a `None` (job gone), since we treat that as an
+                // authoritative unpin below.
+                self.pinned_locate_pending = false;
+                if self.paused {
+                    return false;
+                }
+                let tab = match list {
+                    ListName::Ready => Tab::Ready,
+                    ListName::InFlight => Tab::InFlight,
+                    ListName::Scheduled => Tab::Scheduled,
+                };
+                match matched_position {
+                    Some(pos) => {
+                        // The matched job id is whatever sits at the
+                        // matched position within the returned window.
+                        let local = pos.saturating_sub(window.first_position);
+                        let matched_id = window.items.get(local).map(|j| j.id.clone());
+                        // Pin the cursor to the match itself, then
+                        // apply the window — `sync_cursor_from_id`
+                        // will land the numeric cursor on it.
+                        self.pinned_job_id = matched_id.clone();
+                        self.list_states[tab.idx()].cursor_id = matched_id;
+                        self.list_states[tab.idx()].follow_bottom = false;
+                        self.apply_job_window(tab, window);
+                        if self.viewport_height > 0 {
+                            let ls = &mut self.list_states[tab.idx()];
+                            let half = self.viewport_height / 2;
+                            ls.scroll_pos = ls.cursor.saturating_sub(half);
+                        }
+                        self.active_tab = tab;
+                    }
+                    None => {
+                        // No match found, or Locate returned "anchor
+                        // gone." Either way, drop the pin so the user
+                        // isn't chasing a ghost.
+                        self.pinned_job_id = None;
+                    }
+                }
             }
             Event::ServerDisconnected => {
                 self.status = ConnectionStatus::Disconnected;
@@ -527,15 +977,55 @@ impl App {
         false
     }
 
-    /// Apply a JobWindow snapshot to the corresponding list.
+    /// Apply a JobWindow snapshot to the corresponding list. Updates
+    /// buffer, `first_position`, and `total`; re-derives the numeric
+    /// `cursor` from the (authoritative) `cursor_id` so drift under
+    /// churn resolves.
     fn apply_job_window(&mut self, tab: Tab, window: JobWindow) {
         let ls = &mut self.list_states[tab.idx()];
-        ls.buffer_offset = window.offset;
-        ls.last_subscribe = None; // Allow new prefetch after data arrives.
+        ls.buffer_offset = window.first_position;
+        ls.total = window.total;
+        ls.last_subscribe = None;
+        // Response landed — reopen the prefetch throttle. The rate
+        // limit exists to prevent spam *within* the request/response
+        // cycle; the natural round-trip cadence is our real ceiling.
+        ls.last_prefetch_at = None;
         match tab {
             Tab::Ready => self.ready_jobs = window.items,
             Tab::InFlight => self.in_flight_jobs = window.items,
             Tab::Scheduled => self.scheduled_jobs = window.items,
+        }
+        self.sync_cursor_from_id(tab);
+    }
+
+    /// Sync the numeric cursor to `pinned_job_id`'s current position
+    /// in the buffer — but **only** when the user has actively pinned
+    /// via search (`/`, `n`, `N`).
+    ///
+    /// For plain scroll navigation the cursor is a numeric *depth*
+    /// that should stay put when the buffer's contents shift
+    /// underneath. Vim's model: cursor sits at row N of the viewport,
+    /// row N's content may change as items shift, but the cursor row
+    /// itself doesn't move. Pulling the cursor onto a specific job
+    /// every buffer update is what makes it appear to "jump around"
+    /// under heavy churn.
+    ///
+    /// `follow_bottom` (from `G`) is handled by `apply_follow_bottom`
+    /// clamping the numeric cursor to `total - 1` — no id chase
+    /// needed there either.
+    fn sync_cursor_from_id(&mut self, tab: Tab) {
+        let Some(id) = self.pinned_job_id.clone() else {
+            return;
+        };
+        let buf: &[AdminJob] = match tab {
+            Tab::Ready => &self.ready_jobs,
+            Tab::InFlight => &self.in_flight_jobs,
+            Tab::Scheduled => &self.scheduled_jobs,
+        };
+        if let Some(local) = buf.iter().position(|j| j.id == id) {
+            let ls = &mut self.list_states[tab.idx()];
+            ls.cursor = ls.buffer_offset + local;
+            ls.cursor_id = Some(id);
         }
     }
 
@@ -546,13 +1036,6 @@ impl App {
     /// scroll through the frozen snapshot. Returns `None` when there's
     /// nothing to navigate.
     fn cursor_bounds(&self) -> Option<(usize, usize)> {
-        if !self.paused {
-            let total = self.effective_total();
-            if total == 0 {
-                return None;
-            }
-            return Some((0, total - 1));
-        }
         let tab = self.active_tab;
         let ls = &self.list_states[tab.idx()];
         let buffer_size = match tab {
@@ -563,7 +1046,22 @@ impl App {
         if buffer_size == 0 {
             return None;
         }
-        Some((ls.buffer_offset, ls.buffer_offset + buffer_size - 1))
+        let buffer_lo = ls.buffer_offset;
+        let buffer_hi = ls.buffer_offset + buffer_size - 1;
+        if self.paused {
+            return Some((buffer_lo, buffer_hi));
+        }
+        // Live: the cursor is bounded by (a) what exists on the server
+        // and (b) what we currently have in the buffer. Scrolling past
+        // the buffered range would render empty rows until the prefetch
+        // response arrives; instead we clamp here, fire the prefetch,
+        // and let the cursor advance once the new items are in hand.
+        let total = self.effective_total();
+        if total == 0 {
+            return None;
+        }
+        let max = (total - 1).min(buffer_hi);
+        Some((buffer_lo, max))
     }
 
     /// Clamp cursor/scroll positions and apply follow-bottom tracking.
@@ -585,6 +1083,11 @@ impl App {
                 Some(c) => raw_total.min(c),
                 None => raw_total,
             };
+            let buffer_size = match tab {
+                Tab::Ready => self.ready_jobs.len(),
+                Tab::InFlight => self.in_flight_jobs.len(),
+                Tab::Scheduled => self.scheduled_jobs.len(),
+            };
             let ls = &mut self.list_states[tab.idx()];
 
             if total == 0 {
@@ -592,6 +1095,10 @@ impl App {
                 ls.scroll_pos = 0;
                 continue;
             }
+
+            // Remember the pre-clamp viewport row so we can preserve it
+            // if we end up dragging the cursor upward below.
+            let prev_visual_row = ls.cursor.saturating_sub(ls.scroll_pos);
 
             // Follow-bottom: stick cursor to end.
             if ls.follow_bottom {
@@ -603,9 +1110,44 @@ impl App {
                 ls.cursor = total - 1;
             }
 
-            // Clamp scroll_pos so cursor stays visible.
+            // Clamp cursor to the buffered range too: parking on an
+            // unloaded row would render empties until the prefetch
+            // response arrives. Keep the cursor at the buffer edge and
+            // let it advance once the new items land.
+            let buffer_hi = ls.buffer_offset + buffer_size;
+            let cursor_was_clamped_down = buffer_size > 0 && ls.cursor >= buffer_hi;
+            if cursor_was_clamped_down {
+                ls.cursor = buffer_hi - 1;
+            }
+
+            // Position the viewport so the cursor is visible.
+            //
+            // Under follow-bottom we always park the cursor at the
+            // last viewport row: as `total` shrinks (queue drains),
+            // this keeps the tail rows visible above the cursor
+            // instead of leaving a screenful of blank space below it
+            // (which is what happens if we naively pin `scroll_pos`
+            // to the cursor's numeric value).
+            //
+            // When we've had to drag the cursor upward because the
+            // buffer's tail was chewed away by JobChanged removals,
+            // keep the cursor at the same viewport row it was on
+            // before — otherwise the highlighted row visibly "jumps
+            // up" every time the buffer shrinks. `scroll_pos` slides
+            // up in lockstep with the cursor so the visual row is
+            // preserved.
+            //
+            // Otherwise we just clamp `scroll_pos` around the cursor
+            // in the usual bidirectional way.
             if self.viewport_height > 0 {
-                if ls.cursor < ls.scroll_pos {
+                if ls.follow_bottom {
+                    ls.scroll_pos = ls.cursor.saturating_sub(self.viewport_height - 1);
+                } else if cursor_was_clamped_down {
+                    ls.scroll_pos = ls
+                        .cursor
+                        .saturating_sub(prev_visual_row)
+                        .max(ls.buffer_offset);
+                } else if ls.cursor < ls.scroll_pos {
                     ls.scroll_pos = ls.cursor;
                 } else if ls.cursor >= ls.scroll_pos + self.viewport_height {
                     ls.scroll_pos = ls.cursor - self.viewport_height + 1;
@@ -614,7 +1156,33 @@ impl App {
         }
     }
 
+    /// Release a search pin. Called at the start of every explicit
+    /// navigation action so `follow_pinned_job` doesn't drag the
+    /// cursor back to the pinned row on the next tick.
+    fn release_pin(&mut self) {
+        self.pinned_job_id = None;
+        self.pinned_locate_pending = false;
+    }
+
+    /// Sync `cursor_id` to whichever row currently sits under the
+    /// numeric cursor. Called at the end of every explicit scroll so
+    /// a subsequent buffer refresh doesn't drag the cursor back to
+    /// whatever `cursor_id` was left over from a prior search — that
+    /// would produce the "snap back to the pinned row" bug when
+    /// scrolling past the buffer edge.
+    fn refresh_cursor_id_from_position(&mut self, tab: Tab) {
+        let ls = &mut self.list_states[tab.idx()];
+        let buf: &[AdminJob] = match tab {
+            Tab::Ready => &self.ready_jobs,
+            Tab::InFlight => &self.in_flight_jobs,
+            Tab::Scheduled => &self.scheduled_jobs,
+        };
+        let local = ls.cursor.checked_sub(ls.buffer_offset);
+        ls.cursor_id = local.and_then(|i| buf.get(i)).map(|j| j.id.clone());
+    }
+
     fn scroll_up(&mut self) {
+        self.release_pin();
         let Some((min, _)) = self.cursor_bounds() else {
             return;
         };
@@ -626,13 +1194,17 @@ impl App {
             ls.scroll_pos = ls.cursor;
         }
         ls.follow_bottom = false;
+        let tab = self.active_tab;
+        self.refresh_cursor_id_from_position(tab);
         self.maybe_prefetch();
     }
 
     fn scroll_down(&mut self) {
+        self.release_pin();
         let Some((_, max)) = self.cursor_bounds() else {
             return;
         };
+        let total = self.effective_total();
         let ls = &mut self.list_states[self.active_tab.idx()];
         if ls.cursor < max {
             ls.cursor += 1;
@@ -640,13 +1212,18 @@ impl App {
         if self.viewport_height > 0 && ls.cursor >= ls.scroll_pos + self.viewport_height {
             ls.scroll_pos = ls.cursor - self.viewport_height + 1;
         }
-        // `follow_bottom` only makes sense while live — paused scrolling
-        // never wants the cursor pulled toward the server-side bottom.
-        ls.follow_bottom = !self.paused && ls.cursor == max;
+        // `follow_bottom` only makes sense while live and only when
+        // the cursor has genuinely reached the server-side tail —
+        // stopping at the buffer edge because prefetch hasn't landed
+        // yet shouldn't turn on follow-bottom mid-list.
+        ls.follow_bottom = !self.paused && total > 0 && ls.cursor == total - 1;
+        let tab = self.active_tab;
+        self.refresh_cursor_id_from_position(tab);
         self.maybe_prefetch();
     }
 
     fn page_up(&mut self) {
+        self.release_pin();
         let Some((min, _)) = self.cursor_bounds() else {
             return;
         };
@@ -660,27 +1237,34 @@ impl App {
             ls.scroll_pos = ls.cursor;
         }
         ls.follow_bottom = false;
+        let tab = self.active_tab;
+        self.refresh_cursor_id_from_position(tab);
         self.maybe_prefetch();
     }
 
     fn page_down(&mut self) {
+        self.release_pin();
         let Some((_, max)) = self.cursor_bounds() else {
             return;
         };
         if self.viewport_height == 0 {
             return;
         }
+        let total = self.effective_total();
         let ls = &mut self.list_states[self.active_tab.idx()];
         let jump = self.viewport_height.saturating_sub(1).max(1);
         ls.cursor = (ls.cursor + jump).min(max);
         if ls.cursor >= ls.scroll_pos + self.viewport_height {
             ls.scroll_pos = ls.cursor - self.viewport_height + 1;
         }
-        ls.follow_bottom = !self.paused && ls.cursor == max;
+        ls.follow_bottom = !self.paused && total > 0 && ls.cursor == total - 1;
+        let tab = self.active_tab;
+        self.refresh_cursor_id_from_position(tab);
         self.maybe_prefetch();
     }
 
     fn go_to_start(&mut self) {
+        self.release_pin();
         let Some((min, _)) = self.cursor_bounds() else {
             return;
         };
@@ -688,10 +1272,19 @@ impl App {
         ls.cursor = min;
         ls.scroll_pos = min;
         ls.follow_bottom = false;
-        self.maybe_prefetch();
+        // Clear cursor_id so sync_cursor_from_id derives it from the
+        // freshly-arriving Head window rather than trying to preserve
+        // whatever the cursor was on before.
+        ls.cursor_id = None;
+        let tab = self.active_tab;
+        let limit = self.viewport_height.saturating_mul(3).max(1);
+        // `g` explicitly asks for the head, not a depth-anchored
+        // window. Bypass the usual `anchor_for_prefetch` heuristic.
+        self.send_subscribe(tab, SubscribeAnchor::Head, limit);
     }
 
     fn go_to_end(&mut self) {
+        self.release_pin();
         let Some((_, max)) = self.cursor_bounds() else {
             return;
         };
@@ -703,7 +1296,15 @@ impl App {
             ls.scroll_pos = 0;
         }
         ls.follow_bottom = !self.paused;
-        self.maybe_prefetch();
+        // Clear cursor_id — sync_cursor_from_id will re-derive it
+        // (from `buf.last()` since follow_bottom is set).
+        ls.cursor_id = None;
+        let tab = self.active_tab;
+        let limit = self.viewport_height.saturating_mul(3).max(1);
+        // `G` explicitly asks for the tail. Under drain, subsequent
+        // `maybe_prefetch` calls will use `Offset(cursor - vh)` and
+        // clamp naturally.
+        self.send_subscribe(tab, SubscribeAnchor::Tail, limit);
     }
 }
 
@@ -815,16 +1416,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: default_server(),
             ready: JobWindow {
-                offset: 0,
                 items: vec![job("r1", 0, None)],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![job("w1", 0, Some(100))],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![job("s1", 0, None)],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1145,16 +1752,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv.clone(),
             ready: JobWindow {
-                offset: 100,
                 items: (100..160).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+                first_position: 100,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
         app.handle_event(Event::GoToEnd);
@@ -1169,16 +1782,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv,
             ready: JobWindow {
-                offset: 969,
                 items: vec![],
+                first_position: 969,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1238,16 +1857,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv,
             ready: JobWindow {
-                offset: 0,
                 items: vec![job("snap", 0, None)],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1286,16 +1911,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv,
             ready: JobWindow {
-                offset: 100,
                 items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+                first_position: 100,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1322,16 +1953,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv,
             ready: JobWindow {
-                offset: 100,
                 items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+                first_position: 100,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1354,16 +1991,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv,
             ready: JobWindow {
-                offset: 100,
                 items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+                first_position: 100,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1391,16 +2034,22 @@ mod tests {
         app.handle_event(Event::ServerJobSnapshot {
             server: srv.clone(),
             ready: JobWindow {
-                offset: 100,
                 items: (100..120).map(|i| job(&format!("j{i}"), 0, None)).collect(),
+                first_position: 100,
+                total: 0,
+                resolved_anchor: None,
             },
             in_flight: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
             scheduled: JobWindow {
-                offset: 0,
                 items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
             },
         });
 
@@ -1476,6 +2125,59 @@ mod tests {
     }
 
     #[test]
+    fn opening_delete_prompt_sets_modal_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut app = seed_ready_with_cursor("j1");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.set_modal_mode_flag(flag.clone());
+        app.handle_event(Event::RequestDelete);
+        assert!(flag.load(Ordering::Acquire), "modal flag must be set");
+    }
+
+    #[test]
+    fn cancelling_delete_prompt_clears_modal_flag() {
+        // The whole point of the flag is that the terminal reader can
+        // tell whether a `q` should self-terminate. Clearing it on
+        // every close path (Cancel, Quit, n/N, confirm) is what stops
+        // the reader from staying alive forever.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut app = seed_ready_with_cursor("j1");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.set_modal_mode_flag(flag.clone());
+        app.handle_event(Event::RequestDelete);
+        app.handle_event(Event::Quit);
+        assert!(!flag.load(Ordering::Acquire), "modal flag must be cleared");
+        assert!(app.pending_delete.is_none());
+    }
+
+    #[test]
+    fn confirming_delete_clears_modal_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let mut app = seed_ready_with_cursor("j1");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.set_modal_mode_flag(flag.clone());
+        app.handle_event(Event::RequestDelete);
+        app.handle_event(Event::ConfirmDelete);
+        assert!(!flag.load(Ordering::Acquire), "modal flag must be cleared");
+    }
+
+    #[test]
+    fn n_during_prompt_cancels_delete() {
+        // The terminal reader maps `n` unconditionally to SearchNext.
+        // The delete prompt must intercept that as a "No" gesture —
+        // otherwise the help bar's "n No" hint would silently lie.
+        let mut app = seed_ready_with_cursor("j1");
+        app.handle_event(Event::RequestDelete);
+        assert!(app.pending_delete.is_some());
+        app.handle_event(Event::SearchNext);
+        assert!(app.pending_delete.is_none());
+        assert_eq!(ids(&app.ready_jobs), vec!["j1"]);
+    }
+
+    #[test]
     fn quit_during_prompt_cancels_instead_of_quitting() {
         let mut app = seed_ready_with_cursor("j1");
         app.handle_event(Event::RequestDelete);
@@ -1532,5 +2234,239 @@ mod tests {
             app.pending_delete.is_some(),
             "prompt should still be pending"
         );
+    }
+
+    // ── SearchPrompt.to_query ─────────────────────────────────────
+
+    #[test]
+    fn search_prompt_empty_is_empty_query() {
+        let prompt = SearchPrompt::default();
+        let q = prompt.to_query();
+        assert!(q.queues.is_empty());
+        assert!(q.types.is_empty());
+    }
+
+    #[test]
+    fn search_prompt_queue_and_type_from_fields() {
+        let mut prompt = SearchPrompt::default();
+        prompt.type_input = "send_welcome".into();
+        prompt.queue_input = "emails".into();
+        let q = prompt.to_query();
+        assert_eq!(q.queues, vec!["emails".to_string()]);
+        assert_eq!(q.types, vec!["send_welcome".to_string()]);
+    }
+
+    #[test]
+    fn search_prompt_splits_on_comma_and_whitespace() {
+        let mut prompt = SearchPrompt::default();
+        prompt.queue_input = "emails, billing  reports".into();
+        let q = prompt.to_query();
+        assert_eq!(
+            q.queues,
+            vec![
+                "emails".to_string(),
+                "billing".to_string(),
+                "reports".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn search_prompt_ignores_empty_tokens() {
+        let mut prompt = SearchPrompt::default();
+        prompt.type_input = " , ,send, ".into();
+        let q = prompt.to_query();
+        assert_eq!(q.types, vec!["send".to_string()]);
+    }
+
+    // ── search flow end-to-end ────────────────────────────────────
+
+    fn search_char_key(c: char) -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn search_open_sets_input_state() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::SearchOpen);
+        assert!(app.search_input.is_some());
+    }
+
+    #[test]
+    fn search_cancel_clears_input_without_running_search() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::SearchOpen);
+        for c in "abc".chars() {
+            app.handle_event(Event::SearchKey(search_char_key(c)));
+        }
+        app.handle_event(Event::SearchCancel);
+        assert!(app.search_input.is_none());
+        assert!(app.search_query.is_none());
+    }
+
+    #[test]
+    fn search_submit_captures_query() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::SearchOpen);
+        // Default active field is Type — type "welcome", switch to
+        // Queue, type "emails". Enter combines them.
+        for c in "welcome".chars() {
+            app.handle_event(Event::SearchKey(search_char_key(c)));
+        }
+        app.handle_event(Event::SearchFieldSwitch);
+        for c in "emails".chars() {
+            app.handle_event(Event::SearchKey(search_char_key(c)));
+        }
+        app.handle_event(Event::SearchSubmit);
+        assert!(app.search_input.is_none());
+        let q = app.search_query.expect("query should be captured");
+        assert_eq!(q.queues, vec!["emails".to_string()]);
+        assert_eq!(q.types, vec!["welcome".to_string()]);
+    }
+
+    #[test]
+    fn initial_search_anchor_uses_cursor_id_when_set() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.active_tab = Tab::Ready;
+        app.list_states[Tab::Ready.idx()].cursor_id = Some("j_current".into());
+        assert!(matches!(
+            app.anchor_for_initial_search(),
+            FindAnchor::JobId { ref id } if id == "j_current"
+        ));
+    }
+
+    #[test]
+    fn initial_search_anchor_falls_back_to_start_without_cursor_id() {
+        let app = App::new("127.0.0.1:8901".into());
+        assert!(matches!(app.anchor_for_initial_search(), FindAnchor::Start));
+    }
+
+    #[test]
+    fn step_anchor_prefers_pin_over_cursor_id() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.active_tab = Tab::Ready;
+        app.list_states[Tab::Ready.idx()].cursor_id = Some("j_cursor".into());
+        app.pinned_job_id = Some("j_pinned".into());
+        assert!(matches!(
+            app.anchor_for_step(),
+            FindAnchor::JobId { ref id } if id == "j_pinned"
+        ));
+    }
+
+    #[test]
+    fn step_anchor_falls_back_to_cursor_id_when_unpinned() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.active_tab = Tab::Ready;
+        app.list_states[Tab::Ready.idx()].cursor_id = Some("j_cursor".into());
+        assert!(matches!(
+            app.anchor_for_step(),
+            FindAnchor::JobId { ref id } if id == "j_cursor"
+        ));
+    }
+
+    #[test]
+    fn search_open_prefills_from_active_query() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.search_query = Some(SearchQuery {
+            queues: vec!["emails".into(), "billing".into()],
+            types: vec!["audit".into()],
+        });
+        app.handle_event(Event::SearchOpen);
+        let prompt = app.search_input.as_ref().expect("prompt should be open");
+        assert_eq!(prompt.type_input.value(), "audit");
+        assert_eq!(prompt.queue_input.value(), "emails, billing");
+    }
+
+    #[test]
+    fn search_open_without_active_query_starts_empty() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::SearchOpen);
+        let prompt = app.search_input.as_ref().expect("prompt should be open");
+        assert!(prompt.type_input.value().is_empty());
+        assert!(prompt.queue_input.value().is_empty());
+    }
+
+    #[test]
+    fn search_prompt_from_query_round_trip() {
+        let query = SearchQuery {
+            queues: vec!["a".into(), "b".into()],
+            types: vec!["x".into(), "y".into()],
+        };
+        let prompt = SearchPrompt::from_query(&query);
+        assert_eq!(prompt.to_query(), query);
+    }
+
+    #[test]
+    fn search_field_switch_toggles_active_field() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.handle_event(Event::SearchOpen);
+        assert_eq!(app.search_input.as_ref().unwrap().active, SearchField::Type);
+        app.handle_event(Event::SearchFieldSwitch);
+        assert_eq!(
+            app.search_input.as_ref().unwrap().active,
+            SearchField::Queue
+        );
+        app.handle_event(Event::SearchFieldSwitch);
+        assert_eq!(app.search_input.as_ref().unwrap().active, SearchField::Type);
+    }
+
+    #[test]
+    fn find_result_pins_job_and_snaps_cursor() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.active_tab = Tab::Ready;
+        app.viewport_height = 20;
+        // window.offset=1 → items[0] is at filtered position 1,
+        // items[2] at position 3. matched_position=3 must land on
+        // items[3 - offset] = items[2] = "target".
+        app.handle_event(Event::ServerFindResult {
+            server: default_server(),
+            list: ListName::Ready,
+            matched_position: Some(3),
+            window: JobWindow {
+                items: vec![
+                    job("a", 0, None),
+                    job("b", 0, None),
+                    job("target", 0, None),
+                    job("d", 0, None),
+                    job("e", 0, None),
+                ],
+                first_position: 1,
+                total: 0,
+                resolved_anchor: None,
+            },
+        });
+        assert_eq!(app.pinned_job_id.as_deref(), Some("target"));
+        let ls = &app.list_states[Tab::Ready.idx()];
+        assert_eq!(ls.cursor, 3);
+        assert_eq!(ls.buffer_offset, 1);
+    }
+
+    #[test]
+    fn find_result_none_clears_pin() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.pinned_job_id = Some("stale".into());
+        app.pinned_locate_pending = true;
+        app.handle_event(Event::ServerFindResult {
+            server: default_server(),
+            list: ListName::Ready,
+            matched_position: None,
+            window: JobWindow {
+                items: vec![],
+                first_position: 0,
+                total: 0,
+                resolved_anchor: None,
+            },
+        });
+        assert!(app.pinned_job_id.is_none());
+        assert!(!app.pinned_locate_pending);
+    }
+
+    #[test]
+    fn unpin_event_clears_pinned_job() {
+        let mut app = App::new("127.0.0.1:8901".into());
+        app.pinned_job_id = Some("some-id".into());
+        app.handle_event(Event::Unpin);
+        assert!(app.pinned_job_id.is_none());
     }
 }

@@ -6,6 +6,7 @@ mod cron;
 mod delete;
 mod enqueue;
 mod fail;
+mod find;
 mod group_committer;
 mod in_flight_index;
 mod keys;
@@ -33,6 +34,8 @@ pub use options::{
     JobFilter, ListErrorsOptions, ListJobsOptions, PatchJobOptions, ReplaceCronGroupOptions,
     RetentionConfigPatch,
 };
+
+pub use find::{FindDirection, FindOutcome, WindowAnchor, WindowFallback, WindowOutcome};
 
 pub use results::{BulkCompleteResult, EnqueueResult, ListErrorsPage, ListJobsPage};
 

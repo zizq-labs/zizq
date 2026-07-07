@@ -16,6 +16,7 @@ mod types;
 
 pub use handlers::app;
 pub use types::{
-    AdminBackoff, AdminEvent, AdminJob, AdminMessage, AdminRetention, ClientMessage,
-    JobChangeStatus, JobWindow, ListName, ServerStatus,
+    AdminBackoff, AdminEvent, AdminJob, AdminMessage, AdminRetention, ClientMessage, Direction,
+    Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus,
+    SubscribeAnchor,
 };
