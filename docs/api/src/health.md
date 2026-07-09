@@ -73,34 +73,44 @@ check compatability.
 
 ### Check availability
 
-```shell
-http GET http://127.0.0.1:7890/health
-```
+> Request:
+>
+> ```bash
+> http GET http://127.0.0.1:7890/health
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 15
-content-type: application/json
-date: Fri, 13 Mar 2026 08:15:41 GMT
-
-{
-    "status": "ok"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 15
+> content-type: application/json
+> date: Fri, 13 Mar 2026 08:15:41 GMT
+> ```
+> ```json
+> {
+>     "status": "ok"
+> }
+> ```
 
 ### Check the server version
 
-``` shell
-http GET http://127.0.0.1:7890/version
-```
+> Request:
+>
+> ```bash
+> http GET http://127.0.0.1:7890/version
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 19
-content-type: application/json
-date: Fri, 13 Mar 2026 08:18:34 GMT
-
-{
-    "version": "0.1.0"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 19
+> content-type: application/json
+> date: Fri, 13 Mar 2026 08:18:34 GMT
+> ```
+> ```json
+> {
+>     "version": "0.1.0"
+> }
+> ```

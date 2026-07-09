@@ -646,76 +646,84 @@ When the specified job or error does not exist.
 
 ### List all queues
 
-```shell
-http 127.0.0.1:7890/queues
-```
+> Request:
+>
+> ```bash
+> http 127.0.0.1:7890/queues
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 22
-content-type: application/json
-date: Fri, 03 Apr 2026 11:07:43 GMT
-```
-```json
-{
-    "queues": [
-        "comms",
-        "default",
-        "example",
-        "payments"
-    ]
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 22
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:07:43 GMT
+> ```
+> ```json
+> {
+>     "queues": [
+>         "comms",
+>         "default",
+>         "example",
+>         "payments"
+>     ]
+> }
+> ```
 
 ### List `ready` jobs on a specific queue
 
-```shell
-http GET "http://127.0.0.1:7890/jobs?queue=example&status=ready&limit=2"
-```
+> Request:
+>
+> ```bash
+> http GET "http://127.0.0.1:7890/jobs?queue=example&status=ready&limit=2"
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 584
-content-type: application/json
-date: Fri, 03 Apr 2026 11:00:17 GMT
-```
-```json
-{
-    "jobs": [
-        {
-            "attempts": 0,
-            "id": "03fvmaj8q5po1huy5nd4xmi5f",
-            "payload": {
-                "greet": "World"
-            },
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1775213710452,
-            "status": "ready",
-            "type": "hello_world"
-        },
-        {
-            "attempts": 0,
-            "id": "03fvmame0wyuiexbc2033jby2",
-            "payload": {
-                "greet": "World"
-            },
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1775213737304,
-            "status": "ready",
-            "type": "hello_world",
-            "unique_key": "hello_world:world",
-            "unique_while": "queued"
-        }
-    ],
-    "pages": {
-        "next": "/jobs?from=03fvmame0wyuiexbc2033jby2&order=asc&limit=2&status=ready&queue=example",
-        "prev": null,
-        "self": "/jobs?order=asc&limit=2&status=ready&queue=example"
-    }
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 584
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:00:17 GMT
+> ```
+> ```json
+> {
+>     "jobs": [
+>         {
+>             "attempts": 0,
+>             "id": "03fvmaj8q5po1huy5nd4xmi5f",
+>             "payload": {
+>                 "greet": "World"
+>             },
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1775213710452,
+>             "status": "ready",
+>             "type": "hello_world"
+>         },
+>         {
+>             "attempts": 0,
+>             "id": "03fvmame0wyuiexbc2033jby2",
+>             "payload": {
+>                 "greet": "World"
+>             },
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1775213737304,
+>             "status": "ready",
+>             "type": "hello_world",
+>             "unique_key": "hello_world:world",
+>             "unique_while": "queued"
+>         }
+>     ],
+>     "pages": {
+>         "next": "/jobs?from=03fvmame0wyuiexbc2033jby2&order=asc&limit=2&status=ready&queue=example",
+>         "prev": null,
+>         "self": "/jobs?order=asc&limit=2&status=ready&queue=example"
+>     }
+> }
+> ```
 
 ### Filter jobs by payload content
 
@@ -723,36 +731,40 @@ date: Fri, 03 Apr 2026 11:00:17 GMT
 > The following example is intentionally not correctly percent-encoded for
 > readability. HTTPie handles this ok.
 
-```shell
-http GET 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Uni")'
-```
+> Request:
+>
+> ```bash
+> http GET 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Uni")'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 301
-content-type: application/json
-date: Fri, 03 Apr 2026 11:02:51 GMT
-```
-```json
-{
-    "jobs": [
-        {
-            "attempts": 0,
-            "id": "03fvmbsuryhdkxvb6vjy4qhxp",
-            "payload": {
-                "greet": "Universe"
-            },
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1775214099613,
-            "status": "ready",
-            "type": "hello_world"
-        }
-    ],
-    "pages": {
-        "next": null,
-        "prev": null,
-        "self": "/jobs?order=asc&limit=50&filter=.greet%20%7C%20startswith%28%22Uni%22%29"
-    }
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 301
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:02:51 GMT
+> ```
+> ```json
+> {
+>     "jobs": [
+>         {
+>             "attempts": 0,
+>             "id": "03fvmbsuryhdkxvb6vjy4qhxp",
+>             "payload": {
+>                 "greet": "Universe"
+>             },
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1775214099613,
+>             "status": "ready",
+>             "type": "hello_world"
+>         }
+>     ],
+>     "pages": {
+>         "next": null,
+>         "prev": null,
+>         "self": "/jobs?order=asc&limit=50&filter=.greet%20%7C%20startswith%28%22Uni%22%29"
+>     }
+> }
+> ```

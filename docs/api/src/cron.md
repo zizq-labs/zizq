@@ -1073,184 +1073,202 @@ The specified entry does not exist.
 
 ### List Cron Groups
 
-```shell
-http 127.0.0.1:7890/crons
-```
+> Request:
+>
+> ```bash
+> http 127.0.0.1:7890/crons
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 31
-content-type: application/json
-date: Tue, 05 May 2026 02:54:26 GMT
-```
-```json
-{
-    "crons": [
-        "group-1",
-        "group-2"
-    ]
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 31
+> content-type: application/json
+> date: Tue, 05 May 2026 02:54:26 GMT
+> ```
+> ```json
+> {
+>     "crons": [
+>         "group-1",
+>         "group-2"
+>     ]
+> }
+> ```
 
 ### Define or Redefine a Cron Group
 
 This makes sense to be a step in application startup.
 
-```shell
-http PUT 127.0.0.1:7890/crons/default <<'JSON'
-{
-    "entries": [
-        {
-            "name": "refresh_data_warehouse",
-            "expression": "0 6 * * *",
-            "timezone": "Europe/Rome",
-            "job": {
-                "queue": "data_warehouse",
-                "type": "refresh_data_warehouse",
-                "priority": 1000,
-                "payload": {
-                    "incremental": true
-                }
-            }
-        },
-        {
-            "name": "expire_access_tokens",
-            "expression": "*/15 * * * *",
-            "job": {
-                "queue": "identity",
-                "type": "expire_access_tokens",
-                "payload": {},
-                "unique_key": "expire_access_tokens",
-                "unique_while": "active"
-            }
-        }
-    ]
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PUT 127.0.0.1:7890/crons/default --raw '{
+>     "entries": [
+>         {
+>             "name": "refresh_data_warehouse",
+>             "expression": "0 6 * * *",
+>             "timezone": "Europe/Rome",
+>             "job": {
+>                 "queue": "data_warehouse",
+>                 "type": "refresh_data_warehouse",
+>                 "priority": 1000,
+>                 "payload": {
+>                     "incremental": true
+>                 }
+>             }
+>         },
+>         {
+>             "name": "expire_access_tokens",
+>             "expression": "*/15 * * * *",
+>             "job": {
+>                 "queue": "identity",
+>                 "type": "expire_access_tokens",
+>                 "payload": {},
+>                 "unique_key": "expire_access_tokens",
+>                 "unique_while": "active"
+>             }
+>         }
+>     ]
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 606
-content-type: application/json
-date: Tue, 05 May 2026 04:00:07 GMT
-```
-```json
-{
-    "entries": [
-        {
-            "expression": "0 6 * * *",
-            "job": {
-                "payload": {
-                    "incremental": true
-                },
-                "priority": 1000,
-                "queue": "data_warehouse",
-                "type": "refresh_data_warehouse"
-            },
-            "last_enqueue_at": 1777953600001,
-            "name": "refresh_data_warehouse",
-            "next_enqueue_at": 1778040000000,
-            "paused": false,
-            "timezone": "Europe/Rome"
-        },
-        {
-            "expression": "*/15 * * * *",
-            "job": {
-                "payload": {},
-                "priority": 32768,
-                "queue": "identity",
-                "type": "expire_access_tokens",
-                "unique_key": "expire_access_tokens",
-                "unique_while": "active"
-            },
-            "last_enqueue_at": 1777953600002,
-            "name": "expire_access_tokens",
-            "next_enqueue_at": 1777954500000,
-            "paused": false
-        }
-    ],
-    "name": "default",
-    "paused": false
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 606
+> content-type: application/json
+> date: Tue, 05 May 2026 04:00:07 GMT
+> ```
+> ```json
+> {
+>     "entries": [
+>         {
+>             "expression": "0 6 * * *",
+>             "job": {
+>                 "payload": {
+>                     "incremental": true
+>                 },
+>                 "priority": 1000,
+>                 "queue": "data_warehouse",
+>                 "type": "refresh_data_warehouse"
+>             },
+>             "last_enqueue_at": 1777953600001,
+>             "name": "refresh_data_warehouse",
+>             "next_enqueue_at": 1778040000000,
+>             "paused": false,
+>             "timezone": "Europe/Rome"
+>         },
+>         {
+>             "expression": "*/15 * * * *",
+>             "job": {
+>                 "payload": {},
+>                 "priority": 32768,
+>                 "queue": "identity",
+>                 "type": "expire_access_tokens",
+>                 "unique_key": "expire_access_tokens",
+>                 "unique_while": "active"
+>             },
+>             "last_enqueue_at": 1777953600002,
+>             "name": "expire_access_tokens",
+>             "next_enqueue_at": 1777954500000,
+>             "paused": false
+>         }
+>     ],
+>     "name": "default",
+>     "paused": false
+> }
+> ```
 
 ### Pause an Entry Within a Schedule
 
-```shell
-http PATCH 127.0.0.1:7890/crons/default/entries/refresh_data_warehouse <<'JSON'
-{"paused": true}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PATCH 127.0.0.1:7890/crons/default/entries/refresh_data_warehouse --raw '{
+>     "paused": true
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 299
-content-type: application/json
-date: Tue, 05 May 2026 04:02:43 GMT
-```
-```json
-{
-    "expression": "0 6 * * *",
-    "job": {
-        "payload": {
-            "incremental": true
-        },
-        "priority": 1000,
-        "queue": "data_warehouse",
-        "type": "refresh_data_warehouse"
-    },
-    "last_enqueue_at": 1777953600001,
-    "name": "refresh_data_warehouse",
-    "next_enqueue_at": 1778040000000,
-    "paused": true,
-    "paused_at": 1777953763596,
-    "timezone": "Europe/Rome"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 299
+> content-type: application/json
+> date: Tue, 05 May 2026 04:02:43 GMT
+> ```
+> ```json
+> {
+>     "expression": "0 6 * * *",
+>     "job": {
+>         "payload": {
+>             "incremental": true
+>         },
+>         "priority": 1000,
+>         "queue": "data_warehouse",
+>         "type": "refresh_data_warehouse"
+>     },
+>     "last_enqueue_at": 1777953600001,
+>     "name": "refresh_data_warehouse",
+>     "next_enqueue_at": 1778040000000,
+>     "paused": true,
+>     "paused_at": 1777953763596,
+>     "timezone": "Europe/Rome"
+> }
+> ```
 
 ### Resume an Entry Within a Schedule
 
-```shell
-http PATCH 127.0.0.1:7890/crons/default/entries/refresh_data_warehouse <<'JSON'
-{"paused": false}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PATCH 127.0.0.1:7890/crons/default/entries/refresh_data_warehouse --raw '{
+>     "paused": false
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 327
-content-type: application/json
-date: Tue, 05 May 2026 04:03:40 GMT
-```
-```json
-{
-    "expression": "0 6 * * *",
-    "job": {
-        "payload": {
-            "incremental": true
-        },
-        "priority": 1000,
-        "queue": "data_warehouse",
-        "type": "refresh_data_warehouse"
-    },
-    "last_enqueue_at": 1777953600001,
-    "name": "refresh_data_warehouse",
-    "next_enqueue_at": 1778040000000,
-    "paused": false,
-    "paused_at": 1777953763596,
-    "resumed_at": 1777953820667,
-    "timezone": "Europe/Rome"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 327
+> content-type: application/json
+> date: Tue, 05 May 2026 04:03:40 GMT
+> ```
+> ```json
+> {
+>     "expression": "0 6 * * *",
+>     "job": {
+>         "payload": {
+>             "incremental": true
+>         },
+>         "priority": 1000,
+>         "queue": "data_warehouse",
+>         "type": "refresh_data_warehouse"
+>     },
+>     "last_enqueue_at": 1777953600001,
+>     "name": "refresh_data_warehouse",
+>     "next_enqueue_at": 1778040000000,
+>     "paused": false,
+>     "paused_at": 1777953763596,
+>     "resumed_at": 1777953820667,
+>     "timezone": "Europe/Rome"
+> }
+> ```
 
 ### Delete a Schedule
 
-```shell
-http DELETE 127.0.0.1:7890/crons/default
-```
+> Request:
+>
+> ```bash
+> http DELETE 127.0.0.1:7890/crons/default
+> ```
 
-```http
-HTTP/1.1 204 No Content
-date: Tue, 05 May 2026 04:04:37 GMT
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 204 No Content
+> date: Tue, 05 May 2026 04:04:37 GMT
+> ```

@@ -358,135 +358,147 @@ configured with a pro license.
 
 ### Enqueue a single job
 
-```shell
-http POST http://127.0.0.1:7890/jobs <<'JSON'
-{
-    "queue": "example",
-    "priority": 500,
-    "type": "hello_world",
-    "payload": {"greet": "World"}
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "example",
+>     "priority": 500,
+>     "type": "hello_world",
+>     "payload": {"greet": "World"}
+> }'
+> ```
 
-```http
-HTTP/1.1 201 Created
-content-length: 143
-content-type: application/json
-date: Fri, 13 Mar 2026 08:53:47 GMT
-
-{
-    "attempts": 0,
-    "id": "03fr1jkpcsipbsckqj0y6pgr7",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1773392027425,
-    "status": "ready",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 143
+> content-type: application/json
+> date: Fri, 13 Mar 2026 08:53:47 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "id": "03fr1jkpcsipbsckqj0y6pgr7",
+>     "priority": 500,
+>     "queue": "example",
+>     "ready_at": 1773392027425,
+>     "status": "ready",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Enqueue a scheduled Job
 
 Jobs are explicitly scheduled by providing a `ready_at` timestamp with a future
 dated value.
 
-```shell
-http POST http://127.0.0.1:7890/jobs <<'JSON'
-{
-    "queue": "example",
-    "priority": 500,
-    "type": "hello_world",
-    "payload": {"greet": "Later"},
-    "ready_at": 1773396035647
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "example",
+>     "priority": 500,
+>     "type": "hello_world",
+>     "payload": {"greet": "Later"},
+>     "ready_at": 1773396035647
+> }'
+> ```
 
-```http
-HTTP/1.1 201 Created
-content-length: 147
-content-type: application/json
-date: Fri, 13 Mar 2026 09:01:08 GMT
-
-{
-    "attempts": 0,
-    "id": "03fr1l0cl1quc0sfe6y2711op",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1773396035647,
-    "status": "scheduled",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 147
+> content-type: application/json
+> date: Fri, 13 Mar 2026 09:01:08 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "id": "03fr1l0cl1quc0sfe6y2711op",
+>     "priority": 500,
+>     "queue": "example",
+>     "ready_at": 1773396035647,
+>     "status": "scheduled",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Enqueue jobs with unique keys
 
 Unique jobs require a [pro license](https://zizq.io/pricing).
 
-```shell
-http POST http://127.0.0.1:7890/jobs <<'JSON'
-{
-    "queue": "example",
-    "priority": 500,
-    "type": "hello_world",
-    "unique_key": "hello_world:world",
-    "payload": {"greet": "World"}
-}
-JSON
-```
+> First Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "example",
+>     "priority": 500,
+>     "type": "hello_world",
+>     "unique_key": "hello_world:world",
+>     "payload": {"greet": "World"}
+> }'
+> ```
 
-```http
-HTTP/1.1 201 Created
-content-length: 218
-content-type: application/json
-date: Mon, 23 Mar 2026 11:19:58 GMT
+> First Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 218
+> content-type: application/json
+> date: Mon, 23 Mar 2026 11:19:58 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "duplicate": false,
+>     "id": "03ft8h3ubrx53abhw1fxbora3",
+>     "priority": 500,
+>     "queue": "example",
+>     "ready_at": 1774264798519,
+>     "status": "ready",
+>     "type": "hello_world",
+>     "unique_key": "hello_world:world",
+>     "unique_while": "queued"
+> }
+> ```
 
-{
-    "attempts": 0,
-    "duplicate": false,
-    "id": "03ft8h3ubrx53abhw1fxbora3",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1774264798519,
-    "status": "ready",
-    "type": "hello_world",
-    "unique_key": "hello_world:world",
-    "unique_while": "queued"
-}
-```
+> Subsequent Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "example",
+>     "priority": 500,
+>     "type": "hello_world",
+>     "unique_key": "hello_world:world",
+>     "payload": {"greet": "World"}
+> }'
+> ```
 
-```shell
-http POST http://127.0.0.1:7890/jobs <<'JSON'
-{
-    "queue": "example",
-    "priority": 500,
-    "type": "hello_world",
-    "unique_key": "hello_world:world",
-    "payload": {"greet": "World"}
-}
-JSON
-```
-
-```http
-HTTP/1.1 200 OK
-content-length: 217
-content-type: application/json
-date: Mon, 23 Mar 2026 11:20:26 GMT
-
-{
-    "attempts": 0,
-    "duplicate": true,
-    "id": "03ft8h3ubrx53abhw1fxbora3",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1774264798519,
-    "status": "ready",
-    "type": "hello_world",
-    "unique_key": "hello_world:world",
-    "unique_while": "queued"
-}
-```
+> Subsequent Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 217
+> content-type: application/json
+> date: Mon, 23 Mar 2026 11:20:26 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "duplicate": true,
+>     "id": "03ft8h3ubrx53abhw1fxbora3",
+>     "priority": 500,
+>     "queue": "example",
+>     "ready_at": 1774264798519,
+>     "status": "ready",
+>     "type": "hello_world",
+>     "unique_key": "hello_world:world",
+>     "unique_while": "queued"
+> }
+> ```
 
 ### Bulk enqueue multiple jobs
 
@@ -495,132 +507,141 @@ array containing the same number of jobs, in the same order as the input
 request. This operation is atomic. If any jobs are invalid or fail to be
 enqueued, no jobs are enqueued and an error response is returned.
 
-```shell
-http POST http://127.0.0.1:7890/jobs/bulk <<'JSON'
-{
-    "jobs": [
-        {
-            "queue": "example",
-            "priority": 500,
-            "type": "hello_world",
-            "payload": {"greet": "World"}
-        },
-        {
-            "queue": "example",
-            "priority": 500,
-            "type": "hello_world",
-            "payload": {"greet": "Later"},
-            "ready_at": 1773396035647
-        }
-    ]
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs/bulk --raw '{
+>     "jobs": [
+>         {
+>             "queue": "example",
+>             "priority": 500,
+>             "type": "hello_world",
+>             "payload": {"greet": "World"}
+>         },
+>         {
+>             "queue": "example",
+>             "priority": 500,
+>             "type": "hello_world",
+>             "payload": {"greet": "Later"},
+>             "ready_at": 1773396035647
+>         }
+>     ]
+> }'
+> ```
 
-```http
-HTTP/1.1 201 Created
-content-length: 302
-content-type: application/json
-date: Fri, 13 Mar 2026 09:07:17 GMT
-
-{
-    "jobs": [
-        {
-            "attempts": 0,
-            "id": "03fr1m7p1mwctku2fptz1x5p4",
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1773392837882,
-            "status": "ready",
-            "type": "hello_world"
-        },
-        {
-            "attempts": 0,
-            "id": "03fr1m7p1mwctku2fpx425jzr",
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1773396035647,
-            "status": "scheduled",
-            "type": "hello_world"
-        }
-    ]
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 302
+> content-type: application/json
+> date: Fri, 13 Mar 2026 09:07:17 GMT
+> ```
+> ```json
+> {
+>     "jobs": [
+>         {
+>             "attempts": 0,
+>             "id": "03fr1m7p1mwctku2fptz1x5p4",
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1773392837882,
+>             "status": "ready",
+>             "type": "hello_world"
+>         },
+>         {
+>             "attempts": 0,
+>             "id": "03fr1m7p1mwctku2fpx425jzr",
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1773396035647,
+>             "status": "scheduled",
+>             "type": "hello_world"
+>         }
+>     ]
+> }
+> ```
 
 ### Enqueue a job with explicit backoff policy
 
-```shell
-http POST http://127.0.0.1:7890/jobs <<'JSON'
-{
-    "queue": "example",
-    "priority": 500,
-    "type": "hello_world",
-    "payload": {"greet": "World"},
-    "backoff": {
-        "base_ms": 1000,
-        "exponent": 1.5,
-        "jitter_ms": 10000
-    }
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "example",
+>     "priority": 500,
+>     "type": "hello_world",
+>     "payload": {"greet": "World"},
+>     "backoff": {
+>         "base_ms": 1000,
+>         "exponent": 1.5,
+>         "jitter_ms": 10000
+>     }
+> }'
+> ```
 
-```http
-HTTP/1.1 201 Created
-content-length: 203
-content-type: application/json
-date: Sat, 14 Mar 2026 03:24:16 GMT
-
-{
-    "attempts": 0,
-    "backoff": {
-        "base_ms": 1000,
-        "exponent": 1.5,
-        "jitter_ms": 10000
-    },
-    "id": "03fr7ki3x5kqf1epbydrfebkz",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1773458656424,
-    "status": "ready",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 203
+> content-type: application/json
+> date: Sat, 14 Mar 2026 03:24:16 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "backoff": {
+>         "base_ms": 1000,
+>         "exponent": 1.5,
+>         "jitter_ms": 10000
+>     },
+>     "id": "03fr7ki3x5kqf1epbydrfebkz",
+>     "priority": 500,
+>     "queue": "example",
+>     "ready_at": 1773458656424,
+>     "status": "ready",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Enqueue a job with explicit retention policy
 
-```shell
-http POST http://127.0.0.1:7890/jobs <<'JSON'
-{
-    "queue": "example",
-    "priority": 500,
-    "type": "hello_world",
-    "payload": {"greet": "World"},
-    "retention": {
-        "completed_ms": 86400000,
-        "dead_ms": 604800000
-    }
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "example",
+>     "priority": 500,
+>     "type": "hello_world",
+>     "payload": {"greet": "World"},
+>     "retention": {
+>         "completed_ms": 86400000,
+>         "dead_ms": 604800000
+>     }
+> }'
+> ```
 
-```http
-HTTP/1.1 201 Created
-content-length: 201
-content-type: application/json
-date: Sat, 14 Mar 2026 03:26:01 GMT
-
-{
-    "attempts": 0,
-    "id": "03fr7kudjeradun2wk1v3tn7b",
-    "priority": 500,
-    "queue": "example",
-    "ready_at": 1773458761086,
-    "retention": {
-        "completed_ms": 86400000,
-        "dead_ms": 604800000
-    },
-    "status": "ready",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 201
+> content-type: application/json
+> date: Sat, 14 Mar 2026 03:26:01 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "id": "03fr7kudjeradun2wk1v3tn7b",
+>     "priority": 500,
+>     "queue": "example",
+>     "ready_at": 1773458761086,
+>     "retention": {
+>         "completed_ms": 86400000,
+>         "dead_ms": 604800000
+>     },
+>     "status": "ready",
+>     "type": "hello_world"
+> }
+> ```
