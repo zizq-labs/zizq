@@ -14,30 +14,36 @@ does almost all of the work.
 
 ### 1. Download the binary.
 
-```shell
-curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.5.1/zizq-0.5.1-linux-x86_64.tar.gz
-```
+> Download:
+>
+> ```bash
+> curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.5.1/zizq-0.5.1-linux-x86_64.tar.gz
+> ```
 
 ### 2. Extract it.
 
-```shell
-tar -xvzf zizq-0.5.1-linux-x86_64.tar.gz
-```
+> Extract:
+>
+> ```bash
+> tar -xvzf zizq-0.5.1-linux-x86_64.tar.gz
+> ```
 
 ### 3. Run it to start the server.
 
-```shell
-./zizq serve
-
-Zizq 0.5.1
-2026-04-05T05:41:26.893318Z  INFO zizq::commands::serve: no license key provided, running in free tier
-2026-04-05T05:41:27.081150Z  INFO zizq::commands::serve: store opened root_dir=./zizq-root
-2026-04-05T05:41:27.081547Z  INFO zizq::commands::serve: admin API listening addr=127.0.0.1:8901 scheme=http
-2026-04-05T05:41:27.081842Z  INFO zizq::commands::serve: in-memory indexes rebuilt ready=0 scheduled=0
-2026-04-05T05:41:27.081890Z  INFO zizq::commands::serve: primary API listening addr=127.0.0.1:7890 scheme=http
-Listening on http://127.0.0.1:8901 (admin)
-Listening on http://127.0.0.1:7890 (primary)
-```
+> Run:
+>
+> ```bash
+> ./zizq serve
+> 
+> Zizq 0.5.1
+> 2026-04-05T05:41:26.893318Z  INFO zizq::commands::serve: no license key provided, running in free tier
+> 2026-04-05T05:41:27.081150Z  INFO zizq::commands::serve: store opened root_dir=./zizq-root
+> 2026-04-05T05:41:27.081547Z  INFO zizq::commands::serve: admin API listening addr=127.0.0.1:8901 scheme=http
+> 2026-04-05T05:41:27.081842Z  INFO zizq::commands::serve: in-memory indexes rebuilt ready=0 scheduled=0
+> 2026-04-05T05:41:27.081890Z  INFO zizq::commands::serve: primary API listening addr=127.0.0.1:7890 scheme=http
+> Listening on http://127.0.0.1:8901 (admin)
+> Listening on http://127.0.0.1:7890 (primary)
+> ```
 
 ---------------------------------
 
@@ -59,30 +65,34 @@ purely to illustrate the flexibility of Zizq.
 
 ### 1. Enqueue a job
 
-```bash
-curl -XPOST \
-  http://localhost:7890/jobs \
-  -s \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "queue":"example",
-    "type":"hello_world",
-    "payload":{"greet":"Universe"}
-  }' | jq
-```
+> Request:
+>
+> ```bash
+> curl -XPOST \
+>   http://localhost:7890/jobs \
+>   -s \
+>   -H 'Content-Type: application/json' \
+>   -d '{
+>     "queue":"example",
+>     "type":"hello_world",
+>     "payload":{"greet":"Universe"}
+>   }' | jq
+> ```
 
-```text
-{
-  "id": "03g04auga7wsnux60e4r7wip1",
-  "type": "hello_world",
-  "queue": "example",
-  "priority": 32768,
-  "status": "ready",
-  "ready_at": 1777005093930,
-  "attempts": 0,
-  "duplicate": false
-}
-```
+> Response:
+>
+> ```json
+> {
+>   "id": "03g04auga7wsnux60e4r7wip1",
+>   "type": "hello_world",
+>   "queue": "example",
+>   "priority": 32768,
+>   "status": "ready",
+>   "ready_at": 1777005093930,
+>   "attempts": 0,
+>   "duplicate": false
+> }
+> ```
 
 ### 2. Process the job
 
@@ -90,43 +100,47 @@ curl -XPOST \
 > This script does not exit until it is interrupted. The `while` loop receives
 > lines of JSON from the server. Blank lines are heartbeats and are skipped.
 
-```bash
-curl -XGET \
-  "http://localhost:7890/jobs/take" \
-  -sN | while IFS= read -r job; do
-    [[ "$job" = "" ]] && continue
+> Script:
+>
+> ```bash
+> curl -XGET \
+>   "http://localhost:7890/jobs/take" \
+>   -sN | while IFS= read -r job; do
+>     [[ "$job" = "" ]] && continue
+> 
+>     id="$(echo "$job" | jq -r ".id")"
+>     type="$(echo "$job" | jq -r ".type")"
+> 
+>     echo "Processing job with id=${id} type=${type}..."
+>     echo "$job" | jq
+> 
+>     echo "Acknowledging completion..."
+>     curl -XPOST -s "http://localhost:7890/jobs/${id}/success"
+> 
+>     echo "Done."
+>   done
+> ```
 
-    id="$(echo "$job" | jq -r ".id")"
-    type="$(echo "$job" | jq -r ".type")"
-
-    echo "Processing job with id=${id} type=${type}..."
-    echo "$job" | jq
-
-    echo "Acknowledging completion..."
-    curl -XPOST -s "http://localhost:7890/jobs/${id}/success"
-
-    echo "Done."
-  done
-```
-
-```text
-Processing job with id=03g04auga7wsnux60e4r7wip1 type=hello_world...
-{
-  "id": "03g04auga7wsnux60e4r7wip1",
-  "type": "hello_world",
-  "queue": "example",
-  "priority": 32768,
-  "status": "in_flight",
-  "payload": {
-    "greet": "Universe"
-  },
-  "ready_at": 1777005093930,
-  "attempts": 0,
-  "dequeued_at": 1777005818220
-}
-Acknowledging completion...
-Done.
-```
+> Output:
+>
+> ```text
+> Processing job with id=03g04auga7wsnux60e4r7wip1 type=hello_world...
+> {
+>   "id": "03g04auga7wsnux60e4r7wip1",
+>   "type": "hello_world",
+>   "queue": "example",
+>   "priority": 32768,
+>   "status": "in_flight",
+>   "payload": {
+>     "greet": "Universe"
+>   },
+>   "ready_at": 1777005093930,
+>   "attempts": 0,
+>   "dequeued_at": 1777005818220
+> }
+> Acknowledging completion...
+> Done.
+> ```
 
 ### 3. Keep going
 

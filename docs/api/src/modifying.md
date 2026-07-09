@@ -426,116 +426,142 @@ provided.
 
 ### Update a job's queue and priority
 
-```shell
-http PATCH 127.0.0.1:7890/jobs/03fvmbsuryhdkxvb6vjy4qhxp <<'JSON'
-{"queue": "other", "priority": 100}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PATCH 127.0.0.1:7890/jobs/03fvmbsuryhdkxvb6vjy4qhxp --raw '{
+>     "queue": "other",
+>     "priority": 100
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 141
-content-type: application/json
-date: Fri, 03 Apr 2026 11:10:58 GMT
-
-{
-    "attempts": 0,
-    "id": "03fvmbsuryhdkxvb6vjy4qhxp",
-    "priority": 100,
-    "queue": "other",
-    "ready_at": 1775214099613,
-    "status": "ready",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 141
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:10:58 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "id": "03fvmbsuryhdkxvb6vjy4qhxp",
+>     "priority": 100,
+>     "queue": "other",
+>     "ready_at": 1775214099613,
+>     "status": "ready",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Move a job from `ready` to `scheduled`
 
-```shell
-http PATCH 127.0.0.1:7890/jobs/03fvmbsuryhdkxvb6vjy4qhxp <<'JSON'
-{"ready_at": 1775217412000}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PATCH 127.0.0.1:7890/jobs/03fvmbsuryhdkxvb6vjy4qhxp --raw '{
+>     "ready_at": 1775217412000
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 145
-content-type: application/json
-date: Fri, 03 Apr 2026 11:13:10 GMT
-
-{
-    "attempts": 0,
-    "id": "03fvmbsuryhdkxvb6vjy4qhxp",
-    "priority": 100,
-    "queue": "other",
-    "ready_at": 1775217412000,
-    "status": "scheduled",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 145
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:13:10 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "id": "03fvmbsuryhdkxvb6vjy4qhxp",
+>     "priority": 100,
+>     "queue": "other",
+>     "ready_at": 1775217412000,
+>     "status": "scheduled",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Clear a field back to server default
 
 Setting an optional field to `null` resets it to the server's default value.
 
-```shell
-http PATCH 127.0.0.1:7890/jobs/03fvmbsuryhdkxvb6vjy4qhxp <<'JSON'
-{"retry_limit": null}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PATCH 127.0.0.1:7890/jobs/03fvmbsuryhdkxvb6vjy4qhxp --raw '{
+>     "retry_limit": null
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 145
-content-type: application/json
-date: Fri, 03 Apr 2026 11:15:20 GMT
-
-{
-    "attempts": 0,
-    "id": "03fvmbsuryhdkxvb6vjy4qhxp",
-    "priority": 100,
-    "queue": "other",
-    "ready_at": 1775217412000,
-    "status": "scheduled",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 145
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:15:20 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "id": "03fvmbsuryhdkxvb6vjy4qhxp",
+>     "priority": 100,
+>     "queue": "other",
+>     "ready_at": 1775217412000,
+>     "status": "scheduled",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Move all jobs from one queue to another
 
-```shell
-http PATCH http://127.0.0.1:7890/jobs?queue=example <<'JSON'
-{"queue": "other"}
-JSON
-```
+> Request:
+>
+> ```bash
+> http PATCH http://127.0.0.1:7890/jobs?queue=example --raw '{
+>     "queue": "other"
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 13
-content-type: application/json
-date: Fri, 03 Apr 2026 11:17:09 GMT
-
-{
-    "patched": 4
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 13
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:17:09 GMT
+> ```
+> ```json
+> {
+>     "patched": 4
+> }
+> ```
 
 ### Remove all scheduled jobs on a queue
 
-```shell
-http DELETE "http://127.0.0.1:7890/jobs?queue=example&status=scheduled"
-```
+> Request:
+>
+> ```bash
+> http DELETE "http://127.0.0.1:7890/jobs?queue=example&status=scheduled"
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 13
-content-type: application/json
-date: Fri, 03 Apr 2026 11:18:36 GMT
-
-{
-    "deleted": 2
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 13
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:18:36 GMT
+> ```
+> ```json
+> {
+>     "deleted": 2
+> }
+> ```
 
 ### Safely delete jobs matching filters in pages
 
@@ -548,64 +574,74 @@ used:
 It's important to retain the filters to handle race conditions if the jobs are
 modified between fetching the page and executing the delete.
 
-```shell
-http GET 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Wo")&limit=2'
-```
+> Find Request:
+>
+> ```bash
+> http GET 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Wo")&limit=2'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 624
-content-type: application/json
-date: Fri, 03 Apr 2026 11:22:34 GMT
+> Find Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 624
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:22:34 GMT
+> ```
+> ```json
+> {
+>     "jobs": [
+>         {
+>             "attempts": 0,
+>             "id": "03fvmaj8q5po1huy5nd4xmi5f",
+>             "payload": {
+>                 "greet": "World"
+>             },
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1775213710452,
+>             "status": "ready",
+>             "type": "hello_world"
+>         },
+>         {
+>             "attempts": 0,
+>             "id": "03fvmame0wyuiexbc2033jby2",
+>             "payload": {
+>                 "greet": "World"
+>             },
+>             "priority": 500,
+>             "queue": "example",
+>             "ready_at": 1775213737304,
+>             "status": "ready",
+>             "type": "hello_world",
+>             "unique_key": "hello_world:world",
+>             "unique_while": "queued"
+>         }
+>     ],
+>     "pages": {
+>         "next": "/jobs?from=03fvmame0wyuiexbc2033jby2&order=asc&limit=2&filter=.greet%20%7C%20startswith%28%22Wo%22%29",
+>         "prev": null,
+>         "self": "/jobs?order=asc&limit=2&filter=.greet%20%7C%20startswith%28%22Wo%22%29"
+>     }
+> }
+> ```
 
-{
-    "jobs": [
-        {
-            "attempts": 0,
-            "id": "03fvmaj8q5po1huy5nd4xmi5f",
-            "payload": {
-                "greet": "World"
-            },
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1775213710452,
-            "status": "ready",
-            "type": "hello_world"
-        },
-        {
-            "attempts": 0,
-            "id": "03fvmame0wyuiexbc2033jby2",
-            "payload": {
-                "greet": "World"
-            },
-            "priority": 500,
-            "queue": "example",
-            "ready_at": 1775213737304,
-            "status": "ready",
-            "type": "hello_world",
-            "unique_key": "hello_world:world",
-            "unique_while": "queued"
-        }
-    ],
-    "pages": {
-        "next": "/jobs?from=03fvmame0wyuiexbc2033jby2&order=asc&limit=2&filter=.greet%20%7C%20startswith%28%22Wo%22%29",
-        "prev": null,
-        "self": "/jobs?order=asc&limit=2&filter=.greet%20%7C%20startswith%28%22Wo%22%29"
-    }
-}
-```
+> Delete Request:
+>
+> ```bash
+> http DELETE 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Wo")&id=03fvmaj8q5po1huy5nd4xmi5f,03fvmame0wyuiexbc2033jby2'
+> ```
 
-```shell
-http DELETE 'http://127.0.0.1:7890/jobs?filter=.greet | startswith("Wo")&id=03fvmaj8q5po1huy5nd4xmi5f,03fvmame0wyuiexbc2033jby2'
-```
-
-```http
-HTTP/1.1 200 OK
-content-length: 13
-content-type: application/json
-date: Fri, 03 Apr 2026 11:23:52 GMT
-
-{
-    "deleted": 2
-}
-```
+> Delete Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 13
+> content-type: application/json
+> date: Fri, 03 Apr 2026 11:23:52 GMT
+> ```
+> ```json
+> {
+>     "deleted": 2
+> }
+> ```

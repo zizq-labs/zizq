@@ -359,57 +359,67 @@ The job does not exist or is no longer in-flight.
 
 ### Streaming jobs from all queues
 
-```shell
-http --stream GET http://127.0.0.1:7890/jobs/take
-```
+> Request:
+>
+> ```bash
+> http --stream GET http://127.0.0.1:7890/jobs/take
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-type: application/x-ndjson
-date: Sat, 14 Mar 2026 04:59:48 GMT
-transfer-encoding: chunked
-
-{
-    "attempts": 0,
-    "dequeued_at": 1773464388204,
-    "id": "03fr82s077azjmurys29qjch4",
-    "payload": {
-        "greet": "World On Queue #1"
-    },
-    "priority": 200,
-    "queue": "example_1",
-    "ready_at": 1773464269527,
-    "status": "in_flight",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-type: application/x-ndjson
+> date: Sat, 14 Mar 2026 04:59:48 GMT
+> transfer-encoding: chunked
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "dequeued_at": 1773464388204,
+>     "id": "03fr82s077azjmurys29qjch4",
+>     "payload": {
+>         "greet": "World On Queue #1"
+>     },
+>     "priority": 200,
+>     "queue": "example_1",
+>     "ready_at": 1773464269527,
+>     "status": "in_flight",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Streaming jobs from specified queues
 
-```shell
-http --stream GET "http://127.0.0.1:7890/jobs/take?queue=example_5,example_7"
-```
+> Request:
+>
+> ```bash
+> http --stream GET "http://127.0.0.1:7890/jobs/take?queue=example_5,example_7"
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-type: application/x-ndjson
-date: Sat, 14 Mar 2026 05:01:44 GMT
-transfer-encoding: chunked
-
-{
-    "attempts": 0,
-    "dequeued_at": 1773464504362,
-    "id": "03fr82s4q2jktvg5p1acpeqfe",
-    "payload": {
-        "greet": "World On Queue #5"
-    },
-    "priority": 200,
-    "queue": "example_5",
-    "ready_at": 1773464270599,
-    "status": "in_flight",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-type: application/x-ndjson
+> date: Sat, 14 Mar 2026 05:01:44 GMT
+> transfer-encoding: chunked
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "dequeued_at": 1773464504362,
+>     "id": "03fr82s4q2jktvg5p1acpeqfe",
+>     "payload": {
+>         "greet": "World On Queue #5"
+>     },
+>     "priority": 200,
+>     "queue": "example_5",
+>     "ready_at": 1773464270599,
+>     "status": "in_flight",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Streaming jobs with prefetching
 
@@ -417,118 +427,132 @@ By default `prefetch=1` so only one job is received before each
 acknowledgement. Specifying a higher prefetch value allows the worker to take
 more jobs at once.
 
-```shell
-http --stream GET "http://127.0.0.1:7890/jobs/take?prefetch=3"
-```
+> Request:
+>
+> ```bash
+> http --stream GET "http://127.0.0.1:7890/jobs/take?prefetch=3"
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-type: application/x-ndjson
-date: Sat, 14 Mar 2026 05:04:41 GMT
-transfer-encoding: chunked
-
-{
-    "attempts": 0,
-    "dequeued_at": 1773464681299,
-    "id": "03fr82s077azjmurys29qjch4",
-    "payload": {
-        "greet": "World On Queue #1"
-    },
-    "priority": 200,
-    "queue": "example_1",
-    "ready_at": 1773464269527,
-    "status": "in_flight",
-    "type": "hello_world"
-}
-
-{
-    "attempts": 0,
-    "dequeued_at": 1773464681299,
-    "id": "03fr82s1c7s2arw4bxboy1ibe",
-    "payload": {
-        "greet": "World On Queue #2"
-    },
-    "priority": 200,
-    "queue": "example_2",
-    "ready_at": 1773464269797,
-    "status": "in_flight",
-    "type": "hello_world"
-}
-
-{
-    "attempts": 0,
-    "dequeued_at": 1773464681299,
-    "id": "03fr82s2honqa7zobvzmwql9u",
-    "payload": {
-        "greet": "World On Queue #3"
-    },
-    "priority": 200,
-    "queue": "example_3",
-    "ready_at": 1773464270070,
-    "status": "in_flight",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-type: application/x-ndjson
+> date: Sat, 14 Mar 2026 05:04:41 GMT
+> transfer-encoding: chunked
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "dequeued_at": 1773464681299,
+>     "id": "03fr82s077azjmurys29qjch4",
+>     "payload": {
+>         "greet": "World On Queue #1"
+>     },
+>     "priority": 200,
+>     "queue": "example_1",
+>     "ready_at": 1773464269527,
+>     "status": "in_flight",
+>     "type": "hello_world"
+> }
+> 
+> {
+>     "attempts": 0,
+>     "dequeued_at": 1773464681299,
+>     "id": "03fr82s1c7s2arw4bxboy1ibe",
+>     "payload": {
+>         "greet": "World On Queue #2"
+>     },
+>     "priority": 200,
+>     "queue": "example_2",
+>     "ready_at": 1773464269797,
+>     "status": "in_flight",
+>     "type": "hello_world"
+> }
+> 
+> {
+>     "attempts": 0,
+>     "dequeued_at": 1773464681299,
+>     "id": "03fr82s2honqa7zobvzmwql9u",
+>     "payload": {
+>         "greet": "World On Queue #3"
+>     },
+>     "priority": 200,
+>     "queue": "example_3",
+>     "ready_at": 1773464270070,
+>     "status": "in_flight",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Reporting job success (ack)
 
-```shell
-http POST http://127.0.0.1:7890/jobs/03fr82s1c7s2arw4bxboy1ibe/success
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs/03fr82s1c7s2arw4bxboy1ibe/success
+> ```
 
-```http
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:07:08 GMT
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:07:08 GMT
+> ```
 
 ### Reporting bulk job success (bulk ack)
 
-```shell
-http POST http://127.0.0.1:7890/jobs/success <<'JSON'
-{
-    "ids": [
-        "03fr82s1c7s2arw4bxboy1ibe",
-        "03fr82s2honqa7zobvzmwql9u",
-        "03fr82s3lxshnj4znseuvlaub"
-    ]
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs/success --raw '{
+>     "ids": [
+>         "03fr82s1c7s2arw4bxboy1ibe",
+>         "03fr82s2honqa7zobvzmwql9u",
+>         "03fr82s3lxshnj4znseuvlaub"
+>     ]
+> }'
+> ```
 
-```http
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:10:09 GMT
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:10:09 GMT
+> ```
 
 ### Reporting job failure (nack)
 
-```shell
-http POST http://127.0.0.1:7890/jobs/03fr82s4q2jktvg5p1acpeqfe/failure <<'JSON'
-{
-    "message": "Something went wrong",
-    "error_type": "RuntimeError"
-}
-JSON
-```
+> Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs/03fr82s4q2jktvg5p1acpeqfe/failure --raw '{
+>     "message": "Something went wrong",
+>     "error_type": "RuntimeError"
+> }'
+> ```
 
-```http
-HTTP/1.1 200 OK
-content-length: 203
-content-type: application/json
-date: Sat, 14 Mar 2026 05:11:53 GMT
-
-{
-    "attempts": 1,
-    "dequeued_at": 1773465062881,
-    "failed_at": 1773465113506,
-    "id": "03fr82s4q2jktvg5p1acpeqfe",
-    "priority": 200,
-    "queue": "example_5",
-    "ready_at": 1773465156928,
-    "status": "scheduled",
-    "type": "hello_world"
-}
-```
+> Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 203
+> content-type: application/json
+> date: Sat, 14 Mar 2026 05:11:53 GMT
+> ```
+> ```json
+> {
+>     "attempts": 1,
+>     "dequeued_at": 1773465062881,
+>     "failed_at": 1773465113506,
+>     "id": "03fr82s4q2jktvg5p1acpeqfe",
+>     "priority": 200,
+>     "queue": "example_5",
+>     "ready_at": 1773465156928,
+>     "status": "scheduled",
+>     "type": "hello_world"
+> }
+> ```
 
 ### Acknowledging jobs while streaming
 
@@ -541,41 +565,43 @@ acknowledgement for each job so that the stream receives the next job until no
 more jobs remain. Because the server never closes the stream this pipe command
 will never exit.
 
-```shell
-$ http --stream GET http://127.0.0.1:7890/jobs/take \
-  | jq -r --unbuffered .id \
-  | xargs -I {id} http POST http://127.0.0.1:7890/jobs/{id}/success
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:44 GMT
-
-
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:44 GMT
-
-
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:45 GMT
-
-
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:45 GMT
-
-
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:45 GMT
-
-
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:45 GMT
-
-
-
-HTTP/1.1 204 No Content
-date: Sat, 14 Mar 2026 05:53:46 GMT
-```
+> Script:
+>
+> ```bash
+> $ http --stream GET http://127.0.0.1:7890/jobs/take \
+>   | jq -r --unbuffered .id \
+>   | xargs -I {id} http POST http://127.0.0.1:7890/jobs/{id}/success
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:44 GMT
+> 
+> 
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:44 GMT
+> 
+> 
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:45 GMT
+> 
+> 
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:45 GMT
+> 
+> 
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:45 GMT
+> 
+> 
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:45 GMT
+> 
+> 
+> 
+> HTTP/1.1 204 No Content
+> date: Sat, 14 Mar 2026 05:53:46 GMT
+> ```
