@@ -220,8 +220,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
     use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use getrandom::SysRng;
+    use getrandom::rand_core::UnwrapErr;
     use jsonwebtoken::{EncodingKey, Header};
-    use rand_core::OsRng;
     use serde::Serialize;
 
     #[derive(Serialize)]
@@ -234,7 +235,7 @@ mod tests {
 
     /// Generate an ephemeral Ed25519 keypair and return (private PEM, public PEM).
     fn gen_keypair() -> (String, String) {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let private_pem = signing_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("failed to encode private key");
