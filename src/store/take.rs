@@ -220,7 +220,7 @@ impl Store {
                 // 5. Hydrate phase — read payloads for all committed jobs.
                 let hydrate_start = std::time::Instant::now();
                 for pre in &mut valid {
-                    let payload_key = make_payload_key(&pre.job_id);
+                    let payload_key = make_payload_key(pre.job.payload_key());
                     if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                         pre.job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                     }

@@ -73,6 +73,7 @@ pub(in crate::store) fn prepare_enqueue(
             key: k,
             scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
         }),
+        payload_key: None,
     };
 
     let mut meta = job.clone();
@@ -81,7 +82,7 @@ pub(in crate::store) fn prepare_enqueue(
 
     Ok(PreparedEnqueue {
         job_key: make_job_key(&id),
-        payload_key: make_payload_key(&id),
+        payload_key: make_payload_key(job.payload_key()),
         queue_key: make_queue_key(&job.queue, &id),
         status_key: make_status_key(status, &id),
         type_key: make_type_key(&job.job_type, &id),

@@ -280,6 +280,7 @@ pub(super) struct JobDeletion {
     status_key: Vec<u8>,
     queue_key: Vec<u8>,
     type_key: Vec<u8>,
+    payload_key: Vec<u8>,
     purge_key: Option<Vec<u8>>,
     error_keys: Vec<Vec<u8>>,
     unique_idx_key: Option<Vec<u8>>,
@@ -293,6 +294,7 @@ pub(super) fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces)
         status_key: make_status_key(status, id),
         queue_key: make_queue_key(&job.queue, id),
         type_key: make_type_key(&job.job_type, id),
+        payload_key: make_payload_key(job.payload_key()),
         purge_key: job.purge_at.map(|purge_at| make_purge_key(purge_at, id)),
         error_keys: error_keys(ks, id).collect(),
         unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
@@ -306,7 +308,7 @@ pub(super) fn apply_job_deletion(
     ks: &Keyspaces,
 ) {
     tx.remove(&ks.data, &make_job_key(&del.id));
-    tx.remove_weak(&ks.data, &make_payload_key(&del.id));
+    tx.remove_weak(&ks.data, &del.payload_key);
     tx.remove(&ks.index, &del.status_key);
     tx.remove_weak(&ks.index, &del.queue_key);
     tx.remove_weak(&ks.index, &del.type_key);

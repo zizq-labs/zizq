@@ -295,6 +295,30 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique: Option<UniqueConstraint>,
+
+    /// Address of this job's payload record in the data keyspace.
+    ///
+    /// When `None`, the payload lives at `P\0<job_id>` (default for jobs
+    /// that never mutate their payload). When `Some`, the payload lives
+    /// at `P\0<payload_key>` — used by features that need to rewrite a
+    /// pending job's payload without moving its queue position, so that
+    /// each individual payload record remains write-once/delete-once and
+    /// `remove_weak` stays valid.
+    #[serde(rename = "k")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_key: Option<String>,
+}
+
+impl Job {
+    /// Returns the identifier used to construct this job's payload key.
+    ///
+    /// Falls back to the job id for jobs that don't have a distinct
+    /// `payload_key` set, so existing storage layouts continue to work
+    /// unchanged.
+    pub(crate) fn payload_key(&self) -> &str {
+        self.payload_key.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// Retention configuration for completed and dead jobs.

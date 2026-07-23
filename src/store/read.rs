@@ -45,7 +45,7 @@ impl Store {
             }
 
             // Hydrate the payload from the data keyspace.
-            let payload_key = make_payload_key(&id);
+            let payload_key = make_payload_key(job.payload_key());
             if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                 job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
             }
