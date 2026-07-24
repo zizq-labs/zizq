@@ -38,13 +38,17 @@ pub enum EnqueueResult {
     Created(Job),
     /// The job was a duplicate of an existing job in a conflicting state.
     Duplicate(Job),
+    /// The enqueue was folded into an existing pending batched job. The
+    /// returned job is the batch's job (whose payload now reflects the
+    /// merged result).
+    Folded(Job),
 }
 
 impl EnqueueResult {
     /// Return a reference to the underlying job regardless of variant.
     pub fn job(&self) -> &Job {
         match self {
-            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
+            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) | EnqueueResult::Folded(j) => j,
         }
     }
 
@@ -53,10 +57,15 @@ impl EnqueueResult {
         matches!(self, EnqueueResult::Duplicate(_))
     }
 
+    /// Return `true` if this enqueue was folded into an existing batched job.
+    pub fn is_folded(&self) -> bool {
+        matches!(self, EnqueueResult::Folded(_))
+    }
+
     /// Consume the result and return the underlying job.
     pub fn into_job(self) -> Job {
         match self {
-            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) => j,
+            EnqueueResult::Created(j) | EnqueueResult::Duplicate(j) | EnqueueResult::Folded(j) => j,
         }
     }
 }

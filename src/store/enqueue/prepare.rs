@@ -74,6 +74,7 @@ pub(in crate::store) fn prepare_enqueue(
             scope: unique_while_scope.unwrap_or(UniqueWhile::Queued) as u8,
         }),
         payload_key: None,
+        batch: None,
     };
 
     let mut meta = job.clone();

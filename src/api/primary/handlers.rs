@@ -531,6 +531,17 @@ async fn enqueue(
         );
     }
 
+    // Batched jobs are recognized but not yet implemented.
+    if enqueue_req.batch.is_some() {
+        return respond(
+            fmt,
+            StatusCode::NOT_IMPLEMENTED,
+            &ErrorResponse {
+                error: "batched jobs are not yet implemented".into(),
+            },
+        );
+    }
+
     // License check for unique jobs.
     if enqueue_req.unique_key.is_some() {
         let now_ms = (state.clock)();
@@ -664,6 +675,15 @@ async fn bulk_enqueue(
         }
         if job.unique_key.is_some() {
             has_unique = true;
+        }
+        if job.batch.is_some() {
+            return respond(
+                fmt,
+                StatusCode::NOT_IMPLEMENTED,
+                &ErrorResponse {
+                    error: format!("jobs[{i}]: batched jobs are not yet implemented"),
+                },
+            );
         }
     }
 

@@ -187,6 +187,33 @@ impl UniqueConstraint {
     }
 }
 
+/// Batching configuration for a job.
+///
+/// When a job is enqueued with `batch`, subsequent enqueues sharing the same
+/// `key` may be folded into it: the `when` jq predicate decides whether to
+/// fold, and the `fold` jq expression produces the merged payload. Both
+/// expressions run against `$existing` (the current pending job's payload)
+/// and `$new` (the incoming payload). The first enqueue's `when`/`fold`
+/// wins — subsequent enqueues supply payload against the existing
+/// configuration until the batch is sealed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchConfig {
+    /// Identifies the batch. Only one pending batch may exist per key at a
+    /// time.
+    #[serde(rename = "k")]
+    pub key: String,
+
+    /// jq predicate. When it evaluates truthy, the new payload is folded
+    /// into the existing pending job. When falsy, the existing batch is
+    /// sealed and a fresh pending job is created.
+    #[serde(rename = "w")]
+    pub when: String,
+
+    /// jq expression producing the merged payload when `when` returns true.
+    #[serde(rename = "f")]
+    pub fold: String,
+}
+
 /// A job stored in the queue keyspace.
 ///
 /// Jobs are identified using scru128 because it is time-sequenced and high
@@ -308,6 +335,15 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_key: Option<String>,
+
+    /// Batching configuration. When set, subsequent enqueues sharing this
+    /// batch key may fold their payloads into this job's payload until the
+    /// batch is sealed (predicate fails) or the job transitions to
+    /// InFlight.
+    #[serde(rename = "B")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
 }
 
 impl Job {

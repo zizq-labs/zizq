@@ -51,6 +51,6 @@ pub use store::{Store, StoreEvent};
 pub use cron::{CronEntry, CronGroup};
 
 pub use types::{
-    BackoffConfig, CommitMode, EnvConfigError, ErrorRecord, Job, JobStatus, RetentionConfig,
-    ScanDirection, StoreError, UniqueConstraint, UniqueWhile,
+    BackoffConfig, BatchConfig, CommitMode, EnvConfigError, ErrorRecord, Job, JobStatus,
+    RetentionConfig, ScanDirection, StoreError, UniqueConstraint, UniqueWhile,
 };
