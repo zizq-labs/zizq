@@ -69,6 +69,9 @@ pub enum Feature {
     UniqueJobs,
     /// Cron scheduling — periodic job enqueue from cron expressions.
     CronScheduling,
+    /// Batched jobs — fold subsequent enqueues into a pending job's
+    /// payload via `when`/`fold` jq expressions.
+    BatchedJobs,
 }
 
 impl Feature {
@@ -81,6 +84,7 @@ impl Feature {
             Feature::MutualTls => Tier::Pro,
             Feature::UniqueJobs => Tier::Pro,
             Feature::CronScheduling => Tier::Pro,
+            Feature::BatchedJobs => Tier::Pro,
         }
     }
 }
@@ -94,6 +98,7 @@ impl std::fmt::Display for Feature {
             Feature::MutualTls => write!(f, "mutual TLS"),
             Feature::UniqueJobs => write!(f, "unique jobs"),
             Feature::CronScheduling => write!(f, "cron scheduling"),
+            Feature::BatchedJobs => write!(f, "batched jobs"),
         }
     }
 }

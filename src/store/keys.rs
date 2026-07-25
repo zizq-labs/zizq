@@ -31,6 +31,7 @@ pub(super) enum RecordKind {
 #[repr(u8)]
 pub(super) enum IndexKind {
     PurgeAt = b'A',
+    Batch = b'B',
     Queue = b'Q',
     Status = b'S',
     Type = b'T',
@@ -108,6 +109,19 @@ pub(super) fn make_unique_key(unique_key: &str) -> Vec<u8> {
     key.push(IndexKind::Unique as u8);
     key.push(0);
     key.extend_from_slice(unique_key.as_bytes());
+    key
+}
+
+/// Build a batch index key: `B\0{batch_key}`.
+///
+/// The value stored under this key is the job id of the current pending
+/// batched job for that batch key. Removed when the batch is sealed,
+/// claimed (Ready -> InFlight), or the pending job is deleted.
+pub(super) fn make_batch_key(batch_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + batch_key.len());
+    key.push(IndexKind::Batch as u8);
+    key.push(0);
+    key.extend_from_slice(batch_key.as_bytes());
     key
 }
 

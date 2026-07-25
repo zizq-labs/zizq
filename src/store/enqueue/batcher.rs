@@ -205,14 +205,15 @@ fn process_batch(
 
     // Skip the commit when every result was a duplicate —
     // `apply_enqueue` makes zero tx writes in that case so committing
-    // would be wasteful. Mirrors the single-enqueue fast path.
-    let created = results
+    // would be wasteful. `Folded(_)` writes to the tx too, so it also
+    // counts as "needs commit".
+    let writes = results
         .iter()
-        .filter(|r| matches!(r, EnqueueResult::Created(_)))
+        .filter(|r| !matches!(r, EnqueueResult::Duplicate(_)))
         .count();
-    let duplicate = jobs_count - created;
+    let duplicate = jobs_count - writes;
 
-    if created > 0 {
+    if writes > 0 {
         if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
             tracing::error!(
                 ops = ops_count,
@@ -229,7 +230,7 @@ fn process_batch(
         tracing::debug!(
             ops = ops_count,
             jobs = jobs_count,
-            created,
+            writes,
             duplicate,
             "enqueue auto-batcher: committed batch"
         );

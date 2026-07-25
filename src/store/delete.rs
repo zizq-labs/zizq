@@ -13,8 +13,8 @@
 use tokio::task;
 
 use super::keys::{
-    error_keys, make_job_key, make_payload_key, make_purge_key, make_queue_key, make_status_key,
-    make_type_key, make_unique_key,
+    error_keys, make_batch_key, make_job_key, make_payload_key, make_purge_key, make_queue_key,
+    make_status_key, make_type_key, make_unique_key,
 };
 use super::options::BulkDeleteOptions;
 use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
@@ -284,6 +284,7 @@ pub(super) struct JobDeletion {
     purge_key: Option<Vec<u8>>,
     error_keys: Vec<Vec<u8>>,
     unique_idx_key: Option<Vec<u8>>,
+    batch_idx_key: Option<Vec<u8>>,
 }
 
 /// Collect all keys needed to delete a job. No tx required.
@@ -298,6 +299,7 @@ pub(super) fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces)
         purge_key: job.purge_at.map(|purge_at| make_purge_key(purge_at, id)),
         error_keys: error_keys(ks, id).collect(),
         unique_idx_key: job.unique.as_ref().map(|uc| make_unique_key(&uc.key)),
+        batch_idx_key: job.batch.as_ref().map(|bc| make_batch_key(&bc.key)),
     }
 }
 
@@ -322,6 +324,16 @@ pub(super) fn apply_job_deletion(
     if let Some(ref unique_key) = del.unique_idx_key {
         let job_id = del.id.as_bytes();
         let _ = tx.fetch_update(&ks.index, unique_key, |v| match v {
+            Some(v) if v.as_ref() == job_id => None,
+            other => other.cloned(),
+        });
+    }
+
+    // Same pattern for the batch index: only remove if it still points
+    // at this job. A subsequent seal may have already replaced it.
+    if let Some(ref batch_key) = del.batch_idx_key {
+        let job_id = del.id.as_bytes();
+        let _ = tx.fetch_update(&ks.index, batch_key, |v| match v {
             Some(v) if v.as_ref() == job_id => None,
             other => other.cloned(),
         });

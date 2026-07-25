@@ -111,8 +111,18 @@ mod tests {
     use super::super::results::EnqueueResult;
     use super::super::store::StoreEvent;
     use super::super::test_support::{test_store, test_store_with_retention};
-    use super::super::types::{BackoffConfig, Job, JobStatus, RetentionConfig, UniqueWhile};
+    use super::super::types::{
+        BackoffConfig, BatchConfig, Job, JobStatus, RetentionConfig, UniqueWhile,
+    };
     use crate::time::now_millis;
+
+    fn append_batch(key: &str) -> BatchConfig {
+        BatchConfig {
+            key: key.to_string(),
+            when: "true".to_string(),
+            fold: "$existing + $new".to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn enqueue_returns_job_with_id() {
@@ -936,5 +946,354 @@ mod tests {
             .unwrap();
         assert!(r2.is_duplicate());
         assert_eq!(r2.job().id, r1.job().id);
+    }
+
+    // --- Batched jobs ---
+
+    #[tokio::test]
+    async fn batch_first_enqueue_creates_new_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        let r = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r.is_folded());
+        assert!(!r.is_duplicate());
+        assert_eq!(r.job().payload, Some(serde_json::json!([1])));
+    }
+
+    #[tokio::test]
+    async fn batch_second_enqueue_folds_into_existing() {
+        let store = test_store();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2, 3]))
+                    .batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r1.is_folded());
+        assert!(r2.is_folded());
+        assert_eq!(r2.job().id, r1.job().id);
+        assert_eq!(r2.job().payload, Some(serde_json::json!([1, 2, 3])));
+    }
+
+    #[tokio::test]
+    async fn batch_fold_preserves_fifo_position() {
+        let store = test_store();
+        let now = now_millis();
+
+        // Enqueue a batched job, then a normal job, then fold into the batched.
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("other", "q", serde_json::json!("later")),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+
+        // FIFO: batched job (r1) should be taken before r2, even after fold.
+        let t1 = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(t1.id, r1.job().id);
+        assert_eq!(t1.payload, Some(serde_json::json!([1, 2])));
+
+        let t2 = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(t2.id, r2.job().id);
+    }
+
+    #[tokio::test]
+    async fn batch_seal_when_predicate_false_starts_new_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        let seal_when_two = BatchConfig {
+            key: "k".into(),
+            when: "($existing | length) < 2".into(),
+            fold: "$existing + $new".into(),
+        };
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1]))
+                    .batch(seal_when_two.clone()),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2]))
+                    .batch(seal_when_two.clone()),
+            )
+            .await
+            .unwrap();
+        // r2 folds (existing = [1], length 1 < 2). Now r1's payload is [1, 2].
+        assert!(r2.is_folded());
+
+        let r3 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([3])).batch(seal_when_two),
+            )
+            .await
+            .unwrap();
+        // r3 predicate: existing = [1, 2], length 2 is NOT < 2 → seal, new job.
+        assert!(!r3.is_folded());
+        assert_ne!(r3.job().id, r1.job().id);
+        assert_eq!(r3.job().payload, Some(serde_json::json!([3])));
+    }
+
+    #[tokio::test]
+    async fn batch_folds_persist_across_get_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+
+        let fetched = store.get_job(now, &r1.job().id).await.unwrap().unwrap();
+        assert_eq!(fetched.payload, Some(serde_json::json!([1, 2])));
+    }
+
+    #[tokio::test]
+    async fn batch_take_closes_batch_so_next_enqueue_creates_new() {
+        let store = test_store();
+        store.rebuild_indexes().await.unwrap();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        let taken = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, r1.job().id);
+
+        // Subsequent enqueue for the same key must NOT fold into the
+        // in-flight job — it starts a fresh batch.
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        assert!(!r2.is_folded());
+        assert_ne!(r2.job().id, r1.job().id);
+    }
+
+    #[tokio::test]
+    async fn batch_delete_pending_lets_next_enqueue_create_new() {
+        let store = test_store();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        store.delete_job(&r1.job().id).await.unwrap();
+
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        assert!(!r2.is_folded());
+        assert_ne!(r2.job().id, r1.job().id);
+    }
+
+    #[tokio::test]
+    async fn batch_different_keys_do_not_fold() {
+        let store = test_store();
+        let now = now_millis();
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("a")),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(append_batch("b")),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r1.is_folded());
+        assert!(!r2.is_folded());
+        assert_ne!(r1.job().id, r2.job().id);
+    }
+
+    #[tokio::test]
+    async fn batch_and_unique_together_is_rejected() {
+        let store = test_store();
+        let now = now_millis();
+
+        let err = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1]))
+                    .unique_key("u")
+                    .batch(append_batch("k")),
+            )
+            .await
+            .err()
+            .expect("expected InvalidOperation error");
+        assert!(
+            matches!(err, super::super::types::StoreError::InvalidOperation(_)),
+            "expected InvalidOperation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_invalid_expression_is_rejected_at_enqueue() {
+        let store = test_store();
+        let now = now_millis();
+
+        let bad = BatchConfig {
+            key: "k".into(),
+            when: ".[*]".into(), // invalid syntax
+            fold: "$existing + $new".into(),
+        };
+
+        let err = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(bad),
+            )
+            .await
+            .err()
+            .expect("expected InvalidOperation error");
+        assert!(
+            matches!(err, super::super::types::StoreError::InvalidOperation(_)),
+            "expected InvalidOperation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_bulk_folds_within_single_call() {
+        let store = test_store();
+        let now = now_millis();
+
+        let results = store
+            .enqueue_bulk(
+                now,
+                vec![
+                    EnqueueOptions::new("push", "q", serde_json::json!([1]))
+                        .batch(append_batch("k")),
+                    EnqueueOptions::new("push", "q", serde_json::json!([2]))
+                        .batch(append_batch("k")),
+                    EnqueueOptions::new("push", "q", serde_json::json!([3]))
+                        .batch(append_batch("k")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].is_folded());
+        assert!(results[1].is_folded());
+        assert!(results[2].is_folded());
+        assert_eq!(results[1].job().id, results[0].job().id);
+        assert_eq!(results[2].job().id, results[0].job().id);
+        assert_eq!(results[2].job().payload, Some(serde_json::json!([1, 2, 3])));
+    }
+
+    #[tokio::test]
+    async fn batch_existing_config_wins_over_new() {
+        let store = test_store();
+        let now = now_millis();
+
+        let cfg_a = append_batch("k");
+        let cfg_b = BatchConfig {
+            key: "k".into(),
+            when: "false".into(), // If this won, everything would seal.
+            fold: "$new".into(),
+        };
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(cfg_a.clone()),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(cfg_b),
+            )
+            .await
+            .unwrap();
+
+        // Existing's `when: true` applies, so this folds.
+        assert!(r2.is_folded());
+        assert_eq!(r2.job().payload, Some(serde_json::json!([1, 2])));
     }
 }
