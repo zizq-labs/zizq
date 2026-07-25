@@ -6886,6 +6886,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_folded_payload_visible_via_get() {
+        // Reproduces a user-reported scenario: fold two enqueues,
+        // then fetch the job via GET /jobs/{id} and verify the merged
+        // payload survives round-trip through the API.
+        let app = pro_app();
+
+        let make_body = |v| {
+            serde_json::json!({
+                "type": "audit.events",
+                "queue": "audit",
+                "batch": {
+                    "key": "audit.events",
+                    "when": "[$existing[], $new[]] | length <= 5",
+                    "fold": "$existing | . += $new",
+                },
+                "payload": v,
+            })
+        };
+
+        let req1 = json_request("POST", "/jobs", &make_body(serde_json::json!([{"a": 1}])));
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::CREATED);
+        let body1: serde_json::Value = serde_json::from_str(&response_body(res1).await).unwrap();
+        let job_id = body1["id"].as_str().unwrap().to_string();
+
+        let req2 = json_request("POST", "/jobs", &make_body(serde_json::json!([{"a": 2}])));
+        let res2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2: serde_json::Value = serde_json::from_str(&response_body(res2).await).unwrap();
+        assert_eq!(body2["folded"], true);
+        assert_eq!(body2["id"], serde_json::json!(job_id));
+
+        // Fetch via GET and verify the merged payload.
+        let get_req = json_request("GET", &format!("/jobs/{job_id}"), &serde_json::json!({}));
+        let get_res = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let get_body: serde_json::Value =
+            serde_json::from_str(&response_body(get_res).await).unwrap();
+        assert_eq!(get_body["payload"], serde_json::json!([{"a": 1}, {"a": 2}]));
+
+        // Also verify the stored batch config is visible on the response
+        // — critical for debugging "first-wins" surprises.
+        assert_eq!(get_body["batch"]["key"], "audit.events");
+        assert_eq!(
+            get_body["batch"]["when"],
+            "[$existing[], $new[]] | length <= 5"
+        );
+        assert_eq!(get_body["batch"]["fold"], "$existing | . += $new");
+    }
+
+    #[tokio::test]
     async fn batch_and_unique_together_returns_400() {
         let mut body = batch_enqueue_body(serde_json::json!([1]));
         body["unique_key"] = serde_json::json!("u");

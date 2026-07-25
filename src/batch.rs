@@ -482,6 +482,37 @@ mod tests {
     }
 
     #[test]
+    fn eval_fold_pipe_into_compound_assign() {
+        // User-reported expression: `$existing | . += $new`.
+        // Should produce $existing + $new (array concat).
+        let expr = BatchExpr::compile("true", "$existing | . += $new").unwrap();
+        let out = expr
+            .eval_fold(&json!([{"a": 1}]), &json!([{"a": 2}]))
+            .unwrap();
+        assert_eq!(out, json!([{"a": 1}, {"a": 2}]));
+    }
+
+    #[test]
+    fn eval_fold_pipe_into_array_constructor_using_input() {
+        // User-reported expression: `$existing | [.[], $new[]]`.
+        let expr = BatchExpr::compile("true", "$existing | [.[], $new[]]").unwrap();
+        let out = expr
+            .eval_fold(&json!([{"a": 1}]), &json!([{"a": 2}]))
+            .unwrap();
+        assert_eq!(out, json!([{"a": 1}, {"a": 2}]));
+    }
+
+    #[test]
+    fn eval_fold_array_constructor_from_both_vars() {
+        // User-reported expression: `$existing | [$existing[], $new[]]`.
+        let expr = BatchExpr::compile("true", "$existing | [$existing[], $new[]]").unwrap();
+        let out = expr
+            .eval_fold(&json!([{"a": 1}]), &json!([{"a": 2}]))
+            .unwrap();
+        assert_eq!(out, json!([{"a": 1}, {"a": 2}]));
+    }
+
+    #[test]
     fn eval_fold_preserves_integer_precision() {
         let expr = BatchExpr::compile("true", "9007199254740993").unwrap();
         // 2^53 + 1 cannot be represented exactly as an f64, so a naive

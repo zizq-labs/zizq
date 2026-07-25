@@ -345,6 +345,13 @@ pub struct Job {
     /// Only present on enqueue responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folded: Option<bool>,
+
+    /// Batching configuration stored on this job. The first enqueue's
+    /// `when`/`fold` are the ones that apply for the life of the batch,
+    /// so exposing them on reads lets callers inspect exactly what's
+    /// being evaluated rather than guessing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
 }
 
 /// Convert a store job to an HTTP job, failing if the status byte is invalid.
@@ -410,6 +417,7 @@ impl Job {
             unique_while,
             duplicate,
             folded,
+            batch: job.batch.map(Into::into),
         })
     }
 }
