@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0
+
+- Added **batched jobs** (Pro): a new `batch` field on enqueue
+  requests that accumulates multiple enqueues into a single pending
+  job's payload. Callers supply `batch.key` (identifies the batch),
+  `batch.when` (a jq predicate deciding whether to fold), and
+  `batch.fold` (a jq reducer producing the merged payload). Both
+  expressions run with `$existing` bound to the current pending
+  payload and `$new` bound to the incoming one. When `when` returns
+  truthy the payloads are merged in place at a fresh payload key
+  (preserving FIFO position); when falsy the existing batch seals
+  and a new pending job takes over. Once claimed, a batched job is
+  a normal job — workers see one merged payload and ack once.
+  Suited to downstream services that accept batched calls (APNs
+  push, SES bulk send, etc.) but whose callers enqueue one unit at
+  a time. The first enqueue's `when`/`fold` are stored on the job
+  and win for the whole batch — follow-up enqueues supply payload
+  against the existing config until seal. Enqueue responses gain a
+  `folded: true | false` field, symmetric with `duplicate`.
+  Combining `unique_key` and `batch` on a single enqueue is a 400.
+  Cron entries may carry a `batch` config; the fold logic runs at
+  fire time. Job reads (`GET /jobs`, `GET /jobs/{id}`, enqueue
+  responses) include the stored `batch` config so callers can
+  inspect exactly what `when`/`fold` the batch is running against.
+
 ## 0.5.1
 
 - Added `/` search to `zizq top`. Two labeled fields — Type and Queue
