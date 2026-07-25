@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::PayloadFilter;
 
-use super::types::{BackoffConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile};
+use super::types::{
+    BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile,
+};
 
 /// Predicate that selects which jobs an operation acts on.
 ///
@@ -431,6 +433,13 @@ pub struct EnqueueOptions {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_while: Option<UniqueWhile>,
+
+    /// Batching configuration. When set, the store attempts to fold this
+    /// enqueue into an existing pending job sharing the same batch key.
+    #[serde(rename = "B")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
 }
 
 impl EnqueueOptions {
@@ -452,6 +461,7 @@ impl EnqueueOptions {
             retention: None,
             unique_key: None,
             unique_while: None,
+            batch: None,
         }
     }
 
@@ -499,6 +509,12 @@ impl EnqueueOptions {
     /// Set the uniqueness scope and return `self`.
     pub fn unique_while(mut self, scope: UniqueWhile) -> Self {
         self.unique_while = Some(scope);
+        self
+    }
+
+    /// Set the batching configuration and return `self`.
+    pub fn batch(mut self, batch: BatchConfig) -> Self {
+        self.batch = Some(batch);
         self
     }
 }

@@ -13,7 +13,9 @@ use std::ops::Bound;
 use fjall::{Readable, Slice};
 use tokio::task;
 
-use super::super::enqueue::{apply_enqueue, finalize_enqueue, prepare_enqueue};
+use super::super::enqueue::{
+    apply_enqueue, finalize_enqueue, prepare_enqueue, validate_batch_config,
+};
 use super::super::keys::RecordKind;
 use super::super::options::{CronEntryOptions, ReplaceCronGroupOptions};
 use super::super::store::{Store, StoreEvent};
@@ -46,12 +48,17 @@ impl Store {
             let group_key = make_cron_group_key(&group);
             let prefix = make_cron_group_prefix(&group);
 
-            // Validate all cron expressions before acquiring the write lock.
+            // Validate all cron expressions and batch configs before
+            // acquiring the write lock.
             let mut computed_next: Vec<Option<u64>> = Vec::with_capacity(entries.len());
             for input in &entries {
                 // Validates the expression; None means no future occurrences.
                 let next = cron_next_after(&input.expression, now, input.timezone.as_deref())?;
                 computed_next.push(next);
+
+                if let Some(ref cfg) = input.job.batch {
+                    validate_batch_config(cfg, &input.job.payload)?;
+                }
             }
 
             // Acquire the single-writer lock. All reads within this scope
@@ -275,6 +282,10 @@ impl Store {
             // Validate the cron expression before acquiring the write lock.
             let next_enqueue_at = cron_next_after(&opts.expression, now, opts.timezone.as_deref())?;
 
+            if let Some(ref cfg) = opts.job.batch {
+                validate_batch_config(cfg, &opts.job.payload)?;
+            }
+
             let group_key = make_cron_group_key(&group);
             let entry_key = make_cron_entry_key(&group, &opts.name);
 
@@ -341,6 +352,10 @@ impl Store {
 
         task::spawn_blocking(move || -> Result<CronEntry, StoreError> {
             let next_enqueue_at = cron_next_after(&opts.expression, now, opts.timezone.as_deref())?;
+
+            if let Some(ref cfg) = opts.job.batch {
+                validate_batch_config(cfg, &opts.job.payload)?;
+            }
 
             let group_key = make_cron_group_key(&group);
             let entry_key = make_cron_entry_key(&group, &opts.name);
@@ -955,6 +970,7 @@ mod tests {
         CronEntryOptions, EnqueueOptions, ListJobsOptions, ReplaceCronGroupOptions,
     };
     use super::super::super::test_support::test_store;
+    use crate::store::StoreError;
     use crate::time::now_millis;
 
     /// Fixed timestamp for cron tests: 2023-11-14 22:13:20 UTC.
@@ -1948,5 +1964,129 @@ mod tests {
         let (group, entries) = store.get_cron_group("default").await.unwrap().unwrap();
         assert!(!group.paused);
         assert!(entries.is_empty());
+    }
+
+    // --- Batched cron entries: enqueue-time validation ---
+
+    fn cron_entry_with_batch(
+        name: &str,
+        payload: serde_json::Value,
+        cfg: crate::store::BatchConfig,
+    ) -> CronEntryOptions {
+        CronEntryOptions {
+            name: name.to_string(),
+            expression: "0 * * * *".to_string(),
+            timezone: None,
+            paused: None,
+            job: EnqueueOptions::new("t", "q", payload).batch(cfg),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_cron_entry_rejects_invalid_batch_expression() {
+        let store = test_store();
+        let bad = crate::store::BatchConfig {
+            key: "k".into(),
+            when: ".[*]".into(),
+            fold: "$existing + $new".into(),
+        };
+
+        let err = store
+            .add_cron_entry(
+                "default",
+                cron_entry_with_batch("e1", serde_json::json!([1]), bad),
+                CRON_NOW,
+            )
+            .await
+            .err()
+            .expect("expected InvalidOperation");
+        assert!(matches!(err, StoreError::InvalidOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn add_cron_entry_rejects_batch_dry_run_shape_error() {
+        let store = test_store();
+        let cfg = crate::store::BatchConfig {
+            key: "k".into(),
+            when: "true".into(),
+            fold: "$existing | .items += $new.items".into(),
+        };
+
+        let err = store
+            .add_cron_entry(
+                "default",
+                cron_entry_with_batch("e1", serde_json::json!([1, 2]), cfg),
+                CRON_NOW,
+            )
+            .await
+            .err()
+            .expect("expected InvalidOperation from dry-run");
+        let msg = match err {
+            StoreError::InvalidOperation(m) => m,
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        };
+        assert!(msg.contains("dry-run"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn put_cron_entry_rejects_invalid_batch_expression() {
+        let store = test_store();
+        let bad = crate::store::BatchConfig {
+            key: "k".into(),
+            when: ".[*]".into(),
+            fold: "$existing + $new".into(),
+        };
+
+        let err = store
+            .put_cron_entry(
+                "default",
+                cron_entry_with_batch("e1", serde_json::json!([1]), bad),
+                CRON_NOW,
+            )
+            .await
+            .err()
+            .expect("expected InvalidOperation");
+        assert!(matches!(err, StoreError::InvalidOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn replace_cron_group_rejects_invalid_batch_expression() {
+        let store = test_store();
+        let bad = crate::store::BatchConfig {
+            key: "k".into(),
+            when: ".[*]".into(),
+            fold: "$existing + $new".into(),
+        };
+
+        let opts = ReplaceCronGroupOptions {
+            paused: None,
+            entries: vec![cron_entry_with_batch("e1", serde_json::json!([1]), bad)],
+        };
+        let err = store
+            .replace_cron_group("default", opts, CRON_NOW)
+            .await
+            .err()
+            .expect("expected InvalidOperation");
+        assert!(matches!(err, StoreError::InvalidOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn add_cron_entry_accepts_valid_batch_expression() {
+        let store = test_store();
+        let cfg = crate::store::BatchConfig {
+            key: "k".into(),
+            when: "true".into(),
+            fold: "$existing + $new".into(),
+        };
+
+        let entry = store
+            .add_cron_entry(
+                "default",
+                cron_entry_with_batch("e1", serde_json::json!([1]), cfg),
+                CRON_NOW,
+            )
+            .await
+            .unwrap();
+        assert!(entry.job.batch.is_some());
     }
 }

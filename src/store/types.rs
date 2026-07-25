@@ -187,6 +187,33 @@ impl UniqueConstraint {
     }
 }
 
+/// Batching configuration for a job.
+///
+/// When a job is enqueued with `batch`, subsequent enqueues sharing the same
+/// `key` may be folded into it: the `when` jq predicate decides whether to
+/// fold, and the `fold` jq expression produces the merged payload. Both
+/// expressions run against `$existing` (the current pending job's payload)
+/// and `$new` (the incoming payload). The first enqueue's `when`/`fold`
+/// wins — subsequent enqueues supply payload against the existing
+/// configuration until the batch is sealed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchConfig {
+    /// Identifies the batch. Only one pending batch may exist per key at a
+    /// time.
+    #[serde(rename = "k")]
+    pub key: String,
+
+    /// jq predicate. When it evaluates truthy, the new payload is folded
+    /// into the existing pending job. When falsy, the existing batch is
+    /// sealed and a fresh pending job is created.
+    #[serde(rename = "w")]
+    pub when: String,
+
+    /// jq expression producing the merged payload when `when` returns true.
+    #[serde(rename = "f")]
+    pub fold: String,
+}
+
 /// A job stored in the queue keyspace.
 ///
 /// Jobs are identified using scru128 because it is time-sequenced and high
@@ -295,6 +322,39 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique: Option<UniqueConstraint>,
+
+    /// Address of this job's payload record in the data keyspace.
+    ///
+    /// When `None`, the payload lives at `P\0<job_id>` (default for jobs
+    /// that never mutate their payload). When `Some`, the payload lives
+    /// at `P\0<payload_key>` — used by features that need to rewrite a
+    /// pending job's payload without moving its queue position, so that
+    /// each individual payload record remains write-once/delete-once and
+    /// `remove_weak` stays valid.
+    #[serde(rename = "k")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_key: Option<String>,
+
+    /// Batching configuration. When set, subsequent enqueues sharing this
+    /// batch key may fold their payloads into this job's payload until the
+    /// batch is sealed (predicate fails) or the job transitions to
+    /// InFlight.
+    #[serde(rename = "B")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
+}
+
+impl Job {
+    /// Returns the identifier used to construct this job's payload key.
+    ///
+    /// Falls back to the job id for jobs that don't have a distinct
+    /// `payload_key` set, so existing storage layouts continue to work
+    /// unchanged.
+    pub(crate) fn payload_key(&self) -> &str {
+        self.payload_key.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// Retention configuration for completed and dead jobs.

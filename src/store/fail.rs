@@ -579,7 +579,7 @@ mod tests {
         let job = enqueue_and_take(&store).await;
 
         // Verify payload exists before kill.
-        let payload_key = make_payload_key(&job.id);
+        let payload_key = make_payload_key(job.payload_key());
         assert!(store.ks.data.inner().get(&payload_key).unwrap().is_some());
 
         let mut opts = test_failure_opts();

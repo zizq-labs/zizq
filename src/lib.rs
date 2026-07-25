@@ -10,6 +10,7 @@
 pub const BACKUP_ARCHIVE_PREFIX: &str = "zizq-root";
 
 pub mod api;
+pub mod batch;
 pub mod commands;
 pub mod filter;
 pub mod license;

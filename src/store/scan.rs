@@ -589,7 +589,7 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
                 }
 
                 if *needs_payload {
-                    let payload_key = make_payload_key(&job.id);
+                    let payload_key = make_payload_key(job.payload_key());
                     match reader.get(*data_ks, &payload_key) {
                         Ok(Some(pb)) => match rmp_serde::from_slice(&pb) {
                             Ok(v) => job.payload = Some(v),
@@ -612,7 +612,7 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
             } => loop {
                 let entry = entries.next()?;
 
-                let (key, value) = match entry.into_inner() {
+                let (_key, value) = match entry.into_inner() {
                     Ok(kv) => kv,
                     Err(e) => return Some(Err(e.into())),
                 };
@@ -629,9 +629,7 @@ impl<'a, R: Readable> Iterator for JobStream<'a, R> {
                 }
 
                 if *needs_payload {
-                    // Swap J tag for P tag to look up payload.
-                    let mut payload_key = key.to_vec();
-                    payload_key[0] = RecordKind::Payload as u8;
+                    let payload_key = make_payload_key(job.payload_key());
                     match reader.get(*data_ks, &payload_key) {
                         Ok(Some(pb)) => match rmp_serde::from_slice(&pb) {
                             Ok(v) => job.payload = Some(v),

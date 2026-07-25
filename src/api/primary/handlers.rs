@@ -531,6 +531,16 @@ async fn enqueue(
         );
     }
 
+    if enqueue_req.unique_key.is_some() && enqueue_req.batch.is_some() {
+        return respond(
+            fmt,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse {
+                error: "unique_key and batch cannot be combined".into(),
+            },
+        );
+    }
+
     // License check for unique jobs.
     if enqueue_req.unique_key.is_some() {
         let now_ms = (state.clock)();
@@ -539,6 +549,19 @@ async fn enqueue(
             .read()
             .unwrap()
             .require(now_ms, crate::license::Feature::UniqueJobs)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
+    // License check for batched jobs.
+    if enqueue_req.batch.is_some() {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .read()
+            .unwrap()
+            .require(now_ms, crate::license::Feature::BatchedJobs)
         {
             return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
         }
@@ -573,6 +596,9 @@ async fn enqueue(
             }
         }
     }
+    if let Some(batch) = enqueue_req.batch {
+        opts = opts.batch(batch.into());
+    }
 
     let now = (state.clock)();
     match state
@@ -582,7 +608,7 @@ async fn enqueue(
         .and_then(Job::try_from_result)
     {
         Ok(mut job) => {
-            let status_code = if job.duplicate == Some(true) {
+            let status_code = if job.duplicate == Some(true) || job.folded == Some(true) {
                 StatusCode::OK
             } else {
                 StatusCode::CREATED
@@ -602,6 +628,11 @@ async fn enqueue(
             job.payload = None;
             respond(fmt, status_code, &job)
         }
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
         Err(e) => {
             tracing::error!(%e, "enqueue failed");
             respond(
@@ -623,6 +654,7 @@ async fn bulk_enqueue(
 ) -> Response {
     // Validate all jobs up front.
     let mut has_unique = false;
+    let mut has_batch = false;
     for (i, job) in req.jobs.iter().enumerate() {
         if let Err(msg) = validate_name("type", &job.job_type) {
             return respond(
@@ -665,6 +697,18 @@ async fn bulk_enqueue(
         if job.unique_key.is_some() {
             has_unique = true;
         }
+        if job.batch.is_some() {
+            has_batch = true;
+        }
+        if job.unique_key.is_some() && job.batch.is_some() {
+            return respond(
+                fmt,
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: format!("jobs[{i}]: unique_key and batch cannot be combined"),
+                },
+            );
+        }
     }
 
     // License check for unique jobs (once for the whole batch).
@@ -675,6 +719,19 @@ async fn bulk_enqueue(
             .read()
             .unwrap()
             .require(now_ms, crate::license::Feature::UniqueJobs)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
+    // License check for batched jobs (once for the whole batch).
+    if has_batch {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .read()
+            .unwrap()
+            .require(now_ms, crate::license::Feature::BatchedJobs)
         {
             return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
         }
@@ -712,6 +769,9 @@ async fn bulk_enqueue(
                 // Already validated above.
                 opts = opts.unique_while(parse_unique_while(&unique_while).unwrap());
             }
+            if let Some(batch) = enqueue_req.batch {
+                opts = opts.batch(batch.into());
+            }
             opts
         })
         .collect();
@@ -719,8 +779,10 @@ async fn bulk_enqueue(
     let now = (state.clock)();
     match state.store.enqueue_bulk(now, opts).await {
         Ok(store_results) => {
-            let all_duplicates =
-                !store_results.is_empty() && store_results.iter().all(|r| r.is_duplicate());
+            let all_no_new_jobs = !store_results.is_empty()
+                && store_results
+                    .iter()
+                    .all(|r| r.is_duplicate() || r.is_folded());
             let jobs: Result<Vec<Job>, StoreError> = store_results
                 .into_iter()
                 .map(|r| {
@@ -731,7 +793,7 @@ async fn bulk_enqueue(
                 .collect();
             match jobs {
                 Ok(jobs) => {
-                    let status_code = if all_duplicates {
+                    let status_code = if all_no_new_jobs {
                         StatusCode::OK
                     } else {
                         StatusCode::CREATED
@@ -751,6 +813,11 @@ async fn bulk_enqueue(
                 }
             }
         }
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
         Err(e) => {
             tracing::error!(%e, "bulk enqueue failed");
             respond(
@@ -2253,6 +2320,10 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
         return Err("ready_at is not supported for cron entries".into());
     }
 
+    if entry.job.unique_key.is_some() && entry.job.batch.is_some() {
+        return Err("unique_key and batch cannot be combined".into());
+    }
+
     let unique_while = if let Some(ref s) = entry.job.unique_while {
         Some(parse_unique_while(s)?)
     } else {
@@ -2279,6 +2350,9 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
     }
     if let Some(uw) = unique_while {
         opts = opts.unique_while(uw);
+    }
+    if let Some(batch) = entry.job.batch {
+        opts = opts.batch(batch.into());
     }
 
     Ok(store::CronEntryOptions {
@@ -6752,6 +6826,189 @@ mod tests {
         assert!(!jobs[0]["duplicate"].as_bool().unwrap());
         assert!(jobs[1]["duplicate"].as_bool().unwrap());
         assert!(!jobs[2]["duplicate"].as_bool().unwrap());
+    }
+
+    // --- Batched jobs ---
+
+    fn batch_enqueue_body(payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "push",
+            "queue": "q",
+            "payload": payload,
+            "batch": {
+                "key": "k",
+                "when": "true",
+                "fold": "$existing + $new",
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_returns_403_on_free_tier() {
+        let req = json_request("POST", "/jobs", &batch_enqueue_body(serde_json::json!([1])));
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("pro license"),
+            "error should mention pro license, got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_first_returns_201_and_folded_false() {
+        let req = json_request("POST", "/jobs", &batch_enqueue_body(serde_json::json!([1])));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["folded"], false);
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_second_returns_200_and_folded_true() {
+        let app = pro_app();
+
+        let req1 = json_request("POST", "/jobs", &batch_enqueue_body(serde_json::json!([1])));
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::CREATED);
+        let body1: serde_json::Value = serde_json::from_str(&response_body(res1).await).unwrap();
+
+        let req2 = json_request("POST", "/jobs", &batch_enqueue_body(serde_json::json!([2])));
+        let res2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+
+        let body2: serde_json::Value = serde_json::from_str(&response_body(res2).await).unwrap();
+        assert_eq!(body2["folded"], true);
+        assert_eq!(body2["id"], body1["id"]);
+    }
+
+    #[tokio::test]
+    async fn batch_folded_payload_visible_via_get() {
+        // Reproduces a user-reported scenario: fold two enqueues,
+        // then fetch the job via GET /jobs/{id} and verify the merged
+        // payload survives round-trip through the API.
+        let app = pro_app();
+
+        let make_body = |v| {
+            serde_json::json!({
+                "type": "audit.events",
+                "queue": "audit",
+                "batch": {
+                    "key": "audit.events",
+                    "when": "[$existing[], $new[]] | length <= 5",
+                    "fold": "$existing | . += $new",
+                },
+                "payload": v,
+            })
+        };
+
+        let req1 = json_request("POST", "/jobs", &make_body(serde_json::json!([{"a": 1}])));
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::CREATED);
+        let body1: serde_json::Value = serde_json::from_str(&response_body(res1).await).unwrap();
+        let job_id = body1["id"].as_str().unwrap().to_string();
+
+        let req2 = json_request("POST", "/jobs", &make_body(serde_json::json!([{"a": 2}])));
+        let res2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2: serde_json::Value = serde_json::from_str(&response_body(res2).await).unwrap();
+        assert_eq!(body2["folded"], true);
+        assert_eq!(body2["id"], serde_json::json!(job_id));
+
+        // Fetch via GET and verify the merged payload.
+        let get_req = json_request("GET", &format!("/jobs/{job_id}"), &serde_json::json!({}));
+        let get_res = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let get_body: serde_json::Value =
+            serde_json::from_str(&response_body(get_res).await).unwrap();
+        assert_eq!(get_body["payload"], serde_json::json!([{"a": 1}, {"a": 2}]));
+
+        // Also verify the stored batch config is visible on the response
+        // — critical for debugging "first-wins" surprises.
+        assert_eq!(get_body["batch"]["key"], "audit.events");
+        assert_eq!(
+            get_body["batch"]["when"],
+            "[$existing[], $new[]] | length <= 5"
+        );
+        assert_eq!(get_body["batch"]["fold"], "$existing | . += $new");
+    }
+
+    #[tokio::test]
+    async fn batch_and_unique_together_returns_400() {
+        let mut body = batch_enqueue_body(serde_json::json!([1]));
+        body["unique_key"] = serde_json::json!("u");
+
+        let req = json_request("POST", "/jobs", &body);
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be combined"),
+            "got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_invalid_expression_returns_422() {
+        let body = serde_json::json!({
+            "type": "push",
+            "queue": "q",
+            "payload": [1],
+            "batch": {
+                "key": "k",
+                "when": ".[*]",
+                "fold": "$existing + $new",
+            }
+        });
+        let req = json_request("POST", "/jobs", &body);
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bulk_batch_enqueue_returns_403_on_free_tier() {
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [ batch_enqueue_body(serde_json::json!([1])) ],
+            }),
+        );
+        let res = test_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bulk_batch_folds_within_call() {
+        let req = json_request(
+            "POST",
+            "/jobs/bulk",
+            &serde_json::json!({
+                "jobs": [
+                    batch_enqueue_body(serde_json::json!([1])),
+                    batch_enqueue_body(serde_json::json!([2])),
+                    batch_enqueue_body(serde_json::json!([3])),
+                ],
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs[0]["folded"], false);
+        assert_eq!(jobs[1]["folded"], true);
+        assert_eq!(jobs[2]["folded"], true);
+        assert_eq!(jobs[1]["id"], jobs[0]["id"]);
+        assert_eq!(jobs[2]["id"], jobs[0]["id"]);
     }
 
     // --- DELETE /jobs/{id} ---

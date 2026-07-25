@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fjall::Slice;
 use tokio::task;
 
-use super::keys::{make_job_key, make_payload_key, make_status_key, make_unique_key};
+use super::keys::{
+    make_batch_key, make_job_key, make_payload_key, make_status_key, make_unique_key,
+};
 use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueWhile};
 
@@ -183,6 +185,19 @@ impl Store {
                             })?;
                         }
                     }
+
+                    // Batched jobs close their batch on claim: no more
+                    // folds can target this job. Remove the index entry
+                    // only if it still points at *this* job — a prior
+                    // seal may have already replaced it with a fresh
+                    // batch.
+                    if let Some(ref bc) = pre.job.batch {
+                        let job_id = pre.job_id.as_bytes();
+                        tx.fetch_update(&ks.index, &make_batch_key(&bc.key), |v| match v {
+                            Some(v) if v.as_ref() == job_id => None,
+                            other => other.cloned(),
+                        })?;
+                    }
                 }
 
                 if cas_conflict_detected {
@@ -220,7 +235,7 @@ impl Store {
                 // 5. Hydrate phase — read payloads for all committed jobs.
                 let hydrate_start = std::time::Instant::now();
                 for pre in &mut valid {
-                    let payload_key = make_payload_key(&pre.job_id);
+                    let payload_key = make_payload_key(pre.job.payload_key());
                     if let Some(payload_bytes) = ks.data.get(&payload_key)? {
                         pre.job.payload = Some(rmp_serde::from_slice(&payload_bytes)?);
                     }

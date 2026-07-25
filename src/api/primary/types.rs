@@ -340,6 +340,18 @@ pub struct Job {
     /// Only present on enqueue responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate: Option<bool>,
+
+    /// Whether this enqueue was folded into an existing pending batched job.
+    /// Only present on enqueue responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folded: Option<bool>,
+
+    /// Batching configuration stored on this job. The first enqueue's
+    /// `when`/`fold` are the ones that apply for the life of the batch,
+    /// so exposing them on reads lets callers inspect exactly what's
+    /// being evaluated rather than guessing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
 }
 
 /// Convert a store job to an HTTP job, failing if the status byte is invalid.
@@ -347,27 +359,33 @@ impl TryFrom<store::Job> for Job {
     type Error = StoreError;
 
     fn try_from(job: store::Job) -> Result<Self, Self::Error> {
-        Self::from_store_job(job, None)
+        Self::from_store_job(job, None, None)
     }
 }
 
 impl Job {
-    /// Convert an enqueue result (created or duplicate) into an HTTP job.
+    /// Convert an enqueue result into an HTTP job.
     ///
-    /// Sets the `duplicate` flag based on the result variant so the API
-    /// response can distinguish new jobs from deduplication matches.
+    /// Sets the `duplicate` and `folded` flags based on the result variant
+    /// so the API response can distinguish new jobs from deduplication
+    /// matches and from fold-into-existing-batch outcomes.
     pub fn try_from_result(result: store::EnqueueResult) -> Result<Self, StoreError> {
         let is_duplicate = result.is_duplicate();
+        let is_folded = result.is_folded();
         let job = result.into_job();
-        Self::from_store_job(job, Some(is_duplicate))
+        Self::from_store_job(job, Some(is_duplicate), Some(is_folded))
     }
 
     /// Shared conversion from a store job to an HTTP job.
     ///
     /// Maps compact storage field names and u8 enums to the descriptive
-    /// HTTP representation. The `duplicate` flag is `None` for normal
-    /// lookups and `Some(bool)` for enqueue responses.
-    fn from_store_job(job: store::Job, duplicate: Option<bool>) -> Result<Self, StoreError> {
+    /// HTTP representation. The `duplicate` and `folded` flags are `None`
+    /// for normal lookups and `Some(bool)` for enqueue responses.
+    fn from_store_job(
+        job: store::Job,
+        duplicate: Option<bool>,
+        folded: Option<bool>,
+    ) -> Result<Self, StoreError> {
         let unique_while = job.unique.as_ref().map(|uc| match uc.scope {
             0 => "queued".to_string(),
             1 => "active".to_string(),
@@ -398,6 +416,8 @@ impl Job {
             unique_key: job.unique.map(|uc| uc.key),
             unique_while,
             duplicate,
+            folded,
+            batch: job.batch.map(Into::into),
         })
     }
 }
@@ -496,6 +516,11 @@ pub struct EnqueueRequest {
     /// Only valid when `unique_key` is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_while: Option<String>,
+
+    /// Batching configuration. When present, this enqueue may be folded
+    /// into an existing pending job sharing the same `batch.key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchConfig>,
 }
 
 /// Request shape for bulk job enqueue.
@@ -566,6 +591,46 @@ impl From<store::BackoffConfig> for BackoffConfig {
             exponent: b.exponent,
             base_ms: b.base_ms,
             jitter_ms: b.jitter_ms,
+        }
+    }
+}
+
+/// Client-facing batching configuration.
+///
+/// Mirrors `store::BatchConfig` with the same three fields; kept as a
+/// separate type so the HTTP schema can evolve independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchConfig {
+    /// Identifies the batch. Only one pending batch may exist per key at
+    /// a time on a given queue.
+    pub key: String,
+
+    /// jq predicate deciding whether to fold this enqueue into the
+    /// existing pending batch (`true`) or seal it and start a new batch
+    /// (`false`). Runs against `$existing` and `$new`.
+    pub when: String,
+
+    /// jq expression producing the merged payload when `when` returns
+    /// true. Runs against `$existing` and `$new`.
+    pub fold: String,
+}
+
+impl From<BatchConfig> for store::BatchConfig {
+    fn from(b: BatchConfig) -> Self {
+        Self {
+            key: b.key,
+            when: b.when,
+            fold: b.fold,
+        }
+    }
+}
+
+impl From<store::BatchConfig> for BatchConfig {
+    fn from(b: store::BatchConfig) -> Self {
+        Self {
+            key: b.key,
+            when: b.when,
+            fold: b.fold,
         }
     }
 }
@@ -1157,6 +1222,7 @@ impl CronEntryResponse {
                 retention: entry.job.retention.map(Into::into),
                 unique_key: entry.job.unique_key,
                 unique_while,
+                batch: entry.job.batch.map(Into::into),
             },
             next_enqueue_at: entry.next_enqueue_at,
             last_enqueue_at: entry.last_enqueue_at,
