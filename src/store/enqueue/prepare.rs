@@ -12,7 +12,24 @@ use super::super::keys::{
     make_unique_key,
 };
 use super::super::options::EnqueueOptions;
-use super::super::types::{Job, JobStatus, StoreError, UniqueConstraint, UniqueWhile};
+use super::super::types::{BatchConfig, Job, JobStatus, StoreError, UniqueConstraint, UniqueWhile};
+
+/// Validate a batched-job configuration against a sample payload.
+///
+/// Compiles the `when`/`fold` expressions and dry-runs them with the
+/// supplied payload bound as both `$existing` and `$new`. Callable from
+/// any point that receives a `BatchConfig` from the caller (enqueue,
+/// cron entry creation, cron group replacement) so bad expressions
+/// surface up-front rather than at first fold.
+pub(in crate::store) fn validate_batch_config(
+    cfg: &BatchConfig,
+    payload: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let expr = BatchExpr::compile(&cfg.when, &cfg.fold)
+        .map_err(|e| StoreError::InvalidOperation(format!("batch expression: {e}")))?;
+    expr.dry_run(payload)
+        .map_err(|e| StoreError::InvalidOperation(format!("batch dry-run: {e}")))
+}
 
 /// Pre-computed data for inserting a job into the store.
 ///
@@ -54,8 +71,7 @@ pub(in crate::store) fn prepare_enqueue(
     }
 
     if let Some(ref cfg) = opts.batch {
-        BatchExpr::compile(&cfg.when, &cfg.fold)
-            .map_err(|e| StoreError::InvalidOperation(format!("batch expression: {e}")))?;
+        validate_batch_config(cfg, &opts.payload)?;
     }
 
     let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {

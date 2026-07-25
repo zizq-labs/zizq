@@ -2320,6 +2320,10 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
         return Err("ready_at is not supported for cron entries".into());
     }
 
+    if entry.job.unique_key.is_some() && entry.job.batch.is_some() {
+        return Err("unique_key and batch cannot be combined".into());
+    }
+
     let unique_while = if let Some(ref s) = entry.job.unique_while {
         Some(parse_unique_while(s)?)
     } else {
@@ -2346,6 +2350,9 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
     }
     if let Some(uw) = unique_while {
         opts = opts.unique_while(uw);
+    }
+    if let Some(batch) = entry.job.batch {
+        opts = opts.batch(batch.into());
     }
 
     Ok(store::CronEntryOptions {

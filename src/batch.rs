@@ -87,6 +87,48 @@ impl BatchExpr {
             .unwrap_or(false)
     }
 
+    /// Dry-run both expressions against `payload` bound as both
+    /// `$existing` and `$new` to surface shape errors at enqueue time
+    /// rather than at first fold.
+    ///
+    /// Compile-time errors are caught by `compile`; this catches the
+    /// runtime shape errors that only manifest against actual data
+    /// (`.field` on the wrong type, `length` on an unsupported value,
+    /// etc.). Returns `Err` if either expression errors, or if `fold`
+    /// produces zero or multiple outputs. The boolean output of `when`
+    /// is not consulted — only whether it evaluates without error.
+    pub fn dry_run(&self, payload: &serde_json::Value) -> Result<(), String> {
+        self.try_eval_when(payload, payload)
+            .map_err(|e| format!("when: {e}"))?;
+        self.eval_fold(payload, payload)
+            .map(|_| ())
+            .map_err(|e| format!("fold: {e}"))
+    }
+
+    /// Fallible variant of `eval_when` used only by `dry_run`. Runtime
+    /// callers use `eval_when`, which folds runtime errors into `false`
+    /// so a broken predicate never blocks a fresh enqueue from creating
+    /// a new batch.
+    fn try_eval_when(
+        &self,
+        existing: &serde_json::Value,
+        new: &serde_json::Value,
+    ) -> Result<bool, String> {
+        let existing_val = to_val(existing)
+            .ok_or_else(|| "existing payload could not be interpreted as JSON".to_string())?;
+        let new_val = to_val(new)
+            .ok_or_else(|| "new payload could not be interpreted as JSON".to_string())?;
+
+        let ctx =
+            Ctx::<data::JustLut<Val>>::new(&self.when.lut, Vars::new([existing_val, new_val]));
+
+        match self.when.id.run((ctx, Val::Null)).map(unwrap_valr).next() {
+            None => Ok(false),
+            Some(Ok(v)) => Ok(is_truthy(&v)),
+            Some(Err(e)) => Err(format!("expression failed at runtime: {e}")),
+        }
+    }
+
     /// Evaluate the `fold` reducer, returning the merged payload.
     ///
     /// Returns an error if the expression fails at runtime, produces no
@@ -475,6 +517,49 @@ mod tests {
         let expr = BatchExpr::compile("true", "[$existing, $new, null, false]").unwrap();
         let out = expr.eval_fold(&json!(true), &json!(null)).unwrap();
         assert_eq!(out, json!([true, null, null, false]));
+    }
+
+    #[test]
+    fn dry_run_accepts_shape_compatible_expressions() {
+        let expr = BatchExpr::compile(
+            "($existing.items | length) < 3",
+            "$existing | .items += $new.items",
+        )
+        .unwrap();
+        expr.dry_run(&json!({"items": [1]})).unwrap();
+    }
+
+    #[test]
+    fn dry_run_rejects_shape_incompatible_when() {
+        // Indexing an array with a string field errors in jq. Missing
+        // *object* keys silently return null, so this uses an array
+        // payload to force the error.
+        let expr = BatchExpr::compile("$existing.items == null", "$existing").unwrap();
+        let err = expr.dry_run(&json!([1, 2])).unwrap_err();
+        assert!(err.starts_with("when: "), "got: {err}");
+    }
+
+    #[test]
+    fn dry_run_rejects_shape_incompatible_fold() {
+        // Array indexing with a string key errors in jq.
+        let expr = BatchExpr::compile("true", "$existing | .foo += $new.foo").unwrap();
+        let err = expr.dry_run(&json!([1, 2])).unwrap_err();
+        assert!(err.starts_with("fold: "), "got: {err}");
+    }
+
+    #[test]
+    fn dry_run_rejects_multi_output_fold() {
+        let expr = BatchExpr::compile("true", "$existing, $new").unwrap();
+        let err = expr.dry_run(&json!({})).unwrap_err();
+        assert!(err.starts_with("fold: "), "got: {err}");
+    }
+
+    #[test]
+    fn dry_run_accepts_false_predicate() {
+        // A `when` that always returns false is legal — it just means the
+        // batch always seals rather than folds. Dry-run should still pass.
+        let expr = BatchExpr::compile("false", "$existing + $new").unwrap();
+        expr.dry_run(&json!([1])).unwrap();
     }
 
     #[test]

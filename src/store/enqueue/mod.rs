@@ -17,7 +17,7 @@ mod prepare;
 pub(in crate::store) use apply::apply_enqueue;
 pub(super) use batcher::EnqueueBatcher;
 pub(in crate::store) use finalize::finalize_enqueue;
-pub(in crate::store) use prepare::{PreparedEnqueue, prepare_enqueue};
+pub(in crate::store) use prepare::{PreparedEnqueue, prepare_enqueue, validate_batch_config};
 
 use tokio::task;
 
@@ -1234,6 +1234,35 @@ mod tests {
             matches!(err, super::super::types::StoreError::InvalidOperation(_)),
             "expected InvalidOperation, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_dry_run_rejects_shape_incompatible_expression() {
+        let store = test_store();
+        let now = now_millis();
+
+        // The `fold` indexes the payload with a field access — jq errors
+        // when the payload is an array (compile succeeds, so this only
+        // surfaces via dry-run).
+        let cfg = BatchConfig {
+            key: "k".into(),
+            when: "true".into(),
+            fold: "$existing | .items += $new.items".into(),
+        };
+
+        let err = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1, 2])).batch(cfg),
+            )
+            .await
+            .err()
+            .expect("expected InvalidOperation from dry-run");
+        let msg = match err {
+            super::super::types::StoreError::InvalidOperation(m) => m,
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        };
+        assert!(msg.contains("dry-run"), "got: {msg}");
     }
 
     #[tokio::test]
