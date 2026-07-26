@@ -1325,4 +1325,129 @@ mod tests {
         assert!(r2.is_folded());
         assert_eq!(r2.job().payload, Some(serde_json::json!([1, 2])));
     }
+
+    // --- Batched jobs: interaction with scheduling ---
+
+    #[tokio::test]
+    async fn batch_scheduled_enqueue_does_not_fold_into_immediate() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        // Immediate batched job first — creates the batch head.
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        assert!(!r1.is_folded());
+
+        // Scheduled batched enqueue with same key must NOT fold —
+        // otherwise it'd silently promote to immediate (its
+        // `ready_at` would be discarded).
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2]))
+                    .ready_at(future)
+                    .batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        assert!(!r2.is_folded());
+        assert_ne!(r2.job().id, r1.job().id);
+        assert_eq!(r2.job().status, u8::from(JobStatus::Scheduled));
+        assert_eq!(r2.job().ready_at, future);
+    }
+
+    #[tokio::test]
+    async fn batch_immediate_enqueue_does_not_fold_into_scheduled() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        // Scheduled batched job first.
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1]))
+                    .ready_at(future)
+                    .batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        assert!(!r1.is_folded());
+        assert_eq!(r1.job().status, u8::from(JobStatus::Scheduled));
+
+        // Immediate enqueue with same key must NOT fold — otherwise
+        // the immediate work would inherit the scheduled `ready_at`
+        // and get silently delayed.
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2])).batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        assert!(!r2.is_folded());
+        assert_ne!(r2.job().id, r1.job().id);
+        assert_eq!(r2.job().status, u8::from(JobStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn batch_two_scheduled_enqueues_do_not_fold() {
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let r1 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1]))
+                    .ready_at(future)
+                    .batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+        let r2 = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([2]))
+                    .ready_at(future)
+                    .batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+
+        assert!(!r1.is_folded());
+        assert!(!r2.is_folded());
+        assert_ne!(r1.job().id, r2.job().id);
+    }
+
+    #[tokio::test]
+    async fn batch_scheduled_enqueue_persists_batch_metadata() {
+        // Even though scheduled batched jobs opt out of folding, the
+        // `batch` config is still recorded on the job for
+        // observability — the class-level intent shouldn't disappear
+        // just because scheduling happens to skip the fold path.
+        let store = test_store();
+        let now = now_millis();
+        let future = now + 60_000;
+
+        let r = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("push", "q", serde_json::json!([1]))
+                    .ready_at(future)
+                    .batch(append_batch("k")),
+            )
+            .await
+            .unwrap();
+
+        let fetched = store.get_job(now, &r.job().id).await.unwrap().unwrap();
+        assert!(fetched.batch.is_some(), "batch metadata should persist");
+        assert_eq!(fetched.batch.as_ref().unwrap().key, "k");
+    }
 }

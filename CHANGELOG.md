@@ -24,6 +24,11 @@
   fire time. Job reads (`GET /jobs`, `GET /jobs/{id}`, enqueue
   responses) include the stored `batch` config so callers can
   inspect exactly what `when`/`fold` the batch is running against.
+  Scheduled batched enqueues (`ready_at > now`) opt out of the fold
+  path — they persist as normal scheduled jobs with `batch`
+  metadata for observability, but no fold happens across a
+  `ready_at` boundary in either direction. Fold semantics remain
+  strictly immediate-Ready <-> immediate-Ready.
 
 ## 0.5.1
 
