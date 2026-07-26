@@ -56,7 +56,11 @@ pub(in crate::store) fn apply_enqueue(
     // returned `None` means "fall through to create a new job" — either
     // no existing batch, or the predicate failed and the existing batch
     // was sealed in this tx.
-    if p.job.batch.is_some() {
+    //
+    // Gated on `batch_idx_key` rather than `job.batch` because
+    // scheduled batched enqueues carry `batch` metadata but no index
+    // key (they opt out of folding — see `prepare_enqueue`).
+    if p.batch_idx_key.is_some() {
         if let Some(folded) = try_apply_fold(tx, ks, p)? {
             return Ok(folded);
         }
@@ -125,9 +129,12 @@ fn try_apply_fold(
         ))
     })?;
 
-    if !matches!(existing_status, JobStatus::Ready | JobStatus::Scheduled) {
-        // Index entry outlived the batch's pending state (should be
-        // cleaned up by claim/delete; treat defensively).
+    if existing_status != JobStatus::Ready {
+        // Only immediate-ready jobs are foldable. Scheduled jobs opt
+        // out of batching so that folds never cross a `ready_at`
+        // boundary — otherwise the fold would silently discard one
+        // side's schedule. Other statuses (in-flight, completed,
+        // dead) indicate a stale index entry that we clean up.
         tx.remove(&ks.index, batch_idx_key);
         return Ok(None);
     }

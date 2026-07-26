@@ -91,17 +91,31 @@ pub(in crate::store) fn prepare_enqueue(
 
     let payload_bytes = rmp_serde::to_vec_named(&opts.payload)?;
 
+    // Scheduled batched enqueues opt out of the fold path entirely.
+    // Folding two enqueues with different `ready_at` values would
+    // silently promote a scheduled job to immediate (or vice versa)
+    // since the fold preserves the existing job's schedule and
+    // discards the incoming one's — a footgun that's easier to
+    // disallow than explain. The Job's `batch` metadata is still set
+    // for observability, but no batch index entry is inserted and the
+    // scheduled job is not eligible to be folded into.
+    let batchable_now = opts.batch.is_some() && !scheduled;
+
     // Pre-compute a fresh payload key id for the merged-payload target
     // if this enqueue ends up folding. Discarded when the enqueue
     // instead creates a new job, so the created job's on-disk shape
     // matches a non-batched job (payload at `P\0<job_id>`, no
     // `payload_key` field on the metadata).
-    let fold_payload_key_id = if opts.batch.is_some() {
+    let fold_payload_key_id = if batchable_now {
         Some(scru128::new_string())
     } else {
         None
     };
-    let batch_idx_key = opts.batch.as_ref().map(|cfg| make_batch_key(&cfg.key));
+    let batch_idx_key = if batchable_now {
+        opts.batch.as_ref().map(|cfg| make_batch_key(&cfg.key))
+    } else {
+        None
+    };
 
     let job = Job {
         id: id.clone(),
