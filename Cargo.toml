@@ -27,7 +27,7 @@ croner = "3"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
 humantime = "2"
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 ratatui = "0.30"
 crossterm = "0.29"
 tui-input = "0.15"
