@@ -114,6 +114,22 @@
         </tr>
         <tr>
             <td>
+                <div><code>batch</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                The batched-job configuration attached at enqueue time, if
+                any. Only the first enqueue's config applies for the life
+                of the batch; this field is echoed back on every
+                job-fetch response so callers can observe the exact
+                <code>when</code> / <code>fold</code> expressions the
+                server is evaluating on subsequent folds. See the
+                <a href="./enqueue.html#batched-jobs">Batched jobs</a>
+                section for the field shape.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>ready_at</code> <em>required</em></div>
                 <div><pre>int64</pre></div>
             </td>

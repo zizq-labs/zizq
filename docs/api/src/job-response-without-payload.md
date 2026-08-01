@@ -117,6 +117,35 @@
         </tr>
         <tr>
             <td>
+                <div><code>folded</code> <em>required</em></div>
+                <div><pre>boolean</pre></div>
+            </td>
+            <td>
+                Only returned on enqueue responses. Set to <code>true</code>
+                if this enqueue was folded into an existing pending batched
+                job (see the <code>batch</code> object on the request and
+                the <a href="./enqueue.html#batched-jobs">Batched jobs</a>
+                section). Folded responses use HTTP <code>200 OK</code>
+                rather than <code>201 Created</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                The batched-job configuration attached at enqueue time, if
+                any. Echoed back on every job-fetch response so callers can
+                observe the exact <code>when</code> / <code>fold</code>
+                expressions the server is evaluating on subsequent folds
+                (only the first enqueue's config applies for the life of
+                the batch). See the enqueue-request table for the field
+                shape.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>ready_at</code> <em>required</em></div>
                 <div><pre>int64</pre></div>
             </td>

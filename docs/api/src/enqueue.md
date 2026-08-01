@@ -229,6 +229,66 @@ endpoint wraps an array of `{"jobs": [...]}`.
                 zero, jobs are purged immediately upon completion.
             </td>
         </tr>
+        <tr>
+            <td>
+                <div><code>batch</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Optional batched-job configuration. When present, subsequent
+                enqueues sharing the same <code>batch.key</code> are
+                <em>folded</em> into this job's pending payload via the
+                <code>when</code> and <code>fold</code> jq expressions,
+                rather than creating separate pending jobs. See the
+                <a href="#batched-jobs">Batched jobs</a> section below for
+                the full semantics. All three inner fields are required
+                when this field is set. Mutually exclusive with
+                <code>unique_key</code> — supplying both returns
+                <code>400 Bad Request</code>.
+                <strong>Requires a <em>pro</em> license</strong>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch.key</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Identifies the batch. Only one unsealed batched job exists
+                per key at a time. Enqueues sharing this key fold into the
+                existing pending job (or start a new one if none exists or
+                the existing batch was already sealed).
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch.when</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> predicate that
+                decides whether an incoming enqueue folds into the existing
+                pending job. Evaluated with <code>$existing</code> bound to
+                the current pending payload and <code>$new</code> bound to
+                the incoming payload. Truthy means fold; falsy seals the
+                existing batch and starts a fresh one from the incoming
+                enqueue. Invalid jq syntax, or an expression that returns
+                multiple outputs, returns <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch.fold</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> expression that
+                produces the merged payload when a fold occurs. Runs with the
+                same <code>$existing</code> and <code>$new</code> bindings as
+                <code>when</code>. Must produce exactly one output; multiple
+                outputs return <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
     </tbody>
 </table>
 
@@ -499,6 +559,135 @@ Unique jobs require a [pro license](https://zizq.io/pricing).
 >     "unique_while": "queued"
 > }
 > ```
+
+### Batched jobs {#batched-jobs}
+
+Batched jobs let successive enqueues accumulate into a single pending job.
+The client attaches a `batch` object to the enqueue containing a `key`, a
+`when` jq predicate, and a `fold` jq expression:
+
+- The **key** identifies the batch. Only one unsealed job exists per key at
+  a time.
+- The **when** predicate decides, on each subsequent enqueue with the same
+  key, whether to fold into the existing pending job or seal it and start a
+  fresh one. It runs with `$existing` bound to the current pending payload
+  and `$new` bound to the incoming payload; truthy folds, falsy seals.
+- The **fold** expression produces the merged payload when a fold happens.
+  Same `$existing` / `$new` bindings as `when`.
+
+Batched jobs require a [pro license](https://zizq.io/pricing).
+
+Both `when` and `fold` are compiled and dry-run against the incoming payload
+on every batched enqueue. Bad expressions (syntax errors, undefined
+variables, or shape errors that only manifest against actual data) return
+`422 Unprocessable Entity` up front rather than failing at first fold. An
+expression that returns multiple outputs is also `422`.
+
+`batch` and `unique_key` are mutually exclusive on the same enqueue.
+Supplying both returns `400 Bad Request`.
+
+**Scheduling opt-out**: an enqueue with `batch` and a future `ready_at`
+persists as a normal scheduled job with its `batch` config attached for
+observability, but no fold happens across a `ready_at` boundary in either
+direction. Folding is strictly `ready` → `ready`.
+
+**First-enqueue config wins**: the `when` and `fold` stored on the initial
+pending job are what apply for every subsequent fold against it. Changing
+the config in later enqueues has no effect until the current batch is
+sealed and a new one begins.
+
+The response includes a `folded` boolean indicating whether the enqueue
+was folded into an existing pending job (`true`, status `200`) or created
+a new one (`false`, status `201`). Reading the job later via `GET
+/jobs/{id}` includes the stored `batch` config for visibility into what
+the server is evaluating on subsequent folds.
+
+> First Request:
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "push",
+>     "type": "push.notifications",
+>     "payload": {"device_ids": ["abc"], "platform": "apple"},
+>     "batch": {
+>         "key": "push:apple",
+>         "when": "(($existing | .device_ids) + ($new | .device_ids)) | length <= 100",
+>         "fold": "$existing | .device_ids += ($new | .device_ids)"
+>     }
+> }'
+> ```
+
+> First Response:
+>
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 419
+> content-type: application/json
+> date: Mon, 23 Mar 2026 11:22:14 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "batch": {
+>         "key": "push:apple",
+>         "when": "(($existing | .device_ids) + ($new | .device_ids)) | length <= 100",
+>         "fold": "$existing | .device_ids += ($new | .device_ids)"
+>     },
+>     "folded": false,
+>     "id": "03ft8h9pkr50xbf7ncrhy2wnk",
+>     "priority": 32768,
+>     "queue": "push",
+>     "ready_at": 1774264934000,
+>     "status": "ready",
+>     "type": "push.notifications"
+> }
+> ```
+
+> Subsequent Request (same batch key, different device_ids):
+>
+> ```bash
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "queue": "push",
+>     "type": "push.notifications",
+>     "payload": {"device_ids": ["def", "ghi"], "platform": "apple"},
+>     "batch": {
+>         "key": "push:apple",
+>         "when": "(($existing | .device_ids) + ($new | .device_ids)) | length <= 100",
+>         "fold": "$existing | .device_ids += ($new | .device_ids)"
+>     }
+> }'
+> ```
+
+> Subsequent Response:
+>
+> ```http
+> HTTP/1.1 200 OK
+> content-length: 418
+> content-type: application/json
+> date: Mon, 23 Mar 2026 11:22:31 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "batch": {
+>         "key": "push:apple",
+>         "when": "(($existing | .device_ids) + ($new | .device_ids)) | length <= 100",
+>         "fold": "$existing | .device_ids += ($new | .device_ids)"
+>     },
+>     "folded": true,
+>     "id": "03ft8h9pkr50xbf7ncrhy2wnk",
+>     "priority": 32768,
+>     "queue": "push",
+>     "ready_at": 1774264934000,
+>     "status": "ready",
+>     "type": "push.notifications"
+> }
+> ```
+
+Note that the `id` on the subsequent response matches the first — the
+second enqueue folded into the existing pending job rather than creating
+a new one. Fetching the job now returns a merged payload combining
+`["abc"]` and `["def", "ghi"]`.
 
 ### Bulk enqueue multiple jobs
 
