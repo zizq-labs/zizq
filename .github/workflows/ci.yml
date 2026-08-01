@@ -332,20 +332,49 @@ jobs:
             --repo zizq-labs/zizq-rust \
             --pattern "${{ matrix.tarball }}" \
             --dir artifact
+          # Modern (>= 0.6.0) clients ship a companion `zizq-derive`
+          # crate alongside `zizq`. The checkout at `client/` tells us
+          # which era we're in — pull the sibling artifact only when
+          # the directory exists.
+          if [ -d client/zizq-derive ]; then
+            gh release download "${{ matrix.ref }}" \
+              --repo zizq-labs/zizq-rust \
+              --pattern "zizq-derive-*.crate" \
+              --dir artifact
+          fi
 
       - name: Build client from source (main)
         if: matrix.tarball == ''
         working-directory: client
         run: |
           ./release.sh
-          cp target/release/zizq-*.crate ../artifact/
+          # `zizq-*.crate` would also match `zizq-derive-*.crate` in
+          # modern clients — anchor the second glob element to a digit
+          # so only the main crate matches.
+          cp target/release/zizq-[0-9]*.crate ../artifact/
+          if [ -d zizq-derive ]; then
+            cp target/release/zizq-derive-*.crate ../artifact/
+          fi
 
       - name: Run integration tests
         working-directory: client
         run: |
-          ./integration/run.sh \
-            --binary ${{ github.workspace }}/server/zizq \
-            --crate ${{ github.workspace }}/artifact/zizq-*.crate
+          # Digit-anchored glob so the main-crate arg doesn't
+          # accidentally expand to include the derive sibling.
+          ZIZQ_CRATE=(${{ github.workspace }}/artifact/zizq-[0-9]*.crate)
+          ARGS=(
+            --binary ${{ github.workspace }}/server/zizq
+            --crate "${ZIZQ_CRATE[0]}"
+          )
+          # Pre-0.6.0 clients don't have the sibling crate and don't
+          # accept `--macro-crate`. The `zizq-derive/` directory in
+          # the checkout is the marker for "modern client, please
+          # pass the extra flag".
+          if [ -d zizq-derive ]; then
+            DERIVE_CRATE=(${{ github.workspace }}/artifact/zizq-derive-*.crate)
+            ARGS+=(--macro-crate "${DERIVE_CRATE[0]}")
+          fi
+          ./integration/run.sh "${ARGS[@]}"
 
   # --- Integration gate (stable check name for branch protection) ---
 
