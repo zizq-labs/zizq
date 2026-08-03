@@ -22,9 +22,10 @@ Zizq supports a growing number of features.
 * Scheduled jobs
 * Configurable backoff/retry policies
 * Configurable job retention policies
-* Unique job support
+* Unique job support (deduplicated enqueues)
 * Cron (recurring jobs) scheduling
-* APIs to manage the queue contents
+* Batched job support (folded/merged enqueues)
+* APIs to manage the queue contents, including `jq` expression filters
 * Very high job throughput (over 100K jobs/sec on a Macbook Pro M4)
 * An insightful [`zizq top`](#viewing-live-queue-activity) command
 
