@@ -38,7 +38,7 @@ Where:
 
 * `t` is the delay to apply before retrying
 * `B` is the base delay applied to all retries
-* `a` is the number of previous attempts
+* `a` is the number of attempts so far (including the current failure)
 * `E` is the backoff exponent (optionally fractional)
 * `J` is a random jitter used to spread retries
 
@@ -55,8 +55,8 @@ E = 4
 J = 30s
 ```
 
-This gives just under 4 days of total retry time before the job is eventually
-moved to the `dead` list.
+This gives approximately 25 days of total retry time before the job is
+eventually moved to the `dead` list.
 
 ## Adjusting the Backoff Curve
 
@@ -68,7 +68,7 @@ retry could occur anywhere within the band.
 
 > [!TIP]
 > Adjust the exponent very gradually. A change from `4.0` to `4.2` is enough to
-> change the total retry time from approx. 4 days to approx 7 days.
+> stretch the total retry time from ~25 days to ~40 days.
 
 <style>
   #backoff-chart-container {
@@ -129,6 +129,26 @@ retry could occur anywhere within the band.
     white-space: nowrap;
     z-index: 10;
   }
+
+  .bc-mode {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 1em;
+    margin-top: 0.8em;
+    font-size: 0.9em;
+  }
+
+  .bc-mode-label {
+    color: var(--zizq-text-secondary);
+  }
+
+  .bc-mode label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    cursor: pointer;
+  }
 </style>
 
 <div id="backoff-chart-container">
@@ -154,6 +174,11 @@ retry could occur anywhere within the band.
     <canvas id="bc-canvas">
     </canvas>
     <div id="bc-tooltip"></div>
+  </div>
+  <div class="bc-mode">
+    <span class="bc-mode-label">Y-axis:</span>
+    <label><input type="radio" name="bc-mode" value="cumulative" checked> Cumulative</label>
+    <label><input type="radio" name="bc-mode" value="per-attempt"> Per attempt</label>
   </div>
 </div>
 

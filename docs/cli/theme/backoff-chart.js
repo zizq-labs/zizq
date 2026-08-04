@@ -6,6 +6,17 @@
   const ctx = canvas.getContext('2d');
   const tooltip = $('bc-tooltip');
 
+  // Mode toggle: switches the y-axis between per-attempt delay and running
+  // cumulative total. Defaults to cumulative so the total retry window is
+  // the first thing readers see — per-attempt hides the true scale.
+  document.querySelectorAll('input[name="bc-mode"]').forEach(function(el) {
+    el.addEventListener('change', draw);
+  });
+  function currentMode() {
+    const sel = document.querySelector('input[name="bc-mode"]:checked');
+    return sel ? sel.value : 'cumulative';
+  }
+
   // Full detail: 3d20h9m41s
   function fmtDur(sec) {
     if (sec < 0) sec = 0;
@@ -64,9 +75,12 @@
   }
 
   function computeCurves(p) {
+    // Matches the server's compute_backoff formula: for attempts a=1..N,
+    // delay = B + a^E + a * rand(0..J). Uses 1-indexed attempts so the
+    // first retry gets a real exponent term rather than zero.
     const min = [], max = [], cumMin = [], cumMax = [];
     let totalMin = 0, totalMax = 0;
-    for (let a = 0; a < p.N; a++) {
+    for (let a = 1; a <= p.N; a++) {
       const base = p.B + Math.pow(a, p.E);
       const lo = base;
       const hi = base + a * p.J;
@@ -93,7 +107,13 @@
     const W = rect.width, H = rect.height;
 
     const curves = computeCurves(p);
-    const yMax = Math.max(curves.max[curves.max.length - 1] || 1, 1);
+    // Pick which pair of curves to plot on the y-axis based on the toggle.
+    // Cumulative uses running totals; per-attempt uses the raw min/max delay
+    // for each individual retry. Tooltip content covers both regardless.
+    const mode = currentMode();
+    const plotMin = mode === 'cumulative' ? curves.cumMin : curves.min;
+    const plotMax = mode === 'cumulative' ? curves.cumMax : curves.max;
+    const yMax = Math.max(plotMax[plotMax.length - 1] || 1, 1);
 
     // Layout
     const padL = 56, padR = 16, padT = 16, padB = 36;
@@ -145,8 +165,8 @@
 
     // Fill between curves
     ctx.beginPath();
-    for (let i = 0; i < p.N; i++) ctx.lineTo(xPos(i), yPos(curves.min[i]));
-    for (let i = p.N - 1; i >= 0; i--) ctx.lineTo(xPos(i), yPos(curves.max[i]));
+    for (let i = 0; i < p.N; i++) ctx.lineTo(xPos(i), yPos(plotMin[i]));
+    for (let i = p.N - 1; i >= 0; i--) ctx.lineTo(xPos(i), yPos(plotMax[i]));
     ctx.closePath();
     ctx.fillStyle = accent;
     ctx.globalAlpha = 0.15;
@@ -155,14 +175,14 @@
 
     // Min line
     ctx.beginPath();
-    for (let i = 0; i < p.N; i++) ctx.lineTo(xPos(i), yPos(curves.min[i]));
+    for (let i = 0; i < p.N; i++) ctx.lineTo(xPos(i), yPos(plotMin[i]));
     ctx.strokeStyle = accent;
     ctx.lineWidth = 2;
     ctx.stroke();
 
     // Max line
     ctx.beginPath();
-    for (let i = 0; i < p.N; i++) ctx.lineTo(xPos(i), yPos(curves.max[i]));
+    for (let i = 0; i < p.N; i++) ctx.lineTo(xPos(i), yPos(plotMax[i]));
     ctx.strokeStyle = accent2;
     ctx.lineWidth = 2;
     ctx.stroke();
@@ -182,23 +202,31 @@
       ctx.globalAlpha = 1;
 
       // Dots
-      [curves.min[idx], curves.max[idx]].forEach((v, vi) => {
+      [plotMin[idx], plotMax[idx]].forEach((v, vi) => {
         ctx.beginPath();
         ctx.arc(sx, yPos(v), 4, 0, Math.PI * 2);
         ctx.fillStyle = vi === 0 ? accent : accent2;
         ctx.fill();
       });
 
-      // Tooltip (full detail + cumulative)
+      // Tooltip: primary line matches the current mode; the other view
+      // stays visible below so scrubbing gives both numbers at once.
+      const primary = mode === 'cumulative'
+        ? { label: 'Cumulative', min: curves.cumMin[idx], max: curves.cumMax[idx] }
+        : { label: 'This retry', min: curves.min[idx],    max: curves.max[idx] };
+      const secondary = mode === 'cumulative'
+        ? { label: 'This retry', min: curves.min[idx],    max: curves.max[idx] }
+        : { label: 'Cumulative', min: curves.cumMin[idx], max: curves.cumMax[idx] };
+
       tooltip.style.display = 'block';
       tooltip.innerHTML =
         '<strong>Attempt ' + (idx + 1) + '</strong><br>' +
-        '<span style="color:' + accent + '">Min:</span> ' + fmtDur(curves.min[idx]) + '<br>' +
-        '<span style="color:' + accent2 + '">Max:</span> ' + fmtDur(curves.max[idx]) + '<br>' +
-        '<span style="opacity:0.7">Total: ' + fmtDur(curves.cumMin[idx]) +
-        ' – ' + fmtDur(curves.cumMax[idx]) + '</span>';
+        '<span style="color:' + accent + '">' + primary.label + ' min:</span> ' + fmtDur(primary.min) + '<br>' +
+        '<span style="color:' + accent2 + '">' + primary.label + ' max:</span> ' + fmtDur(primary.max) + '<br>' +
+        '<span style="opacity:0.7">' + secondary.label + ': ' + fmtDur(secondary.min) +
+        ' – ' + fmtDur(secondary.max) + '</span>';
 
-      let tx = sx + 12, ty = yPos((curves.min[idx] + curves.max[idx]) / 2) - 30;
+      let tx = sx + 12, ty = yPos((plotMin[idx] + plotMax[idx]) / 2) - 30;
       if (tx + 140 > W) tx = sx - 140;
       if (ty < 0) ty = 4;
       tooltip.style.left = tx + 'px';

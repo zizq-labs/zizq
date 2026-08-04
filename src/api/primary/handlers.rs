@@ -3539,7 +3539,7 @@ mod tests {
         let router = app(state.clone());
 
         // Enqueue with a custom backoff: exponent=1, base_ms=200, jitter=0.
-        // Backoff for attempt 1: 1^1 + 200 = 201ms.
+        // Backoff for attempt 1: 1^1 * 1000 + 200 = 1200ms.
         let req = json_request(
             "POST",
             "/jobs",
@@ -3579,8 +3579,8 @@ mod tests {
         let ready_at = job["ready_at"].as_u64().unwrap();
         assert_eq!(
             ready_at,
-            now + 201,
-            "ready_at should use per-job backoff (1^1 + 200 = 201ms), not server default",
+            now + 1200,
+            "ready_at should use per-job backoff (1^1 * 1000 + 200 = 1200ms), not server default",
         );
     }
 
@@ -5876,7 +5876,8 @@ mod tests {
     #[tokio::test]
     async fn failure_applies_default_backoff() {
         // Use a known backoff config with zero jitter so the result is
-        // deterministic: delay = attempts^exponent + base_ms = 1^2 + 500 = 501.
+        // deterministic: delay = attempts^exponent * 1000 + base_ms
+        //                     = 1^2 * 1000 + 500 = 1500.
         let mut config = store::StorageConfig::default();
         config.default_backoff = store::BackoffConfig {
             exponent: 2.0,
@@ -5905,7 +5906,7 @@ mod tests {
             .unwrap();
 
         // Fail the job — the handler reads (state.clock)() which returns
-        // our fixed `now`, so ready_at = now + 501 exactly.
+        // our fixed `now`, so ready_at = now + 1500 exactly.
         let req = json_request(
             "POST",
             &format!("/jobs/{job_id}/failure"),
@@ -5918,12 +5919,12 @@ mod tests {
         assert_eq!(job["status"], "scheduled");
 
         // With exponent=2, base_ms=500, jitter=0, attempts=1:
-        // delay = 1^2 + 500 = 501ms
+        // delay = 1^2 * 1000 + 500 = 1500ms
         let ready_at = job["ready_at"].as_u64().unwrap();
         assert_eq!(
             ready_at,
-            now + 501,
-            "ready_at should be exactly now + 501ms (backoff for attempt 1)",
+            now + 1500,
+            "ready_at should be exactly now + 1500ms (backoff for attempt 1)",
         );
     }
 
