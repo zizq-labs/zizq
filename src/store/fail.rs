@@ -245,7 +245,11 @@ impl Store {
 
 /// Compute the backoff delay in milliseconds for a given attempt count.
 ///
-/// Formula: `delay_ms = attempts^exponent + base_ms + rand(0..jitter_ms) * (attempts + 1)`
+/// Formula: `delay_ms = attempts^exponent * 1000 + base_ms + rand(0..jitter_ms) * attempts`
+///
+/// The exponent term is scaled to ms so the curve grows on a human timescale.
+/// With defaults (exponent=4, base=15s, jitter=30s, retry_limit=25) the total
+/// retry window is roughly 25 days.
 ///
 /// The jitter component scales linearly with the attempt count so that
 /// later retries spread further apart, reducing collision likelihood when
@@ -254,14 +258,15 @@ fn compute_backoff(attempts: u32, backoff: &BackoffConfig) -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
 
-    let base_delay = (attempts as f32).powf(backoff.exponent) + backoff.base_ms as f32;
+    let base_delay =
+        (attempts as f64).powf(backoff.exponent as f64) * 1000.0 + backoff.base_ms as f64;
 
     // Cheap random value using the same approach as rand_id() in http.rs.
     let rand_frac = (RandomState::new().build_hasher().finish() as f64) / (u64::MAX as f64); // 0.0..1.0
 
-    let jitter = rand_frac * backoff.jitter_ms as f64 * (attempts as f64 + 1.0);
+    let jitter = rand_frac * backoff.jitter_ms as f64 * attempts as f64;
 
-    (base_delay as f64 + jitter) as u64
+    (base_delay + jitter) as u64
 }
 
 #[cfg(test)]
@@ -288,12 +293,12 @@ mod tests {
             jitter_ms: 0,
         };
 
-        // attempts=1: 1^2 + 100 = 101
-        assert_eq!(compute_backoff(1, &backoff), 101);
-        // attempts=2: 2^2 + 100 = 104
-        assert_eq!(compute_backoff(2, &backoff), 104);
-        // attempts=3: 3^2 + 100 = 109
-        assert_eq!(compute_backoff(3, &backoff), 109);
+        // attempts=1: 1^2 * 1000 + 100 = 1100
+        assert_eq!(compute_backoff(1, &backoff), 1100);
+        // attempts=2: 2^2 * 1000 + 100 = 4100
+        assert_eq!(compute_backoff(2, &backoff), 4100);
+        // attempts=3: 3^2 * 1000 + 100 = 9100
+        assert_eq!(compute_backoff(3, &backoff), 9100);
     }
 
     #[test]
@@ -307,8 +312,8 @@ mod tests {
         // Run many times to exercise randomness.
         for attempts in 1..=10 {
             let delay = compute_backoff(attempts, &backoff);
-            let base = (attempts as f64).powf(2.0) + 100.0;
-            let max_jitter = 50.0 * (attempts as f64 + 1.0);
+            let base = (attempts as f64).powf(2.0) * 1000.0 + 100.0;
+            let max_jitter = 50.0 * attempts as f64;
             assert!(
                 delay >= base as u64,
                 "delay {delay} below base {base} for attempt {attempts}"
@@ -329,8 +334,62 @@ mod tests {
             jitter_ms: 0,
         };
 
-        // attempts=0: 0^2 + 100 = 100
+        // attempts=0: 0^2 * 1000 + 100 = 100
         assert_eq!(compute_backoff(0, &backoff), 100);
+    }
+
+    /// Pin the total retry window that the server defaults produce.
+    ///
+    /// With `exponent=4`, `base=15s`, `jitter=30s`, `retry_limit=25` a job
+    /// takes ~25 days to exhaust all retries before moving to `dead`.
+    /// Regressing this window (e.g. re-introducing the historic ms/seconds
+    /// unit bug that made retries exhaust in hours) would silently change
+    /// production behaviour.
+    #[test]
+    fn compute_backoff_total_retry_window_with_defaults() {
+        use crate::store::storage_config::{
+            DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
+            DEFAULT_RETRY_LIMIT,
+        };
+
+        const DAY_MS: u64 = 86_400_000;
+
+        // Minimum total: force jitter to zero and sum every scheduled delay
+        // from the first retry (attempts=1) to the last (attempts=N).
+        let no_jitter = BackoffConfig {
+            exponent: DEFAULT_BACKOFF_EXPONENT,
+            base_ms: DEFAULT_BACKOFF_BASE_MS,
+            jitter_ms: 0,
+        };
+        let min_total_ms: u64 = (1..=DEFAULT_RETRY_LIMIT)
+            .map(|a| compute_backoff(a, &no_jitter))
+            .sum();
+
+        // Maximum total: compute analytically since compute_backoff randomises
+        // jitter. Max per-attempt delay is a^E*1000 + base_ms + jitter_ms*a.
+        let max_total_ms: u64 = (1..=DEFAULT_RETRY_LIMIT)
+            .map(|a| {
+                let base = (a as f64).powf(DEFAULT_BACKOFF_EXPONENT as f64) * 1000.0
+                    + DEFAULT_BACKOFF_BASE_MS as f64;
+                let max_jitter = DEFAULT_BACKOFF_JITTER_MS as f64 * a as f64;
+                (base + max_jitter) as u64
+            })
+            .sum();
+
+        assert!(
+            min_total_ms >= 24 * DAY_MS,
+            "min total {} ms (~{} days) below expected floor of 24 days — \
+             backoff formula regressed?",
+            min_total_ms,
+            min_total_ms / DAY_MS
+        );
+        assert!(
+            max_total_ms <= 26 * DAY_MS,
+            "max total {} ms (~{} days) above expected ceiling of 26 days — \
+             backoff formula regressed?",
+            max_total_ms,
+            max_total_ms / DAY_MS
+        );
     }
 
     // --- record_failure tests ---

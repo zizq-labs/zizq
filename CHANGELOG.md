@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.1
+
+- Fixed a units error in the retry backoff formula where the
+  `attempts^exponent` term was treated as milliseconds instead of
+  seconds. With the shipped defaults this silently shortened the
+  total retry window from the intended ~25 days to under 4 hours,
+  so a transient production incident could exhaust all retries
+  within a single outage rather than spanning multiple days. Added
+  a pinning test that asserts the total retry window with the
+  default configuration stays within a 24-26 day band, so a future
+  regression on the same axis is caught in CI.
+
 ## 0.6.0
 
 - Added **batched jobs** (Pro): a new `batch` field on enqueue
