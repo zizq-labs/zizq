@@ -55,7 +55,7 @@ E = 4
 J = 30s
 ```
 
-This gives roughly 3 weeks of total retry time before the job is eventually
+This gives just under 4 days of total retry time before the job is eventually
 moved to the `dead` list.
 
 ## Adjusting the Backoff Curve
@@ -65,6 +65,10 @@ parameters affects the backoff curve. The defaults are very reasonable. There
 are two lines on the chart due to the presence of the random jitter, which is
 designed to avoid clusters of failures all retrying at the same time. An actual
 retry could occur anywhere within the band.
+
+> [!TIP]
+> Adjust the exponent very gradually. A change from `4.0` to `4.2` is enough to
+> change the total retry time from approx. 4 days to approx 7 days.
 
 <style>
   #backoff-chart-container {
@@ -117,7 +121,7 @@ retry could occur anywhere within the band.
     position: absolute;
     pointer-events: none;
     background: var(--sidebar-bg, #1e1e2e);
-    color :var(--fg, #cdd6f4);
+    color: var(--zizq-text-on-dark-primary, #cdd6f4);
     border: 1px solid var(--sidebar-fg, #585b70);
     border-radius: 4px;
     padding: 4px 8px;
