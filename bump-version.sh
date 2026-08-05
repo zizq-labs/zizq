@@ -49,12 +49,17 @@ cargo update -p zizq --quiet 2>/dev/null || cargo generate-lockfile --quiet 2>/d
 echo "  Updated Cargo.lock"
 
 # Update docs.
-for doc in docs/getting-started/src/quick-start.md docs/cli/src/installation.md README.md
+for doc in docs/getting-started/src/quick-start.md docs/cli/src/installation.md README.md LICENSE
 do
     sed -i "s/Zizq ${CURRENT}/Zizq ${NEW}/" $doc
     sed -i "s/\\/v${CURRENT}\\//\\/v${NEW}\\//" $doc
     sed -i "s/zizq-${CURRENT}/zizq-${NEW}/" $doc
 done
+
+# Update Change Date in LICENSE to 4 years from today.
+NEW_CHANGE_DATE=$(date -d "+4 years" +%Y-%m-%d)
+sed -i "s/^Change Date:.*/Change Date:          ${NEW_CHANGE_DATE}/" LICENSE
+echo "  Updated LICENSE Change Date to ${NEW_CHANGE_DATE}"
 
 # Add new CHANGELOG section if it doesn't already exist.
 if ! grep -q "^## ${NEW}" CHANGELOG.md 2>/dev/null; then

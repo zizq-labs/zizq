@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
+// Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Job deletion operations: single-job purge/delete, bulk delete, and
