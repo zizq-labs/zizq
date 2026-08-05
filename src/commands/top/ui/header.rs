@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Chris Corbyn <chris@zizq.io>
+// Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Top-of-screen header — version, connection indicator, server info,
