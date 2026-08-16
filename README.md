@@ -193,7 +193,7 @@ By default `zizq top` connects to `127.0.0.1:8901`. Specify `--url` to connect
 to a different host.
 
 Scroll up and down the list to visualise the backlog. The current position in
-the list is presented in the overall queue depth in real time. You can wiew the
+the list is presented in the overall queue depth in real time. You can view the
 jobs that are currently in-flight, ready and scheduled for a later time.
 
 <p align="center">
