@@ -182,10 +182,27 @@ jobs:
 
       - name: Run integration tests
         working-directory: client
+        env:
+          ZIZQ_LICENSE_KEY: ${{ secrets.ZIZQ_LICENSE_KEY }}
         run: |
-          ./integration/run.sh \
-            --binary ${{ github.workspace }}/server/zizq \
+          ARGS=(
+            --binary ${{ github.workspace }}/server/zizq
             --tarball ${{ github.workspace }}/artifact/zizq-*.tgz
+          )
+          # Harnesses predating 0.3.x reject unknown arguments rather
+          # than ignoring them, and predate this flag entirely. Probe
+          # the checkout for the parser arm rather than keeping a
+          # version table here — same idiom as the `zizq-derive`
+          # check in the Rust job.
+          if grep -q -- '--license-key)' integration/run.sh; then
+            if [[ -n "$ZIZQ_LICENSE_KEY" ]]; then
+              ARGS+=(--license-key "$ZIZQ_LICENSE_KEY")
+            fi
+          else
+            echo "note: this client's harness predates --license-key;" \
+                 "licensed tests will skip"
+          fi
+          ./integration/run.sh "${ARGS[@]}"
 
   discover-ruby:
     name: Discover Ruby Versions
@@ -259,10 +276,27 @@ jobs:
 
       - name: Run integration tests
         working-directory: client
+        env:
+          ZIZQ_LICENSE_KEY: ${{ secrets.ZIZQ_LICENSE_KEY }}
         run: |
-          ./integration/run.sh \
-            --binary ${{ github.workspace }}/server/zizq \
+          ARGS=(
+            --binary ${{ github.workspace }}/server/zizq
             --gem ${{ github.workspace }}/artifact/zizq-*.gem
+          )
+          # Harnesses predating 0.3.x reject unknown arguments rather
+          # than ignoring them, and predate this flag entirely. Probe
+          # the checkout for the parser arm rather than keeping a
+          # version table here — same idiom as the `zizq-derive`
+          # check in the Rust job.
+          if grep -q -- '--license-key)' integration/run.sh; then
+            if [[ -n "$ZIZQ_LICENSE_KEY" ]]; then
+              ARGS+=(--license-key "$ZIZQ_LICENSE_KEY")
+            fi
+          else
+            echo "note: this client's harness predates --license-key;" \
+                 "licensed tests will skip"
+          fi
+          ./integration/run.sh "${ARGS[@]}"
 
   discover-rust:
     name: Discover Rust Versions
@@ -358,6 +392,8 @@ jobs:
 
       - name: Run integration tests
         working-directory: client
+        env:
+          ZIZQ_LICENSE_KEY: ${{ secrets.ZIZQ_LICENSE_KEY }}
         run: |
           # Digit-anchored glob so the main-crate arg doesn't
           # accidentally expand to include the derive sibling.
@@ -374,6 +410,125 @@ jobs:
             DERIVE_CRATE=(${{ github.workspace }}/artifact/zizq-derive-*.crate)
             ARGS+=(--macro-crate "${DERIVE_CRATE[0]}")
           fi
+          # Harnesses predating 0.3.x reject unknown arguments rather
+          # than ignoring them, and predate this flag entirely. Probe
+          # the checkout for the parser arm rather than keeping a
+          # version table here — same idiom as the `zizq-derive`
+          # check in the Rust job.
+          if grep -q -- '--license-key)' integration/run.sh; then
+            if [[ -n "$ZIZQ_LICENSE_KEY" ]]; then
+              ARGS+=(--license-key "$ZIZQ_LICENSE_KEY")
+            fi
+          else
+            echo "note: this client's harness predates --license-key;" \
+                 "licensed tests will skip"
+          fi
+          ./integration/run.sh "${ARGS[@]}"
+
+  discover-elixir:
+    name: Discover Elixir Versions
+    needs: release-binary
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Discover compatible client versions
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          matrix=$(./.github/scripts/discover-client-versions.sh \
+            elixir "${{ needs.release-binary.outputs.version }}")
+          echo "Discovered matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  integration-elixir:
+    name: Integration (Elixir, ${{ matrix.label }})
+    needs: [release-binary, discover-elixir]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover-elixir.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: zizq-binary-v${{ needs.release-binary.outputs.version }}
+          path: server
+      - name: Unpack server binary
+        run: tar -xzf server/zizq-${{ needs.release-binary.outputs.version }}-linux-x86_64.tar.gz -C server
+
+      - name: Checkout Elixir client @ ${{ matrix.ref }}
+        uses: actions/checkout@v7
+        with:
+          repository: zizq-labs/zizq-elixir
+          ref: ${{ matrix.ref }}
+          path: client
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      # Pinned to the client's declared floor (`elixir: "~> 1.18"` in
+      # its mix.exs), so every tag this matrix can select compiles by
+      # construction. Bump when the client raises its floor — a
+      # floating toolchain would let an unrelated Elixir or OTP
+      # release muddy the signal this job exists to give.
+      - name: Set up BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - name: Prepare artifact directory
+        run: mkdir -p artifact
+
+      - name: Download release tarball (tagged version)
+        if: matrix.tarball != ''
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          gh release download "${{ matrix.ref }}" \
+            --repo zizq-labs/zizq-elixir \
+            --pattern "${{ matrix.tarball }}" \
+            --dir artifact
+
+      - name: Build client from source (main)
+        if: matrix.tarball == ''
+        working-directory: client
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+          ./release.sh
+          cp _build/release/zizq-*.tar ../artifact/
+
+      # The harness is a separate Mix project built against the
+      # packaged tarball, so it tests what would be published rather
+      # than the checkout.
+      - name: Run integration tests
+        working-directory: client
+        env:
+          ZIZQ_LICENSE_KEY: ${{ secrets.ZIZQ_LICENSE_KEY }}
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          ARGS=(
+            --binary ${{ github.workspace }}/server/zizq
+            --tarball ${{ github.workspace }}/artifact/zizq-*.tar
+          )
+          # Harnesses predating 0.3.x reject unknown arguments rather
+          # than ignoring them, and predate this flag entirely. Probe
+          # the checkout for the parser arm rather than keeping a
+          # version table here — same idiom as the `zizq-derive`
+          # check in the Rust job.
+          if grep -q -- '--license-key)' integration/run.sh; then
+            if [[ -n "$ZIZQ_LICENSE_KEY" ]]; then
+              ARGS+=(--license-key "$ZIZQ_LICENSE_KEY")
+            fi
+          else
+            echo "note: this client's harness predates --license-key;" \
+                 "licensed tests will skip"
+          fi
           ./integration/run.sh "${ARGS[@]}"
 
   # --- Integration gate (stable check name for branch protection) ---
@@ -381,17 +536,19 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    needs: [integration-node, integration-ruby, integration-rust]
+    needs: [integration-node, integration-ruby, integration-rust, integration-elixir]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.integration-node.result }}" != "success" ] || \
              [ "${{ needs.integration-ruby.result }}" != "success" ] || \
-             [ "${{ needs.integration-rust.result }}" != "success" ]; then
+             [ "${{ needs.integration-rust.result }}" != "success" ] || \
+             [ "${{ needs.integration-elixir.result }}" != "success" ]; then
             echo "Integration tests failed or were skipped."
             echo "  Node: ${{ needs.integration-node.result }}"
             echo "  Ruby: ${{ needs.integration-ruby.result }}"
             echo "  Rust: ${{ needs.integration-rust.result }}"
+            echo "  Elixir: ${{ needs.integration-elixir.result }}"
             exit 1
           fi
           echo "All integration tests passed."

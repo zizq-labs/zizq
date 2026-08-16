@@ -259,8 +259,9 @@ architectures.
 
 ### Client libraries
 
-Zizq provides [client libraries](/docs/clients) (starting with
-[Ruby](/docs/clients/ruby/) and [Node.js](/docs/clients/node/)) to simplify
+Zizq provides [client libraries](/docs/clients) for
+[Ruby](/docs/clients/ruby/), [Node.js](/docs/clients/node/),
+[Elixir](/docs/clients/elixir/) and [Rust](/docs/clients/rust/) to simplify
 integration.
 
 More clients for other languages will be added over time and based on demand,
