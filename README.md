@@ -5,7 +5,8 @@ It is very fast and has no external dependencies, including dependencies on
 services such as Redis or a RDBMS.
 
 The server runs as a straightforward HTTP/2 and HTTP/1.1 API, with easy-to-use
-clients currently implemented in Node.js and Ruby — and others planned soon.
+clients currently implemented in Node.js, Ruby, Elixir and Rust (and others
+planned soon).
 
  [![CI](https://github.com/zizq-labs/zizq/actions/workflows/ci.yml/badge.svg)](https://github.com/zizq-labs/zizq/actions/workflows/ci.yml)
 
@@ -82,10 +83,11 @@ up to listen on a public IP address.
 
 Zizq provides official client libraries under the MIT license. The goal is to
 provide clients for a number of common languages. We have started with Node.js,
-Ruby and Rust.
+Ruby, Elixir and Rust.
 
-* [Official Ruby Client](https://github.com/zizq-labs/zizq-ruby)
 * [Official Node.js Client](https://github.com/zizq-labs/zizq-node)
+* [Official Ruby Client](https://github.com/zizq-labs/zizq-ruby)
+* [Official Elixir Client](https://github.com/zizq-labs/zizq-elixir)
 * [Official Rust Client](https://github.com/zizq-labs/zizq-rust)
 
 Want a client for Zizq in a language not currently supported?
