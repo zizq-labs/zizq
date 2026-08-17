@@ -1,8 +1,8 @@
 # Zizq
 
-Zizq is a powerful, persistent job queue, packed into a single native binary.
-It is very fast and has no external dependencies, including dependencies on
-services such as Redis or a RDBMS.
+Zizq (**/zɪsk/**) is a fast and durable job queue packed into a single native
+binary, built on an embedded LSM database — not on Redis, and not on your
+RDBMS.
 
 The server runs as a straightforward HTTP/2 and HTTP/1.1 API, with easy-to-use
 clients currently implemented in Node.js, Ruby, Elixir and Rust (and others
@@ -74,25 +74,6 @@ explicitly specified by providing the `--root-dir` flag, or by specifying the
 Run `zizq serve --help` to see a complete list of available options. The
 defaults should be good even for production use, provided the server is not set
 up to listen on a public IP address.
-
-### Client libraries
-
-> [!NOTE]
-> [Full documentation](https://zizq.io/docs/clients) for our client libraries
-> is available on the website.
-
-Zizq provides official client libraries under the MIT license. The goal is to
-provide clients for a number of common languages. We have started with Node.js,
-Ruby, Elixir and Rust.
-
-* [Official Node.js Client](https://github.com/zizq-labs/zizq-node)
-* [Official Ruby Client](https://github.com/zizq-labs/zizq-ruby)
-* [Official Elixir Client](https://github.com/zizq-labs/zizq-elixir)
-* [Official Rust Client](https://github.com/zizq-labs/zizq-rust)
-
-Want a client for Zizq in a language not currently supported?
-[leave a feature request](https://github.com/zizq-labs/zizq/issues) or
-[build your own](https://zizq.io/docs/api/) easily.
 
 ### Communicating with the server
 
@@ -177,6 +158,81 @@ Processing job with id=03g0ej3ybwh5uh1ap10xgufm3 type=hello_world...
 Acknowledging completion...
 Done.
 ```
+
+### Client libraries
+
+> [!NOTE]
+> [Full documentation](https://zizq.io/docs/clients) for our client libraries
+> is available on the website.
+
+Zizq provides official client libraries under the MIT license. The goal is to
+provide clients for a number of common languages. We have started with Node.js,
+Ruby, Elixir and Rust.
+
+Each handles connection pooling, serialization and concurrency for you, and
+each ships a worker that runs jobs with a configurable level of concurrency.
+
+Jobs can be enqueued from one language and processed by a worker in another.
+
+#### Node.js — [repo](https://github.com/zizq-labs/zizq-node) · [docs](https://zizq.io/docs/clients/node/)
+
+```ts
+import { Client } from "@zizq-labs/zizq";
+
+const client = new Client({ url: "http://127.0.0.1:7890" });
+
+await client.enqueue({
+  type: "send_email",
+  queue: "emails",
+  payload: { userId: 42, template: "welcome" },
+});
+```
+
+#### Ruby — [repo](https://github.com/zizq-labs/zizq-ruby) · [docs](https://zizq.io/docs/clients/ruby/)
+
+```ruby
+class SendEmailJob
+  include Zizq::Job
+
+  zizq_queue 'emails'
+
+  def perform(user_id, template:)
+    Mailer.deliver(User.find(user_id), template)
+  end
+end
+
+Zizq.enqueue(SendEmailJob, 42, template: 'welcome')
+```
+
+#### Elixir — [repo](https://github.com/zizq-labs/zizq-elixir) · [docs](https://zizq.io/docs/clients/elixir/)
+
+```elixir
+defmodule MyApp.SendEmail do
+  use Zizq.JobKind, type: "send_email", queue: "emails"
+
+  @impl Zizq.JobKind
+  def perform(%{"user_id" => id}), do: MyApp.Mailer.deliver(id)
+end
+
+MyApp.SendEmail.new(%{"user_id" => 42})
+|> Zizq.enqueue(MyApp.Zizq)
+```
+
+#### Rust — [repo](https://github.com/zizq-labs/zizq-rust) · [docs](https://zizq.io/docs/clients/rust/)
+
+```rust
+#[derive(Serialize, Deserialize, JobKind)]
+#[zizq(name = "send_email", queue = "emails")]
+struct SendEmail {
+    user_id: u64,
+}
+
+client.enqueue(SendEmail { user_id: 42 }).await?;
+```
+
+Want a client for Zizq in a language not currently supported?
+[leave a feature request](https://github.com/zizq-labs/zizq/issues) or
+[build your own](https://zizq.io/docs/api/) easily.
 
 ### Viewing live queue activity
 
