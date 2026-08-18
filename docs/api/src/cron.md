@@ -149,6 +149,20 @@ schedule data unconditionally and Zizq is smart enough to handle it safely.
         </tr>
         <tr>
             <td>
+                <div><code>timezone</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Optional IANA timezone identifier applied to every entry in
+                the group that does not specify one of its own. When not
+                specified, those entries are evaluated in the system timezone
+                where the Zizq server is running. Because this endpoint
+                replaces the group in full, omitting this field clears any
+                timezone the group previously had.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>entries</code> <em>required</em></div>
                 <div><pre>array</pre></div>
             </td>
@@ -186,8 +200,9 @@ schedule data unconditionally and Zizq is smart enough to handle it safely.
             <td>
                 Optional IANA timezone identifier in which the cron expression
                 should be evaluated. When not specified, the expression is
-                evaluated in the system timezone where the Zizq server is
-                running.
+                evaluated in the group's <code>timezone</code>, or in the system
+                timezone where the Zizq server is running when the group does not
+                specify one either.
             </td>
         </tr>
         <tr>
@@ -431,7 +446,11 @@ Returned when the server is not configured with a pro license.
 
 ## `PATCH /crons/{group}` { #patch-crons-group }
 
-Update an existing cron group. Currently only used to pause/resume the group.
+Update an existing cron group, to pause/resume it or to change the timezone
+its entries default to.
+
+Fields that are omitted are left unchanged. A field explicitly set to `null`
+is cleared.
 
 ### Parameters { #patch-crons-group-parameters }
 
@@ -466,6 +485,20 @@ Update an existing cron group. Currently only used to pause/resume the group.
                 the <code>resumed_at</code> timestamp on the group and
                 re-commences enqueueing jobs for all unpaused entries in the
                 group.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>timezone</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                IANA timezone identifier applied to every entry in the group
+                that does not specify one of its own. Set it to
+                <code>null</code> to clear it, which returns those entries to
+                the system timezone where the Zizq server is running. Changing
+                it reschedules every entry that inherits it; entries that
+                specify their own timezone are unaffected.
             </td>
         </tr>
     </tbody>
@@ -696,8 +729,9 @@ within it. This operation is atomic and idempotent when given the same entry.
             <td>
                 Optional IANA timezone identifier in which the cron expression
                 should be evaluated. When not specified, the expression is
-                evaluated in the system timezone where the Zizq server is
-                running.
+                evaluated in the group's <code>timezone</code>, or in the system
+                timezone where the Zizq server is running when the group does not
+                specify one either.
             </td>
         </tr>
         <tr>

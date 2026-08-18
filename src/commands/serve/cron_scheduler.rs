@@ -254,6 +254,7 @@ mod tests {
                 "default",
                 ReplaceCronGroupOptions {
                     paused: None,
+                    timezone: None,
                     entries: vec![cron_entry("e1", "* * * * *")],
                 },
                 t,
@@ -306,6 +307,7 @@ mod tests {
                 "default",
                 ReplaceCronGroupOptions {
                     paused: None,
+                    timezone: None,
                     entries: vec![cron_entry("e1", "* * * * *")],
                 },
                 t,
@@ -349,6 +351,7 @@ mod tests {
                 "default",
                 ReplaceCronGroupOptions {
                     paused: None,
+                    timezone: None,
                     entries: vec![cron_entry("e1", "* * * * *")],
                 },
                 t,
@@ -408,6 +411,7 @@ mod tests {
                 "default",
                 ReplaceCronGroupOptions {
                     paused: None,
+                    timezone: None,
                     entries: vec![cron_entry("e1", "* * * * *")],
                 },
                 t,

@@ -525,8 +525,25 @@ pub struct ReplaceCronGroupOptions {
     /// state (or default to `false` for new groups).
     pub paused: Option<bool>,
 
+    /// Default IANA timezone name for entries that do not name one of
+    /// their own. Because this is a full replace, `None` clears any
+    /// timezone the group already had.
+    pub timezone: Option<String>,
+
     /// The entries that should exist in the group after the replace.
     pub entries: Vec<CronEntryOptions>,
+}
+
+/// Options for `Store::patch_cron_group`.
+///
+/// Follows JSON Merge Patch semantics: `None` leaves a field alone.
+pub struct PatchCronGroupOptions {
+    /// Whether the group should be paused.
+    pub paused: Option<bool>,
+
+    /// The group's default timezone. `Some(None)` clears it, which falls
+    /// the group's un-scoped entries back to the server's local timezone.
+    pub timezone: Option<Option<String>>,
 }
 
 /// A single entry in a `replace_cron_group` request.
@@ -541,7 +558,8 @@ pub struct CronEntryOptions {
     pub expression: String,
 
     /// IANA timezone name (e.g. `Australia/Melbourne`). `None` means use
-    /// the system's local timezone.
+    /// the group's timezone, or the system's local timezone when the
+    /// group does not name one either.
     pub timezone: Option<String>,
 
     /// Whether this entry should be paused. `None` means preserve existing

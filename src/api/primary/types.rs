@@ -1078,9 +1078,28 @@ pub struct ListCronGroupsResponse {
 }
 
 /// Request shape for `PATCH /crons/{name}`.
+///
+/// Absent fields are left unchanged. A `null` timezone clears the group's
+/// default, falling its un-scoped entries back to the server's local
+/// timezone.
 #[derive(Deserialize)]
 pub struct PatchCronGroupRequest {
     /// Whether the group should be paused.
+    #[serde(default)]
+    pub paused: Option<bool>,
+
+    /// Default IANA timezone name for entries that do not name one.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    pub timezone: Option<Option<String>>,
+}
+
+/// Request shape for `PATCH /crons/{name}/entries/{entry}`.
+///
+/// Separate from `PatchCronGroupRequest` because only a group carries a
+/// timezone — an entry's is set by writing the entry itself.
+#[derive(Deserialize)]
+pub struct PatchCronEntryRequest {
+    /// Whether the entry should be paused.
     pub paused: bool,
 }
 
@@ -1090,6 +1109,11 @@ pub struct ReplaceCronGroupRequest {
     /// Whether the group should be paused. Omitted means preserve existing
     /// state (or default to `false` for new groups).
     pub paused: Option<bool>,
+
+    /// Default IANA timezone name (e.g. `Australia/Melbourne`) for entries
+    /// that do not name one of their own. Because this is a full replace,
+    /// omitting it clears any timezone the group already had.
+    pub timezone: Option<String>,
 
     pub entries: Vec<CronEntryRequest>,
 }
@@ -1103,8 +1127,9 @@ pub struct CronEntryRequest {
     /// Cron expression (e.g. `*/15 * * * *`).
     pub expression: String,
 
-    /// IANA timezone name (e.g. `Australia/Melbourne`). When omitted,
-    /// the server's local timezone is used.
+    /// IANA timezone name (e.g. `Australia/Melbourne`). When omitted, the
+    /// group's timezone is used, or the server's local timezone when the
+    /// group does not name one either.
     pub timezone: Option<String>,
 
     /// Whether this entry should be paused. Omitted means preserve
@@ -1125,6 +1150,10 @@ pub struct CronGroupResponse {
 
     /// Whether the group is paused.
     pub paused: bool,
+
+    /// Default IANA timezone name for entries that do not name one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 
     /// When the group was last paused (ms since epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1147,6 +1176,7 @@ impl CronGroupResponse {
         Self {
             name,
             paused: group.paused,
+            timezone: group.timezone,
             paused_at: group.paused_at,
             resumed_at: group.resumed_at,
             entries: entries
@@ -1166,7 +1196,8 @@ pub struct CronEntryResponse {
     /// Cron expression.
     pub expression: String,
 
-    /// IANA timezone name. `None` means system local timezone.
+    /// IANA timezone name. `None` means the group's timezone, or the
+    /// system local timezone when the group does not name one either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
 

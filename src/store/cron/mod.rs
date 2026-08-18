@@ -24,6 +24,14 @@ pub struct CronGroup {
     #[serde(default)]
     pub paused: bool,
 
+    /// Default IANA timezone name (e.g. `Australia/Melbourne`) for entries
+    /// in this group that do not name one of their own. When `None`, such
+    /// entries fall back to the system's local timezone.
+    #[serde(rename = "Z")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+
     /// When the group was last paused (ms since epoch).
     #[serde(rename = "p")]
     #[serde(default)]
@@ -51,7 +59,8 @@ pub struct CronEntry {
     pub expression: String,
 
     /// IANA timezone name (e.g. `Australia/Melbourne`). When `None`, the
-    /// system's local timezone is used.
+    /// group's timezone is used, falling back to the system's local
+    /// timezone when the group does not name one either.
     #[serde(rename = "Z")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
