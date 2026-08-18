@@ -37,9 +37,9 @@ use super::types::{
     CronGroupResponse, DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse,
     FailureRequest, HealthResponse, Job, JobStatus, ListCronGroupsResponse, ListErrorsPages,
     ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse,
-    ListQueuesResponse, Order, PatchCronGroupRequest, PatchJobBody, PatchJobsParams, RangeQuery,
-    ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse, VersionResponse,
-    parse_unique_while,
+    ListQueuesResponse, Order, PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody,
+    PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
+    VersionResponse, parse_unique_while,
 };
 
 /// Default priority for jobs that don't specify one.
@@ -2486,6 +2486,7 @@ async fn replace_cron_group(
 
     let opts = store::ReplaceCronGroupOptions {
         paused: req.paused,
+        timezone: req.timezone,
         entries: entry_opts,
     };
 
@@ -2600,7 +2601,7 @@ async fn patch_cron_entry(
     AcceptFormat(fmt): AcceptFormat,
     State(state): State<Arc<AppState>>,
     Path((name, entry)): Path<(String, String)>,
-    NegotiatedBody(req): NegotiatedBody<PatchCronGroupRequest>,
+    NegotiatedBody(req): NegotiatedBody<PatchCronEntryRequest>,
 ) -> Response {
     let now_ms = (state.clock)();
     if let Err(e) = state
@@ -2676,7 +2677,8 @@ async fn delete_cron_entry(
     }
 }
 
-/// Handle `PATCH /crons/{name}` — update group-level fields (pause/unpause).
+/// Handle `PATCH /crons/{name}` — update group-level fields (pause state
+/// and default timezone).
 async fn patch_cron_group(
     AcceptFormat(fmt): AcceptFormat,
     State(state): State<Arc<AppState>>,
@@ -2693,11 +2695,12 @@ async fn patch_cron_group(
         return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
     }
 
-    match state
-        .store
-        .patch_cron_group(&name, req.paused, now_ms)
-        .await
-    {
+    let opts = store::PatchCronGroupOptions {
+        paused: req.paused,
+        timezone: req.timezone,
+    };
+
+    match state.store.patch_cron_group(&name, opts, now_ms).await {
         Ok(Some(group)) => {
             // Re-fetch the full group with entries for the response.
             match state.store.get_cron_group(&name).await {
@@ -2732,6 +2735,9 @@ async fn patch_cron_group(
                 error: format!("cron group '{name}' not found"),
             },
         ),
+        Err(StoreError::InvalidOperation(msg)) => {
+            respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error: msg })
+        }
         Err(e) => {
             tracing::error!(%e, "patch_cron_group failed");
             respond(
@@ -8194,6 +8200,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cron_put_accepts_group_level_timezone() {
+        let app = pro_app();
+
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "timezone": "Australia/Melbourne",
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["timezone"], "Australia/Melbourne");
+        // The entry inherits it rather than carrying a copy.
+        assert!(body["entries"][0]["timezone"].is_null());
+
+        // It survives a read-back.
+        let req = json_request("GET", "/crons/default", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["timezone"], "Australia/Melbourne");
+    }
+
+    #[tokio::test]
+    async fn cron_put_omitting_group_timezone_clears_it() {
+        let app = pro_app();
+
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "timezone": "Australia/Melbourne",
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // A replace is a full replace.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["timezone"].is_null());
+    }
+
+    #[tokio::test]
+    async fn cron_put_rejects_invalid_group_timezone() {
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "timezone": "Not/Real",
+                "entries": []
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn cron_put_rejects_invalid_timezone() {
         let req = cron_put(
             "default",
@@ -8404,6 +8489,120 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["paused"], false);
         assert!(body["resumed_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn cron_patch_sets_group_timezone() {
+        let app = pro_app();
+
+        // Both timezones are named explicitly so the test does not depend on
+        // the local timezone of the machine running it.
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "paused": true,
+                "timezone": "UTC",
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let before = body["entries"][0]["next_enqueue_at"].as_u64().unwrap();
+
+        let req = cron_patch(
+            "default",
+            &serde_json::json!({ "timezone": "Australia/Melbourne" }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["timezone"], "Australia/Melbourne");
+        // An absent `paused` leaves the pause state alone.
+        assert_eq!(body["paused"], true);
+        // The entry inherits the group's timezone, so it was rescheduled.
+        let after = body["entries"][0]["next_enqueue_at"].as_u64().unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn cron_patch_clears_group_timezone_with_null() {
+        let app = pro_app();
+
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "timezone": "Australia/Melbourne",
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = cron_patch("default", &serde_json::json!({ "timezone": null }));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body["timezone"].is_null());
+    }
+
+    #[tokio::test]
+    async fn cron_patch_preserves_group_timezone_when_absent() {
+        let app = pro_app();
+
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "timezone": "Australia/Melbourne",
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = cron_patch("default", &serde_json::json!({ "paused": true }));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["paused"], true);
+        assert_eq!(body["timezone"], "Australia/Melbourne");
+    }
+
+    #[tokio::test]
+    async fn cron_patch_rejects_invalid_group_timezone() {
+        let app = pro_app();
+
+        let req = cron_put(
+            "default",
+            &serde_json::json!({
+                "entries": [{
+                    "name": "e1",
+                    "expression": "0 9 * * *",
+                    "job": { "type": "t", "queue": "q", "payload": {} }
+                }]
+            }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = cron_patch("default", &serde_json::json!({ "timezone": "Not/Real" }));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

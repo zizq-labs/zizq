@@ -30,6 +30,19 @@
         </tr>
         <tr>
             <td>
+                <div><code>timezone</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                IANA timezone identifier applied to every entry in the group
+                that does not specify one of its own. Absent when the group
+                does not specify one, in which case those entries are
+                evaluated in the system timezone where the Zizq server is
+                running.
+            </td>
+        </tr>
+        <tr>
+            <td>
                 <div><code>paused_at</code></div>
                 <div><pre>int64</pre></div>
             </td>
@@ -89,8 +102,9 @@
             <td>
                 Optional IANA timezone identifier in which the cron expression
                 should be evaluated. When not specified, the expression is
-                evaluated in the system timezone where the Zizq server is
-                running.
+                evaluated in the group's <code>timezone</code>, or in the system
+                timezone where the Zizq server is running when the group does not
+                specify one either.
             </td>
         </tr>
         <tr>

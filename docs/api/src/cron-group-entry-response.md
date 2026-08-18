@@ -36,8 +36,9 @@
             <td>
                 Optional IANA timezone identifier in which the cron expression
                 should be evaluated. When not specified, the expression is
-                evaluated in the system timezone where the Zizq server is
-                running.
+                evaluated in the group's <code>timezone</code>, or in the system
+                timezone where the Zizq server is running when the group does not
+                specify one either.
             </td>
         </tr>
         <tr>

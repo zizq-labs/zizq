@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.7.0 (Unreleased)
+
+- Added a **group-level cron timezone**. `PUT /crons/{group}` and
+  `PATCH /crons/{group}` now accept a `timezone` field alongside
+  `paused`, and it is returned on every cron group response. Entries
+  that do not name a timezone of their own are evaluated in the
+  group's; entries that do are unaffected. Without either, entries
+  continue to run in the server's local timezone, so existing
+  schedules are unchanged. Previously a client wanting one timezone
+  for a whole schedule had to copy it onto every entry, which did not
+  survive a read-back as a group-level fact.
+
+  `PATCH /crons/{group}` follows JSON merge patch semantics for this:
+  an absent field is left alone, and `"timezone": null` clears the
+  group's timezone. `paused` is now optional there for the same
+  reason — a patch may change only the timezone. Because
+  `PUT /crons/{group}` replaces a group in full, omitting `timezone`
+  on a `PUT` clears it.
+
+  Changing a group's timezone reschedules every entry that inherits
+  it, rather than leaving the old firing times in place until each
+  entry next fires.
+
+- Fixed cron entries keeping a stale `next_enqueue_at` when only their
+  `timezone` changed. `PUT /crons/{group}` and
+  `PUT /crons/{group}/entries/{entry}` preserve scheduling state when
+  an entry is unchanged, but compared expressions alone — so moving an
+  entry between timezones left it firing at the old wall-clock time
+  until its next occurrence passed. The comparison now covers the
+  effective timezone as well.
+
 ## 0.6.1
 
 - Fixed a units error in the retry backoff formula where the
