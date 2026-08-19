@@ -16,6 +16,11 @@
 //! This module holds the stored policy only. Token accounting, the
 //! per-budget dispatch queues, and the reference a job carries are
 //! separate concerns and land alongside dispatch.
+//!
+//! The `impl Store { ... }` methods for the budget API live in the
+//! sibling `ops` submodule.
+
+mod ops;
 
 use serde::{Deserialize, Serialize};
 

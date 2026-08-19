@@ -18,6 +18,7 @@ use super::types::JobStatus;
 /// and errors coexist in the same fjall keyspace without collision.
 #[repr(u8)]
 pub(super) enum RecordKind {
+    Budget = b'B',
     Cron = b'C',
     Error = b'E',
     Job = b'J',

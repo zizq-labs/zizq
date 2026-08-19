@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::PayloadFilter;
 
+use super::budget::BudgetStrategy;
 use super::types::{
     BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile,
 };
@@ -544,6 +545,19 @@ pub struct PatchCronGroupOptions {
     /// The group's default timezone. `Some(None)` clears it, which falls
     /// the group's un-scoped entries back to the server's local timezone.
     pub timezone: Option<Option<String>>,
+}
+
+/// Options for `Store::patch_budget`.
+///
+/// Follows JSON Merge Patch semantics: `None` leaves a field alone.
+/// Neither field is nullable — a budget with no allocation or no
+/// strategy is not a budget, so there is nothing to clear them to.
+pub struct PatchBudgetOptions {
+    /// Tokens the bucket holds when full.
+    pub allocation: Option<u32>,
+
+    /// How tokens replenish.
+    pub strategy: Option<BudgetStrategy>,
 }
 
 /// A single entry in a `replace_cron_group` request.
