@@ -107,13 +107,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use super::super::budget::BudgetRef;
+    use super::super::budget::{BudgetBinding, BudgetPolicy, BudgetStrategy};
+    use super::super::options::ListJobsOptions;
     use super::super::options::{EnqueueOptions, FailureOptions};
     use super::super::results::EnqueueResult;
     use super::super::store::StoreEvent;
     use super::super::test_support::{test_store, test_store_with_retention};
     use super::super::types::{
-        BackoffConfig, BatchConfig, Job, JobStatus, RetentionConfig, UniqueWhile,
+        BackoffConfig, BatchConfig, Job, JobStatus, RetentionConfig, StoreError, UniqueWhile,
     };
     use crate::time::now_millis;
 
@@ -155,8 +156,12 @@ mod tests {
             .enqueue(
                 now_millis(),
                 EnqueueOptions::new("test", "default", serde_json::json!({}))
-                    .budget(BudgetRef::new("stripe"))
-                    .budget(BudgetRef::new("per_tenant").cost(5)),
+                    .budget(BudgetBinding::new("stripe").create_with(while_in_flight(10)))
+                    .budget(
+                        BudgetBinding::new("per_tenant")
+                            .cost(5)
+                            .create_with(while_in_flight(10)),
+                    ),
             )
             .await
             .unwrap()
@@ -217,6 +222,173 @@ mod tests {
 
         let encoded = rmp_serde::to_vec_named(&job).unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains('G'));
+    }
+
+    fn while_in_flight(allocation: u32) -> BudgetPolicy {
+        BudgetPolicy {
+            allocation,
+            strategy: BudgetStrategy::WhileInFlight,
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_creates_a_budget_from_create_with() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe").create_with(while_in_flight(50))),
+            )
+            .await
+            .unwrap();
+
+        let budget = store.get_budget("stripe").await.unwrap().unwrap();
+        assert_eq!(budget.allocation, 50);
+        assert_eq!(budget.created_at, now);
+    }
+
+    /// The server stays authoritative: an enqueue cannot restate the
+    /// policy of a budget an operator has already configured.
+    #[tokio::test]
+    async fn create_with_is_ignored_when_the_budget_exists() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe").create_with(while_in_flight(1))),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_budget("stripe")
+                .await
+                .unwrap()
+                .unwrap()
+                .allocation,
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_an_unknown_budget_without_create_with() {
+        let store = test_store();
+
+        let result = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("absent")),
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// A job that costs more than the budget can ever hold would never
+    /// dispatch, so it is refused rather than parked forever.
+    #[tokio::test]
+    async fn enqueue_rejects_a_cost_above_the_allocation() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        let result = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe").cost(11)),
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_a_zero_cost() {
+        let store = test_store();
+
+        let result = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe").cost(0)),
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_the_same_budget_named_twice() {
+        let store = test_store();
+
+        let result = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe"))
+                    .budget(BudgetBinding::new("stripe").cost(2)),
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// A rejected enqueue must leave nothing behind — not the job, and
+    /// not a budget an earlier binding in the same request would have
+    /// created.
+    #[tokio::test]
+    async fn a_rejected_enqueue_creates_no_budget() {
+        let store = test_store();
+
+        let result = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("created").create_with(while_in_flight(10)))
+                    .budget(BudgetBinding::new("absent")),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(store.get_budget("created").await.unwrap().is_none());
+    }
+
+    /// One bad job must not take down the whole bulk, nor leave half of
+    /// it written — `POST /jobs/bulk` is all-or-nothing.
+    #[tokio::test]
+    async fn a_bulk_fails_whole_when_one_job_has_a_bad_budget() {
+        let store = test_store();
+        let now = now_millis();
+
+        let good = EnqueueOptions::new("good", "default", serde_json::json!({}))
+            .budget(BudgetBinding::new("stripe").create_with(while_in_flight(10)));
+        let bad = EnqueueOptions::new("bad", "default", serde_json::json!({}))
+            .budget(BudgetBinding::new("absent"));
+
+        let result = store.enqueue_bulk(now, vec![good, bad]).await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+
+        // Neither the valid job nor the budget it would have created.
+        assert!(store.get_budget("stripe").await.unwrap().is_none());
+        assert_eq!(store.count_jobs(ListJobsOptions::new()).await.unwrap(), 0);
     }
 
     #[tokio::test]

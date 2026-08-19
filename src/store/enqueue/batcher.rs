@@ -24,9 +24,8 @@
 //! per-job.
 //!
 //! An op can be rejected on its own without disturbing the rest of the
-//! batch — the other ops still commit. Nothing rejects an op yet; the
-//! path exists so that validation needing a database read (which
-//! therefore has to happen inside the transaction) can fail one
+//! batch — the other ops still commit. That is what lets validation
+//! needing a database read (resolving a job's budgets, say) reject one
 //! request without failing unrelated concurrent ones.
 //! The channel is op-count bounded — a bulk counts as one op against
 //! the channel/batch budget regardless of how many jobs it carries,

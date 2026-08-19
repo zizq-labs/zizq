@@ -12,6 +12,7 @@ use fjall::Readable;
 
 use crate::batch::BatchExpr;
 
+use super::super::budget::{Budget, check_budget_capacity, make_budget_key};
 use super::super::keys::{make_job_key, make_payload_key};
 use super::super::results::EnqueueResult;
 use super::super::store::Keyspaces;
@@ -209,6 +210,106 @@ fn try_apply_fold(
     Ok(Some(EnqueueResult::Folded(updated_meta)))
 }
 
+/// Result of resolving one op's budget references.
+enum BudgetPrePass {
+    /// Every reference resolved. These budget records must be written
+    /// before the op's jobs, and are the ones `create_with` asked for.
+    Proceed(Vec<(Vec<u8>, Vec<u8>)>),
+
+    /// The op is rejected. Nothing has been written for it.
+    Reject(StoreError),
+}
+
+/// Resolve every budget an op's jobs reference, planning any that
+/// `create_with` asks to bring into existence.
+///
+/// Runs before a single one of the op's jobs is written, and writes
+/// nothing itself — a rejected op must leave no trace, and a shared
+/// transaction cannot be partially rolled back. The caller applies the
+/// planned creations only once the whole op has resolved.
+///
+/// The outer `Err` is a database failure, fatal to the batch. A
+/// rejection of this op alone comes back as `Reject`.
+fn plan_op_budgets(
+    tx: &fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    op: &[PreparedEnqueue],
+) -> Result<BudgetPrePass, StoreError> {
+    // Policies planned by earlier jobs in this same op, so that two
+    // jobs naming the same new budget agree on one creation rather
+    // than racing to define it. First writer wins, matching how a
+    // `create_with` loses to an already-stored budget.
+    let mut planned: HashMap<String, Budget> = HashMap::new();
+
+    for p in op {
+        for reference in &p.job.budgets {
+            let binding = p
+                .budgets
+                .iter()
+                .find(|b| b.key == reference.key)
+                .expect("every job budget ref comes from a binding");
+
+            // Reads through the tx, so a budget created by an earlier
+            // op in this same batch is already visible.
+            let stored: Option<Budget> = match tx.get(&ks.data, make_budget_key(&reference.key))? {
+                Some(bytes) => Some(rmp_serde::from_slice(&bytes)?),
+                None => None,
+            };
+
+            let budget = match stored.or_else(|| planned.get(&reference.key).cloned()) {
+                Some(budget) => budget,
+                None => match binding.create_with {
+                    Some(policy) => {
+                        match Budget::new(policy.allocation, policy.strategy, p.now) {
+                            Ok(budget) => {
+                                // Counted against the cap like any
+                                // other creation — enqueue must not be
+                                // a back door around it.
+                                if let Err(e) =
+                                    check_budget_capacity(tx, ks, &reference.key, planned.len())
+                                {
+                                    return Ok(BudgetPrePass::Reject(e));
+                                }
+                                planned.insert(reference.key.clone(), budget.clone());
+                                budget
+                            }
+                            Err(e) => return Ok(BudgetPrePass::Reject(e)),
+                        }
+                    }
+                    None => {
+                        return Ok(BudgetPrePass::Reject(StoreError::InvalidOperation(
+                            format!(
+                                "budget '{}' does not exist and the enqueue supplied no \
+                             create_with policy to create it with",
+                                reference.key
+                            ),
+                        )));
+                    }
+                },
+            };
+
+            // A job costing more than the budget can ever hold would
+            // never dispatch, so it is rejected rather than accepted
+            // into a permanent stall.
+            if reference.cost > budget.allocation {
+                return Ok(BudgetPrePass::Reject(StoreError::InvalidOperation(
+                    format!(
+                        "job costs {} of budget '{}', which only allocates {}",
+                        reference.cost, reference.key, budget.allocation
+                    ),
+                )));
+            }
+        }
+    }
+
+    Ok(BudgetPrePass::Proceed(
+        planned
+            .into_iter()
+            .map(|(key, budget)| Ok((make_budget_key(&key), rmp_serde::to_vec_named(&budget)?)))
+            .collect::<Result<Vec<_>, StoreError>>()?,
+    ))
+}
+
 /// Per-op outcome: every job's result, or the one error that failed the
 /// op as a whole.
 ///
@@ -256,6 +357,20 @@ pub(super) fn apply_enqueue_batch(
     let mut outcomes: Vec<OpOutcome> = Vec::with_capacity(ops.len());
 
     for (op_idx, prepared) in ops.iter().enumerate() {
+        // Resolve budgets before writing anything for this op, so a
+        // rejection leaves the transaction untouched.
+        match plan_op_budgets(tx, ks, prepared)? {
+            BudgetPrePass::Proceed(creations) => {
+                for (key, bytes) in creations {
+                    tx.insert(&ks.data, key, bytes);
+                }
+            }
+            BudgetPrePass::Reject(e) => {
+                outcomes.push(Err(e));
+                continue;
+            }
+        }
+
         // Maps unique_key -> index within this op's own results.
         let mut op_unique_keys: HashMap<String, usize> = HashMap::new();
         let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());

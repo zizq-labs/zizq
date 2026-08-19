@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::PayloadFilter;
 
-use super::budget::{BudgetRef, BudgetStrategy};
+use super::budget::{BudgetBinding, BudgetStrategy};
 use super::types::{
     BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile,
 };
@@ -447,7 +447,7 @@ pub struct EnqueueOptions {
     #[serde(rename = "G")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub budgets: Vec<BudgetRef>,
+    pub budgets: Vec<BudgetBinding>,
 }
 
 impl EnqueueOptions {
@@ -531,7 +531,7 @@ impl EnqueueOptions {
     ///
     /// Call once per budget — a job may draw from several, and they are
     /// acquired all-or-nothing at dispatch.
-    pub fn budget(mut self, budget: BudgetRef) -> Self {
+    pub fn budget(mut self, budget: BudgetBinding) -> Self {
         self.budgets.push(budget);
         self
     }

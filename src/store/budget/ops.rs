@@ -62,7 +62,7 @@ impl Store {
                 )));
             }
 
-            check_budget_capacity(&ks, &key)?;
+            check_budget_capacity(&tx, &ks, &key, NOTHING_PLANNED)?;
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
@@ -99,7 +99,7 @@ impl Store {
                 }
                 // Replacing a budget cannot push the server over its
                 // cap; only creating one can.
-                None => check_budget_capacity(&ks, &key)?,
+                None => check_budget_capacity(&tx, &ks, &key, NOTHING_PLANNED)?,
             }
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
@@ -239,27 +239,53 @@ impl Store {
 /// many budgets exist. Only creates pay for this, and creating a budget
 /// is an operator-scale event, not a per-job one.
 ///
+/// `reader` is the open write transaction, so the count sees budgets
+/// created earlier in the same transaction. `planned` covers creations
+/// this operation has decided on but not yet written, which the scan
+/// therefore cannot see — without it, one request creating several
+/// budgets at the boundary would check each against the same stale
+/// count and overshoot by all but one. Callers that write immediately
+/// after checking pass [`NOTHING_PLANNED`].
+///
 /// Call under the write lock, so the count cannot shift underneath the
 /// decision.
-fn check_budget_capacity(ks: &Keyspaces, key: &str) -> Result<(), StoreError> {
+/// No creations are staged behind this one — the caller writes the
+/// budget as soon as the check passes.
+const NOTHING_PLANNED: usize = 0;
+
+pub(in crate::store) fn check_budget_capacity(
+    reader: &impl Readable,
+    ks: &Keyspaces,
+    key: &str,
+    planned: usize,
+) -> Result<(), StoreError> {
+    let too_many = || {
+        StoreError::InvalidOperation(format!(
+            "cannot create budget '{key}': the server already holds its maximum of \
+             {} budgets (--max-budgets / ZIZQ_MAX_BUDGETS). Raise the limit, or \
+             express the throttle as one shared budget rather than one per caller.",
+            ks.max_budgets
+        ))
+    };
+
+    let remaining = ks.max_budgets.saturating_sub(planned);
+    if remaining == 0 {
+        return Err(too_many());
+    }
+
     let start = vec![RecordKind::Budget as u8, 0];
     let end = vec![RecordKind::Budget as u8, 1];
-
-    let data: &fjall::Keyspace = ks.data.as_ref();
     let mut count = 0usize;
 
-    for guard in data.range::<Vec<u8>, _>((Bound::Included(start), Bound::Excluded(end))) {
+    for guard in
+        reader.range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
+    {
         // Surface a read error rather than undercounting into an
         // allow decision.
         guard.into_inner()?;
         count += 1;
-        if count >= ks.max_budgets {
-            return Err(StoreError::InvalidOperation(format!(
-                "cannot create budget '{key}': the server already holds its maximum of \
-                 {} budgets (--max-budgets / ZIZQ_MAX_BUDGETS). Raise the limit, or \
-                 express the throttle as one shared budget rather than one per caller.",
-                ks.max_budgets
-            )));
+        if count >= remaining {
+            return Err(too_many());
         }
     }
 
@@ -267,7 +293,7 @@ fn check_budget_capacity(ks: &Keyspaces, key: &str) -> Result<(), StoreError> {
 }
 
 /// Build a budget key: `B\0{key}`.
-fn make_budget_key(key: &str) -> Vec<u8> {
+pub(in crate::store) fn make_budget_key(key: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + key.len());
     bytes.push(RecordKind::Budget as u8);
     bytes.push(0);

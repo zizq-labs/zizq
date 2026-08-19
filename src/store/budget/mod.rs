@@ -22,6 +22,8 @@
 
 mod ops;
 
+pub(in crate::store) use ops::{check_budget_capacity, make_budget_key};
+
 use serde::{Deserialize, Serialize};
 
 use super::types::StoreError;
@@ -111,15 +113,93 @@ impl TryFrom<StrategyRepr> for BudgetStrategy {
 /// how much of it to draw.
 pub const DEFAULT_BUDGET_COST: u32 = 1;
 
+/// What a budget does, without the bookkeeping a stored one carries.
+///
+/// Separate from [`Budget`] because an enqueue can supply a policy for
+/// a budget that does not exist yet, at which point there is no
+/// creation time to speak of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetPolicy {
+    /// Tokens the bucket holds when full.
+    #[serde(rename = "a")]
+    pub allocation: u32,
+
+    /// How tokens replenish.
+    #[serde(rename = "s")]
+    pub strategy: BudgetStrategy,
+}
+
+/// A job's request to draw on a budget, as supplied at enqueue time.
+///
+/// Narrows to a [`BudgetRef`] on the stored job — `create_with` is
+/// consumed when the enqueue is applied and never persisted per job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetBinding {
+    /// Key of the budget to draw from.
+    #[serde(rename = "k")]
+    pub key: String,
+
+    /// Tokens to consume on dispatch.
+    #[serde(rename = "c")]
+    pub cost: u32,
+
+    /// Policy to create the budget with when it does not yet exist.
+    ///
+    /// Ignored when it does — the server is authoritative, so an
+    /// enqueue can never quietly restate the throttle an operator
+    /// configured. Absent, referencing a budget that does not exist is
+    /// an error rather than an unthrottled dispatch.
+    #[serde(rename = "w")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_with: Option<BudgetPolicy>,
+}
+
+impl BudgetBinding {
+    /// Draw one token from the named budget, which must already exist.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            cost: DEFAULT_BUDGET_COST,
+            create_with: None,
+        }
+    }
+
+    /// Set how many tokens this job consumes and return `self`.
+    pub fn cost(mut self, cost: u32) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// Create the budget with this policy if it does not exist, and
+    /// return `self`.
+    pub fn create_with(mut self, policy: BudgetPolicy) -> Self {
+        self.create_with = Some(policy);
+        self
+    }
+
+    /// The part of this binding that the job carries.
+    ///
+    /// `to_` rather than `as_`: this clones the key to build an owned
+    /// [`BudgetRef`], where `as_` conventionally promises a free borrow
+    /// (and would shadow [`AsRef::as_ref`] besides).
+    pub(in crate::store) fn to_ref(&self) -> BudgetRef {
+        BudgetRef {
+            key: self.key.clone(),
+            cost: self.cost,
+        }
+    }
+}
+
 /// A job's binding to a budget: which budget, and how much of it the
 /// job consumes when it dispatches.
 ///
 /// Kept to the two fields dispatch actually needs, so a job that uses
-/// budgets stays as compact as one that does not. The `initial_policy`
-/// an enqueue may carry is deliberately absent — that is consumed when
-/// the enqueue is handled and never persisted per job, or every job
-/// would carry a copy of a policy the server is already authoritative
-/// for.
+/// budgets stays as compact as one that does not. The `create_with`
+/// policy an enqueue may carry is deliberately absent — it is consumed
+/// when the enqueue is applied and never persisted per job, or every
+/// job would carry a copy of a policy the server is already
+/// authoritative for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetRef {
     /// Key of the budget this job draws from.
