@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
+mod budget;
 mod complete;
 mod cron;
 mod delete;
@@ -47,6 +48,8 @@ pub use storage_config::{
     StorageConfig,
 };
 pub use store::{Store, StoreEvent};
+
+pub use budget::{Budget, BudgetStrategy, MAX_BUDGET_ALLOCATION};
 
 pub use cron::{CronEntry, CronGroup};
 
