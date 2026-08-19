@@ -1113,6 +1113,22 @@ pub struct BudgetStrategyRequest {
     pub duration_ms: Option<u64>,
 }
 
+/// Request shape for `PATCH /budgets/{key}`.
+///
+/// Absent fields are left unchanged. Neither is nullable — a budget
+/// with no allocation or no strategy is not a budget, so there is
+/// nothing to clear them to, and plain `Option` says exactly that.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchBudgetRequest {
+    /// Tokens the bucket holds when full.
+    pub allocation: Option<u32>,
+
+    /// How tokens replenish. Replaced whole when given — a strategy is
+    /// only meaningful with the fields its kind implies.
+    pub strategy: Option<BudgetStrategyRequest>,
+}
+
 /// Response shape for a single budget.
 #[derive(Serialize)]
 pub struct BudgetResponse {

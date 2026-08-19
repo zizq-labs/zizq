@@ -223,6 +223,9 @@ pub(super) struct Keyspaces {
     /// Commit mode for enqueue operations (resolved at construction;
     /// inherits the default when not overridden).
     pub(super) enqueue_commit_mode: CommitMode,
+
+    /// Cap on how many budgets may exist. Enforced when creating one.
+    pub(super) max_budgets: usize,
 }
 
 impl Keyspaces {
@@ -327,6 +330,7 @@ impl Store {
             group_committer,
             default_commit_mode,
             enqueue_commit_mode,
+            max_budgets: config.max_budgets,
         });
         let ready_index = Arc::new(ReadyIndex::new());
         let scheduled_index = Arc::new(ScheduledIndex::new());

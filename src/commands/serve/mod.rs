@@ -192,6 +192,14 @@ pub struct Args {
     #[arg(long, default_value_t = store::DEFAULT_ENQUEUE_BATCH_SIZE, value_name = "NUMBER", env = "ZIZQ_ENQUEUE_BATCH_SIZE")]
     enqueue_batch_size: usize,
 
+    /// Maximum number of budgets that may exist on the server.
+    /// Creating a budget beyond this is rejected. Budgets are listed
+    /// whole by `GET /budgets`, so an unbounded count means an
+    /// unbounded response; the cap also makes a budget-per-customer
+    /// pattern fail loudly rather than degrade quietly.
+    #[arg(long, default_value_t = store::DEFAULT_MAX_BUDGETS, value_name = "NUMBER", env = "ZIZQ_MAX_BUDGETS")]
+    max_budgets: usize,
+
     /// Maximum number of concurrent completion (ack) requests coalesced
     /// into one auto-batched commit. Same shape as `--enqueue-batch-size`:
     /// op-count bounded, with bulk-acks counting as one op regardless of
@@ -569,6 +577,7 @@ async fn init_store(
     storage_config.default_commit_mode = args.default_commit_mode;
     storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
     storage_config.enqueue_batch_size = args.enqueue_batch_size;
+    storage_config.max_budgets = args.max_budgets;
     storage_config.complete_batch_size = args.complete_batch_size;
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");

@@ -28,7 +28,7 @@ use tokio::task;
 
 use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
-use super::super::store::Store;
+use super::super::store::{Keyspaces, Store};
 use super::super::types::StoreError;
 use super::{Budget, BudgetStrategy};
 
@@ -62,6 +62,8 @@ impl Store {
                 )));
             }
 
+            check_budget_capacity(&ks, &key)?;
+
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
 
@@ -90,9 +92,14 @@ impl Store {
 
             let mut tx = ks.write_tx();
 
-            if let Some(bytes) = ks.data.get(&budget_key)? {
-                let existing: Budget = rmp_serde::from_slice(&bytes)?;
-                budget.created_at = existing.created_at;
+            match ks.data.get(&budget_key)? {
+                Some(bytes) => {
+                    let existing: Budget = rmp_serde::from_slice(&bytes)?;
+                    budget.created_at = existing.created_at;
+                }
+                // Replacing a budget cannot push the server over its
+                // cap; only creating one can.
+                None => check_budget_capacity(&ks, &key)?,
             }
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
@@ -225,6 +232,40 @@ impl Store {
     }
 }
 
+/// Reject a create that would take the server past `max_budgets`.
+///
+/// Counts by scanning the budget prefix, stopping as soon as the cap is
+/// reached — so the work is bounded by the cap rather than by however
+/// many budgets exist. Only creates pay for this, and creating a budget
+/// is an operator-scale event, not a per-job one.
+///
+/// Call under the write lock, so the count cannot shift underneath the
+/// decision.
+fn check_budget_capacity(ks: &Keyspaces, key: &str) -> Result<(), StoreError> {
+    let start = vec![RecordKind::Budget as u8, 0];
+    let end = vec![RecordKind::Budget as u8, 1];
+
+    let data: &fjall::Keyspace = ks.data.as_ref();
+    let mut count = 0usize;
+
+    for guard in data.range::<Vec<u8>, _>((Bound::Included(start), Bound::Excluded(end))) {
+        // Surface a read error rather than undercounting into an
+        // allow decision.
+        guard.into_inner()?;
+        count += 1;
+        if count >= ks.max_budgets {
+            return Err(StoreError::InvalidOperation(format!(
+                "cannot create budget '{key}': the server already holds its maximum of \
+                 {} budgets (--max-budgets / ZIZQ_MAX_BUDGETS). Raise the limit, or \
+                 express the throttle as one shared budget rather than one per caller.",
+                ks.max_budgets
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Build a budget key: `B\0{key}`.
 fn make_budget_key(key: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + key.len());
@@ -237,7 +278,7 @@ fn make_budget_key(key: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::super::super::options::PatchBudgetOptions;
-    use super::super::super::test_support::test_store;
+    use super::super::super::test_support::{test_store, test_store_with_max_budgets};
     use super::super::BudgetStrategy;
     use crate::store::StoreError;
 
@@ -442,6 +483,97 @@ mod tests {
         // Rejected patches leave the stored policy alone.
         let loaded = store.get_budget("stripe").await.unwrap().unwrap();
         assert_eq!(loaded.allocation, 100);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_budget_past_the_cap() {
+        let store = test_store_with_max_budgets(2);
+
+        for key in ["a", "b"] {
+            store
+                .create_budget(key, 10, BudgetStrategy::WhileInFlight, NOW)
+                .await
+                .unwrap();
+        }
+
+        let result = store
+            .create_budget("c", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+        assert!(store.get_budget("c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn put_rejects_a_new_budget_past_the_cap() {
+        let store = test_store_with_max_budgets(1);
+        store
+            .create_budget("a", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        let result = store
+            .put_budget("b", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// The cap bounds how many budgets exist, so replacing one at the
+    /// cap has to keep working — otherwise an operator at the limit
+    /// could not adjust an allocation without deleting something first.
+    #[tokio::test]
+    async fn put_replaces_an_existing_budget_at_the_cap() {
+        let store = test_store_with_max_budgets(1);
+        store
+            .create_budget("a", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        let replaced = store
+            .put_budget("a", 50, BudgetStrategy::WhileInFlight, NOW + 1)
+            .await
+            .unwrap();
+        assert_eq!(replaced.allocation, 50);
+    }
+
+    /// Likewise a patch, which never creates.
+    #[tokio::test]
+    async fn patch_works_at_the_cap() {
+        let store = test_store_with_max_budgets(1);
+        store
+            .create_budget("a", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        let patched = store
+            .patch_budget("a", patch(Some(50), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(patched.allocation, 50);
+    }
+
+    /// Deleting frees a slot, so the cap is a live ceiling rather than
+    /// a high-water mark.
+    #[tokio::test]
+    async fn deleting_frees_capacity_under_the_cap() {
+        let store = test_store_with_max_budgets(1);
+        store
+            .create_budget("a", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .create_budget("b", 10, BudgetStrategy::WhileInFlight, NOW)
+                .await
+                .is_err()
+        );
+
+        store.delete_budget("a").await.unwrap();
+        store
+            .create_budget("b", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

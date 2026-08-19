@@ -38,9 +38,9 @@ use super::types::{
     ErrorRecord, ErrorResponse, FailureRequest, HealthResponse, Job, JobStatus,
     ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
     ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse, ListQueuesResponse, Order,
-    PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody, PatchJobsParams, RangeQuery,
-    ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse, VersionResponse,
-    parse_unique_while,
+    PatchBudgetRequest, PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody,
+    PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
+    VersionResponse, parse_unique_while,
 };
 
 /// Default priority for jobs that don't specify one.
@@ -423,7 +423,14 @@ pub fn app(state: Arc<AppState>) -> Router {
                 .delete(delete_cron_entry),
         )
         .route("/budgets", get(list_budgets))
-        .route("/budgets/{key}", get(get_budget).post(create_budget))
+        .route(
+            "/budgets/{key}",
+            get(get_budget)
+                .post(create_budget)
+                .put(put_budget)
+                .patch(patch_budget)
+                .delete(delete_budget),
+        )
         .route("/reset", post(reset))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(
@@ -2530,6 +2537,171 @@ async fn create_budget(
         ),
         Err(e) => {
             tracing::error!(%e, "create_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PUT /budgets/{key}` — create a budget or replace its policy.
+///
+/// Unlike `POST`, this overwrites an existing policy — including one an
+/// operator adjusted. `created_at` is preserved either way.
+async fn put_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<BudgetRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let allocation = req.allocation;
+    let strategy = match validate_budget_request(&key, req) {
+        Ok(strategy) => strategy,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
+
+    match state
+        .store
+        .put_budget(&key, allocation, strategy, now_ms)
+        .await
+    {
+        Ok(budget) => respond(
+            fmt,
+            StatusCode::OK,
+            &BudgetResponse::from_store(key, budget),
+        ),
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "put_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PATCH /budgets/{key}` — update named fields of a policy.
+///
+/// Absent fields are left alone. A patch has nothing to merge into when
+/// the budget does not exist, so this 404s rather than creating one.
+async fn patch_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<PatchBudgetRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let strategy = match req.strategy.map(parse_budget_strategy).transpose() {
+        Ok(strategy) => strategy,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
+
+    let opts = store::PatchBudgetOptions {
+        allocation: req.allocation,
+        strategy,
+    };
+
+    match state.store.patch_budget(&key, opts, now_ms).await {
+        Ok(Some(budget)) => respond(
+            fmt,
+            StatusCode::OK,
+            &BudgetResponse::from_store(key, budget),
+        ),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("budget '{key}' not found"),
+            },
+        ),
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `DELETE /budgets/{key}` — remove a budget.
+async fn delete_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.delete_budget(&key).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("budget '{key}' not found"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "delete_budget failed");
             respond(
                 fmt,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -8350,6 +8522,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budget_put_creates_when_absent() {
+        let req = json_request("PUT", "/budgets/stripe", &while_in_flight(100));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 100);
+    }
+
+    #[tokio::test]
+    async fn budget_put_replaces_an_existing_policy() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+
+        let req = json_request(
+            "PUT",
+            "/budgets/stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "time_based", "duration_ms": 1000 }
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 10);
+        assert_eq!(body["strategy"]["type"], "time_based");
+        // A replace changes the policy, not the budget's identity.
+        assert_eq!(body["created_at"], created["created_at"]);
+    }
+
+    #[tokio::test]
+    async fn budget_patch_changes_only_the_named_field() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "allocation": 25 }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 25);
+        // Untouched by a patch that did not mention it.
+        assert_eq!(body["strategy"]["type"], "time_based");
+        assert_eq!(body["strategy"]["duration_ms"], 60000);
+    }
+
+    #[tokio::test]
+    async fn budget_patch_returns_404_for_a_missing_budget() {
+        let req = json_request(
+            "PATCH",
+            "/budgets/absent",
+            &serde_json::json!({ "allocation": 10 }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_patch_rejects_an_invalid_merged_policy() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "allocation": 0 }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_delete_removes_and_returns_204() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+
+        let req = empty_request("DELETE", "/budgets/stripe");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_delete_returns_404_for_a_missing_budget() {
+        let req = empty_request("DELETE", "/budgets/absent");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn budget_endpoints_return_403_on_free_tier() {
         let app = test_app();
 
@@ -8365,7 +8661,25 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
         let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
-        let res = app.oneshot(req).await.unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = json_request("PUT", "/budgets/stripe", &while_in_flight(10));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "allocation": 10 }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let res = app
+            .oneshot(empty_request("DELETE", "/budgets/stripe"))
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 

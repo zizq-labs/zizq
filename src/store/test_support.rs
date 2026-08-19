@@ -39,6 +39,16 @@ pub(super) fn test_store_with_retention(completed_ms: u64, dead_ms: u64) -> Stor
     store
 }
 
+/// Open a fresh store with a specific cap on the number of budgets.
+pub(super) fn test_store_with_max_budgets(max_budgets: usize) -> Store {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = StorageConfig::default();
+    config.max_budgets = max_budgets;
+    let store = Store::open(dir.path().join("data"), config).unwrap();
+    std::mem::forget(dir);
+    store
+}
+
 /// Open a fresh store with a specific retry limit and zero-jitter backoff.
 pub(super) fn test_store_with_retry_limit(retry_limit: u32) -> Store {
     let dir = tempfile::tempdir().unwrap();
