@@ -14,7 +14,8 @@ use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::super::enqueue::{
-    apply_enqueue, finalize_enqueue, prepare_enqueue, validate_batch_config,
+    BudgetPrePass, apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue,
+    validate_batch_config,
 };
 use super::super::keys::RecordKind;
 use super::super::options::{CronEntryOptions, PatchCronGroupOptions, ReplaceCronGroupOptions};
@@ -881,22 +882,69 @@ impl Store {
                 let tz = entry.timezone.as_deref().or(group_timezone.as_deref());
                 let next = cron_next_after(&entry.expression, now, tz)?;
 
-                // Prepare the job enqueue (unless paused).
+                // Prepare the job enqueue (unless paused). Pure — the
+                // entry is not mutated until the budget pre-pass below
+                // has said whether this tick actually fires.
                 let prepared = if !is_paused {
-                    entry.last_enqueue_at = Some(now);
                     Some(prepare_enqueue(entry.job.clone(), now)?)
                 } else {
                     None
                 };
 
-                // Advance the schedule (time moves forward regardless of pause).
+                // ---- inside tx: CAS + enqueue ----
+                let mut tx = ks.write_tx();
+
+                // Cron fires through `apply_enqueue` directly rather
+                // than the batcher, so it runs the budget pre-pass
+                // itself — otherwise a scheduled job would reference
+                // budgets nobody resolved, and a `create_with` on the
+                // template would never create anything.
+                //
+                // Resolution succeeding is an invariant, not a hope: an
+                // entry is validated before it enters a schedule, and a
+                // budget it references cannot be deleted or shrunk out
+                // from under it. A rejection here therefore means one of
+                // those protections has a hole, which is why it is
+                // logged as an error rather than treated as a normal
+                // outcome.
+                let mut budget_creations = Vec::new();
+                let mut fires = prepared.is_some();
+
+                if let Some(ref p) = prepared {
+                    match plan_op_budgets(&tx, &ks, std::slice::from_ref(p))? {
+                        BudgetPrePass::Proceed(creations) => budget_creations = creations,
+                        BudgetPrePass::Reject(e) => {
+                            // Skip the tick rather than failing the
+                            // promotion. Returning an error would
+                            // discard the schedule advance with it,
+                            // leaving the entry perpetually due and the
+                            // scheduler spinning on it — a far worse
+                            // way to surface a bug than a gap and a
+                            // log line.
+                            tracing::error!(
+                                group = %group,
+                                entry = %entry_name,
+                                error = %e,
+                                "cron entry references budgets that no longer resolve — \
+                                 this should be impossible, as entries are validated on \
+                                 install and their budgets protected from deletion and \
+                                 shrinking. Skipping this tick."
+                            );
+                            fires = false;
+                        }
+                    }
+                }
+
+                if fires {
+                    entry.last_enqueue_at = Some(now);
+                }
+
+                // Advance the schedule (time moves forward regardless of
+                // pause, or of a tick that could not fire).
                 let old_next = entry.next_enqueue_at;
                 entry.next_enqueue_at = next;
 
                 let updated_entry_bytes: Slice = rmp_serde::to_vec_named(&entry)?.into();
-
-                // ---- inside tx: CAS + enqueue ----
-                let mut tx = ks.write_tx();
 
                 // CAS the cron entry — retry if it changed since pre-read.
                 let prev =
@@ -907,11 +955,15 @@ impl Store {
                     continue; // Entry changed — retry.
                 }
 
-                // Enqueue the job if not paused.
-                let enqueue_result = if let Some(ref p) = prepared {
-                    Some(apply_enqueue(&mut tx, &ks, p)?)
-                } else {
-                    None
+                // Enqueue the job if this tick fires.
+                let enqueue_result = match (fires, prepared.as_ref()) {
+                    (true, Some(p)) => {
+                        for (key, bytes) in budget_creations {
+                            tx.insert(&ks.data, key, bytes);
+                        }
+                        Some(apply_enqueue(&mut tx, &ks, p)?)
+                    }
+                    _ => None,
                 };
 
                 ks.commit(tx, ks.enqueue_commit_mode)?;
@@ -2725,5 +2777,103 @@ mod tests {
             .await
             .unwrap();
         assert!(entry.job.batch.is_some());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::super::super::budget::{BudgetBinding, BudgetPolicy, BudgetStrategy};
+    use super::super::super::options::{
+        CronEntryOptions, EnqueueOptions, ListJobsOptions, ReplaceCronGroupOptions,
+    };
+    use super::super::super::test_support::test_store;
+    use crate::store::Store;
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn entry_with(job: EnqueueOptions) -> CronEntryOptions {
+        CronEntryOptions {
+            name: "nightly".to_string(),
+            // Every minute, so it is due almost immediately.
+            expression: "* * * * *".to_string(),
+            timezone: Some("UTC".to_string()),
+            paused: None,
+            job,
+        }
+    }
+
+    async fn install(store: &Store, job: EnqueueOptions) {
+        store
+            .replace_cron_group(
+                "g",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![entry_with(job)],
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Cron fires through `apply_enqueue` directly, so it has to run
+    /// the budget pre-pass itself or a `create_with` on the template
+    /// would never create anything.
+    #[tokio::test]
+    async fn firing_creates_a_budget_from_the_template() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({})).budget(
+            BudgetBinding::new("stripe").create_with(BudgetPolicy {
+                allocation: 10,
+                strategy: BudgetStrategy::WhileInFlight,
+            }),
+        );
+        install(&store, job).await;
+
+        let fired = store
+            .promote_cron_entry("g", "nightly", NOW + 120_000)
+            .await
+            .unwrap();
+        assert!(fired.is_some());
+
+        let budget = store.get_budget("stripe").await.unwrap().unwrap();
+        assert_eq!(budget.allocation, 10);
+    }
+
+    /// Defence in depth for a state the install-time and deletion
+    /// protections are supposed to make unreachable.
+    ///
+    /// The property under test is not that skipping is *correct* — it
+    /// is that an invariant violation degrades into a gap rather than a
+    /// wedged scheduler. Failing the promotion would discard the
+    /// schedule advance too, leaving the entry perpetually due and the
+    /// scheduler spinning on it.
+    #[tokio::test]
+    async fn an_unresolvable_budget_degrades_to_a_skipped_tick() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({}))
+            .budget(BudgetBinding::new("absent"));
+        install(&store, job).await;
+
+        let before = store
+            .get_cron_entry("g", "nightly")
+            .await
+            .unwrap()
+            .unwrap()
+            .next_enqueue_at
+            .unwrap();
+
+        let entry = store
+            .promote_cron_entry("g", "nightly", before)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Advanced, so the scheduler moves on rather than retrying.
+        assert!(entry.next_enqueue_at.unwrap() > before);
+        // Did not fire.
+        assert_eq!(entry.last_enqueue_at, None);
+        assert_eq!(store.count_jobs(ListJobsOptions::new()).await.unwrap(), 0);
     }
 }

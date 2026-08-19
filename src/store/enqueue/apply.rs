@@ -211,7 +211,7 @@ fn try_apply_fold(
 }
 
 /// Result of resolving one op's budget references.
-enum BudgetPrePass {
+pub(in crate::store) enum BudgetPrePass {
     /// Every reference resolved. These budget records must be written
     /// before the op's jobs, and are the ones `create_with` asked for.
     Proceed(Vec<(Vec<u8>, Vec<u8>)>),
@@ -230,7 +230,7 @@ enum BudgetPrePass {
 ///
 /// The outer `Err` is a database failure, fatal to the batch. A
 /// rejection of this op alone comes back as `Reject`.
-fn plan_op_budgets(
+pub(in crate::store) fn plan_op_budgets(
     tx: &fjall::SingleWriterWriteTx<'_>,
     ks: &Keyspaces,
     op: &[PreparedEnqueue],

@@ -521,6 +521,37 @@ pub struct EnqueueRequest {
     /// into an existing pending job sharing the same `batch.key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws on when it dispatches. Empty (or absent)
+    /// means the job is unthrottled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetBindingRequest>,
+}
+
+/// One entry in an enqueue's `budgets` array.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetBindingRequest {
+    /// Key of the budget to draw from.
+    pub key: String,
+
+    /// Tokens to consume on dispatch. Defaults to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u32>,
+
+    /// Policy to create the budget with if it does not exist yet.
+    ///
+    /// Ignored when it does — the server stays authoritative, so an
+    /// enqueue cannot restate a throttle an operator has configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_with: Option<BudgetRequest>,
+
+    /// Reserved for sub-buckets, which partition one budget by a
+    /// discriminator. Not implemented, and rejected rather than
+    /// ignored — a request that works today must not change meaning
+    /// when the field starts doing something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
 }
 
 /// Request shape for bulk job enqueue.
@@ -1084,7 +1115,10 @@ pub struct ListBudgetsResponse {
 }
 
 /// Request shape for `POST /budgets/{key}` and `PUT /budgets/{key}`.
-#[derive(Deserialize)]
+///
+/// Also serialised, because a cron entry's job template is reported
+/// back in this same shape.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetRequest {
     /// Tokens the bucket holds when full.
@@ -1101,7 +1135,7 @@ pub struct BudgetRequest {
 /// accept `duration_ms` on a `while_in_flight` budget — a request that
 /// reads as if it set a refill period but did not. Parsing the tag by
 /// hand (see `parse_budget_strategy`) makes that a 422.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetStrategyRequest {
     /// `"time_based"` or `"while_in_flight"`.
@@ -1110,7 +1144,26 @@ pub struct BudgetStrategyRequest {
 
     /// Period over which the full allocation replenishes. Required for
     /// `time_based`, rejected for `while_in_flight`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+}
+
+impl BudgetBindingRequest {
+    /// Report a stored binding, as carried by a cron entry's job
+    /// template.
+    ///
+    /// `create_with` is not reported: it is consumed when the entry
+    /// fires, and echoing it would suggest the budget's policy is
+    /// whatever the template asked for rather than whatever the server
+    /// currently holds.
+    pub fn from_store(binding: &store::BudgetBinding) -> Self {
+        Self {
+            key: binding.key.clone(),
+            cost: Some(binding.cost),
+            create_with: None,
+            bucket: None,
+        }
+    }
 }
 
 /// Request shape for `PATCH /budgets/{key}`.
@@ -1367,6 +1420,12 @@ impl CronEntryResponse {
                 unique_key: entry.job.unique_key,
                 unique_while,
                 batch: entry.job.batch.map(Into::into),
+                budgets: entry
+                    .job
+                    .budgets
+                    .iter()
+                    .map(BudgetBindingRequest::from_store)
+                    .collect(),
             },
             next_enqueue_at: entry.next_enqueue_at,
             last_enqueue_at: entry.last_enqueue_at,

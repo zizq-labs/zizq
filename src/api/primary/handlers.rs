@@ -32,11 +32,11 @@ use crate::filter::PayloadFilter;
 use crate::state::AppState;
 
 use super::types::{
-    BudgetRequest, BudgetResponse, BudgetStrategyRequest, BulkEnqueueRequest, BulkEnqueueResponse,
-    BulkSuccessNotFoundResponse, BulkSuccessRequest, CommaSet, CountJobsParams, CountJobsResponse,
-    CronEntryRequest, CronEntryResponse, CronGroupResponse, DeleteJobsParams, EnqueueRequest,
-    ErrorRecord, ErrorResponse, FailureRequest, HealthResponse, Job, JobStatus,
-    ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
+    BudgetBindingRequest, BudgetRequest, BudgetResponse, BudgetStrategyRequest, BulkEnqueueRequest,
+    BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest, CommaSet,
+    CountJobsParams, CountJobsResponse, CronEntryRequest, CronEntryResponse, CronGroupResponse,
+    DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse,
+    Job, JobStatus, ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
     ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse, ListQueuesResponse, Order,
     PatchBudgetRequest, PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody,
     PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
@@ -577,6 +577,18 @@ async fn enqueue(
         }
     }
 
+    if !enqueue_req.budgets.is_empty() {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .read()
+            .unwrap()
+            .require(now_ms, crate::license::Feature::Budgets)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
     let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
 
     let mut opts =
@@ -608,6 +620,20 @@ async fn enqueue(
     }
     if let Some(batch) = enqueue_req.batch {
         opts = opts.batch(batch.into());
+    }
+    match parse_budget_bindings(enqueue_req.budgets) {
+        Ok(bindings) => {
+            for binding in bindings {
+                opts = opts.budget(binding);
+            }
+        }
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
     }
 
     let now = (state.clock)();
@@ -665,6 +691,7 @@ async fn bulk_enqueue(
     // Validate all jobs up front.
     let mut has_unique = false;
     let mut has_batch = false;
+    let mut has_budgets = false;
     for (i, job) in req.jobs.iter().enumerate() {
         if let Err(msg) = validate_name("type", &job.job_type) {
             return respond(
@@ -710,6 +737,9 @@ async fn bulk_enqueue(
         if job.batch.is_some() {
             has_batch = true;
         }
+        if !job.budgets.is_empty() {
+            has_budgets = true;
+        }
         if job.unique_key.is_some() && job.batch.is_some() {
             return respond(
                 fmt,
@@ -747,11 +777,25 @@ async fn bulk_enqueue(
         }
     }
 
+    // License check for budgets (once for the whole batch).
+    if has_budgets {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .read()
+            .unwrap()
+            .require(now_ms, crate::license::Feature::Budgets)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
     // Convert to store options.
-    let opts: Vec<store::EnqueueOptions> = req
+    let opts: Result<Vec<store::EnqueueOptions>, String> = req
         .jobs
         .into_iter()
-        .map(|enqueue_req| {
+        .enumerate()
+        .map(|(i, enqueue_req)| {
             let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
             let mut opts = store::EnqueueOptions::new(
                 enqueue_req.job_type,
@@ -782,9 +826,25 @@ async fn bulk_enqueue(
             if let Some(batch) = enqueue_req.batch {
                 opts = opts.batch(batch.into());
             }
-            opts
+            for binding in parse_budget_bindings(enqueue_req.budgets)
+                .map_err(|msg| format!("jobs[{i}]: {msg}"))?
+            {
+                opts = opts.budget(binding);
+            }
+            Ok(opts)
         })
         .collect();
+
+    let opts = match opts {
+        Ok(opts) => opts,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
 
     let now = (state.clock)();
     match state.store.enqueue_bulk(now, opts).await {
@@ -2364,6 +2424,14 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
     if let Some(batch) = entry.job.batch {
         opts = opts.batch(batch.into());
     }
+    // A scheduled job is throttleable like any other. `create_with`
+    // stays on the stored template because an entry may be installed
+    // before its budget exists — an application declaring its whole
+    // schedule on boot should not have to order budget creation first.
+    // The budget is created the first time the entry fires.
+    for binding in parse_budget_bindings(entry.job.budgets)? {
+        opts = opts.budget(binding);
+    }
 
     Ok(store::CronEntryOptions {
         name: entry.name,
@@ -2372,6 +2440,44 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
         paused: entry.paused,
         job: opts,
     })
+}
+
+/// Convert an enqueue's `budgets` array into its store form.
+///
+/// `bucket` is rejected rather than dropped: it is reserved for
+/// sub-buckets, and silently accepting it now would mean a request that
+/// works today quietly changes meaning once the field does something.
+fn parse_budget_bindings(
+    budgets: Vec<BudgetBindingRequest>,
+) -> Result<Vec<store::BudgetBinding>, String> {
+    budgets
+        .into_iter()
+        .map(|entry| {
+            if entry.bucket.is_some() {
+                return Err(format!(
+                    "budget '{}' sets bucket, which is reserved and not yet supported",
+                    entry.key
+                ));
+            }
+
+            let mut binding = store::BudgetBinding::new(entry.key);
+
+            if let Some(cost) = entry.cost {
+                binding = binding.cost(cost);
+            }
+
+            if let Some(policy) = entry.create_with {
+                let allocation = policy.allocation;
+                let strategy = parse_budget_strategy(policy.strategy)?;
+                binding = binding.create_with(store::BudgetPolicy {
+                    allocation,
+                    strategy,
+                });
+            }
+
+            Ok(binding)
+        })
+        .collect()
 }
 
 /// Convert a wire strategy into its store form.
