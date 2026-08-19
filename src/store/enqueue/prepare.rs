@@ -139,6 +139,7 @@ pub(in crate::store) fn prepare_enqueue(
         }),
         payload_key: None,
         batch: opts.batch,
+        budgets: opts.budgets,
     };
 
     let mut meta = job.clone();

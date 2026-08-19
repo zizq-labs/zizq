@@ -107,6 +107,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    use super::super::budget::BudgetRef;
     use super::super::options::{EnqueueOptions, FailureOptions};
     use super::super::results::EnqueueResult;
     use super::super::store::StoreEvent;
@@ -141,6 +142,81 @@ mod tests {
         assert_eq!(job.priority, 0);
         assert_eq!(job.status, u8::from(JobStatus::Ready));
         assert_eq!(job.payload, Some(serde_json::json!({"task": "test"})));
+    }
+
+    /// A job carries its budget bindings through the write and back out
+    /// of the store, so dispatch can find them without re-reading the
+    /// enqueue request.
+    #[tokio::test]
+    async fn enqueue_persists_budget_refs() {
+        let store = test_store();
+
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetRef::new("stripe"))
+                    .budget(BudgetRef::new("per_tenant").cost(5)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let stored = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+
+        assert_eq!(stored.budgets.len(), 2);
+        assert_eq!(stored.budgets[0].key, "stripe");
+        // Naming a budget without a cost draws one token.
+        assert_eq!(stored.budgets[0].cost, 1);
+        assert_eq!(stored.budgets[1].key, "per_tenant");
+        assert_eq!(stored.budgets[1].cost, 5);
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_budgets_stores_none() {
+        let store = test_store();
+
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "default", serde_json::json!({})),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let stored = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert!(stored.budgets.is_empty());
+    }
+
+    /// An unthrottled job should not pay for the feature, so the field
+    /// is absent from its encoding rather than present and empty.
+    #[test]
+    fn a_job_without_budgets_omits_the_field() {
+        let job = Job {
+            id: "test".into(),
+            job_type: "test".into(),
+            queue: "default".into(),
+            priority: 0,
+            payload: None,
+            status: JobStatus::Ready.into(),
+            ready_at: 0,
+            attempts: 0,
+            retry_limit: None,
+            backoff: None,
+            dequeued_at: None,
+            failed_at: None,
+            retention: None,
+            purge_at: None,
+            completed_at: None,
+            unique: None,
+            payload_key: None,
+            batch: None,
+            budgets: Vec::new(),
+        };
+
+        let encoded = rmp_serde::to_vec_named(&job).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains('G'));
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::PayloadFilter;
 
-use super::budget::BudgetStrategy;
+use super::budget::{BudgetRef, BudgetStrategy};
 use super::types::{
     BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile,
 };
@@ -441,6 +441,13 @@ pub struct EnqueueOptions {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws from when it dispatches. Empty means the
+    /// job is unthrottled and never touches the budget machinery.
+    #[serde(rename = "G")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetRef>,
 }
 
 impl EnqueueOptions {
@@ -463,6 +470,7 @@ impl EnqueueOptions {
             unique_key: None,
             unique_while: None,
             batch: None,
+            budgets: Vec::new(),
         }
     }
 
@@ -516,6 +524,15 @@ impl EnqueueOptions {
     /// Set the batching configuration and return `self`.
     pub fn batch(mut self, batch: BatchConfig) -> Self {
         self.batch = Some(batch);
+        self
+    }
+
+    /// Bind this job to a budget and return `self`.
+    ///
+    /// Call once per budget — a job may draw from several, and they are
+    /// acquired all-or-nothing at dispatch.
+    pub fn budget(mut self, budget: BudgetRef) -> Self {
+        self.budgets.push(budget);
         self
     }
 }

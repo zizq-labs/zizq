@@ -107,6 +107,50 @@ impl TryFrom<StrategyRepr> for BudgetStrategy {
     }
 }
 
+/// Default tokens a job consumes when it names a budget without saying
+/// how much of it to draw.
+pub const DEFAULT_BUDGET_COST: u32 = 1;
+
+/// A job's binding to a budget: which budget, and how much of it the
+/// job consumes when it dispatches.
+///
+/// Kept to the two fields dispatch actually needs, so a job that uses
+/// budgets stays as compact as one that does not. The `initial_policy`
+/// an enqueue may carry is deliberately absent — that is consumed when
+/// the enqueue is handled and never persisted per job, or every job
+/// would carry a copy of a policy the server is already authoritative
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetRef {
+    /// Key of the budget this job draws from.
+    #[serde(rename = "k")]
+    pub key: String,
+
+    /// Tokens consumed from that budget on dispatch.
+    #[serde(rename = "c")]
+    pub cost: u32,
+}
+
+impl BudgetRef {
+    /// Bind to a budget at the default cost of one token.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            cost: DEFAULT_BUDGET_COST,
+        }
+    }
+
+    /// Set how many tokens this job consumes and return `self`.
+    ///
+    /// Not validated here — a cost is only meaningful against the
+    /// budget's allocation, which is resolved when the enqueue is
+    /// handled.
+    pub fn cost(mut self, cost: u32) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
 /// A named budget's policy, stored at `B\0{key}` in the data keyspace.
 ///
 /// The key lives in the record's position rather than in the record, as

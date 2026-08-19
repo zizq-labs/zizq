@@ -12,6 +12,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use tokio::task;
 
+use super::budget::BudgetRef;
+
 /// Error type returned by store operations.
 #[derive(Debug)]
 pub enum StoreError {
@@ -344,6 +346,13 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws from when it dispatches. Empty means the
+    /// job is unthrottled and never touches the budget machinery.
+    #[serde(rename = "G")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetRef>,
 }
 
 impl Job {

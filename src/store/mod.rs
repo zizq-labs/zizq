@@ -49,7 +49,7 @@ pub use storage_config::{
 };
 pub use store::{Store, StoreEvent};
 
-pub use budget::{Budget, BudgetStrategy, MAX_BUDGET_ALLOCATION};
+pub use budget::{Budget, BudgetRef, BudgetStrategy, DEFAULT_BUDGET_COST, MAX_BUDGET_ALLOCATION};
 
 pub use cron::{CronEntry, CronGroup};
 
