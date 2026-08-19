@@ -72,6 +72,8 @@ pub enum Feature {
     /// Batched jobs — fold subsequent enqueues into a pending job's
     /// payload via `when`/`fold` jq expressions.
     BatchedJobs,
+    /// Budgets — server-side rate and concurrency limits on dispatch.
+    Budgets,
 }
 
 impl Feature {
@@ -85,6 +87,7 @@ impl Feature {
             Feature::UniqueJobs => Tier::Pro,
             Feature::CronScheduling => Tier::Pro,
             Feature::BatchedJobs => Tier::Pro,
+            Feature::Budgets => Tier::Pro,
         }
     }
 }
@@ -99,6 +102,7 @@ impl std::fmt::Display for Feature {
             Feature::UniqueJobs => write!(f, "unique jobs"),
             Feature::CronScheduling => write!(f, "cron scheduling"),
             Feature::BatchedJobs => write!(f, "batched jobs"),
+            Feature::Budgets => write!(f, "budgets"),
         }
     }
 }

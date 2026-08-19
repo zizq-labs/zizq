@@ -161,14 +161,19 @@ impl Store {
         .await?
     }
 
-    /// List every budget key, in lexicographic order.
+    /// List every budget with its policy, in lexicographic key order.
     ///
     /// A plain range scan, unlike `list_cron_groups` — budget keys have
     /// nothing nested beneath them, so there is nothing to step over.
-    pub async fn list_budgets(&self) -> Result<Vec<String>, StoreError> {
+    ///
+    /// The policy comes back with the key because the scan has already
+    /// read it; discarding it here would only force the caller into a
+    /// read per budget. A budget's policy is a handful of scalars, so
+    /// the whole list stays small at any sane number of budgets.
+    pub async fn list_budgets(&self) -> Result<Vec<(String, Budget)>, StoreError> {
         let ks = self.ks.clone();
 
-        task::spawn_blocking(move || -> Result<Vec<String>, StoreError> {
+        task::spawn_blocking(move || -> Result<Vec<(String, Budget)>, StoreError> {
             let snapshot = ks.db.read_tx();
 
             // Every budget key is `B\0{key}`, so `[B\0, B\1)` is exactly
@@ -179,11 +184,12 @@ impl Store {
             snapshot
                 .range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
                 .map(|guard| {
-                    let (key, _) = guard.into_inner()?;
+                    let (key, value) = guard.into_inner()?;
                     // Skip the `B\0` prefix to recover the budget key.
-                    String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                    let key = String::from_utf8(key[2..].to_vec()).map_err(|e| {
                         StoreError::Corruption(format!("budget key is not valid UTF-8: {e}"))
-                    })
+                    })?;
+                    Ok((key, rmp_serde::from_slice(&value)?))
                 })
                 .collect()
         })
@@ -466,10 +472,45 @@ mod tests {
                 .unwrap();
         }
 
+        let keys: Vec<String> = store
+            .list_budgets()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["algolia", "ses", "stripe"]);
+    }
+
+    /// The listing scan has already read each record, so it hands the
+    /// policy back rather than making the caller re-read it.
+    #[tokio::test]
+    async fn list_returns_each_policy_alongside_its_key() {
+        let store = test_store();
+        store
+            .create_budget(
+                "stripe",
+                100,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 60_000,
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+
+        let listed = store.list_budgets().await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "stripe");
+        assert_eq!(listed[0].1.allocation, 100);
         assert_eq!(
-            store.list_budgets().await.unwrap(),
-            ["algolia", "ses", "stripe"]
+            listed[0].1.strategy,
+            BudgetStrategy::TimeBased {
+                duration_ms: 60_000
+            }
         );
+        assert_eq!(listed[0].1.created_at, NOW);
     }
 
     #[tokio::test]
@@ -514,6 +555,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.list_budgets().await.unwrap(), ["stripe"]);
+        let keys: Vec<String> = store
+            .list_budgets()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["stripe"]);
     }
 }

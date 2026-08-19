@@ -1069,6 +1069,103 @@ pub fn default_prefetch() -> usize {
     DEFAULT_PREFETCH
 }
 
+// --- Budget types ---
+
+/// Response shape for `GET /budgets`.
+///
+/// Carries whole policies rather than bare keys, unlike `GET /crons`.
+/// A budget's policy is a handful of scalars that the listing scan has
+/// already read, so inlining it saves the caller a request per budget;
+/// a cron group's entries are large enough that the same choice would
+/// not be free.
+#[derive(Serialize)]
+pub struct ListBudgetsResponse {
+    pub budgets: Vec<BudgetResponse>,
+}
+
+/// Request shape for `POST /budgets/{key}` and `PUT /budgets/{key}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetRequest {
+    /// Tokens the bucket holds when full.
+    pub allocation: u32,
+
+    /// How tokens replenish.
+    pub strategy: BudgetStrategyRequest,
+}
+
+/// Wire form of a budget strategy.
+///
+/// Deliberately not a tagged enum. Serde ignores surplus fields on a
+/// unit variant of an internally-tagged enum, which would silently
+/// accept `duration_ms` on a `while_in_flight` budget — a request that
+/// reads as if it set a refill period but did not. Parsing the tag by
+/// hand (see `parse_budget_strategy`) makes that a 422.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetStrategyRequest {
+    /// `"time_based"` or `"while_in_flight"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+
+    /// Period over which the full allocation replenishes. Required for
+    /// `time_based`, rejected for `while_in_flight`.
+    pub duration_ms: Option<u64>,
+}
+
+/// Response shape for a single budget.
+#[derive(Serialize)]
+pub struct BudgetResponse {
+    /// The budget's key.
+    pub key: String,
+
+    /// Tokens the bucket holds when full.
+    pub allocation: u32,
+
+    /// How tokens replenish.
+    pub strategy: BudgetStrategyResponse,
+
+    /// When the budget was created (ms since epoch).
+    pub created_at: u64,
+
+    /// When the policy was last changed (ms since epoch).
+    pub updated_at: u64,
+}
+
+/// Wire form of a stored strategy, mirroring `BudgetStrategyRequest`.
+#[derive(Serialize)]
+pub struct BudgetStrategyResponse {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+
+    /// Present for `time_based` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+impl BudgetResponse {
+    pub fn from_store(key: String, budget: store::Budget) -> Self {
+        let strategy = match budget.strategy {
+            store::BudgetStrategy::TimeBased { duration_ms } => BudgetStrategyResponse {
+                kind: "time_based",
+                duration_ms: Some(duration_ms),
+            },
+            store::BudgetStrategy::WhileInFlight => BudgetStrategyResponse {
+                kind: "while_in_flight",
+                duration_ms: None,
+            },
+        };
+
+        Self {
+            key,
+            allocation: budget.allocation,
+            strategy,
+            created_at: budget.created_at,
+            updated_at: budget.updated_at,
+        }
+    }
+}
+
 // --- Cron scheduling types ---
 
 /// Response shape for `GET /crons`.
