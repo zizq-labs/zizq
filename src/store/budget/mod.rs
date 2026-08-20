@@ -22,7 +22,13 @@
 
 mod ops;
 
-pub(in crate::store) use ops::{check_budget_capacity, make_budget_key};
+pub(in crate::store) use ops::{BudgetPlan, plan_budgets};
+
+/// Exposed for tests that need to construct an inconsistent store on
+/// purpose — see the cron defence-in-depth case. No production caller
+/// outside this module builds budget keys.
+#[cfg(test)]
+pub(in crate::store) use ops::make_budget_key;
 
 use serde::{Deserialize, Serialize};
 

@@ -21,16 +21,18 @@
 //! should exist" on every boot needs a call that will not clobber an
 //! allocation someone tightened during an incident.
 
+use std::collections::HashMap;
 use std::ops::Bound;
 
 use fjall::Readable;
 use tokio::task;
 
+use super::super::cron::cron_budget_usage;
 use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
 use super::super::store::{Keyspaces, Store};
 use super::super::types::StoreError;
-use super::{Budget, BudgetStrategy};
+use super::{Budget, BudgetBinding, BudgetStrategy};
 
 impl Store {
     /// Create a budget, failing if the key is taken.
@@ -96,6 +98,7 @@ impl Store {
                 Some(bytes) => {
                     let existing: Budget = rmp_serde::from_slice(&bytes)?;
                     budget.created_at = existing.created_at;
+                    check_cron_costs_fit(&tx, &ks, &key, budget.allocation)?;
                 }
                 // Replacing a budget cannot push the server over its
                 // cap; only creating one can.
@@ -143,6 +146,8 @@ impl Store {
                 now,
             )?;
             budget.created_at = existing.created_at;
+
+            check_cron_costs_fit(&tx, &ks, &key, budget.allocation)?;
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
@@ -207,9 +212,14 @@ impl Store {
     ///
     /// Returns `true` if it existed, `false` otherwise.
     ///
-    /// Deleting a budget that jobs still reference will be rejected
-    /// once cost accounting lands — there is nothing tracking those
-    /// references yet, so this currently deletes unconditionally.
+    /// Refused with [`StoreError::Conflict`] while any cron entry's
+    /// job template references it — an entry is a standing claim that
+    /// never drains, so deleting out from under one would strand a
+    /// schedule.
+    ///
+    /// The equivalent guard for *jobs* referencing the budget needs the
+    /// per-budget accounting that arrives with dispatch; until then a
+    /// budget referenced only by queued jobs can still be deleted.
     pub async fn delete_budget(&self, key: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
         let key = key.to_string();
@@ -221,6 +231,19 @@ impl Store {
 
             if ks.data.get(&budget_key)?.is_none() {
                 return Ok(false);
+            }
+
+            if let Some(usage) = cron_budget_usage(&tx, &ks, &key)? {
+                let plural = if usage.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                };
+                return Err(StoreError::Conflict(format!(
+                    "budget '{key}' is referenced by {} cron {plural}, including '{}'. \
+                     Remove them before deleting it.",
+                    usage.entries, usage.example
+                )));
             }
 
             tx.remove(&ks.data, &budget_key);
@@ -292,6 +315,126 @@ pub(in crate::store) fn check_budget_capacity(
     Ok(())
 }
 
+/// Reject an allocation that a cron entry's template could never fit
+/// inside.
+///
+/// A cron entry is a standing claim: unlike a job it never drains, so
+/// there is no "wait for it to finish" remedy. Shrinking below what a
+/// template costs would leave an entry that is installed, valid on its
+/// face, and permanently unable to fire.
+fn check_cron_costs_fit(
+    reader: &impl Readable,
+    ks: &Keyspaces,
+    key: &str,
+    allocation: u32,
+) -> Result<(), StoreError> {
+    let Some(usage) = cron_budget_usage(reader, ks, key)? else {
+        return Ok(());
+    };
+
+    if allocation < usage.max_cost {
+        return Err(StoreError::InvalidOperation(format!(
+            "budget '{key}' cannot allocate {allocation}: cron entry '{}' draws {} from it. \
+             Lower the entry's cost or remove it first.",
+            usage.example, usage.max_cost
+        )));
+    }
+
+    Ok(())
+}
+
+/// The outcome of planning a set of budget bindings.
+pub(in crate::store) enum BudgetPlan {
+    /// Every binding resolved. These records must be written before
+    /// whatever referenced them.
+    Proceed(Vec<(Vec<u8>, Vec<u8>)>),
+
+    /// A binding could not be honoured. Nothing has been written.
+    Reject(StoreError),
+}
+
+/// Resolve a set of budget bindings, planning any that `create_with`
+/// asks to bring into existence.
+///
+/// The single place the binding rules live, so that enqueueing a job,
+/// installing a cron entry, and firing one cannot drift apart on what
+/// they accept. Writes nothing — the caller applies the returned
+/// records once whatever it is validating has resolved as a whole,
+/// because a shared transaction cannot be partially rolled back.
+///
+/// `reader` should be the open write transaction, so budgets created
+/// earlier in it are already visible.
+///
+/// The outer `Err` is a database failure. A rejection of the bindings
+/// themselves comes back as `Reject`.
+pub(in crate::store) fn plan_budgets<'a, I>(
+    reader: &impl Readable,
+    ks: &Keyspaces,
+    bindings: I,
+    now: u64,
+) -> Result<BudgetPlan, StoreError>
+where
+    I: IntoIterator<Item = &'a BudgetBinding>,
+{
+    // Budgets an earlier binding in this same set already planned, so
+    // that two references to one new budget agree on a single creation
+    // rather than racing to define it. First writer wins, matching how
+    // a `create_with` loses to an already-stored budget.
+    let mut planned: HashMap<String, Budget> = HashMap::new();
+
+    for binding in bindings {
+        let stored: Option<Budget> = match reader.get(&ks.data, make_budget_key(&binding.key))? {
+            Some(bytes) => Some(rmp_serde::from_slice(&bytes)?),
+            None => None,
+        };
+
+        let budget = match stored.or_else(|| planned.get(&binding.key).cloned()) {
+            Some(budget) => budget,
+            None => {
+                let Some(policy) = binding.create_with else {
+                    return Ok(BudgetPlan::Reject(StoreError::InvalidOperation(format!(
+                        "budget '{}' does not exist and no create_with policy was \
+                         supplied to create it with",
+                        binding.key
+                    ))));
+                };
+
+                let budget = match Budget::new(policy.allocation, policy.strategy, now) {
+                    Ok(budget) => budget,
+                    Err(e) => return Ok(BudgetPlan::Reject(e)),
+                };
+
+                // Counted against the cap like any other creation —
+                // creating one as a side effect must not be a back door
+                // around it.
+                if let Err(e) = check_budget_capacity(reader, ks, &binding.key, planned.len()) {
+                    return Ok(BudgetPlan::Reject(e));
+                }
+
+                planned.insert(binding.key.clone(), budget.clone());
+                budget
+            }
+        };
+
+        // Costing more than the budget can ever hold would never
+        // dispatch, so it is refused rather than accepted into a
+        // permanent stall.
+        if binding.cost > budget.allocation {
+            return Ok(BudgetPlan::Reject(StoreError::InvalidOperation(format!(
+                "cost {} exceeds budget '{}', which only allocates {}",
+                binding.cost, binding.key, budget.allocation
+            ))));
+        }
+    }
+
+    Ok(BudgetPlan::Proceed(
+        planned
+            .into_iter()
+            .map(|(key, budget)| Ok((make_budget_key(&key), rmp_serde::to_vec_named(&budget)?)))
+            .collect::<Result<Vec<_>, StoreError>>()?,
+    ))
+}
+
 /// Build a budget key: `B\0{key}`.
 pub(in crate::store) fn make_budget_key(key: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + key.len());
@@ -306,6 +449,7 @@ mod tests {
     use super::super::super::options::PatchBudgetOptions;
     use super::super::super::test_support::{test_store, test_store_with_max_budgets};
     use super::super::BudgetStrategy;
+    use crate::store::Store;
     use crate::store::StoreError;
 
     const NOW: u64 = 1_700_000_000_000;
@@ -721,5 +865,174 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, ["stripe"]);
+    }
+
+    // --- Protection against breaking an installed schedule ---
+
+    /// Install a one-entry schedule whose template draws `cost` from
+    /// `budget`, which must already exist.
+    async fn install_cron_drawing(store: &Store, budget: &str, cost: u32) {
+        use super::super::super::options::{
+            CronEntryOptions, EnqueueOptions, ReplaceCronGroupOptions,
+        };
+        use super::super::BudgetBinding;
+
+        store
+            .replace_cron_group(
+                "g",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![CronEntryOptions {
+                        name: "nightly".to_string(),
+                        expression: "0 3 * * *".to_string(),
+                        timezone: Some("UTC".to_string()),
+                        paused: None,
+                        job: EnqueueOptions::new("t", "q", serde_json::json!({}))
+                            .budget(BudgetBinding::new(budget).cost(cost)),
+                    }],
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_is_refused_while_a_cron_entry_references_it() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 1).await;
+
+        let result = store.delete_budget("stripe").await;
+        assert!(matches!(result, Err(StoreError::Conflict(_))));
+
+        // Still there — a refused delete changes nothing.
+        assert!(store.get_budget("stripe").await.unwrap().is_some());
+    }
+
+    /// The refusal has to name something the operator can act on.
+    #[tokio::test]
+    async fn a_refused_delete_names_the_offending_entry() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 1).await;
+
+        let Err(StoreError::Conflict(msg)) = store.delete_budget("stripe").await else {
+            panic!("expected a conflict");
+        };
+        assert!(msg.contains("g/nightly"), "unhelpful message: {msg}");
+    }
+
+    #[tokio::test]
+    async fn delete_is_allowed_once_the_entry_is_gone() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 1).await;
+
+        store.delete_cron_group("g").await.unwrap();
+        assert!(store.delete_budget("stripe").await.unwrap());
+    }
+
+    /// A budget nothing references deletes as before.
+    #[tokio::test]
+    async fn delete_is_unaffected_by_unrelated_cron_entries() {
+        let store = test_store();
+        for key in ["stripe", "ses"] {
+            store
+                .create_budget(key, 10, BudgetStrategy::WhileInFlight, NOW)
+                .await
+                .unwrap();
+        }
+        install_cron_drawing(&store, "ses", 1).await;
+
+        assert!(store.delete_budget("stripe").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn patch_cannot_shrink_below_a_cron_template_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 5).await;
+
+        let result = store
+            .patch_budget("stripe", patch(Some(4), None), NOW + 1)
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+
+        assert_eq!(
+            store
+                .get_budget("stripe")
+                .await
+                .unwrap()
+                .unwrap()
+                .allocation,
+            10
+        );
+    }
+
+    /// Shrinking *to* the template's cost still fits, so it is allowed —
+    /// the entry can still fire, just with nothing to spare.
+    #[tokio::test]
+    async fn patch_may_shrink_exactly_to_the_cron_template_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 5).await;
+
+        let patched = store
+            .patch_budget("stripe", patch(Some(5), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(patched.allocation, 5);
+    }
+
+    #[tokio::test]
+    async fn put_cannot_shrink_below_a_cron_template_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 5).await;
+
+        let result = store
+            .put_budget("stripe", 4, BudgetStrategy::WhileInFlight, NOW + 1)
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// Growing is always fine, and so is any change that keeps the
+    /// template fitting.
+    #[tokio::test]
+    async fn patch_may_grow_a_referenced_budget() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 5).await;
+
+        let patched = store
+            .patch_budget("stripe", patch(Some(100), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(patched.allocation, 100);
     }
 }

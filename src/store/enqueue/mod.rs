@@ -14,7 +14,7 @@ mod batcher;
 mod finalize;
 mod prepare;
 
-pub(in crate::store) use apply::{BudgetPrePass, apply_enqueue, plan_op_budgets};
+pub(in crate::store) use apply::{apply_enqueue, plan_op_budgets};
 pub(super) use batcher::EnqueueBatcher;
 pub(in crate::store) use finalize::finalize_enqueue;
 pub(in crate::store) use prepare::{PreparedEnqueue, prepare_enqueue, validate_batch_config};
