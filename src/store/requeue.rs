@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 use fjall::Slice;
 use tokio::task;
 
+use super::dispatch::Placement;
 use super::keys::{make_job_key, make_status_key};
 use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError};
@@ -22,7 +23,7 @@ impl Store {
     /// Subscribers are notified.
     pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let id = id.to_string();
         let event_id = id.clone();
 
@@ -49,7 +50,6 @@ impl Store {
                 let new_status_key = make_status_key(JobStatus::Ready, &id);
 
                 let queue = job.queue.clone();
-                let priority = job.priority;
                 let dequeued_at = job.dequeued_at.unwrap_or(0);
                 job.status = JobStatus::Ready.into();
 
@@ -71,7 +71,7 @@ impl Store {
                 ks.commit(tx, ks.default_commit_mode)?;
 
                 // Insert into the in-memory ready index after commit succeeds.
-                ready_index.insert(&queue, priority, id.clone());
+                dispatch.insert(Placement::of(&job));
 
                 return Ok(Some((queue, dequeued_at)));
             }

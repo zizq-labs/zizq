@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 use fjall::Slice;
 use tokio::task;
 
+use super::dispatch::Placement;
 use super::keys::{IndexKind, make_job_key, make_purge_key, make_status_key};
 use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError};
@@ -73,14 +74,12 @@ impl Store {
     /// Subscribers are notified with `StoreEvent::JobCreated`.
     pub async fn promote_scheduled(&self, job: &Job) -> Result<(), StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
 
         let id = job.id.clone();
         let event_id = job.id.clone();
         let event_queue = job.queue.clone();
-        let queue = job.queue.clone();
-        let priority = job.priority;
         let ready_at = job.ready_at;
 
         task::spawn_blocking(move || -> Result<_, StoreError> {
@@ -145,7 +144,7 @@ impl Store {
                 };
 
                 // Insert into the in-memory ready index after commit succeeds.
-                ready_index.insert(&queue, priority, id);
+                dispatch.insert(Placement::of(&updated));
 
                 return Ok(());
             }

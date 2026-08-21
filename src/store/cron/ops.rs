@@ -880,7 +880,7 @@ impl Store {
     ) -> Result<Option<CronEntry>, StoreError> {
         let ks = self.ks.clone();
         let cron_index = self.cron_index.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -1018,7 +1018,7 @@ impl Store {
 
                 // Finalize job enqueue (in-memory indexes + events).
                 if let Some(ref result) = enqueue_result {
-                    finalize_enqueue(result, &ready_index, &scheduled_index, &event_tx);
+                    finalize_enqueue(result, &dispatch, &scheduled_index, &event_tx);
                 }
 
                 return Ok(Some(entry));

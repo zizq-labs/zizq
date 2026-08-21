@@ -55,7 +55,7 @@ impl Store {
         }
 
         // Route through the auto-batcher. Per-op dedup happens inside
-        // the batcher; ready_index updates, in_flight_count decrement,
+        // the batcher; dispatch updates, in_flight_count decrement,
         // and JobCompleted event broadcasts are all performed once per
         // unique completed job in the batcher thread.
         let batcher = self.complete_batcher.clone();

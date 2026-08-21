@@ -45,8 +45,8 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use super::super::dispatch::{Dispatch, Placement};
 use super::super::in_flight_index::InFlightIndex;
-use super::super::ready_index::ReadyIndex;
 use super::super::results::BulkCompleteResult;
 use super::super::store::{Keyspaces, StoreEvent};
 use super::super::types::StoreError;
@@ -73,7 +73,7 @@ impl CompleteBatcher {
     /// of the store internals it needs to apply + finalize batches.
     pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
-        ready_index: Arc<ReadyIndex>,
+        dispatch: Arc<Dispatch>,
         in_flight_index: Arc<InFlightIndex>,
         event_tx: broadcast::Sender<StoreEvent>,
         default_completed_retention_ms: u64,
@@ -98,7 +98,7 @@ impl CompleteBatcher {
 
                     process_batch(
                         &ks,
-                        &ready_index,
+                        &dispatch,
                         &in_flight_index,
                         &event_tx,
                         default_completed_retention_ms,
@@ -134,7 +134,7 @@ impl CompleteBatcher {
 /// to each waiter's oneshot.
 fn process_batch(
     ks: &Keyspaces,
-    ready_index: &ReadyIndex,
+    dispatch: &Dispatch,
     in_flight_index: &InFlightIndex,
     event_tx: &broadcast::Sender<StoreEvent>,
     default_completed_retention_ms: u64,
@@ -253,12 +253,17 @@ fn process_batch(
         break (prepared, not_found_set);
     };
 
-    // Update ready_index and remove from in_flight_index once per id.
+    // Update dispatch and remove from in_flight_index once per id.
     // `prepared` is already dedup'd: `flat_ids` is built via `global_seen`
     // above, and `pre_read_completes` preserves that uniqueness.
     let mut completed_set: HashSet<String> = HashSet::with_capacity(prepared.len());
     for p in &prepared {
-        ready_index.remove(&p.queue, p.priority, &p.id);
+        dispatch.remove(Placement {
+            queue: &p.queue,
+            priority: p.priority,
+            id: &p.id,
+            budgets: &p.budgets,
+        });
         in_flight_index.remove(p.dequeued_at, &p.id);
         completed_set.insert(p.id.clone());
     }

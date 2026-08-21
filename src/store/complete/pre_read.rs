@@ -7,6 +7,7 @@
 
 use fjall::Slice;
 
+use super::super::budget::BudgetRef;
 use super::super::delete::{JobDeletion, prepare_job_deletion};
 use super::super::keys::{make_job_key, make_purge_key, make_status_key};
 use super::super::store::Keyspaces;
@@ -27,6 +28,10 @@ pub(super) struct PreparedComplete {
     /// Dequeue timestamp from the in-flight record, used to remove the
     /// matching entry from the `InFlightIndex` after commit.
     pub(super) dequeued_at: u64,
+    /// The job's budget bindings, carried from the pre-read so the
+    /// post-commit index cleanup can describe its placement without
+    /// reading the record again.
+    pub(super) budgets: Vec<BudgetRef>,
     /// `None` for zero-retention completions (which delete the job).
     pub(super) updated_bytes: Option<Slice>,
     /// `Some` for zero-retention completions (delete-paths).
@@ -94,6 +99,7 @@ pub(super) fn pre_read_completes(
                 pre_bytes,
                 priority: job.priority,
                 dequeued_at,
+                budgets: job.budgets.clone(),
                 updated_bytes: None,
                 deletion: Some(del),
                 index_keys: None,
@@ -120,6 +126,7 @@ pub(super) fn pre_read_completes(
                 pre_bytes,
                 priority: job.priority,
                 dequeued_at,
+                budgets: job.budgets.clone(),
                 updated_bytes: Some(updated_slice),
                 deletion: None,
                 index_keys: Some(CompletionRetentionKeys {

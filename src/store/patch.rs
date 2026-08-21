@@ -15,9 +15,10 @@ use fjall::Slice;
 use tokio::sync::broadcast;
 use tokio::task;
 
+use super::budget::BudgetRef;
+use super::dispatch::{Dispatch, Placement};
 use super::keys::{make_job_key, make_queue_key, make_status_key};
 use super::options::{BulkPatchOptions, PatchJobOptions};
-use super::ready_index::ReadyIndex;
 use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Keyspaces, Store, StoreEvent};
@@ -78,6 +79,7 @@ impl PatchJobOptions {
 
         PatchDiff {
             id: job.id.clone(),
+            budgets: job.budgets.clone(),
             old_status,
             new_status: JobStatus::try_from(job.status).unwrap(),
             old_queue,
@@ -105,6 +107,9 @@ pub(crate) struct PatchDiff {
     new_priority: u16,
     old_ready_at: u64,
     new_ready_at: u64,
+    /// The job's budget bindings. A patch cannot change them, but
+    /// re-placing the job into the ready state needs to know them.
+    budgets: Vec<BudgetRef>,
 }
 
 impl PatchDiff {
@@ -125,21 +130,41 @@ impl PatchDiff {
     /// Update in-memory ready and scheduled indexes.
     ///
     /// Must be called after a successful `commit()`.
-    fn update_indexes(&self, ready_index: &ReadyIndex, scheduled_index: &ScheduledIndex) {
+    fn update_indexes(&self, dispatch: &Dispatch, scheduled_index: &ScheduledIndex) {
         match (self.old_status, self.new_status) {
             (JobStatus::Ready, JobStatus::Ready) => {
                 if self.old_queue != self.new_queue || self.old_priority != self.new_priority {
-                    ready_index.remove(&self.old_queue, self.old_priority, &self.id);
-                    ready_index.insert(&self.new_queue, self.new_priority, self.id.clone());
+                    dispatch.remove(Placement {
+                        queue: &self.old_queue,
+                        priority: self.old_priority,
+                        id: &self.id,
+                        budgets: &self.budgets,
+                    });
+                    dispatch.insert(Placement {
+                        queue: &self.new_queue,
+                        priority: self.new_priority,
+                        id: &self.id,
+                        budgets: &self.budgets,
+                    });
                 }
             }
             (JobStatus::Ready, JobStatus::Scheduled) => {
-                ready_index.remove(&self.old_queue, self.old_priority, &self.id);
+                dispatch.remove(Placement {
+                    queue: &self.old_queue,
+                    priority: self.old_priority,
+                    id: &self.id,
+                    budgets: &self.budgets,
+                });
                 scheduled_index.insert(self.new_ready_at, self.id.clone());
             }
             (JobStatus::Scheduled, JobStatus::Ready) => {
                 scheduled_index.remove(self.old_ready_at, &self.id);
-                ready_index.insert(&self.new_queue, self.new_priority, self.id.clone());
+                dispatch.insert(Placement {
+                    queue: &self.new_queue,
+                    priority: self.new_priority,
+                    id: &self.id,
+                    budgets: &self.budgets,
+                });
             }
             (JobStatus::Scheduled, JobStatus::Scheduled) => {
                 if self.old_ready_at != self.new_ready_at {
@@ -201,7 +226,7 @@ impl Store {
         patch: PatchJobOptions,
     ) -> Result<Option<Job>, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let event_tx = self.event_tx.clone();
         let id = id.to_string();
@@ -288,7 +313,7 @@ impl Store {
 
             ks.commit(tx, ks.default_commit_mode)?;
 
-            diff.update_indexes(&ready_index, &scheduled_index);
+            diff.update_indexes(&dispatch, &scheduled_index);
             diff.emit_events(&event_tx);
 
             Ok(Some(job))
@@ -307,7 +332,7 @@ impl Store {
     /// Returns the count of actually patched jobs.
     pub async fn patch_jobs(&self, opts: BulkPatchOptions) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let event_tx = self.event_tx.clone();
 
@@ -375,7 +400,7 @@ impl Store {
             ks.commit(tx, ks.default_commit_mode)?;
 
             for diff in &diffs {
-                diff.update_indexes(&ready_index, &scheduled_index);
+                diff.update_indexes(&dispatch, &scheduled_index);
             }
 
             Ok(diffs)
@@ -728,7 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_job_queue_updates_ready_index() {
+    async fn patch_job_queue_updates_dispatch() {
         let store = test_store();
         let now = now_millis();
 
@@ -759,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_job_priority_updates_ready_index() {
+    async fn patch_job_priority_updates_dispatch() {
         let store = test_store();
         let now = now_millis();
 

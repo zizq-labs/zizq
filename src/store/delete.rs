@@ -12,6 +12,8 @@
 
 use tokio::task;
 
+use super::budget::BudgetRef;
+use super::dispatch::Placement;
 use super::keys::{
     error_keys, make_batch_key, make_job_key, make_payload_key, make_purge_key, make_queue_key,
     make_status_key, make_type_key, make_unique_key,
@@ -28,7 +30,7 @@ impl Store {
     /// job was found and deleted, `false` if already purged.
     pub async fn purge_job(&self, id: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let in_flight_index = self.in_flight_index.clone();
         let id = id.to_string();
@@ -56,7 +58,7 @@ impl Store {
             // Remove from in-memory indexes based on the job's status.
             match status {
                 JobStatus::Ready => {
-                    ready_index.remove(&job.queue, job.priority, &id);
+                    dispatch.remove(Placement::of(&job));
                 }
                 JobStatus::Scheduled => {
                     scheduled_index.remove(job.ready_at, &id);
@@ -98,7 +100,7 @@ impl Store {
     /// Emits `StoreEvent::JobDeleted` for each deleted job.
     pub async fn delete_jobs(&self, opts: BulkDeleteOptions) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let in_flight_index = self.in_flight_index.clone();
         let event_tx = self.event_tx.clone();
@@ -148,6 +150,10 @@ impl Store {
                 priority: u16,
                 ready_at: u64,
                 dequeued_at: u64,
+                /// Carried from the pre-read so the post-commit index
+                /// cleanup can describe the job's placement without
+                /// reading it again.
+                budgets: Vec<BudgetRef>,
             }
 
             let mut deleted: Vec<Deleted> = Vec::new();
@@ -171,6 +177,7 @@ impl Store {
                     priority: job.priority,
                     ready_at: job.ready_at,
                     dequeued_at: job.dequeued_at.unwrap_or(0),
+                    budgets: job.budgets,
                 });
             }
 
@@ -184,7 +191,12 @@ impl Store {
             for d in &deleted {
                 match d.status {
                     JobStatus::Ready => {
-                        ready_index.remove(&d.queue, d.priority, &d.id);
+                        dispatch.remove(Placement {
+                            queue: &d.queue,
+                            priority: d.priority,
+                            id: &d.id,
+                            budgets: &d.budgets,
+                        });
                     }
                     JobStatus::Scheduled => {
                         scheduled_index.remove(d.ready_at, &d.id);
@@ -223,12 +235,12 @@ impl Store {
     /// skipped.
     pub async fn purge_batch(&self, ids: &[String]) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let ids = ids.to_vec();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // ---- outside tx: prepare all deletions ----
-            let mut deletions: Vec<(JobDeletion, String, u16)> = Vec::new();
+            let mut deletions: Vec<(JobDeletion, String, u16, Vec<BudgetRef>)> = Vec::new();
 
             for id in &ids {
                 let job_key = make_job_key(id);
@@ -247,20 +259,30 @@ impl Store {
 
                 let priority = job.priority;
                 let queue = job.queue.clone();
-                deletions.push((prepare_job_deletion(&job, status, &ks), queue, priority));
+                deletions.push((
+                    prepare_job_deletion(&job, status, &ks),
+                    queue,
+                    priority,
+                    job.budgets,
+                ));
             }
 
             // ---- inside tx (writes only) ----
             let count = deletions.len();
             let mut tx = ks.write_tx();
-            for (del, _, _) in &deletions {
+            for (del, _, _, _) in &deletions {
                 apply_job_deletion(&mut tx, del, &ks);
             }
             ks.commit(tx, ks.default_commit_mode)?;
 
-            // Defensive: remove from ready_index in case of inconsistency.
-            for (del, queue, priority) in deletions {
-                ready_index.remove(&queue, priority, &del.id);
+            // Defensive: remove from dispatch in case of inconsistency.
+            for (del, queue, priority, budgets) in deletions {
+                dispatch.remove(Placement {
+                    queue: &queue,
+                    priority,
+                    id: &del.id,
+                    budgets: &budgets,
+                });
             }
 
             Ok(count)

@@ -61,7 +61,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use super::super::ready_index::ReadyIndex;
+use super::super::dispatch::Dispatch;
 use super::super::results::EnqueueResult;
 use super::super::scheduled_index::ScheduledIndex;
 use super::super::store::{Keyspaces, StoreEvent};
@@ -96,7 +96,7 @@ impl EnqueueBatcher {
     /// one op regardless of how many jobs it carries.
     pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
-        ready_index: Arc<ReadyIndex>,
+        dispatch: Arc<Dispatch>,
         scheduled_index: Arc<ScheduledIndex>,
         event_tx: broadcast::Sender<StoreEvent>,
         batch_size: usize,
@@ -126,7 +126,7 @@ impl EnqueueBatcher {
                         }
                     }
 
-                    process_batch(&ks, &ready_index, &scheduled_index, &event_tx, batch);
+                    process_batch(&ks, &dispatch, &scheduled_index, &event_tx, batch);
                 }
             })
             .expect("failed to spawn enqueue-batcher thread");
@@ -161,7 +161,7 @@ impl EnqueueBatcher {
 /// corresponding to the jobs they submitted.
 fn process_batch(
     ks: &Keyspaces,
-    ready_index: &ReadyIndex,
+    dispatch: &Dispatch,
     scheduled_index: &ScheduledIndex,
     event_tx: &broadcast::Sender<StoreEvent>,
     batch: Vec<EnqueueOp>,
@@ -260,7 +260,7 @@ fn process_batch(
     for (outcome, reply) in outcomes.into_iter().zip(replies) {
         if let Ok(ref results) = outcome {
             for r in results {
-                finalize_enqueue(r, ready_index, scheduled_index, event_tx);
+                finalize_enqueue(r, dispatch, scheduled_index, event_tx);
             }
         }
         let _ = reply.send(outcome);

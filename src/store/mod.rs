@@ -5,6 +5,7 @@ mod budget;
 mod complete;
 mod cron;
 mod delete;
+mod dispatch;
 mod enqueue;
 mod fail;
 mod find;

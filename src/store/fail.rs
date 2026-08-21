@@ -7,6 +7,7 @@ use fjall::Slice;
 use tokio::task;
 
 use super::delete::{apply_job_deletion, prepare_job_deletion};
+use super::dispatch::Placement;
 use super::keys::{make_error_key, make_job_key, make_purge_key, make_status_key, make_unique_key};
 use super::options::FailureOptions;
 use super::store::{Store, StoreEvent};
@@ -31,7 +32,7 @@ impl Store {
     ) -> Result<Option<Job>, StoreError> {
         let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let default_dead_retention_ms = self.default_dead_retention_ms;
         let default_retry_limit = self.default_retry_limit;
         let default_backoff = self.default_backoff.clone();
@@ -161,7 +162,7 @@ impl Store {
                     job.status = JobStatus::Dead.into();
                     ks.commit(tx, ks.default_commit_mode)?;
 
-                    ready_index.remove(&job.queue, job.priority, &id);
+                    dispatch.remove(Placement::of(&job));
 
                     break job;
                 }
@@ -204,7 +205,7 @@ impl Store {
 
                 ks.commit(tx, ks.default_commit_mode)?;
 
-                ready_index.remove(&job.queue, job.priority, &id);
+                dispatch.remove(Placement::of(&job));
 
                 break job;
             };

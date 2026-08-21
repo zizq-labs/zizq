@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fjall::Slice;
 use tokio::task;
 
+use super::dispatch::Placement;
 use super::keys::{
     make_batch_key, make_job_key, make_payload_key, make_status_key, make_unique_key,
 };
@@ -69,7 +70,7 @@ impl Store {
         }
 
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let event_tx = self.event_tx.clone();
         let queues = queues.clone();
 
@@ -96,7 +97,7 @@ impl Store {
                 // 1. Claim phase — collect up to `n` candidates from the ready index.
                 let mut claimed: Vec<(u16, String, String)> = Vec::with_capacity(n);
                 while claimed.len() < n {
-                    match ready_index.claim(&queues) {
+                    match dispatch.claim(&queues) {
                         Some(entry) => claimed.push(entry),
                         None => break,
                     }
@@ -209,7 +210,7 @@ impl Store {
                     );
                     drop(tx);
                     for pre in &valid {
-                        ready_index.insert(&pre.job.queue, pre.job.priority, pre.job_id.clone());
+                        dispatch.insert(Placement::of(&pre.job));
                     }
                     continue; // Back to the top of the retry loop
                 }
@@ -221,7 +222,7 @@ impl Store {
                     //    ready index and notify workers.
                     let _tx = ks.write_tx();
                     for pre in &valid {
-                        ready_index.insert(&pre.job.queue, pre.job.priority, pre.job_id.clone());
+                        dispatch.insert(Placement::of(&pre.job));
 
                         let _ = event_tx.send(StoreEvent::JobCreated {
                             id: pre.job_id.clone(),

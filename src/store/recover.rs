@@ -15,6 +15,7 @@ use std::sync::atomic::Ordering;
 use fjall::{Readable, Slice};
 use tokio::task;
 
+use super::dispatch::Placement;
 use super::keys::{IndexKind, make_job_key, make_status_key, make_unique_key};
 use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueWhile};
@@ -42,7 +43,7 @@ impl Store {
         self.index_ready.store(false, Ordering::Release);
 
         let (ready, scheduled, cron) = tokio::try_join!(
-            self.rebuild_ready_index(),
+            self.rebuild_dispatch(),
             self.rebuild_scheduled_index(),
             self.rebuild_cron_index(),
         )?;
@@ -56,7 +57,7 @@ impl Store {
     ///
     /// Runs synchronously so it completes before any API requests are
     /// accepted. Does not touch the in-memory ready index — that's
-    /// handled by `rebuild_ready_index`, which runs immediately after.
+    /// handled by `rebuild_dispatch`, which runs immediately after.
     fn recover_in_flight_jobs(&self) -> Result<usize, StoreError> {
         let ks = &self.ks;
 
@@ -126,9 +127,9 @@ impl Store {
     /// Scans for all Ready jobs, reads their metadata to get queue and
     /// priority, and inserts each entry into the skip list. No mutex needed —
     /// each `insert()` is lock-free, and recovery runs before any consumers.
-    async fn rebuild_ready_index(&self) -> Result<usize, StoreError> {
+    async fn rebuild_dispatch(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Ready jobs.
@@ -155,7 +156,7 @@ impl Store {
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                ready_index.insert(&job.queue, job.priority, job_id);
+                dispatch.insert(Placement::of(&job));
                 count += 1;
             }
 

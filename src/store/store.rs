@@ -11,7 +11,7 @@
 //! - `index`: status (`S` tag), queue (`Q` tag), type (`T` tag), and purge-at
 //!   (`A` tag) secondary indexes. No bloom filters, smaller memtable. See
 //!   `IndexKind` for key layouts.
-//! - In-memory `ReadyIndex`: lock-free crossbeam skip-list priority index of
+//! - In-memory `Dispatch`: lock-free crossbeam skip-list priority index of
 //!   ready jobs, rebuilt from the status index on startup.
 //! - In-memory `ScheduledIndex`: lock-free crossbeam skip-set chronological
 //!   index of scheduled jobs, rebuilt from the status index on startup.
@@ -29,10 +29,10 @@ use tokio::sync::broadcast;
 
 use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
+use super::dispatch::Dispatch;
 use super::enqueue::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::in_flight_index::InFlightIndex;
-use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 use super::storage_config::StorageConfig;
 use super::types::{BackoffConfig, CommitMode, StoreError};
@@ -135,7 +135,7 @@ pub struct Store {
     ///
     /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
     /// no external mutex needed.
-    pub(super) ready_index: Arc<ReadyIndex>,
+    pub(super) dispatch: Arc<Dispatch>,
 
     /// In-memory chronological index of scheduled jobs.
     ///
@@ -332,7 +332,7 @@ impl Store {
             enqueue_commit_mode,
             max_budgets: config.max_budgets,
         });
-        let ready_index = Arc::new(ReadyIndex::new());
+        let dispatch = Arc::new(Dispatch::new());
         let scheduled_index = Arc::new(ScheduledIndex::new());
         let in_flight_index = Arc::new(InFlightIndex::new());
 
@@ -343,7 +343,7 @@ impl Store {
         // SyncSender closes, the worker drains remaining ops and exits.
         let enqueue_batcher = Arc::new(EnqueueBatcher::start(
             ks.clone(),
-            ready_index.clone(),
+            dispatch.clone(),
             scheduled_index.clone(),
             event_tx.clone(),
             config.enqueue_batch_size,
@@ -353,7 +353,7 @@ impl Store {
         // batcher, coalesces concurrent completion (ack) requests.
         let complete_batcher = Arc::new(CompleteBatcher::start(
             ks.clone(),
-            ready_index.clone(),
+            dispatch.clone(),
             in_flight_index.clone(),
             event_tx.clone(),
             config.default_completed_retention_ms,
@@ -363,7 +363,7 @@ impl Store {
         Ok(Self {
             config: config.clone(),
             ks,
-            ready_index,
+            dispatch,
             scheduled_index,
             in_flight_index,
             cron_index: Arc::new(CronScheduleIndex::new()),
@@ -384,7 +384,7 @@ impl Store {
 
     /// Total number of ready jobs across all queues.
     pub fn ready_count(&self) -> usize {
-        self.ready_index.len()
+        self.dispatch.len()
     }
 
     /// Total number of in-flight jobs across all connections.
