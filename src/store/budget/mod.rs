@@ -20,6 +20,7 @@
 //! The `impl Store { ... }` methods for the budget API live in the
 //! sibling `ops` submodule.
 
+mod limiter;
 mod ops;
 
 pub(in crate::store) use ops::{BudgetPlan, plan_budgets};
