@@ -225,6 +225,16 @@ impl Limiter {
         }
     }
 
+    /// Whether tokens come back when a job finishes rather than on a
+    /// clock.
+    ///
+    /// The two are mutually exclusive, and callers need to tell them
+    /// apart: crediting a dripping bucket when a job completes would
+    /// return a token the drip is already restoring.
+    pub(super) fn returns_on_release(&self) -> bool {
+        self.drip.is_none()
+    }
+
     /// Give `cost` tokens back.
     ///
     /// Capped at capacity, which matters after a budget is shrunk: jobs

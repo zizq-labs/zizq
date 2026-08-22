@@ -22,6 +22,7 @@
 
 mod limiter;
 mod ops;
+mod registry;
 
 pub(in crate::store) use ops::{BudgetPlan, plan_budgets};
 
