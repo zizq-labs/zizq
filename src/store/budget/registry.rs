@@ -106,7 +106,7 @@ struct BudgetGroup {
 }
 
 /// Live accounting for every budget with a group.
-pub(super) struct Budgets {
+pub(in crate::store) struct Budgets {
     inner: Mutex<HashMap<String, BudgetGroup>>,
 
     /// Every parked job, exactly once, whatever number of budgets it
@@ -135,9 +135,8 @@ pub(super) struct Budgets {
     waiting: AtomicUsize,
 }
 
-#[allow(dead_code, reason = "wired up when budgeted jobs reach dispatch")]
 impl Budgets {
-    pub(super) fn new() -> Self {
+    pub(in crate::store) fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             all: ReadyIndex::new(),
@@ -149,7 +148,8 @@ impl Budgets {
     ///
     /// Deliberately lock-free: this is the check that keeps unbudgeted
     /// dispatch off the mutex entirely.
-    pub(super) fn waiting(&self) -> usize {
+    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    pub(in crate::store) fn waiting(&self) -> usize {
         self.waiting.load(Ordering::Relaxed)
     }
 
@@ -159,7 +159,7 @@ impl Budgets {
     /// An existing group keeps its tokens and its waiting jobs — a
     /// policy change adjusts a running budget rather than resetting it,
     /// so tightening one does not hand out a fresh allocation.
-    pub(super) fn sync(&self, key: &str, budget: &Budget, now: u64) {
+    pub(in crate::store) fn sync(&self, key: &str, budget: &Budget, now: u64) {
         let mut groups = self.inner.lock().unwrap();
 
         match groups.get_mut(key) {
@@ -181,7 +181,7 @@ impl Budgets {
     /// Any jobs still waiting on it are dropped with it, so this is
     /// only correct once nothing references the budget — which is what
     /// deletion being refused while references exist is for.
-    pub(super) fn forget(&self, key: &str) {
+    pub(in crate::store) fn forget(&self, key: &str) {
         let mut groups = self.inner.lock().unwrap();
 
         if let Some(group) = groups.remove(key) {
@@ -212,7 +212,13 @@ impl Budgets {
     /// queues, because any of them could be the one that frees up.
     /// Whichever group offers it, the acquire still has to satisfy
     /// every budget it names.
-    pub(super) fn park(&self, budgets: &[BudgetRef], queue: &str, priority: u16, job_id: &str) {
+    pub(in crate::store) fn park(
+        &self,
+        budgets: &[BudgetRef],
+        queue: &str,
+        priority: u16,
+        job_id: &str,
+    ) {
         // Counted up before the jobs land, unlike the removal paths
         // which count down afterwards. Both orderings leave a window
         // where the count disagrees with the queues, and the point is
@@ -266,7 +272,13 @@ impl Budgets {
     ///
     /// Must clear the job from *every* group it was parked on, or it
     /// would keep being offered from the ones it was missed in.
-    pub(super) fn unpark(&self, budgets: &[BudgetRef], queue: &str, priority: u16, job_id: &str) {
+    pub(in crate::store) fn unpark(
+        &self,
+        budgets: &[BudgetRef],
+        queue: &str,
+        priority: u16,
+        job_id: &str,
+    ) {
         let mut groups = self.inner.lock().unwrap();
         let mut removed = 0;
 
@@ -293,7 +305,8 @@ impl Budgets {
     /// index hands back from a claim. An empty `queues` means the
     /// worker will take from anywhere; otherwise only jobs in those
     /// queues are considered, and the best across them wins.
-    pub(super) fn head(
+    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    pub(in crate::store) fn head(
         &self,
         key: &str,
         queues: &HashSet<String>,
@@ -307,7 +320,7 @@ impl Budgets {
     /// Lock-free and lazy — reads the roll-up rather than merging the
     /// per-budget queues, so nothing needs deduplicating and nothing is
     /// collected up front.
-    pub(super) fn entries(&self) -> impl Iterator<Item = (u16, String)> + '_ {
+    pub(in crate::store) fn entries(&self) -> impl Iterator<Item = (u16, String)> + '_ {
         self.all.iter()
     }
 
@@ -321,7 +334,7 @@ impl Budgets {
     /// Reached on every admin event while `zizq top` is connected — so
     /// once per job state change — which is why it must not walk the
     /// queues to work the answer out.
-    pub(super) fn job_count(&self) -> usize {
+    pub(in crate::store) fn job_count(&self) -> usize {
         self.all.len()
     }
 
@@ -341,7 +354,8 @@ impl Budgets {
     /// A referenced budget with no group fails the acquire. Dispatching
     /// as though it were unlimited would be the one outcome worse than
     /// not dispatching.
-    pub(super) fn try_acquire_all(&self, budgets: &[BudgetRef], now: u64) -> bool {
+    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    pub(in crate::store) fn try_acquire_all(&self, budgets: &[BudgetRef], now: u64) -> bool {
         let mut groups = self.inner.lock().unwrap();
         let mut taken: Vec<&BudgetRef> = Vec::with_capacity(budgets.len());
 
@@ -378,7 +392,8 @@ impl Budgets {
     ///
     /// Distinct from [`release_concurrency`](Self::release_concurrency),
     /// which is about work that *did* run.
-    pub(super) fn refund(&self, budgets: &[BudgetRef]) {
+    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    pub(in crate::store) fn refund(&self, budgets: &[BudgetRef]) {
         let mut groups = self.inner.lock().unwrap();
 
         for reference in budgets {
@@ -401,7 +416,8 @@ impl Budgets {
     /// would hand back a token twice and let the budget run over its
     /// rate. That matters for a job bound to one of each, where the
     /// same call covers both.
-    pub(super) fn release_concurrency(&self, budgets: &[BudgetRef]) {
+    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    pub(in crate::store) fn release_concurrency(&self, budgets: &[BudgetRef]) {
         let mut groups = self.inner.lock().unwrap();
 
         for reference in budgets {
@@ -414,7 +430,8 @@ impl Budgets {
     }
 
     /// Forget every budget and everything waiting on one.
-    pub(super) fn clear(&self) {
+    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    pub(in crate::store) fn clear(&self) {
         let mut groups = self.inner.lock().unwrap();
         groups.clear();
         self.all.clear();

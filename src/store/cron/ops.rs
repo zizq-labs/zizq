@@ -13,7 +13,9 @@ use std::ops::Bound;
 use fjall::{Readable, Slice};
 use tokio::task;
 
-use super::super::budget::{BudgetPlan, plan_budgets};
+use super::super::budget::{
+    Budget, BudgetPlan, plan_budgets, sync_created_budgets, write_created_budgets,
+};
 use super::super::enqueue::{
     apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue, validate_batch_config,
 };
@@ -39,6 +41,7 @@ impl Store {
         now: u64,
     ) -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -164,6 +167,8 @@ impl Store {
                 }
             }
 
+            let created_budgets: Vec<(String, Budget)>;
+
             // Resolve every entry's budgets, creating any the templates
             // ask for. Done at install rather than at first firing so
             // that an entry accepted into a schedule is guaranteed to
@@ -176,10 +181,9 @@ impl Store {
                 new_entries.iter().flat_map(|e| e.job.budgets.iter()),
                 now,
             )? {
-                BudgetPlan::Proceed(creations) => {
-                    for (key, bytes) in creations {
-                        tx.insert(&ks.data, key, bytes);
-                    }
+                BudgetPlan::Proceed(planned) => {
+                    write_created_budgets(&mut tx, &ks, &planned)?;
+                    created_budgets = planned;
                 }
                 BudgetPlan::Reject(e) => return Err(e),
             }
@@ -192,6 +196,7 @@ impl Store {
             }
 
             ks.commit(tx, ks.default_commit_mode)?;
+            sync_created_budgets(&live, &created_budgets, now);
 
             // ---- outside tx: update in-memory cron index ----
 
@@ -324,6 +329,7 @@ impl Store {
         now: u64,
     ) -> Result<CronEntry, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -376,11 +382,12 @@ impl Store {
                 last_enqueue_at: None,
             };
 
+            let created_budgets: Vec<(String, Budget)>;
+
             match plan_budgets(&tx, &ks, entry.job.budgets.iter(), now)? {
-                BudgetPlan::Proceed(creations) => {
-                    for (key, bytes) in creations {
-                        tx.insert(&ks.data, key, bytes);
-                    }
+                BudgetPlan::Proceed(planned) => {
+                    write_created_budgets(&mut tx, &ks, &planned)?;
+                    created_budgets = planned;
                 }
                 BudgetPlan::Reject(e) => return Err(e),
             }
@@ -388,6 +395,7 @@ impl Store {
             tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
 
             ks.commit(tx, ks.default_commit_mode)?;
+            sync_created_budgets(&live, &created_budgets, now);
 
             // ---- outside tx: update in-memory cron index ----
             if let Some(next) = entry.next_enqueue_at {
@@ -414,6 +422,7 @@ impl Store {
         now: u64,
     ) -> Result<CronEntry, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -460,11 +469,12 @@ impl Store {
                 group_meta.timezone.as_deref(),
             );
 
+            let created_budgets: Vec<(String, Budget)>;
+
             match plan_budgets(&tx, &ks, entry.job.budgets.iter(), now)? {
-                BudgetPlan::Proceed(creations) => {
-                    for (key, bytes) in creations {
-                        tx.insert(&ks.data, key, bytes);
-                    }
+                BudgetPlan::Proceed(planned) => {
+                    write_created_budgets(&mut tx, &ks, &planned)?;
+                    created_budgets = planned;
                 }
                 BudgetPlan::Reject(e) => return Err(e),
             }
@@ -472,6 +482,7 @@ impl Store {
             tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
 
             ks.commit(tx, ks.default_commit_mode)?;
+            sync_created_budgets(&live, &created_budgets, now);
 
             // ---- outside tx: update in-memory cron index ----
             if let Some(old) = &old_entry {
@@ -879,6 +890,7 @@ impl Store {
         now: u64,
     ) -> Result<Option<CronEntry>, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
@@ -945,7 +957,7 @@ impl Store {
                 // those protections has a hole, which is why it is
                 // logged as an error rather than treated as a normal
                 // outcome.
-                let mut budget_creations = Vec::new();
+                let mut budget_creations: Vec<(String, Budget)> = Vec::new();
                 let mut fires = prepared.is_some();
 
                 if let Some(ref p) = prepared {
@@ -996,15 +1008,15 @@ impl Store {
                 // Enqueue the job if this tick fires.
                 let enqueue_result = match (fires, prepared.as_ref()) {
                     (true, Some(p)) => {
-                        for (key, bytes) in budget_creations {
-                            tx.insert(&ks.data, key, bytes);
-                        }
+                        write_created_budgets(&mut tx, &ks, &budget_creations)?;
                         Some(apply_enqueue(&mut tx, &ks, p)?)
                     }
                     _ => None,
                 };
 
                 ks.commit(tx, ks.enqueue_commit_mode)?;
+
+                sync_created_budgets(&live, &budget_creations, now);
 
                 // ---- outside tx: update in-memory indexes ----
 

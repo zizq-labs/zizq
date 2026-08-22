@@ -391,6 +391,73 @@ mod tests {
         assert_eq!(store.count_jobs(ListJobsOptions::new()).await.unwrap(), 0);
     }
 
+    /// A budgeted job is ready, but parked in its budget's group
+    /// rather than the priority index — so a worker never has to walk
+    /// past it, and it does not dispatch until its budgets are debited.
+    #[tokio::test]
+    async fn a_budgeted_job_is_parked_rather_than_dispatchable() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("throttled", "q", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe").create_with(while_in_flight(10))),
+            )
+            .await
+            .unwrap();
+
+        // Counted as ready...
+        assert_eq!(store.ready_count(), 1);
+        // ...and listed as ready...
+        assert_eq!(store.count_jobs(ListJobsOptions::new()).await.unwrap(), 1);
+        // ...but not handed to a worker.
+        assert!(
+            store
+                .take_next_job(now, &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Unthrottled work is untouched by a backed-up budget — the whole
+    /// reason budgeted jobs live outside the priority index.
+    #[tokio::test]
+    async fn a_parked_budgeted_job_does_not_block_unthrottled_work() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                // Priority 0 — ahead of the plain job, so an index it
+                // shared would offer it first.
+                EnqueueOptions::new("throttled", "q", serde_json::json!({}))
+                    .priority(0)
+                    .budget(BudgetBinding::new("stripe").create_with(while_in_flight(10))),
+            )
+            .await
+            .unwrap();
+
+        let plain = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("plain", "q", serde_json::json!({})).priority(9),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let taken = store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, plain.id);
+    }
+
     #[tokio::test]
     async fn enqueue_generates_unique_ids() {
         let store = test_store();

@@ -27,6 +27,7 @@ use fjall::config::{FilterPolicy, PinningPolicy};
 use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use tokio::sync::broadcast;
 
+use super::budget::Budgets;
 use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
 use super::dispatch::Dispatch;
@@ -136,6 +137,13 @@ pub struct Store {
     /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
     /// no external mutex needed.
     pub(super) dispatch: Arc<Dispatch>,
+
+    /// Live budget state — token buckets and the jobs waiting on them.
+    ///
+    /// Shared with `dispatch`, which parks jobs into it. Held here too
+    /// because it is the store that learns when a policy changes and
+    /// has to bring the running state in line.
+    pub(super) budgets: Arc<Budgets>,
 
     /// In-memory chronological index of scheduled jobs.
     ///
@@ -332,7 +340,8 @@ impl Store {
             enqueue_commit_mode,
             max_budgets: config.max_budgets,
         });
-        let dispatch = Arc::new(Dispatch::new());
+        let budgets = Arc::new(Budgets::new());
+        let dispatch = Arc::new(Dispatch::new(budgets.clone()));
         let scheduled_index = Arc::new(ScheduledIndex::new());
         let in_flight_index = Arc::new(InFlightIndex::new());
 
@@ -344,6 +353,7 @@ impl Store {
         let enqueue_batcher = Arc::new(EnqueueBatcher::start(
             ks.clone(),
             dispatch.clone(),
+            budgets.clone(),
             scheduled_index.clone(),
             event_tx.clone(),
             config.enqueue_batch_size,
@@ -364,6 +374,7 @@ impl Store {
             config: config.clone(),
             ks,
             dispatch,
+            budgets,
             scheduled_index,
             in_flight_index,
             cron_index: Arc::new(CronScheduleIndex::new()),

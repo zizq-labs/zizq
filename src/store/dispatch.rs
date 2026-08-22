@@ -37,8 +37,10 @@
 //! two directions cannot disagree.
 
 use std::collections::HashSet;
+use std::iter::Peekable;
+use std::sync::Arc;
 
-use super::budget::BudgetRef;
+use super::budget::{BudgetRef, Budgets};
 use super::ready_index::ReadyIndex;
 use super::types::Job;
 
@@ -58,13 +60,8 @@ pub(super) struct Placement<'a> {
     /// The job's id.
     pub(super) id: &'a str,
 
-    /// Budgets the job draws on. Empty for an unthrottled job.
-    ///
-    /// Carried but not yet read: routing on it arrives with the budget
-    /// groups. It is part of the signature now so that landing those
-    /// changes one function body rather than all thirteen call sites
-    /// again.
-    #[allow(dead_code, reason = "read once budgeted jobs route into groups")]
+    /// Budgets the job draws on. Empty for an unthrottled job, which
+    /// is what decides where it is placed.
     pub(super) budgets: &'a [BudgetRef],
 }
 
@@ -88,28 +85,52 @@ impl<'a> Placement<'a> {
 pub(super) struct Dispatch {
     /// Priority index of ready jobs that nothing throttles.
     ready: ReadyIndex,
+
+    /// Live budget state, holding the jobs that something does.
+    ///
+    /// Shared with the store, which syncs it as budget policies are
+    /// created and changed.
+    budgets: Arc<Budgets>,
 }
 
 impl Dispatch {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(budgets: Arc<Budgets>) -> Self {
         Self {
             ready: ReadyIndex::new(),
+            budgets,
         }
     }
 
-    /// Total number of ready jobs.
+    /// Total number of ready jobs, throttled or not.
+    ///
+    /// A throttled job is still ready — it is waiting on capacity, not
+    /// on anything about its own state — so it counts here.
     pub(super) fn len(&self) -> usize {
-        self.ready.len()
+        self.ready.len() + self.budgets.job_count()
     }
 
     /// Place a job into the ready state.
+    ///
+    /// A job bound to budgets goes to their groups rather than the
+    /// priority index. That is the whole point of the split: the
+    /// dispatcher never has to walk past a job it cannot dispatch, so a
+    /// backed-up throttle costs unthrottled work nothing.
     pub(super) fn insert(&self, at: Placement<'_>) {
-        self.ready.insert(at.queue, at.priority, at.id.to_string());
+        if at.budgets.is_empty() {
+            self.ready.insert(at.queue, at.priority, at.id.to_string());
+        } else {
+            self.budgets.park(at.budgets, at.queue, at.priority, at.id);
+        }
     }
 
     /// Take a job out of the ready state.
     pub(super) fn remove(&self, at: Placement<'_>) {
-        self.ready.remove(at.queue, at.priority, at.id);
+        if at.budgets.is_empty() {
+            self.ready.remove(at.queue, at.priority, at.id);
+        } else {
+            self.budgets
+                .unpark(at.budgets, at.queue, at.priority, at.id);
+        }
     }
 
     /// Iterate ready jobs in priority order, yielding `(priority, id)`.
@@ -119,7 +140,12 @@ impl Dispatch {
     /// A throttled job is still queued, and omitting it would make it
     /// invisible to `GET /jobs?status=ready`.
     pub(super) fn iter(&self) -> impl Iterator<Item = (u16, String)> + '_ {
-        self.ready.iter()
+        // Both sides are already ordered by priority then id, so this
+        // interleaves them rather than collecting and sorting.
+        Merge {
+            left: self.ready.iter().peekable(),
+            right: self.budgets.entries().peekable(),
+        }
     }
 
     /// Claim the highest-priority, oldest dispatchable job.
@@ -131,12 +157,50 @@ impl Dispatch {
     /// from disk anyway — the index is advisory, and the record is what
     /// says whether the job is still there and still ready.
     pub(super) fn claim(&self, queues: &HashSet<String>) -> Option<(u16, String, String)> {
+        // Budgeted jobs are parked but not yet offered: selecting one
+        // means debiting its budgets, which lands with the acquire.
+        // Until then they are visible to listings and invisible to
+        // workers.
         self.ready.claim(queues)
+    }
+}
+
+/// Interleaves two already-ordered streams of ready jobs.
+///
+/// Ready jobs live in two places, and a caller listing them wants one
+/// sequence in dispatch order. Merging lazily keeps the priority index
+/// side lazy too — a listing that takes ten jobs does not walk a
+/// hundred thousand.
+struct Merge<L: Iterator<Item = (u16, String)>, R: Iterator<Item = (u16, String)>> {
+    left: Peekable<L>,
+    right: Peekable<R>,
+}
+
+impl<L, R> Iterator for Merge<L, R>
+where
+    L: Iterator<Item = (u16, String)>,
+    R: Iterator<Item = (u16, String)>,
+{
+    type Item = (u16, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.left.peek(), self.right.peek()) {
+            (Some(left), Some(right)) => {
+                if left <= right {
+                    self.left.next()
+                } else {
+                    self.right.next()
+                }
+            }
+            (Some(_), None) => self.left.next(),
+            (None, _) => self.right.next(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::budget::{Budget, BudgetStrategy};
     use super::*;
 
     fn placement<'a>(id: &'a str, budgets: &'a [BudgetRef]) -> Placement<'a> {
@@ -150,7 +214,7 @@ mod tests {
 
     #[test]
     fn a_job_round_trips() {
-        let dispatch = Dispatch::new();
+        let dispatch = Dispatch::new(Arc::new(Budgets::new()));
         dispatch.insert(placement("a", &[]));
 
         assert_eq!(dispatch.len(), 1);
@@ -163,7 +227,7 @@ mod tests {
 
     #[test]
     fn removing_takes_a_job_out() {
-        let dispatch = Dispatch::new();
+        let dispatch = Dispatch::new(Arc::new(Budgets::new()));
         dispatch.insert(placement("a", &[]));
 
         dispatch.remove(placement("a", &[]));
@@ -171,22 +235,96 @@ mod tests {
         assert_eq!(dispatch.len(), 0);
     }
 
-    /// Budgets ride along on the placement without changing where an
-    /// unthrottled job goes — the routing they will drive lands with
-    /// the budget groups.
-    #[test]
-    fn a_budgeted_job_is_placed_like_any_other_for_now() {
-        let dispatch = Dispatch::new();
-        let budgets = vec![BudgetRef::new("stripe")];
-        dispatch.insert(placement("a", &budgets));
+    const NOW: u64 = 1_700_000_000_000;
 
+    /// A dispatcher whose registry already knows about `stripe`, as it
+    /// would in the store — nothing parks on a budget the registry has
+    /// not been told about.
+    fn with_stripe() -> (Dispatch, Arc<Budgets>) {
+        let budgets = Arc::new(Budgets::new());
+        let policy = Budget::new(10, BudgetStrategy::WhileInFlight, NOW).unwrap();
+        budgets.sync("stripe", &policy, NOW);
+        (Dispatch::new(budgets.clone()), budgets)
+    }
+
+    /// The heart of the split: a budgeted job is ready, and counted and
+    /// listed as such, but it is not in the priority index — so a
+    /// worker never walks past it, and it cannot be handed out until
+    /// its budgets have been debited.
+    #[test]
+    fn a_budgeted_job_is_parked_rather_than_indexed() {
+        let (dispatch, _budgets) = with_stripe();
+        let refs = vec![BudgetRef::new("stripe")];
+
+        dispatch.insert(placement("a", &refs));
+
+        assert!(dispatch.claim(&HashSet::new()).is_none());
         assert_eq!(dispatch.len(), 1);
-        assert!(dispatch.claim(&HashSet::new()).is_some());
+        assert_eq!(dispatch.iter().count(), 1);
+    }
+
+    #[test]
+    fn removing_a_budgeted_job_takes_it_out_of_its_group() {
+        let (dispatch, _budgets) = with_stripe();
+        let refs = vec![BudgetRef::new("stripe")];
+
+        dispatch.insert(placement("a", &refs));
+        dispatch.remove(placement("a", &refs));
+
+        assert_eq!(dispatch.len(), 0);
+        assert_eq!(dispatch.iter().count(), 0);
+    }
+
+    /// Listings read from two places now, and have to look like one.
+    #[test]
+    fn iter_interleaves_both_sources_in_dispatch_order() {
+        let (dispatch, _budgets) = with_stripe();
+        let refs = vec![BudgetRef::new("stripe")];
+
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 5,
+            id: "plain-mid",
+            budgets: &[],
+        });
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 1,
+            id: "throttled-first",
+            budgets: &refs,
+        });
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 9,
+            id: "throttled-last",
+            budgets: &refs,
+        });
+
+        let listed: Vec<(u16, String)> = dispatch.iter().collect();
+        assert_eq!(
+            listed,
+            vec![
+                (1, "throttled-first".into()),
+                (5, "plain-mid".into()),
+                (9, "throttled-last".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn len_counts_both_sources() {
+        let (dispatch, _budgets) = with_stripe();
+        let refs = vec![BudgetRef::new("stripe")];
+
+        dispatch.insert(placement("plain", &[]));
+        dispatch.insert(placement("throttled", &refs));
+
+        assert_eq!(dispatch.len(), 2);
     }
 
     #[test]
     fn removing_a_job_that_was_never_placed_is_harmless() {
-        let dispatch = Dispatch::new();
+        let dispatch = Dispatch::new(Arc::new(Budgets::new()));
         dispatch.remove(placement("absent", &[]));
 
         assert_eq!(dispatch.len(), 0);
@@ -194,7 +332,7 @@ mod tests {
 
     #[test]
     fn iter_yields_ready_jobs_in_priority_order() {
-        let dispatch = Dispatch::new();
+        let dispatch = Dispatch::new(Arc::new(Budgets::new()));
         dispatch.insert(Placement {
             queue: "q",
             priority: 5,

@@ -24,7 +24,11 @@ mod limiter;
 mod ops;
 mod registry;
 
-pub(in crate::store) use ops::{BudgetPlan, plan_budgets};
+pub(in crate::store) use registry::Budgets;
+
+pub(in crate::store) use ops::{
+    BudgetPlan, plan_budgets, sync_created_budgets, write_created_budgets,
+};
 
 /// Exposed for tests that need to construct an inconsistent store on
 /// purpose — see the cron defence-in-depth case. No production caller

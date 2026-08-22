@@ -12,7 +12,7 @@ use fjall::Readable;
 
 use crate::batch::BatchExpr;
 
-use super::super::budget::{BudgetPlan, plan_budgets};
+use super::super::budget::{Budget, BudgetPlan, plan_budgets, write_created_budgets};
 use super::super::keys::{make_job_key, make_payload_key};
 use super::super::results::EnqueueResult;
 use super::super::store::Keyspaces;
@@ -272,7 +272,7 @@ pub(super) fn apply_enqueue_batch(
     tx: &mut fjall::SingleWriterWriteTx<'_>,
     ks: &Keyspaces,
     ops: &[Vec<PreparedEnqueue>],
-) -> Result<Vec<OpOutcome>, StoreError> {
+) -> Result<(Vec<OpOutcome>, Vec<(String, Budget)>), StoreError> {
     // Maps unique_key -> (op index, job index) for conflicts against ops
     // already applied in this batch. Only successful ops are registered:
     // a failed op writes nothing, so its keys must not shadow a later
@@ -280,14 +280,19 @@ pub(super) fn apply_enqueue_batch(
     let mut batch_unique_keys: HashMap<String, (usize, usize)> = HashMap::new();
     let mut outcomes: Vec<OpOutcome> = Vec::with_capacity(ops.len());
 
+    // Budgets brought into existence by a `create_with` somewhere in
+    // this batch. Handed back so the caller can sync them into the live
+    // registry once the commit is durable — a job parking on a budget
+    // with no group vanishes from dispatch.
+    let mut created: Vec<(String, Budget)> = Vec::new();
+
     for (op_idx, prepared) in ops.iter().enumerate() {
         // Resolve budgets before writing anything for this op, so a
         // rejection leaves the transaction untouched.
         match plan_op_budgets(tx, ks, prepared)? {
-            BudgetPlan::Proceed(creations) => {
-                for (key, bytes) in creations {
-                    tx.insert(&ks.data, key, bytes);
-                }
+            BudgetPlan::Proceed(planned) => {
+                write_created_budgets(tx, ks, &planned)?;
+                created.extend(planned);
             }
             BudgetPlan::Reject(e) => {
                 outcomes.push(Err(e));
@@ -343,7 +348,7 @@ pub(super) fn apply_enqueue_batch(
         outcomes.push(Ok(results));
     }
 
-    Ok(outcomes)
+    Ok((outcomes, created))
 }
 
 #[cfg(test)]
@@ -374,7 +379,7 @@ mod tests {
         let ks = store.ks.clone();
         let outcomes = tokio::task::spawn_blocking(move || {
             let mut tx = ks.write_tx();
-            let outcomes = apply_enqueue_batch(&mut tx, &ks, &ops).unwrap();
+            let (outcomes, _created) = apply_enqueue_batch(&mut tx, &ks, &ops).unwrap();
             drop(tx);
             outcomes
         })
@@ -409,7 +414,7 @@ mod tests {
         let ks = store.ks.clone();
         let outcomes = tokio::task::spawn_blocking(move || {
             let mut tx = ks.write_tx();
-            let outcomes = apply_enqueue_batch(&mut tx, &ks, &ops).unwrap();
+            let (outcomes, _created) = apply_enqueue_batch(&mut tx, &ks, &ops).unwrap();
             drop(tx);
             outcomes
         })

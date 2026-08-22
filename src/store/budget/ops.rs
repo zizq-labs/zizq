@@ -32,6 +32,7 @@ use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
 use super::super::store::{Keyspaces, Store};
 use super::super::types::StoreError;
+use super::registry::Budgets;
 use super::{Budget, BudgetBinding, BudgetStrategy};
 
 impl Store {
@@ -47,6 +48,7 @@ impl Store {
         now: u64,
     ) -> Result<Budget, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let key = key.to_string();
 
         task::spawn_blocking(move || -> Result<Budget, StoreError> {
@@ -69,6 +71,11 @@ impl Store {
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
 
+            // Only after the record is durable: a group built from a
+            // policy that failed to commit would throttle against
+            // something that does not exist.
+            live.sync(&key, &budget, now);
+
             Ok(budget)
         })
         .await?
@@ -86,6 +93,7 @@ impl Store {
         now: u64,
     ) -> Result<Budget, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let key = key.to_string();
 
         task::spawn_blocking(move || -> Result<Budget, StoreError> {
@@ -108,6 +116,8 @@ impl Store {
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
 
+            live.sync(&key, &budget, now);
+
             Ok(budget)
         })
         .await?
@@ -125,6 +135,7 @@ impl Store {
         now: u64,
     ) -> Result<Option<Budget>, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let key = key.to_string();
 
         task::spawn_blocking(move || -> Result<Option<Budget>, StoreError> {
@@ -151,6 +162,8 @@ impl Store {
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
+
+            live.sync(&key, &budget, now);
 
             Ok(Some(budget))
         })
@@ -222,6 +235,7 @@ impl Store {
     /// budget referenced only by queued jobs can still be deleted.
     pub async fn delete_budget(&self, key: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let key = key.to_string();
 
         task::spawn_blocking(move || -> Result<bool, StoreError> {
@@ -248,6 +262,8 @@ impl Store {
 
             tx.remove(&ks.data, &budget_key);
             ks.commit(tx, ks.default_commit_mode)?;
+
+            live.forget(&key);
 
             Ok(true)
         })
@@ -345,9 +361,11 @@ fn check_cron_costs_fit(
 
 /// The outcome of planning a set of budget bindings.
 pub(in crate::store) enum BudgetPlan {
-    /// Every binding resolved. These records must be written before
-    /// whatever referenced them.
-    Proceed(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Every binding resolved. Any budgets listed here must be written
+    /// before whatever referenced them, and synced into the live
+    /// registry once that write is durable — a job parking on a budget
+    /// with no group would be silently dropped from dispatch.
+    Proceed(Vec<(String, Budget)>),
 
     /// A binding could not be honoured. Nothing has been written.
     Reject(StoreError),
@@ -427,12 +445,44 @@ where
         }
     }
 
-    Ok(BudgetPlan::Proceed(
-        planned
-            .into_iter()
-            .map(|(key, budget)| Ok((make_budget_key(&key), rmp_serde::to_vec_named(&budget)?)))
-            .collect::<Result<Vec<_>, StoreError>>()?,
-    ))
+    Ok(BudgetPlan::Proceed(planned.into_iter().collect()))
+}
+
+/// Write planned budget creations into a transaction.
+///
+/// Paired with [`sync_created_budgets`], which must run once the
+/// transaction is durable. Splitting the two is deliberate: a group
+/// built from a policy whose write then failed would throttle jobs
+/// against a budget that does not exist.
+pub(in crate::store) fn write_created_budgets(
+    tx: &mut fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    created: &[(String, Budget)],
+) -> Result<(), StoreError> {
+    for (key, budget) in created {
+        tx.insert(
+            &ks.data,
+            make_budget_key(key),
+            rmp_serde::to_vec_named(budget)?,
+        );
+    }
+
+    Ok(())
+}
+
+/// Bring newly written budgets into the live registry.
+///
+/// Call only after the writes from [`write_created_budgets`] have
+/// committed. Skipping it would leave jobs parking on budgets with no
+/// group, which drops them from dispatch without a trace.
+pub(in crate::store) fn sync_created_budgets(
+    live: &Budgets,
+    created: &[(String, Budget)],
+    now: u64,
+) {
+    for (key, budget) in created {
+        live.sync(key, budget, now);
+    }
 }
 
 /// Build a budget key: `B\0{key}`.

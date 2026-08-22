@@ -61,6 +61,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use super::super::budget::{Budgets, sync_created_budgets};
 use super::super::dispatch::Dispatch;
 use super::super::results::EnqueueResult;
 use super::super::scheduled_index::ScheduledIndex;
@@ -97,6 +98,7 @@ impl EnqueueBatcher {
     pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
         dispatch: Arc<Dispatch>,
+        budgets: Arc<Budgets>,
         scheduled_index: Arc<ScheduledIndex>,
         event_tx: broadcast::Sender<StoreEvent>,
         batch_size: usize,
@@ -126,7 +128,7 @@ impl EnqueueBatcher {
                         }
                     }
 
-                    process_batch(&ks, &dispatch, &scheduled_index, &event_tx, batch);
+                    process_batch(&ks, &dispatch, &budgets, &scheduled_index, &event_tx, batch);
                 }
             })
             .expect("failed to spawn enqueue-batcher thread");
@@ -162,6 +164,7 @@ impl EnqueueBatcher {
 fn process_batch(
     ks: &Keyspaces,
     dispatch: &Dispatch,
+    budgets: &Budgets,
     scheduled_index: &ScheduledIndex,
     event_tx: &broadcast::Sender<StoreEvent>,
     batch: Vec<EnqueueOp>,
@@ -179,6 +182,10 @@ fn process_batch(
     }
     let jobs_count: usize = ops.iter().map(Vec::len).sum();
 
+    // Every op carries its caller's clock reading; any of them will do
+    // for stamping budgets this batch creates.
+    let now = ops.iter().flatten().next().map(|p| p.now);
+
     tracing::debug!(
         ops = ops_count,
         jobs = jobs_count,
@@ -186,7 +193,7 @@ fn process_batch(
     );
 
     let mut tx = ks.write_tx();
-    let outcomes = match apply_enqueue_batch(&mut tx, ks, &ops) {
+    let (outcomes, created_budgets) = match apply_enqueue_batch(&mut tx, ks, &ops) {
         Ok(r) => r,
         Err(e) => {
             // apply_enqueue_batch failed for the whole batch (e.g. a
@@ -234,6 +241,13 @@ fn process_batch(
             }
             return;
         }
+        // Only now that the records are durable. A group built from a
+        // policy whose write failed would throttle jobs against a
+        // budget that does not exist.
+        if let Some(now) = now {
+            sync_created_budgets(budgets, &created_budgets, now);
+        }
+
         tracing::debug!(
             ops = ops_count,
             jobs = jobs_count,
