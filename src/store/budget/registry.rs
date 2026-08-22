@@ -73,10 +73,11 @@
 //! publish the count before signalling a waiting worker, never after —
 //! the signal is what guarantees someone looks again.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::super::ready_index::ReadyIndex;
 use super::limiter::Limiter;
 use super::{Budget, BudgetRef};
 
@@ -85,18 +86,46 @@ struct BudgetGroup {
     /// Tokens, and how they come back.
     limiter: Limiter,
 
-    /// Jobs waiting on this budget, ordered exactly as the ready index
-    /// orders its own: priority first, then id, which is time-ordered.
+    /// Jobs waiting on this budget.
+    ///
+    /// The same index the unthrottled jobs use, one instance per
+    /// budget. It already solves exactly this problem — ordered by
+    /// priority then id, with a per-queue view so a worker taking from
+    /// named queues does not walk past jobs in queues it did not ask
+    /// for.
+    ///
+    /// Its lock-free internals are redundant under the registry mutex.
+    /// That is a deliberate trade: a budget exists to cap a dispatch
+    /// rate, so this is by construction not a hot path, and shared
+    /// correctness is worth more here than shaving uncontended atomics
+    /// off a path the feature exists to slow down.
     ///
     /// Holds identity only, not job records. The store is authoritative
-    /// and a claimed job is re-read from it anyway, so keeping whole
-    /// jobs here would be a second copy to go stale.
-    jobs: BTreeSet<(u16, String)>,
+    /// and a claimed job is re-read from it anyway.
+    jobs: ReadyIndex,
 }
 
 /// Live accounting for every budget with a group.
 pub(super) struct Budgets {
     inner: Mutex<HashMap<String, BudgetGroup>>,
+
+    /// Every parked job, exactly once, whatever number of budgets it
+    /// draws from.
+    ///
+    /// Deliberately outside the mutex. The lock exists so that an
+    /// acquire spanning several budgets is atomic, and a reader
+    /// counting or listing jobs has no stake in that — it wants a
+    /// number, not a consistent view of token state. `ReadyIndex` is
+    /// safe to read concurrently, which is why `ready_count` is
+    /// lock-free today, and the same applies here: a count read
+    /// mid-update is momentarily stale, and the next read corrects it.
+    ///
+    /// It exists because the per-budget groups cannot answer "how many
+    /// jobs" without deduplication — a job waits in one queue per
+    /// budget, so summing the groups would report a two-budget job
+    /// twice. Feeding an inflated depth to `zizq top` would undermine
+    /// every other number on the screen.
+    all: ReadyIndex,
 
     /// Jobs currently waiting on some budget.
     ///
@@ -111,6 +140,7 @@ impl Budgets {
     pub(super) fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            all: ReadyIndex::new(),
             waiting: AtomicUsize::new(0),
         }
     }
@@ -139,7 +169,7 @@ impl Budgets {
                     key.to_string(),
                     BudgetGroup {
                         limiter: Limiter::new(budget, now),
-                        jobs: BTreeSet::new(),
+                        jobs: ReadyIndex::new(),
                     },
                 );
             }
@@ -156,6 +186,19 @@ impl Budgets {
 
         if let Some(group) = groups.remove(key) {
             self.waiting.fetch_sub(group.jobs.len(), Ordering::Relaxed);
+
+            // Jobs left waiting only on this budget leave the roll-up
+            // with it; ones that also draw on a surviving budget stay.
+            // Normally an empty loop, since deleting a budget anything
+            // references is refused.
+            for (priority, id, queue) in group.jobs.iter_with_queue() {
+                let elsewhere = groups
+                    .values()
+                    .any(|other| other.jobs.contains(priority, &id));
+                if !elsewhere {
+                    self.all.remove(&queue, priority, &id);
+                }
+            }
         }
     }
 
@@ -169,7 +212,7 @@ impl Budgets {
     /// queues, because any of them could be the one that frees up.
     /// Whichever group offers it, the acquire still has to satisfy
     /// every budget it names.
-    pub(super) fn park(&self, budgets: &[BudgetRef], priority: u16, job_id: &str) {
+    pub(super) fn park(&self, budgets: &[BudgetRef], queue: &str, priority: u16, job_id: &str) {
         // Counted up before the jobs land, unlike the removal paths
         // which count down afterwards. Both orderings leave a window
         // where the count disagrees with the queues, and the point is
@@ -188,11 +231,22 @@ impl Budgets {
             // protections exist to prevent. Skipped rather than
             // conjured: inventing a group here would invent an
             // allocation to go with it.
-            if let Some(group) = groups.get_mut(&reference.key)
-                && group.jobs.insert((priority, job_id.to_string()))
-            {
-                parked += 1;
+            if let Some(group) = groups.get_mut(&reference.key) {
+                // Measured rather than assumed: inserting a job already
+                // parked here is a no-op, and counting it anyway would
+                // leave the tally permanently above zero, pinning the
+                // lock-free hint on forever.
+                let before = group.jobs.len();
+                group.jobs.insert(queue, priority, job_id.to_string());
+                parked += group.jobs.len() - before;
             }
+        }
+
+        if parked > 0 {
+            // Written under the lock alongside the groups, though read
+            // without it. Idempotent, so a job on several budgets lands
+            // here once.
+            self.all.insert(queue, priority, job_id.to_string());
         }
 
         // Give back what the optimistic count over-claimed: references
@@ -212,25 +266,63 @@ impl Budgets {
     ///
     /// Must clear the job from *every* group it was parked on, or it
     /// would keep being offered from the ones it was missed in.
-    pub(super) fn unpark(&self, budgets: &[BudgetRef], priority: u16, job_id: &str) {
+    pub(super) fn unpark(&self, budgets: &[BudgetRef], queue: &str, priority: u16, job_id: &str) {
         let mut groups = self.inner.lock().unwrap();
         let mut removed = 0;
 
         for reference in budgets {
-            if let Some(group) = groups.get_mut(&reference.key)
-                && group.jobs.remove(&(priority, job_id.to_string()))
-            {
-                removed += 1;
+            if let Some(group) = groups.get_mut(&reference.key) {
+                let before = group.jobs.len();
+                group.jobs.remove(queue, priority, job_id);
+                removed += before - group.jobs.len();
             }
+        }
+
+        if removed > 0 {
+            // The job is leaving the ready state altogether, not just
+            // one budget's queue, so it leaves the roll-up too.
+            self.all.remove(queue, priority, job_id);
         }
 
         self.waiting.fetch_sub(removed, Ordering::Relaxed);
     }
 
-    /// The job at the front of a budget's queue, if any.
-    pub(super) fn head(&self, key: &str) -> Option<(u16, String)> {
+    /// The next job a budget would offer, if any.
+    ///
+    /// Yields `(priority, job_id, queue)`, matching what the ready
+    /// index hands back from a claim. An empty `queues` means the
+    /// worker will take from anywhere; otherwise only jobs in those
+    /// queues are considered, and the best across them wins.
+    pub(super) fn head(
+        &self,
+        key: &str,
+        queues: &HashSet<String>,
+    ) -> Option<(u16, String, String)> {
         let groups = self.inner.lock().unwrap();
-        groups.get(key)?.jobs.first().cloned()
+        groups.get(key)?.jobs.peek(queues)
+    }
+
+    /// Every job waiting on any budget, in dispatch order, once each.
+    ///
+    /// Lock-free and lazy — reads the roll-up rather than merging the
+    /// per-budget queues, so nothing needs deduplicating and nothing is
+    /// collected up front.
+    pub(super) fn entries(&self) -> impl Iterator<Item = (u16, String)> + '_ {
+        self.all.iter()
+    }
+
+    /// How many distinct jobs are waiting on any budget.
+    ///
+    /// Lock-free and constant time. Counts a job once however many
+    /// budgets it draws from, unlike [`waiting`](Self::waiting), which
+    /// tallies queue memberships and exists only as a "is there
+    /// anything at all" hint.
+    ///
+    /// Reached on every admin event while `zizq top` is connected — so
+    /// once per job state change — which is why it must not walk the
+    /// queues to work the answer out.
+    pub(super) fn job_count(&self) -> usize {
+        self.all.len()
     }
 
     /// Take tokens from every budget, or none of them.
@@ -325,6 +417,7 @@ impl Budgets {
     pub(super) fn clear(&self) {
         let mut groups = self.inner.lock().unwrap();
         groups.clear();
+        self.all.clear();
         self.waiting.store(0, Ordering::Relaxed);
     }
 
@@ -381,11 +474,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, 0, "a");
+        budgets.park(&refs, "q", 0, "a");
         assert_eq!(budgets.waiting(), 1);
         assert_eq!(budgets.depth("stripe"), 1);
 
-        budgets.unpark(&refs, 0, "a");
+        budgets.unpark(&refs, "q", 0, "a");
         assert_eq!(budgets.waiting(), 0);
         assert_eq!(budgets.depth("stripe"), 0);
     }
@@ -397,11 +490,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
         let refs = vec![draws("stripe", 1), draws("tenant", 1)];
 
-        budgets.park(&refs, 0, "a");
+        budgets.park(&refs, "q", 0, "a");
         assert_eq!(budgets.depth("stripe"), 1);
         assert_eq!(budgets.depth("tenant"), 1);
 
-        budgets.unpark(&refs, 0, "a");
+        budgets.unpark(&refs, "q", 0, "a");
         assert_eq!(budgets.depth("stripe"), 0);
         assert_eq!(budgets.depth("tenant"), 0);
         assert_eq!(budgets.waiting(), 0);
@@ -414,11 +507,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, 0, "a");
-        budgets.park(&refs, 0, "a");
+        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, "a");
         assert_eq!(budgets.waiting(), 1);
 
-        budgets.unpark(&refs, 0, "a");
+        budgets.unpark(&refs, "q", 0, "a");
         assert_eq!(budgets.waiting(), 0);
     }
 
@@ -426,7 +519,7 @@ mod tests {
     fn unparking_a_job_that_was_never_parked_is_harmless() {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
 
-        budgets.unpark(&[draws("stripe", 1)], 0, "absent");
+        budgets.unpark(&[draws("stripe", 1)], "q", 0, "absent");
 
         assert_eq!(budgets.waiting(), 0);
     }
@@ -436,15 +529,135 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, 5, "later");
-        budgets.park(&refs, 1, "urgent");
-        budgets.park(&refs, 5, "earlier");
+        budgets.park(&refs, "q", 5, "later");
+        budgets.park(&refs, "q", 1, "urgent");
+        budgets.park(&refs, "q", 5, "earlier");
 
-        assert_eq!(budgets.head("stripe"), Some((1, "urgent".into())));
+        assert_eq!(
+            budgets.head("stripe", &HashSet::new()),
+            Some((1, "urgent".into(), "q".into()))
+        );
 
-        budgets.unpark(&refs, 1, "urgent");
+        budgets.unpark(&refs, "q", 1, "urgent");
         // Same priority falls back to id order, which is time order.
-        assert_eq!(budgets.head("stripe"), Some((5, "earlier".into())));
+        assert_eq!(
+            budgets.head("stripe", &HashSet::new()),
+            Some((5, "earlier".into(), "q".into()))
+        );
+    }
+
+    fn queues(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The roll-up counts a job once however many budgets it draws
+    /// from — summing the per-budget queues would report it twice, and
+    /// that number is what `zizq top` shows as the ready depth.
+    #[test]
+    fn a_multi_budget_job_counts_once() {
+        let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
+        let refs = vec![draws("stripe", 1), draws("tenant", 1)];
+
+        budgets.park(&refs, "q", 0, "a");
+
+        assert_eq!(budgets.job_count(), 1);
+        // ...while the hint tallies queue memberships, so it sees two.
+        assert_eq!(budgets.waiting(), 2);
+
+        let listed: Vec<(u16, String)> = budgets.entries().collect();
+        assert_eq!(listed, vec![(0, "a".into())]);
+    }
+
+    #[test]
+    fn the_roll_up_empties_when_a_job_leaves() {
+        let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
+        let refs = vec![draws("stripe", 1), draws("tenant", 1)];
+
+        budgets.park(&refs, "q", 0, "a");
+        budgets.unpark(&refs, "q", 0, "a");
+
+        assert_eq!(budgets.job_count(), 0);
+        assert_eq!(budgets.entries().count(), 0);
+    }
+
+    #[test]
+    fn the_roll_up_lists_jobs_in_dispatch_order() {
+        let budgets = registry_with(&[("stripe", concurrency(5))]);
+        let refs = vec![draws("stripe", 1)];
+
+        budgets.park(&refs, "q", 9, "low");
+        budgets.park(&refs, "q", 1, "high");
+
+        let listed: Vec<(u16, String)> = budgets.entries().collect();
+        assert_eq!(listed, vec![(1, "high".into()), (9, "low".into())]);
+    }
+
+    /// Dropping one budget must not evict a job that is still waiting
+    /// on another.
+    #[test]
+    fn forgetting_a_budget_keeps_jobs_that_draw_on_another() {
+        let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
+        budgets.park(&[draws("stripe", 1), draws("tenant", 1)], "q", 0, "shared");
+        budgets.park(&[draws("stripe", 1)], "q", 0, "only-stripe");
+
+        budgets.forget("stripe");
+
+        let listed: Vec<(u16, String)> = budgets.entries().collect();
+        assert_eq!(listed, vec![(0, "shared".into())]);
+        assert_eq!(budgets.job_count(), 1);
+    }
+
+    #[test]
+    fn a_filtered_head_only_considers_the_named_queues() {
+        let budgets = registry_with(&[("stripe", concurrency(5))]);
+        let refs = vec![draws("stripe", 1)];
+
+        budgets.park(&refs, "emails", 1, "urgent-email");
+        budgets.park(&refs, "reports", 5, "slow-report");
+
+        assert_eq!(
+            budgets.head("stripe", &queues(&["reports"])),
+            Some((5, "slow-report".into(), "reports".into()))
+        );
+    }
+
+    /// A worker asking for a queue the group holds nothing for gets
+    /// nothing — without walking the jobs it did not ask about.
+    #[test]
+    fn a_filtered_head_is_empty_when_no_job_matches() {
+        let budgets = registry_with(&[("stripe", concurrency(5))]);
+        budgets.park(&[draws("stripe", 1)], "emails", 0, "a");
+
+        assert_eq!(budgets.head("stripe", &queues(&["reports"])), None);
+    }
+
+    #[test]
+    fn a_filtered_head_picks_the_best_across_the_named_queues() {
+        let budgets = registry_with(&[("stripe", concurrency(5))]);
+        let refs = vec![draws("stripe", 1)];
+
+        budgets.park(&refs, "emails", 9, "low");
+        budgets.park(&refs, "reports", 2, "high");
+        budgets.park(&refs, "ignored", 0, "highest");
+
+        assert_eq!(
+            budgets.head("stripe", &queues(&["emails", "reports"])),
+            Some((2, "high".into(), "reports".into()))
+        );
+    }
+
+    /// The per-queue view has to be maintained on the way out too, or a
+    /// filtered head would keep offering a job that has already gone.
+    #[test]
+    fn unparking_clears_the_job_from_the_queue_view() {
+        let budgets = registry_with(&[("stripe", concurrency(5))]);
+        let refs = vec![draws("stripe", 1)];
+
+        budgets.park(&refs, "emails", 0, "a");
+        budgets.unpark(&refs, "emails", 0, "a");
+
+        assert_eq!(budgets.head("stripe", &queues(&["emails"])), None);
+        assert_eq!(budgets.head("stripe", &HashSet::new()), None);
     }
 
     #[test]
@@ -570,7 +783,7 @@ mod tests {
     #[test]
     fn syncing_an_existing_budget_keeps_its_waiting_jobs() {
         let budgets = registry_with(&[("stripe", concurrency(10))]);
-        budgets.park(&[draws("stripe", 1)], 0, "a");
+        budgets.park(&[draws("stripe", 1)], "q", 0, "a");
 
         budgets.sync("stripe", &concurrency(20), NOW);
 
@@ -600,8 +813,8 @@ mod tests {
     #[test]
     fn forgetting_a_budget_drops_its_waiting_jobs_from_the_count() {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
-        budgets.park(&[draws("stripe", 1)], 0, "a");
-        budgets.park(&[draws("stripe", 1)], 0, "b");
+        budgets.park(&[draws("stripe", 1)], "q", 0, "a");
+        budgets.park(&[draws("stripe", 1)], "q", 0, "b");
         assert_eq!(budgets.waiting(), 2);
 
         budgets.forget("stripe");
@@ -613,7 +826,7 @@ mod tests {
     #[test]
     fn clearing_forgets_everything() {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
-        budgets.park(&[draws("stripe", 1), draws("tenant", 1)], 0, "a");
+        budgets.park(&[draws("stripe", 1), draws("tenant", 1)], "q", 0, "a");
 
         budgets.clear();
 

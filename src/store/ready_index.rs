@@ -97,6 +97,52 @@ impl ReadyIndex {
         })
     }
 
+    /// Whether an entry is present.
+    pub(super) fn contains(&self, priority: u16, job_id: &str) -> bool {
+        self.global.contains_key(&(priority, job_id.to_string()))
+    }
+
+    /// Iterate every entry, yielding `(priority, job_id, queue)`.
+    ///
+    /// The queue-bearing counterpart of [`iter`](Self::iter), for
+    /// callers that need to address entries in another index.
+    pub(super) fn iter_with_queue(&self) -> impl Iterator<Item = (u16, String, String)> + '_ {
+        self.global.iter().map(|entry| {
+            let (priority, job_id) = entry.key();
+            (*priority, job_id.clone(), entry.value().clone())
+        })
+    }
+
+    /// Drop every entry.
+    pub(super) fn clear(&self) {
+        self.global.clear();
+        self.by_queue.clear();
+    }
+
+    /// The job this index would offer next, without taking it.
+    ///
+    /// Same selection as [`claim`](Self::claim) but non-destructive, for
+    /// callers that must decide whether they can accept a job before
+    /// committing to removing it — a budgeted job cannot be taken until
+    /// its budgets have been debited, and that can fail.
+    pub(super) fn peek(&self, queues: &HashSet<String>) -> Option<(u16, String, String)> {
+        if queues.is_empty() {
+            let entry = self.global.front()?;
+            let (priority, job_id) = entry.key();
+            return Some((*priority, job_id.clone(), entry.value().clone()));
+        }
+
+        queues
+            .iter()
+            .filter_map(|queue| {
+                let set = self.by_queue.get(queue)?;
+                let entry = set.front()?;
+                let (priority, job_id) = entry.value();
+                Some((*priority, job_id.clone(), queue.clone()))
+            })
+            .min()
+    }
+
     /// Atomically claim the highest-priority (lowest number), oldest ready job.
     ///
     /// Returns `(priority, job_id, queue)` if a job was claimed, or `None` if
