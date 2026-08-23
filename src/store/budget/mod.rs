@@ -28,7 +28,8 @@ mod registry;
 pub(in crate::store) use registry::Budgets;
 
 pub(in crate::store) use ops::{
-    BudgetPlan, plan_budgets, sync_created_budgets, write_created_budgets,
+    BudgetPlan, plan_budgets, stage_budgets, sync_created_budgets, unstage_budgets,
+    write_created_budgets,
 };
 
 /// Exposed for tests that need to construct an inconsistent store on

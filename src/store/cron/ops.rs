@@ -14,13 +14,15 @@ use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::super::budget::{
-    Budget, BudgetPlan, plan_budgets, sync_created_budgets, write_created_budgets,
+    Budget, BudgetPlan, plan_budgets, stage_budgets, sync_created_budgets, unstage_budgets,
+    write_created_budgets,
 };
 use super::super::enqueue::{
     apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue, validate_batch_config,
 };
 use super::super::keys::RecordKind;
 use super::super::options::{CronEntryOptions, PatchCronGroupOptions, ReplaceCronGroupOptions};
+use super::super::results::EnqueueResult;
 use super::super::store::{Keyspaces, Store, StoreEvent};
 use super::super::types::StoreError;
 use super::{CronEntry, CronGroup};
@@ -1014,9 +1016,21 @@ impl Store {
                     _ => None,
                 };
 
-                ks.commit(tx, ks.enqueue_commit_mode)?;
+                // Staged before the commit, while the write lock still
+                // excludes every other writer — see `stage_budgets`.
+                // Cron fires jobs like any other enqueue, so it needs
+                // the same protection against a budget being deleted in
+                // the gap between durability and accounting.
+                let fired = enqueue_result.as_ref().and_then(|r| match r {
+                    EnqueueResult::Created(job) => Some(job),
+                    EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
+                });
+                stage_budgets(&live, &budget_creations, fired, now);
 
-                sync_created_budgets(&live, &budget_creations, now);
+                if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
+                    unstage_budgets(&live, &budget_creations, fired);
+                    return Err(e);
+                }
 
                 // ---- outside tx: update in-memory indexes ----
 
@@ -2975,6 +2989,34 @@ mod budget_tests {
 
         let budget = store.get_budget("stripe").await.unwrap().unwrap();
         assert_eq!(budget.allocation, 10);
+    }
+
+    /// A cron firing is an enqueue like any other, so the job it
+    /// creates counts against its budgets. Installing the entry alone
+    /// must not — an entry is a standing claim guarded separately, and
+    /// counting it here would double-count every schedule.
+    #[tokio::test]
+    async fn firing_tracks_the_job_it_enqueues() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({})).budget(
+            BudgetBinding::new("stripe")
+                .cost(6)
+                .create_with(BudgetPolicy {
+                    allocation: 10,
+                    strategy: BudgetStrategy::WhileInFlight,
+                }),
+        );
+        install(&store, job).await;
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+
+        store
+            .promote_cron_entry("g", "nightly", NOW + 120_000)
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(6));
     }
 
     /// Defence in depth for a state the install-time and deletion

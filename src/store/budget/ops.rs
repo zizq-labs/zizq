@@ -31,7 +31,7 @@ use super::super::cron::cron_budget_usage;
 use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
 use super::super::store::{Keyspaces, Store};
-use super::super::types::StoreError;
+use super::super::types::{Job, StoreError};
 use super::registry::Budgets;
 use super::{Budget, BudgetBinding, BudgetStrategy};
 
@@ -450,10 +450,8 @@ where
 
 /// Write planned budget creations into a transaction.
 ///
-/// Paired with [`sync_created_budgets`], which must run once the
-/// transaction is durable. Splitting the two is deliberate: a group
-/// built from a policy whose write then failed would throttle jobs
-/// against a budget that does not exist.
+/// Paired with [`stage_budgets`], which brings the same creations into
+/// the live registry.
 pub(in crate::store) fn write_created_budgets(
     tx: &mut fjall::SingleWriterWriteTx<'_>,
     ks: &Keyspaces,
@@ -470,11 +468,22 @@ pub(in crate::store) fn write_created_budgets(
     Ok(())
 }
 
-/// Bring newly written budgets into the live registry.
+/// Bring newly written budgets into the live registry, **after** the
+/// transaction that wrote them has committed.
 ///
-/// Call only after the writes from [`write_created_budgets`] have
-/// committed. Skipping it would leave jobs parking on budgets with no
-/// group, which drops them from dispatch without a trace.
+/// For paths that create budgets without enqueuing jobs — installing a
+/// cron group, whose entries reference budgets but are not themselves
+/// tracked jobs. Waiting for durability is right here, and is the
+/// safer half of the trade: a group built from a policy whose write
+/// then failed would throttle jobs against a budget that does not
+/// exist.
+///
+/// There is no accounting window to close, because the guard protecting
+/// a budget referenced by a cron entry reads the *keyspace* inside the
+/// deleting transaction (`cron_budget_usage`) rather than the registry.
+/// A concurrent delete is therefore serialised against the install by
+/// the write lock, with no in-memory state in the middle. Paths that
+/// enqueue jobs have no such luxury and must use [`stage_budgets`].
 pub(in crate::store) fn sync_created_budgets(
     live: &Budgets,
     created: &[(String, Budget)],
@@ -482,6 +491,76 @@ pub(in crate::store) fn sync_created_budgets(
 ) {
     for (key, budget) in created {
         live.sync(key, budget, now);
+    }
+}
+
+/// Bring the in-memory budget state in line with a transaction that is
+/// written but **not yet committed**.
+///
+/// Two things are staged: groups for the budgets this transaction
+/// creates, and cost accounting for the jobs it enqueues.
+///
+/// **Call while the write lock is still held**, which is what makes the
+/// accounting safe. The guards that refuse to delete or shrink a budget
+/// read the live registry rather than the keyspace, so if this ran after
+/// the commit there would be a window — the records durable, the
+/// accounting not yet applied — in which a concurrent `DELETE
+/// /budgets/{key}` sees the budget as unreferenced and removes it. The
+/// job it stranded would then park into a group that no longer exists,
+/// which drops it from dispatch permanently: a restart does not recover
+/// it, because the budget really is gone. Staging under the lock means a
+/// delete either runs entirely before this transaction — in which case
+/// the enqueue's own in-transaction validation rejects the reference —
+/// or entirely after, and sees the jobs.
+///
+/// The earlier ordering, which synced only after a durable commit, was
+/// guarding against the opposite failure: a group built from a policy
+/// whose write then failed would throttle jobs against a budget that
+/// does not exist. That risk is real, and is why [`unstage_budgets`]
+/// exists rather than the ordering simply being reversed.
+pub(in crate::store) fn stage_budgets<'a>(
+    live: &Budgets,
+    created: &[(String, Budget)],
+    jobs: impl IntoIterator<Item = &'a Job>,
+    now: u64,
+) {
+    for (key, budget) in created {
+        live.sync(key, budget, now);
+    }
+
+    // After the groups exist — a job tracked against a budget with no
+    // group is silently skipped, and a batch that creates a budget and
+    // enqueues against it in one transaction would lose the accounting
+    // for exactly the jobs that need it most.
+    for job in jobs {
+        live.track(&job.budgets);
+    }
+}
+
+/// Undo [`stage_budgets`] after a commit that did not happen.
+///
+/// Takes the same `created` and `jobs` the staging call was given, so
+/// the two stay symmetrical by construction rather than by a caller
+/// remembering what it staged.
+///
+/// This runs after the write lock has been released, so there is a brief
+/// window in which the registry describes work that no longer exists.
+/// The consequence is a delete or shrink refused that would in fact have
+/// been safe — transient, self-correcting, and in the conservative
+/// direction. The reverse ordering has no such harmless failure.
+pub(in crate::store) fn unstage_budgets<'a>(
+    live: &Budgets,
+    created: &[(String, Budget)],
+    jobs: impl IntoIterator<Item = &'a Job>,
+) {
+    for job in jobs {
+        live.untrack(&job.budgets);
+    }
+
+    // After the untracking, so the counts a group is discarded with are
+    // the ones it should have had.
+    for (key, _) in created {
+        live.forget(key);
     }
 }
 

@@ -61,13 +61,13 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use super::super::budget::{Budgets, sync_created_budgets};
+use super::super::budget::{Budgets, stage_budgets, unstage_budgets};
 use super::super::dispatch::Dispatch;
 use super::super::results::EnqueueResult;
 use super::super::scheduled_index::ScheduledIndex;
 use super::super::store::{Keyspaces, StoreEvent};
-use super::super::types::StoreError;
-use super::apply::apply_enqueue_batch;
+use super::super::types::{Job, StoreError};
+use super::apply::{OpOutcome, apply_enqueue_batch};
 use super::finalize::finalize_enqueue;
 use super::prepare::PreparedEnqueue;
 
@@ -228,7 +228,19 @@ fn process_batch(
     let duplicate = jobs_count - writes;
 
     if writes > 0 {
+        // Staged before the commit, while the write lock still excludes
+        // every other writer. Doing it afterwards would leave a window
+        // in which the jobs are durable but unaccounted for, and a
+        // concurrent budget delete would see them as absent.
+        if let Some(now) = now {
+            stage_budgets(budgets, &created_budgets, created_jobs(&outcomes), now);
+        }
+
         if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
+            // Nothing became durable, so nothing may go on referencing
+            // it — including the groups this batch would have created.
+            unstage_budgets(budgets, &created_budgets, created_jobs(&outcomes));
+
             tracing::error!(
                 ops = ops_count,
                 jobs = jobs_count,
@@ -240,12 +252,6 @@ fn process_batch(
                 let _ = reply.send(Err(StoreError::Internal(msg.clone())));
             }
             return;
-        }
-        // Only now that the records are durable. A group built from a
-        // policy whose write failed would throttle jobs against a
-        // budget that does not exist.
-        if let Some(now) = now {
-            sync_created_budgets(budgets, &created_budgets, now);
         }
 
         tracing::debug!(
@@ -279,4 +285,25 @@ fn process_batch(
         }
         let _ = reply.send(outcome);
     }
+}
+
+/// The jobs a batch actually brought into existence.
+///
+/// Only `Created` counts. A `Duplicate` returns a job that was already
+/// enqueued, and a `Folded` merges a payload into a batched job that
+/// already exists — in both cases the job was tracked when it was first
+/// created, and counting it again would leave the budget permanently
+/// holding a reference to work that has already finished.
+///
+/// Borrows rather than collects, so the staging and unwinding calls can
+/// each walk the same outcomes without either of them owning a copy.
+fn created_jobs(outcomes: &[OpOutcome]) -> impl Iterator<Item = &Job> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .flatten()
+        .filter_map(|result| match result {
+            EnqueueResult::Created(job) => Some(job),
+            EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
+        })
 }

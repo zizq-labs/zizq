@@ -250,6 +250,87 @@ mod tests {
         assert_eq!(budget.created_at, now);
     }
 
+    /// An enqueued job is counted against every budget it draws from,
+    /// so the guards can tell that deleting or shrinking one would
+    /// strand work already committed to it.
+    #[tokio::test]
+    async fn enqueue_tracks_a_job_against_its_budgets() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!({}))
+                    .budget(BudgetBinding::new("stripe").cost(9)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(9));
+    }
+
+    /// The ordering inside `stage_budgets`: the group has to exist
+    /// before the job is tracked against it, or a batch that creates a
+    /// budget and enqueues against it in one transaction silently loses
+    /// the accounting for the very jobs that need it.
+    #[tokio::test]
+    async fn a_budget_created_by_the_same_enqueue_still_tracks_the_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!({})).budget(
+                    BudgetBinding::new("stripe")
+                        .cost(4)
+                        .create_with(while_in_flight(50)),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(4));
+    }
+
+    /// A duplicate returns the job that already exists rather than
+    /// writing a new one. Counting it again would leave the budget
+    /// holding a reference that nothing will ever release.
+    #[tokio::test]
+    async fn a_duplicate_enqueue_does_not_track_a_second_time() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!({}))
+                        .budget(BudgetBinding::new("stripe").cost(3))
+                        .unique_key("only-one"),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+    }
+
     /// The server stays authoritative: an enqueue cannot restate the
     /// policy of a budget an operator has already configured.
     #[tokio::test]

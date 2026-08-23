@@ -244,8 +244,15 @@ impl Budgets {
     /// and creates budgets before writing the job, so a missing group
     /// means state that should not exist, and inventing one here would
     /// invent an allocation with it.
-    #[allow(dead_code, reason = "used once the job-side guards call it")]
+    /// An unbudgeted job returns without taking the lock. Enqueue calls
+    /// this for every job it writes, and most jobs draw on nothing —
+    /// keeping them off the mutex entirely is the non-negotiable that
+    /// says the feature costs nothing to those not using it.
     pub(in crate::store) fn track(&self, budgets: &[BudgetRef]) {
+        if budgets.is_empty() {
+            return;
+        }
+
         let mut inner = self.inner.lock().unwrap();
 
         for reference in budgets {
@@ -259,9 +266,13 @@ impl Budgets {
     ///
     /// Called when a job reaches a terminal state or is deleted — not
     /// when it is merely dispatched. See [`Budgets::track`] for how this
-    /// pair differs from the other two.
-    #[allow(dead_code, reason = "used once the job-side guards call it")]
+    /// pair differs from the other two, and for why an unbudgeted job
+    /// returns without taking the lock.
     pub(in crate::store) fn untrack(&self, budgets: &[BudgetRef]) {
+        if budgets.is_empty() {
+            return;
+        }
+
         let mut inner = self.inner.lock().unwrap();
 
         for reference in budgets {
