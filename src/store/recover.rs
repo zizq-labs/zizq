@@ -164,9 +164,15 @@ impl Store {
     /// Scans for all Ready jobs, reads their metadata to get queue and
     /// priority, and inserts each entry into the skip list. No mutex needed —
     /// each `insert()` is lock-free, and recovery runs before any consumers.
+    ///
+    /// Also counts each job against its budgets. That accounting is
+    /// memory-only, so it has to be rebuilt from the same scan rather
+    /// than surviving the restart; folding it in here avoids a third
+    /// pass over the job records purely to re-derive it.
     async fn rebuild_dispatch(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
         let dispatch = self.dispatch.clone();
+        let budgets = self.budgets.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Ready jobs.
@@ -193,6 +199,7 @@ impl Store {
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
+                budgets.track(&job.budgets);
                 dispatch.insert(Placement::of(&job));
                 count += 1;
             }
@@ -206,9 +213,15 @@ impl Store {
     ///
     /// Scans for all Scheduled jobs, reads their metadata to get `ready_at`,
     /// and inserts each entry into the SkipSet.
+    ///
+    /// Counts each job against its budgets too. A scheduled job is not
+    /// queued for dispatch and holds no tokens, but it is unfinished
+    /// work already committed to the budget — shrinking an allocation
+    /// below what one costs would strand it the moment it came due.
     async fn rebuild_scheduled_index(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
+        let budgets = self.budgets.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Scheduled jobs.
@@ -240,6 +253,7 @@ impl Store {
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
+                budgets.track(&job.budgets);
                 scheduled_index.insert(job.ready_at, job_id);
                 count += 1;
             }
@@ -520,6 +534,54 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The cost accounting is memory-only, so a restart has to re-derive
+    /// it or every budget comes back looking unreferenced — and the
+    /// guards would then happily delete one out from under a full queue.
+    ///
+    /// Covers both scans: a ready job and a scheduled one. The scheduled
+    /// job is the easier one to miss, since it is not queued for
+    /// dispatch and holds no tokens, but shrinking below its cost would
+    /// strand it the moment it came due.
+    #[tokio::test]
+    async fn a_rebuild_restores_the_cost_accounting() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("ready"))
+                    .budget(BudgetBinding::new("stripe").cost(3)),
+            )
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("later"))
+                    .budget(BudgetBinding::new("stripe").cost(8))
+                    .ready_at(now + 600_000),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 2);
+
+        store.budgets.clear();
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+
+        store.rebuild_indexes().await.unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 2);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(8));
     }
 
     /// A job that was mid-flight when the process died holds no token in

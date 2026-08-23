@@ -264,6 +264,10 @@ fn process_batch(
             id: &p.id,
             budgets: &p.budgets,
         });
+        // Completion is terminal, so the job stops counting against its
+        // budgets entirely — distinct from returning the tokens it
+        // borrowed to run, which is `release_concurrency`.
+        dispatch.untrack(&p.budgets);
         in_flight_index.remove(p.dequeued_at, &p.id);
         completed_set.insert(p.id.clone());
     }

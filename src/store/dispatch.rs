@@ -251,6 +251,23 @@ impl Dispatch {
             self.budgets.refund(budgets);
         }
     }
+
+    /// Stop counting a job against the budgets it drew from.
+    ///
+    /// For jobs reaching a terminal state or being deleted outright —
+    /// not for dispatch, which leaves a job counted because it is still
+    /// unfinished. See `Budgets::track` for how the three pairs differ.
+    ///
+    /// **Call after the commit that ends the job, never before.** The
+    /// aggregate is allowed to read high and never low: counting a
+    /// finished job for a moment longer costs at worst a delete or
+    /// shrink refused that would have been safe, where dropping the
+    /// count before the write is durable would let a budget be deleted
+    /// out from under a job that is still very much alive. The staging
+    /// on the enqueue side leans the same way for the same reason.
+    pub(super) fn untrack(&self, budgets: &[BudgetRef]) {
+        self.budgets.untrack(budgets);
+    }
 }
 
 /// Interleaves two already-ordered streams of ready jobs.

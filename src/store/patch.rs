@@ -266,7 +266,7 @@ impl Store {
                 };
 
                 // Reject patches on terminal jobs.
-                if matches!(status, JobStatus::Completed | JobStatus::Dead) {
+                if status.is_terminal() {
                     patch_err = Some(StoreError::InvalidOperation(format!(
                         "cannot patch job {} in {} status",
                         job.id,
@@ -379,7 +379,7 @@ impl Store {
                 };
 
                 // Skip terminal jobs.
-                if matches!(status, JobStatus::Completed | JobStatus::Dead) {
+                if status.is_terminal() {
                     continue;
                 }
 

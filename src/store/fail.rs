@@ -163,6 +163,7 @@ impl Store {
                     ks.commit(tx, ks.default_commit_mode)?;
 
                     dispatch.remove(Placement::of(&job));
+                    dispatch.untrack(&job.budgets);
 
                     break job;
                 }
@@ -206,6 +207,7 @@ impl Store {
                 ks.commit(tx, ks.default_commit_mode)?;
 
                 dispatch.remove(Placement::of(&job));
+                dispatch.untrack(&job.budgets);
 
                 break job;
             };
@@ -275,7 +277,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::keys::{error_keys, make_error_key, make_payload_key};
-    use super::super::options::{EnqueueOptions, ListJobsOptions};
+    use super::super::options::{EnqueueOptions, FailureOptions, ListJobsOptions};
     use super::super::store::StoreEvent;
     use super::super::test_support::{
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retry_limit,
@@ -283,6 +285,74 @@ mod tests {
     use super::super::types::{BackoffConfig, ErrorRecord, JobStatus};
     use super::compute_backoff;
     use crate::time::now_millis;
+
+    /// Enqueue a job drawing `cost` from a fresh budget, and take it.
+    async fn budgeted_in_flight(store: &super::Store, cost: u32) -> String {
+        let now = now_millis();
+        store
+            .create_budget(
+                "stripe",
+                100,
+                super::super::budget::BudgetStrategy::WhileInFlight,
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(super::super::budget::BudgetBinding::new("stripe").cost(cost)),
+            )
+            .await
+            .unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    /// A retry is not terminal. The job goes back to Scheduled and will
+    /// run again, so it is still work the budget owes capacity to —
+    /// untracking here would let the allocation shrink below a cost the
+    /// job still needs when it comes due.
+    #[tokio::test]
+    async fn a_retry_leaves_the_job_tracked() {
+        let store = test_store();
+        let id = budgeted_in_flight(&store, 7).await;
+
+        let job = store
+            .record_failure(now_millis(), &id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Scheduled as u8);
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(7));
+    }
+
+    /// Killing a job is terminal, so it stops counting.
+    #[tokio::test]
+    async fn killing_a_job_untracks_it() {
+        let store = test_store();
+        let id = budgeted_in_flight(&store, 7).await;
+
+        let opts = FailureOptions {
+            kill: true,
+            ..test_failure_opts()
+        };
+        let job = store
+            .record_failure(now_millis(), &id, opts)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Dead as u8);
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+    }
 
     // --- compute_backoff tests ---
 

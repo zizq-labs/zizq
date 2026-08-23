@@ -72,6 +72,7 @@ impl Store {
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::budget::{BudgetBinding, BudgetStrategy};
     use super::super::keys::error_keys;
     use super::super::options::EnqueueOptions;
     use super::super::store::StoreEvent;
@@ -79,6 +80,43 @@ mod tests {
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retention,
     };
     use crate::time::now_millis;
+
+    /// Completion is terminal, so the job stops counting against the
+    /// budget — otherwise the budget would accumulate a permanent debt
+    /// of finished work and eventually refuse every change to itself.
+    #[tokio::test]
+    async fn completing_a_job_untracks_it_from_its_budgets() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("stripe").cost(4)),
+            )
+            .await
+            .unwrap();
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Dispatched but unfinished — still counted.
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+        assert_eq!(store.budgets.max_cost("stripe"), None);
+    }
 
     #[tokio::test]
     async fn mark_completed_removes_job() {
