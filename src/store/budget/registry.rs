@@ -81,6 +81,35 @@ use super::super::ready_index::ReadyIndex;
 use super::limiter::Limiter;
 use super::{Budget, BudgetRef};
 
+/// Everything the mutex guards.
+struct Inner {
+    /// Per-budget token state and waiting jobs.
+    groups: HashMap<String, BudgetGroup>,
+
+    /// Budgets that currently have at least one job waiting.
+    ///
+    /// Selection consults this rather than every budget. A server may
+    /// hold thousands of budgets while only a handful have work, and
+    /// walking the idle ones on every claim would make dequeue cost
+    /// scale with how many budgets are *configured* rather than how
+    /// many are actually contended.
+    occupied: HashSet<String>,
+
+    /// What each waiting job draws on, keyed by job id.
+    ///
+    /// A group knows a job is waiting on *it*, but dispatching that job
+    /// means debiting every budget it names, and the group has no way
+    /// to know what the others are. Recorded here on the way in rather
+    /// than re-read from the store at selection time, which would put a
+    /// disk read inside the lock.
+    ///
+    /// Unlike the placement map an earlier draft of the dispatcher
+    /// kept, this is not a second source of truth racing a first: it
+    /// lives under the same mutex as the groups and is written by the
+    /// same two functions, so the two cannot disagree.
+    refs: HashMap<String, Vec<BudgetRef>>,
+}
+
 /// The jobs waiting on one budget, and its tokens.
 struct BudgetGroup {
     /// Tokens, and how they come back.
@@ -107,7 +136,7 @@ struct BudgetGroup {
 
 /// Live accounting for every budget with a group.
 pub(in crate::store) struct Budgets {
-    inner: Mutex<HashMap<String, BudgetGroup>>,
+    inner: Mutex<Inner>,
 
     /// Every parked job, exactly once, whatever number of budgets it
     /// draws from.
@@ -138,7 +167,11 @@ pub(in crate::store) struct Budgets {
 impl Budgets {
     pub(in crate::store) fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                groups: HashMap::new(),
+                occupied: HashSet::new(),
+                refs: HashMap::new(),
+            }),
             all: ReadyIndex::new(),
             waiting: AtomicUsize::new(0),
         }
@@ -160,12 +193,12 @@ impl Budgets {
     /// policy change adjusts a running budget rather than resetting it,
     /// so tightening one does not hand out a fresh allocation.
     pub(in crate::store) fn sync(&self, key: &str, budget: &Budget, now: u64) {
-        let mut groups = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
-        match groups.get_mut(key) {
+        match inner.groups.get_mut(key) {
             Some(group) => group.limiter.adopt(budget, now),
             None => {
-                groups.insert(
+                inner.groups.insert(
                     key.to_string(),
                     BudgetGroup {
                         limiter: Limiter::new(budget, now),
@@ -182,9 +215,10 @@ impl Budgets {
     /// only correct once nothing references the budget — which is what
     /// deletion being refused while references exist is for.
     pub(in crate::store) fn forget(&self, key: &str) {
-        let mut groups = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
-        if let Some(group) = groups.remove(key) {
+        if let Some(group) = inner.groups.remove(key) {
+            inner.occupied.remove(key);
             self.waiting.fetch_sub(group.jobs.len(), Ordering::Relaxed);
 
             // Jobs left waiting only on this budget leave the roll-up
@@ -192,7 +226,8 @@ impl Budgets {
             // Normally an empty loop, since deleting a budget anything
             // references is refused.
             for (priority, id, queue) in group.jobs.iter_with_queue() {
-                let elsewhere = groups
+                let elsewhere = inner
+                    .groups
                     .values()
                     .any(|other| other.jobs.contains(priority, &id));
                 if !elsewhere {
@@ -228,8 +263,9 @@ impl Budgets {
         // dispatch that never happens.
         self.waiting.fetch_add(budgets.len(), Ordering::Relaxed);
 
-        let mut groups = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let mut parked = 0;
+        let mut newly_occupied: Vec<String> = Vec::new();
 
         for reference in budgets {
             // A missing group means a job referencing a budget that was
@@ -237,7 +273,7 @@ impl Budgets {
             // protections exist to prevent. Skipped rather than
             // conjured: inventing a group here would invent an
             // allocation to go with it.
-            if let Some(group) = groups.get_mut(&reference.key) {
+            if let Some(group) = inner.groups.get_mut(&reference.key) {
                 // Measured rather than assumed: inserting a job already
                 // parked here is a no-op, and counting it anyway would
                 // leave the tally permanently above zero, pinning the
@@ -245,10 +281,20 @@ impl Budgets {
                 let before = group.jobs.len();
                 group.jobs.insert(queue, priority, job_id.to_string());
                 parked += group.jobs.len() - before;
+
+                if before == 0 {
+                    newly_occupied.push(reference.key.clone());
+                }
             }
         }
 
+        for key in newly_occupied {
+            inner.occupied.insert(key);
+        }
+
         if parked > 0 {
+            inner.refs.insert(job_id.to_string(), budgets.to_vec());
+
             // Written under the lock alongside the groups, though read
             // without it. Idempotent, so a job on several budgets lands
             // here once.
@@ -279,16 +325,8 @@ impl Budgets {
         priority: u16,
         job_id: &str,
     ) {
-        let mut groups = self.inner.lock().unwrap();
-        let mut removed = 0;
-
-        for reference in budgets {
-            if let Some(group) = groups.get_mut(&reference.key) {
-                let before = group.jobs.len();
-                group.jobs.remove(queue, priority, job_id);
-                removed += before - group.jobs.len();
-            }
-        }
+        let mut inner = self.inner.lock().unwrap();
+        let removed = Self::dequeue(&mut inner, budgets, queue, priority, job_id);
 
         if removed > 0 {
             // The job is leaving the ready state altogether, not just
@@ -297,6 +335,63 @@ impl Budgets {
         }
 
         self.waiting.fetch_sub(removed, Ordering::Relaxed);
+    }
+
+    /// Take a job out of every budget queue it sits in, and forget what
+    /// it drew on. Returns how many queues it left.
+    ///
+    /// The shared half of removing a job, whether that is because it
+    /// dispatched or because it left the ready state some other way.
+    /// Caller holds the lock and owns the roll-up and counter updates.
+    fn dequeue(
+        inner: &mut Inner,
+        budgets: &[BudgetRef],
+        queue: &str,
+        priority: u16,
+        job_id: &str,
+    ) -> usize {
+        let mut removed = 0;
+        let mut emptied: Vec<String> = Vec::new();
+
+        for reference in budgets {
+            if let Some(group) = inner.groups.get_mut(&reference.key) {
+                let before = group.jobs.len();
+                group.jobs.remove(queue, priority, job_id);
+                removed += before - group.jobs.len();
+
+                if group.jobs.len() == 0 {
+                    emptied.push(reference.key.clone());
+                }
+            }
+        }
+
+        for key in emptied {
+            inner.occupied.remove(&key);
+        }
+
+        if removed > 0 {
+            inner.refs.remove(job_id);
+        }
+
+        removed
+    }
+
+    /// The head of every budget that has work, best first.
+    ///
+    /// One candidate per budget: only a budget's own head can be next
+    /// from within that budget, so there is nothing to gain from looking
+    /// deeper.
+    fn candidates(inner: &Inner, queues: &HashSet<String>) -> Vec<(u16, String, String)> {
+        let mut candidates: Vec<(u16, String, String)> = inner
+            .occupied
+            .iter()
+            .filter_map(|key| inner.groups.get(key)?.jobs.peek(queues))
+            .collect();
+
+        candidates.sort();
+        // A job at the head of several budgets is one candidate.
+        candidates.dedup();
+        candidates
     }
 
     /// The next job a budget would offer, if any.
@@ -311,8 +406,8 @@ impl Budgets {
         key: &str,
         queues: &HashSet<String>,
     ) -> Option<(u16, String, String)> {
-        let groups = self.inner.lock().unwrap();
-        groups.get(key)?.jobs.peek(queues)
+        let inner = self.inner.lock().unwrap();
+        inner.groups.get(key)?.jobs.peek(queues)
     }
 
     /// Every job waiting on any budget, in dispatch order, once each.
@@ -338,6 +433,75 @@ impl Budgets {
         self.all.len()
     }
 
+    /// The best job any budget is offering, whether or not it can be
+    /// afforded.
+    ///
+    /// Used to decide between a budgeted job and an unthrottled one
+    /// before committing to either. Says nothing about capacity — a job
+    /// named here may still fail to acquire.
+    pub(in crate::store) fn head_of_any(
+        &self,
+        queues: &HashSet<String>,
+    ) -> Option<(u16, String, String)> {
+        let inner = self.inner.lock().unwrap();
+        Self::candidates(&inner, queues).into_iter().next()
+    }
+
+    /// Take the best job any budget can currently afford, debiting it.
+    ///
+    /// Returns the job that is now the caller's — its tokens spent and
+    /// its place in every queue given up — along with the bindings that
+    /// were debited. The caller needs those to refund if the job turns
+    /// out not to be dispatchable after all, and cannot recover them
+    /// from the job record, which by then may be deleted.
+    ///
+    /// `None` means nothing is affordable right now — either nothing is
+    /// waiting, or everything waiting is short.
+    ///
+    /// # What gets considered
+    ///
+    /// Only the head of each budget's queue. A job behind the head of
+    /// its own budget waits its turn even if it is cheaper and would
+    /// fit, which keeps a budget FIFO for the work bound to it.
+    ///
+    /// Across budgets it is best-first, and a job whose budgets are
+    /// short is passed over for one that fits — the design accepts
+    /// that so a job wanting a rare combination cannot act as a poison
+    /// pill for everything behind it.
+    ///
+    /// # Cost
+    ///
+    /// Walks the budgets that have work, in the order their heads would
+    /// dispatch, stopping at the first that can pay. A drained budget
+    /// is examined and skipped rather than known to be unaffordable in
+    /// advance; parking those on a timer is what removes them from
+    /// consideration, and lands with the refill tick.
+    pub(in crate::store) fn claim_next(
+        &self,
+        queues: &HashSet<String>,
+        now: u64,
+    ) -> Option<(u16, String, String, Vec<BudgetRef>)> {
+        let mut inner = self.inner.lock().unwrap();
+
+        for (priority, job_id, queue) in Self::candidates(&inner, queues) {
+            let Some(refs) = inner.refs.get(&job_id).cloned() else {
+                continue;
+            };
+
+            if !Self::acquire_all(&mut inner, &refs, now) {
+                continue;
+            }
+
+            let removed = Self::dequeue(&mut inner, &refs, &queue, priority, &job_id);
+            self.all.remove(&queue, priority, &job_id);
+            self.waiting.fetch_sub(removed, Ordering::Relaxed);
+
+            return Some((priority, job_id, queue, refs));
+        }
+
+        None
+    }
+
     /// Take tokens from every budget, or none of them.
     ///
     /// Called when dispatch has chosen a job and needs to know whether
@@ -356,11 +520,17 @@ impl Budgets {
     /// not dispatching.
     #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
     pub(in crate::store) fn try_acquire_all(&self, budgets: &[BudgetRef], now: u64) -> bool {
-        let mut groups = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        Self::acquire_all(&mut inner, budgets, now)
+    }
+
+    /// The all-or-nothing acquire itself. Caller holds the lock.
+    fn acquire_all(inner: &mut Inner, budgets: &[BudgetRef], now: u64) -> bool {
         let mut taken: Vec<&BudgetRef> = Vec::with_capacity(budgets.len());
 
         for reference in budgets {
-            let acquired = groups
+            let acquired = inner
+                .groups
                 .get_mut(&reference.key)
                 .is_some_and(|group| group.limiter.try_acquire(reference.cost, now));
 
@@ -371,7 +541,7 @@ impl Budgets {
                 // state, but the rollback is what would keep this
                 // correct under per-budget locks.
                 for undo in taken {
-                    if let Some(group) = groups.get_mut(&undo.key) {
+                    if let Some(group) = inner.groups.get_mut(&undo.key) {
                         group.limiter.release(undo.cost);
                     }
                 }
@@ -394,10 +564,10 @@ impl Budgets {
     /// which is about work that *did* run.
     #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
     pub(in crate::store) fn refund(&self, budgets: &[BudgetRef]) {
-        let mut groups = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
         for reference in budgets {
-            if let Some(group) = groups.get_mut(&reference.key) {
+            if let Some(group) = inner.groups.get_mut(&reference.key) {
                 group.limiter.release(reference.cost);
             }
         }
@@ -418,10 +588,10 @@ impl Budgets {
     /// same call covers both.
     #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
     pub(in crate::store) fn release_concurrency(&self, budgets: &[BudgetRef]) {
-        let mut groups = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
         for reference in budgets {
-            if let Some(group) = groups.get_mut(&reference.key)
+            if let Some(group) = inner.groups.get_mut(&reference.key)
                 && group.limiter.returns_on_release()
             {
                 group.limiter.release(reference.cost);
@@ -432,17 +602,25 @@ impl Budgets {
     /// Forget every budget and everything waiting on one.
     #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
     pub(in crate::store) fn clear(&self) {
-        let mut groups = self.inner.lock().unwrap();
-        groups.clear();
+        let mut inner = self.inner.lock().unwrap();
+        inner.groups.clear();
+        inner.occupied.clear();
+        inner.refs.clear();
         self.all.clear();
         self.waiting.store(0, Ordering::Relaxed);
+    }
+
+    /// How many budgets currently have work.
+    #[cfg(test)]
+    fn occupied_count(&self) -> usize {
+        self.inner.lock().unwrap().occupied.len()
     }
 
     /// How many jobs are waiting on one budget.
     #[cfg(test)]
     fn depth(&self, key: &str) -> usize {
-        let groups = self.inner.lock().unwrap();
-        groups.get(key).map_or(0, |group| group.jobs.len())
+        let inner = self.inner.lock().unwrap();
+        inner.groups.get(key).map_or(0, |group| group.jobs.len())
     }
 }
 
@@ -622,6 +800,75 @@ mod tests {
         let listed: Vec<(u16, String)> = budgets.entries().collect();
         assert_eq!(listed, vec![(0, "shared".into())]);
         assert_eq!(budgets.job_count(), 1);
+    }
+
+    /// A starved budget must not hold up a healthy one. A job on a
+    /// once-a-month budget can sit at the very front — highest
+    /// priority, oldest — for weeks, and work behind it on a
+    /// thousand-a-minute budget still has to flow.
+    #[tokio::test]
+    async fn a_starved_budget_does_not_block_a_healthy_one() {
+        let budgets = registry_with(&[("monthly", concurrency(1)), ("fast", concurrency(1000))]);
+
+        // The monthly budget's only token is already spent.
+        assert!(budgets.try_acquire_all(&[draws("monthly", 1)], NOW));
+
+        // Priority 0 and enqueued first, so it is the best candidate.
+        budgets.park(&[draws("monthly", 1)], "q", 0, "aaa-starved");
+        budgets.park(&[draws("fast", 1)], "q", 9, "zzz-healthy");
+
+        let claimed = budgets.claim_next(&HashSet::new(), NOW);
+        assert_eq!(
+            claimed.map(|(_, id, _, _)| id),
+            Some("zzz-healthy".to_string())
+        );
+
+        // The starved job is still waiting, not lost.
+        assert_eq!(budgets.job_count(), 1);
+    }
+
+    /// Within one budget it is strict FIFO, deliberately: a cheaper job
+    /// does not overtake the head just because it happens to fit.
+    /// Otherwise an expensive job could be starved indefinitely by a
+    /// stream of small ones behind it.
+    #[tokio::test]
+    async fn a_cheaper_job_does_not_overtake_its_own_budget_head() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+
+        // Five left, but the head wants six.
+        assert!(budgets.try_acquire_all(&[draws("stripe", 5)], NOW));
+
+        budgets.park(&[draws("stripe", 6)], "q", 0, "expensive-head");
+        budgets.park(&[draws("stripe", 1)], "q", 9, "cheap-behind");
+
+        assert!(budgets.claim_next(&HashSet::new(), NOW).is_none());
+    }
+
+    /// Selection walks the budgets that have work, not every budget
+    /// that exists — a server holding thousands of idle budgets should
+    /// not pay for them on each dequeue.
+    #[tokio::test]
+    async fn idle_budgets_are_not_consulted() {
+        let mut pairs: Vec<(String, Budget)> = (0..64)
+            .map(|i| (format!("idle-{i}"), concurrency(1)))
+            .collect();
+        pairs.push(("busy".to_string(), concurrency(1)));
+
+        let budgets = Budgets::new();
+        for (key, budget) in &pairs {
+            budgets.sync(key, budget, NOW);
+        }
+        budgets.park(&[draws("busy", 1)], "q", 0, "a");
+
+        assert_eq!(budgets.occupied_count(), 1);
+        assert_eq!(
+            budgets
+                .claim_next(&HashSet::new(), NOW)
+                .map(|(_, id, _, _)| id),
+            Some("a".to_string())
+        );
+        // And it drops back out once its work is gone.
+        assert_eq!(budgets.occupied_count(), 0);
     }
 
     #[test]

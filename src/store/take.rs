@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fjall::Slice;
 use tokio::task;
 
-use super::dispatch::Placement;
+use super::dispatch::{Claimed, Placement};
 use super::keys::{
     make_batch_key, make_job_key, make_payload_key, make_status_key, make_unique_key,
 };
@@ -95,9 +95,9 @@ impl Store {
             // index and re-claim, same pattern as take_next_job.
             loop {
                 // 1. Claim phase — collect up to `n` candidates from the ready index.
-                let mut claimed: Vec<(u16, String, String)> = Vec::with_capacity(n);
+                let mut claimed: Vec<Claimed> = Vec::with_capacity(n);
                 while claimed.len() < n {
-                    match dispatch.claim(&queues) {
+                    match dispatch.claim(&queues, now) {
                         Some(entry) => claimed.push(entry),
                         None => break,
                     }
@@ -115,15 +115,25 @@ impl Store {
                 //    Filter out any that are deleted or no longer Ready.
                 let mut valid: Vec<PreRead> = Vec::with_capacity(claimed.len());
 
-                for (_priority, job_id, _queue) in &claimed {
+                for candidate in &claimed {
+                    let job_id = &candidate.id;
                     let job_key = make_job_key(job_id);
                     let pre_bytes = match ks.data.get(&job_key)? {
                         Some(bytes) => bytes,
-                        None => continue, // Deleted.
+                        None => {
+                            // Deleted between the claim and this read.
+                            // Any tokens spent releasing it bought
+                            // nothing, so they go back — otherwise a
+                            // concurrency budget would count a job that
+                            // never ran as permanently in flight.
+                            dispatch.refund(&candidate.budgets);
+                            continue;
+                        }
                     };
 
                     let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
                     if job.status != JobStatus::Ready as u8 {
+                        dispatch.refund(&candidate.budgets);
                         continue; // No longer ready.
                     }
 
@@ -210,6 +220,9 @@ impl Store {
                     );
                     drop(tx);
                     for pre in &valid {
+                        // Back on the queue and not running, so its
+                        // tokens are not owed by anyone.
+                        dispatch.refund(&pre.job.budgets);
                         dispatch.insert(Placement::of(&pre.job));
                     }
                     continue; // Back to the top of the retry loop
@@ -222,6 +235,7 @@ impl Store {
                     //    ready index and notify workers.
                     let _tx = ks.write_tx();
                     for pre in &valid {
+                        dispatch.refund(&pre.job.budgets);
                         dispatch.insert(Placement::of(&pre.job));
 
                         let _ = event_tx.send(StoreEvent::JobCreated {

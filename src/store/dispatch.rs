@@ -81,6 +81,25 @@ impl<'a> Placement<'a> {
     }
 }
 
+/// A job handed to a worker, and what it cost to get it.
+///
+/// Carries only what the caller cannot get elsewhere. Priority and
+/// queue are deliberately absent: the caller re-reads the job record,
+/// which is authoritative for both.
+pub(super) struct Claimed {
+    pub(super) id: String,
+
+    /// Budgets debited to release this job. Empty for an unthrottled
+    /// one.
+    ///
+    /// Carried because a claim is not the end of the story: the caller
+    /// re-reads the job and may find it deleted or no longer ready, and
+    /// tokens spent on work that never runs have to go back. For a
+    /// deleted job the record is gone, so this is the only remaining
+    /// record of what was taken.
+    pub(super) budgets: Vec<BudgetRef>,
+}
+
 /// Owns the placement of every ready job.
 pub(super) struct Dispatch {
     /// Priority index of ready jobs that nothing throttles.
@@ -151,17 +170,86 @@ impl Dispatch {
     /// Claim the highest-priority, oldest dispatchable job.
     ///
     /// Returns `(priority, job_id, queue)`, or `None` when nothing can
-    /// be dispatched right now.
+    /// be dispatched right now. A budgeted job comes back only if its
+    /// budgets could all be debited, and those tokens are already spent
+    /// by the time it does.
     ///
     /// Deliberately not a [`Placement`]: the caller re-reads the job
     /// from disk anyway — the index is advisory, and the record is what
     /// says whether the job is still there and still ready.
-    pub(super) fn claim(&self, queues: &HashSet<String>) -> Option<(u16, String, String)> {
-        // Budgeted jobs are parked but not yet offered: selecting one
-        // means debiting its budgets, which lands with the acquire.
-        // Until then they are visible to listings and invisible to
-        // workers.
-        self.ready.claim(queues)
+    ///
+    /// # Ordering across the two sources
+    ///
+    /// Unthrottled and budgeted jobs are compared on the same
+    /// `(priority, id)` the priority index already orders by, so the
+    /// existing guarantee — priority first, then oldest — holds across
+    /// both. What it does *not* mean is that the best job overall
+    /// always goes next: a budgeted job at the front can be passed over
+    /// for a lower-priority unthrottled one when its budgets are short.
+    /// That is the intended behaviour rather than a compromise, since
+    /// waiting for it would be letting a throttle it does not apply to
+    /// hold up unthrottled work.
+    pub(super) fn claim(&self, queues: &HashSet<String>, now: u64) -> Option<Claimed> {
+        // Nothing budgeted anywhere: the overwhelmingly common case,
+        // and it must not pay for the machinery. One relaxed load, no
+        // mutex, straight to the index.
+        if self.budgets.waiting() == 0 {
+            return self.ready.claim(queues).map(Self::unthrottled);
+        }
+
+        // Compare before committing. Claiming from the index is
+        // destructive and debiting budgets is too, so whichever is
+        // better has to be decided first.
+        let plain = self.ready.peek(queues);
+        let throttled = self.budgets.head_of_any(queues);
+        let throttled_is_first = match (plain, throttled) {
+            (Some(plain), Some(throttled)) => throttled < plain,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+
+        if throttled_is_first && let Some(claimed) = self.budgets.claim_next(queues, now) {
+            return Some(Self::throttled(claimed));
+        }
+
+        // Either the index had the better job, or the budgeted one
+        // turned out to be unaffordable. Both end here.
+        if let Some(claimed) = self.ready.claim(queues) {
+            return Some(Self::unthrottled(claimed));
+        }
+
+        // The index emptied under us, or never had anything. A budgeted
+        // job may still be affordable — without this a worker would be
+        // told there is no work while a job it could have run sits
+        // parked.
+        if throttled_is_first {
+            return None;
+        }
+
+        // Throttled is supposed to go second, and ready index was empty.
+        self.budgets.claim_next(queues, now).map(Self::throttled)
+    }
+
+    /// Wrap a job taken from a budget group.
+    fn throttled((_, id, _, budgets): (u16, String, String, Vec<BudgetRef>)) -> Claimed {
+        Claimed { id, budgets }
+    }
+
+    /// Wrap a job taken straight from the priority index.
+    fn unthrottled((_, id, _): (u16, String, String)) -> Claimed {
+        Claimed {
+            id,
+            budgets: Vec::new(),
+        }
+    }
+
+    /// Give back tokens debited for a job that will not run after all.
+    ///
+    /// A no-op for an unthrottled job, which took none.
+    pub(super) fn refund(&self, budgets: &[BudgetRef]) {
+        if !budgets.is_empty() {
+            self.budgets.refund(budgets);
+        }
     }
 }
 
@@ -218,10 +306,9 @@ mod tests {
         dispatch.insert(placement("a", &[]));
 
         assert_eq!(dispatch.len(), 1);
-        assert_eq!(
-            dispatch.claim(&HashSet::new()),
-            Some((0, "a".into(), "q".into()))
-        );
+        let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
+        assert_eq!(claimed.id, "a");
+        assert!(claimed.budgets.is_empty());
         assert_eq!(dispatch.len(), 0);
     }
 
@@ -247,20 +334,85 @@ mod tests {
         (Dispatch::new(budgets.clone()), budgets)
     }
 
-    /// The heart of the split: a budgeted job is ready, and counted and
-    /// listed as such, but it is not in the priority index — so a
-    /// worker never walks past it, and it cannot be handed out until
-    /// its budgets have been debited.
+    /// A budgeted job whose budget can pay is handed out like any
+    /// other, and comes back carrying what it cost.
     #[test]
-    fn a_budgeted_job_is_parked_rather_than_indexed() {
+    fn a_budgeted_job_is_claimed_when_its_budget_can_pay() {
         let (dispatch, _budgets) = with_stripe();
         let refs = vec![BudgetRef::new("stripe")];
 
         dispatch.insert(placement("a", &refs));
 
-        assert!(dispatch.claim(&HashSet::new()).is_none());
+        let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
+        assert_eq!(claimed.id, "a");
+        // The bindings come back so the caller can refund them if the
+        // job turns out not to be dispatchable after all.
+        assert_eq!(claimed.budgets.len(), 1);
+        assert_eq!(dispatch.len(), 0);
+    }
+
+    /// Drained, it stays put — still ready, still listed, just not
+    /// offered to a worker.
+    #[test]
+    fn a_budgeted_job_is_withheld_when_its_budget_cannot_pay() {
+        let (dispatch, budgets) = with_stripe();
+        let refs = vec![BudgetRef::new("stripe")];
+
+        // Spend the whole allocation before the job is considered.
+        assert!(budgets.try_acquire_all(&[BudgetRef::new("stripe").cost(10)], NOW));
+
+        dispatch.insert(placement("a", &refs));
+
+        assert!(dispatch.claim(&HashSet::new(), NOW).is_none());
         assert_eq!(dispatch.len(), 1);
         assert_eq!(dispatch.iter().count(), 1);
+    }
+
+    /// The reason budgeted jobs live outside the priority index: a
+    /// throttle that cannot pay must not hold up work it does not
+    /// apply to, even work of much lower priority.
+    #[test]
+    fn a_withheld_job_does_not_block_unthrottled_work() {
+        let (dispatch, budgets) = with_stripe();
+        assert!(budgets.try_acquire_all(&[BudgetRef::new("stripe").cost(10)], NOW));
+
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 0,
+            id: "throttled",
+            budgets: &[BudgetRef::new("stripe")],
+        });
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 9,
+            id: "plain",
+            budgets: &[],
+        });
+
+        let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
+        assert_eq!(claimed.id, "plain");
+    }
+
+    /// And when it can pay, priority still decides.
+    #[test]
+    fn a_payable_budgeted_job_outranks_a_lower_priority_plain_one() {
+        let (dispatch, _budgets) = with_stripe();
+
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 0,
+            id: "throttled",
+            budgets: &[BudgetRef::new("stripe")],
+        });
+        dispatch.insert(Placement {
+            queue: "q",
+            priority: 9,
+            id: "plain",
+            budgets: &[],
+        });
+
+        let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
+        assert_eq!(claimed.id, "throttled");
     }
 
     #[test]
