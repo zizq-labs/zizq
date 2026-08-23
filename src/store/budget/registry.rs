@@ -78,6 +78,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::ready_index::ReadyIndex;
+use super::costs::CostCounts;
 use super::limiter::Limiter;
 use super::{Budget, BudgetRef};
 
@@ -132,6 +133,15 @@ struct BudgetGroup {
     /// Holds identity only, not job records. The store is authoritative
     /// and a claimed job is re-read from it anyway.
     jobs: ReadyIndex,
+
+    /// What the jobs drawing on this budget cost.
+    ///
+    /// Wider than `jobs`, and deliberately so: a job counts here from
+    /// enqueue until it reaches a terminal state, including while it is
+    /// scheduled for the future or already in flight — neither of which
+    /// is waiting in `jobs`. The guards this feeds have to consider a
+    /// job that is not queued *yet* as much as one that is.
+    costs: CostCounts,
 }
 
 /// Live accounting for every budget with a group.
@@ -203,10 +213,85 @@ impl Budgets {
                     BudgetGroup {
                         limiter: Limiter::new(budget, now),
                         jobs: ReadyIndex::new(),
+                        costs: CostCounts::default(),
                     },
                 );
             }
         }
+    }
+
+    /// Record a job against every budget it draws from.
+    ///
+    /// This is the *lifecycle* pair, and the registry now has three of
+    /// them. They answer different questions and span different periods,
+    /// so it is worth being explicit about which is which:
+    ///
+    /// - `track` / `untrack` — does this budget have any unfinished job
+    ///   at all? Spans enqueue to terminal, covering scheduled and
+    ///   in-flight jobs that are not queued for dispatch. Feeds the
+    ///   guards that refuse to delete or shrink a budget out from under
+    ///   work that is already committed to it.
+    /// - `park` / `unpark` — is this job waiting to be dispatched right
+    ///   now? Spans ready to claimed. Feeds selection.
+    /// - `try_acquire_all` / `refund` / `release_concurrency` — tokens.
+    ///   Spans the dispatch itself.
+    ///
+    /// A job is tracked once per budget it names. Bindings are validated
+    /// to name each budget at most once, so no job double-counts against
+    /// one budget.
+    ///
+    /// A budget with no group is skipped, as in `park`: enqueue resolves
+    /// and creates budgets before writing the job, so a missing group
+    /// means state that should not exist, and inventing one here would
+    /// invent an allocation with it.
+    #[allow(dead_code, reason = "used once the job-side guards call it")]
+    pub(in crate::store) fn track(&self, budgets: &[BudgetRef]) {
+        let mut inner = self.inner.lock().unwrap();
+
+        for reference in budgets {
+            if let Some(group) = inner.groups.get_mut(&reference.key) {
+                group.costs.add(reference.cost);
+            }
+        }
+    }
+
+    /// Drop a job from every budget it draws from.
+    ///
+    /// Called when a job reaches a terminal state or is deleted — not
+    /// when it is merely dispatched. See [`Budgets::track`] for how this
+    /// pair differs from the other two.
+    #[allow(dead_code, reason = "used once the job-side guards call it")]
+    pub(in crate::store) fn untrack(&self, budgets: &[BudgetRef]) {
+        let mut inner = self.inner.lock().unwrap();
+
+        for reference in budgets {
+            if let Some(group) = inner.groups.get_mut(&reference.key) {
+                group.costs.remove(reference.cost);
+            }
+        }
+    }
+
+    /// The largest cost any unfinished job draws from `key`.
+    ///
+    /// `None` when the budget has no group, or nothing draws on it. Both
+    /// mean the same thing to a caller deciding whether an allocation is
+    /// safe to shrink: there is no job to strand.
+    #[allow(dead_code, reason = "used once the job-side guards call it")]
+    pub(in crate::store) fn max_cost(&self, key: &str) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+
+        inner.groups.get(key).and_then(|group| group.costs.max())
+    }
+
+    /// How many unfinished jobs draw on `key`.
+    ///
+    /// Zero for a budget with no group. The deletion guard reads this:
+    /// a budget nothing references can go.
+    #[allow(dead_code, reason = "used once the job-side guards call it")]
+    pub(in crate::store) fn tracked(&self, key: &str) -> usize {
+        let inner = self.inner.lock().unwrap();
+
+        inner.groups.get(key).map_or(0, |group| group.costs.len())
     }
 
     /// Drop a budget's live state.
@@ -1096,5 +1181,98 @@ mod tests {
 
         assert_eq!(budgets.waiting(), 0);
         assert!(!budgets.try_acquire_all(&[draws("stripe", 1)], NOW));
+    }
+
+    #[test]
+    fn tracking_records_a_job_against_every_budget_it_draws_from() {
+        let budgets = registry_with(&[("stripe", concurrency(10)), ("tenant", per_minute(10))]);
+
+        budgets.track(&[draws("stripe", 3), draws("tenant", 7)]);
+
+        assert_eq!(budgets.tracked("stripe"), 1);
+        assert_eq!(budgets.tracked("tenant"), 1);
+        assert_eq!(budgets.max_cost("stripe"), Some(3));
+        assert_eq!(budgets.max_cost("tenant"), Some(7));
+    }
+
+    #[test]
+    fn untracking_removes_the_job_from_every_budget() {
+        let budgets = registry_with(&[("stripe", concurrency(10)), ("tenant", per_minute(10))]);
+        let refs = [draws("stripe", 3), draws("tenant", 7)];
+
+        budgets.track(&refs);
+        budgets.untrack(&refs);
+
+        assert_eq!(budgets.tracked("stripe"), 0);
+        assert_eq!(budgets.tracked("tenant"), 0);
+        assert_eq!(budgets.max_cost("stripe"), None);
+        assert_eq!(budgets.max_cost("tenant"), None);
+    }
+
+    /// Tracking is lifecycle membership, not queue membership. A job
+    /// that has been dispatched is no longer parked but is still
+    /// unfinished, and a shrink underneath it would strand its retry.
+    #[test]
+    fn dispatching_a_job_leaves_it_tracked() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+        let refs = [draws("stripe", 4)];
+
+        budgets.track(&refs);
+        budgets.park(&refs, "q", 0, "a");
+
+        let claimed = budgets.claim_next(&HashSet::new(), NOW);
+        assert!(claimed.is_some());
+
+        assert_eq!(budgets.waiting(), 0);
+        assert_eq!(budgets.tracked("stripe"), 1);
+        assert_eq!(budgets.max_cost("stripe"), Some(4));
+    }
+
+    /// A budget nobody has ever mentioned reads as unreferenced rather
+    /// than as an error — the guards treat "no group" and "no jobs" the
+    /// same way, since neither has a job to strand.
+    #[test]
+    fn an_unknown_budget_is_untracked_rather_than_missing() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+
+        assert_eq!(budgets.tracked("nonexistent"), 0);
+        assert_eq!(budgets.max_cost("nonexistent"), None);
+    }
+
+    /// Tracking a job against a budget with no group is skipped, not
+    /// conjured — the same rule `park` follows, and for the same reason.
+    #[test]
+    fn tracking_an_unknown_budget_creates_nothing() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+
+        budgets.track(&[draws("ghost", 5)]);
+
+        assert_eq!(budgets.tracked("ghost"), 0);
+        assert_eq!(budgets.max_cost("ghost"), None);
+    }
+
+    /// A policy change adjusts a running budget. Whatever is already
+    /// committed to it stays committed — otherwise a shrink could erase
+    /// the very accounting that decides whether the shrink is safe.
+    #[test]
+    fn a_policy_change_leaves_tracked_jobs_alone() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+
+        budgets.track(&[draws("stripe", 6)]);
+        budgets.sync("stripe", &concurrency(20), NOW);
+
+        assert_eq!(budgets.tracked("stripe"), 1);
+        assert_eq!(budgets.max_cost("stripe"), Some(6));
+    }
+
+    #[test]
+    fn forgetting_a_budget_discards_its_cost_accounting() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+
+        budgets.track(&[draws("stripe", 6)]);
+        budgets.forget("stripe");
+
+        assert_eq!(budgets.tracked("stripe"), 0);
+        assert_eq!(budgets.max_cost("stripe"), None);
     }
 }

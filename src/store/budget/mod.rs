@@ -20,6 +20,7 @@
 //! The `impl Store { ... }` methods for the budget API live in the
 //! sibling `ops` submodule.
 
+mod costs;
 mod limiter;
 mod ops;
 mod registry;
