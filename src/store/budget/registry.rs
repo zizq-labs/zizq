@@ -600,7 +600,7 @@ impl Budgets {
     }
 
     /// Forget every budget and everything waiting on one.
-    #[allow(dead_code, reason = "used once dispatch selects from budget groups")]
+    #[allow(dead_code, reason = "used once POST /reset wipes budgets too")]
     pub(in crate::store) fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.groups.clear();
