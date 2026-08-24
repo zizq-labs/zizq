@@ -268,6 +268,32 @@ impl Dispatch {
     pub(super) fn untrack(&self, budgets: &[BudgetRef]) {
         self.budgets.untrack(budgets);
     }
+
+    /// Hand back the capacity a job was occupying while it ran.
+    ///
+    /// For every exit from in-flight — acknowledged, failed into a
+    /// retry, killed, deleted, or returned by a worker disconnect. What
+    /// they have in common is the only thing that matters here: the job
+    /// has stopped running, so a `while_in_flight` budget has a slot
+    /// free again. Rate limits keep their tokens, which is the whole
+    /// distinction between the two strategies — a `time_based` token
+    /// says a dispatch happened, and one did.
+    ///
+    /// Distinct from [`Dispatch::refund`], which is for a job that never
+    /// ran at all and gives back *every* budget's tokens. A disconnect
+    /// is the case that makes the difference concrete: the job did
+    /// dispatch and did run for some unknown time, so refunding the rate
+    /// limit would let a flapping worker re-dispatch it for free.
+    ///
+    /// **Call after the commit that ends the job's flight.** Releasing
+    /// first and then failing to commit would hand out a slot for a job
+    /// that is still running; releasing after leaves the slot held a
+    /// moment too long, which merely delays a dispatch.
+    pub(super) fn release_concurrency(&self, budgets: &[BudgetRef]) {
+        if !budgets.is_empty() {
+            self.budgets.release_concurrency(budgets);
+        }
+    }
 }
 
 /// Interleaves two already-ordered streams of ready jobs.

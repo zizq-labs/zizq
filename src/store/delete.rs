@@ -65,6 +65,11 @@ impl Store {
                 }
                 JobStatus::InFlight => {
                     in_flight_index.remove(job.dequeued_at.unwrap_or(0), &id);
+                    // Only an in-flight job is holding capacity. A ready
+                    // or scheduled one was never dispatched, so it has
+                    // no slot to give back and crediting one would
+                    // invent capacity out of nothing.
+                    dispatch.release_concurrency(&job.budgets);
                 }
                 _ => {}
             }
@@ -212,6 +217,8 @@ impl Store {
                     }
                     JobStatus::InFlight => {
                         in_flight_index.remove(d.dequeued_at, &d.id);
+                        // See `purge_job`: only in-flight holds capacity.
+                        dispatch.release_concurrency(&d.budgets);
                     }
                     _ => {}
                 }
@@ -459,6 +466,113 @@ mod tests {
         assert!(store.delete_job(&id).await.unwrap());
 
         assert_eq!(store.budgets.tracked("stripe"), 0);
+    }
+
+    /// Deleting a job out from under a worker is the one exit from
+    /// in-flight the worker never gets to report, so nothing else will
+    /// ever hand the slot back.
+    #[tokio::test]
+    async fn deleting_an_in_flight_job_returns_its_slot() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+        for payload in ["a", "b"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("solo")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(store.delete_job(&taken.id).await.unwrap());
+
+        let next = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, taken.id);
+    }
+
+    /// A queued job never acquired anything, so deleting it must not
+    /// credit a slot — that would invent capacity and let the budget
+    /// run two jobs at once on an allocation of one.
+    #[tokio::test]
+    async fn deleting_a_queued_job_does_not_invent_a_slot() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+        for payload in ["a", "b", "c"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("solo")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let running = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Delete one of the two still waiting.
+        let waiting = store
+            .list_jobs(ListJobsOptions::new().statuses([JobStatus::Ready].into()))
+            .await
+            .unwrap()
+            .jobs;
+        assert_eq!(waiting.len(), 2);
+        assert!(store.delete_job(&waiting[0].id).await.unwrap());
+
+        // The one still running holds the only slot.
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // And it still works normally once that one finishes.
+        store
+            .mark_completed(now_millis(), &running.id)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// The bulk path counts down per job, on the same terminal-state

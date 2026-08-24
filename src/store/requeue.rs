@@ -70,6 +70,20 @@ impl Store {
 
                 ks.commit(tx, ks.default_commit_mode)?;
 
+                // Released, not refunded. The job did dispatch and did
+                // run for some unknown amount of time before the worker
+                // went away, so a rate limit keeps the token it spent —
+                // otherwise a flapping worker could re-dispatch the same
+                // job indefinitely at no cost to the limit it exists to
+                // enforce. Only the concurrency slot comes back.
+                //
+                // Before the re-insert, not after. Queueing the job
+                // first leaves a window where it is visible while still
+                // holding its own slot, so a claim can look at it, fail
+                // to acquire, and then the release lands with nothing to
+                // provoke another attempt.
+                dispatch.release_concurrency(&job.budgets);
+
                 // Insert into the in-memory ready index after commit succeeds.
                 dispatch.insert(Placement::of(&job));
 
@@ -96,11 +110,99 @@ impl Store {
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::budget::{BudgetBinding, BudgetStrategy};
     use super::super::options::EnqueueOptions;
     use super::super::store::StoreEvent;
     use super::super::test_support::{test_failure_opts, test_store};
     use super::super::types::JobStatus;
     use crate::time::now_millis;
+
+    /// A worker that vanished was, from the budget's point of view, a
+    /// completion whose outcome never arrived: the job has stopped
+    /// running, so the slot is genuinely free. Holding it would let one
+    /// disconnect wedge a concurrency budget of one for good.
+    #[tokio::test]
+    async fn a_disconnect_returns_the_concurrency_slot() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("solo")),
+            )
+            .await
+            .unwrap();
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(store.requeue(&taken.id).await.unwrap());
+
+        // Takeable again, on the same single slot it just gave back.
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retaken.id, taken.id);
+    }
+
+    /// The other half of the same decision, and the reason a disconnect
+    /// releases rather than refunds. The job did dispatch and did run
+    /// for some unknown time, so a rate limit keeps the token it spent.
+    /// Refunding it would let a flapping worker re-dispatch the same job
+    /// indefinitely at no cost to the limit.
+    #[tokio::test]
+    async fn a_disconnect_does_not_refund_a_rate_limit() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget(
+                "hourly",
+                1,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 3_600_000,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("hourly")),
+            )
+            .await
+            .unwrap();
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(store.requeue(&taken.id).await.unwrap());
+
+        // Queued again, but this hour's dispatch has been used.
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn requeue_returns_job_to_queue() {

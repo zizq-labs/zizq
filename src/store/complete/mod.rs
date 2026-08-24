@@ -81,6 +81,56 @@ mod tests {
     };
     use crate::time::now_millis;
 
+    /// The point of a concurrency budget: one job at a time, and the
+    /// next one goes as soon as the last is acknowledged. Without the
+    /// release, an allocation of one dispatches exactly once in the
+    /// lifetime of the process and then withholds forever.
+    #[tokio::test]
+    async fn acknowledging_frees_the_slot_for_the_next_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("one-at-a-time", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        for payload in ["a", "b"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("one-at-a-time")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The allocation is spent while it runs.
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        store.mark_completed(now_millis(), &first.id).await.unwrap();
+
+        let second = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
     /// Completion is terminal, so the job stops counting against the
     /// budget — otherwise the budget would accumulate a permanent debt
     /// of finished work and eventually refuse every change to itself.

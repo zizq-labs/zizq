@@ -135,6 +135,12 @@ impl Store {
 
                     ks.commit(tx, ks.default_commit_mode)?;
 
+                    // The attempt is over even though the job is not:
+                    // it waits out its backoff holding no capacity, and
+                    // acquires again when the retry is dispatched. It
+                    // stays *tracked* throughout, being unfinished work
+                    // the budget still owes room to.
+                    dispatch.release_concurrency(&job.budgets);
                     scheduled_index.insert(job.ready_at, id.clone());
 
                     break job;
@@ -163,6 +169,7 @@ impl Store {
                     ks.commit(tx, ks.default_commit_mode)?;
 
                     dispatch.remove(Placement::of(&job));
+                    dispatch.release_concurrency(&job.budgets);
                     dispatch.untrack(&job.budgets);
 
                     break job;
@@ -207,6 +214,7 @@ impl Store {
                 ks.commit(tx, ks.default_commit_mode)?;
 
                 dispatch.remove(Placement::of(&job));
+                dispatch.release_concurrency(&job.budgets);
                 dispatch.untrack(&job.budgets);
 
                 break job;
@@ -312,6 +320,98 @@ mod tests {
             .unwrap()
             .unwrap()
             .id
+    }
+
+    /// Enqueue `count` jobs each drawing one token from a concurrency
+    /// budget of `allocation`.
+    async fn contending_for(store: &super::Store, allocation: u32, count: usize) {
+        let now = now_millis();
+        store
+            .create_budget(
+                "slot",
+                allocation,
+                super::super::budget::BudgetStrategy::WhileInFlight,
+                now,
+            )
+            .await
+            .unwrap();
+        for i in 0..count {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(i))
+                        .budget(super::super::budget::BudgetBinding::new("slot")),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A failed attempt is over even though the job is not. Holding the
+    /// slot through the backoff would mean one flaky job blocking a
+    /// concurrency budget for as long as it keeps failing — and with a
+    /// growing backoff, for longer each time.
+    #[tokio::test]
+    async fn a_retry_returns_the_slot_it_was_holding() {
+        let store = test_store();
+        contending_for(&store, 1, 2).await;
+
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let failed = store
+            .record_failure(now_millis(), &first.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, JobStatus::Scheduled as u8);
+
+        let second = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn killing_a_job_returns_the_slot_it_was_holding() {
+        let store = test_store();
+        contending_for(&store, 1, 2).await;
+
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let opts = FailureOptions {
+            kill: true,
+            ..test_failure_opts()
+        };
+        store
+            .record_failure(now_millis(), &first.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A retry is not terminal. The job goes back to Scheduled and will
