@@ -23,6 +23,8 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use fjall::Readable;
 use tokio::task;
@@ -30,7 +32,7 @@ use tokio::task;
 use super::super::cron::cron_budget_usage;
 use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
-use super::super::store::{Keyspaces, Store};
+use super::super::store::{Keyspaces, Store, StoreEvent};
 use super::super::types::{Job, StoreError};
 use super::registry::Budgets;
 use super::{Budget, BudgetBinding, BudgetStrategy};
@@ -96,7 +98,7 @@ impl Store {
         let live = self.budgets.clone();
         let key = key.to_string();
 
-        task::spawn_blocking(move || -> Result<Budget, StoreError> {
+        let budget = task::spawn_blocking(move || -> Result<Budget, StoreError> {
             let mut budget = Budget::new(allocation, strategy, now)?;
             let budget_key = make_budget_key(&key);
 
@@ -120,7 +122,17 @@ impl Store {
 
             Ok(budget)
         })
-        .await?
+        .await??;
+
+        // A wider allocation can make parked jobs affordable, and
+        // nothing else would say so: a concurrency budget has no clock
+        // for the waker to have set a timer against, so its jobs would
+        // sit until unrelated traffic happened along. Announced here
+        // rather than inside the closure, which holds the keyspace and
+        // the registry but not the event channel.
+        self.wake_budgeted_jobs(now, BUDGET_WAKE_LIMIT);
+
+        Ok(budget)
     }
 
     /// Update named fields of an existing budget's policy.
@@ -138,7 +150,7 @@ impl Store {
         let live = self.budgets.clone();
         let key = key.to_string();
 
-        task::spawn_blocking(move || -> Result<Option<Budget>, StoreError> {
+        let budget = task::spawn_blocking(move || -> Result<Option<Budget>, StoreError> {
             let budget_key = make_budget_key(&key);
 
             let mut tx = ks.write_tx();
@@ -167,7 +179,12 @@ impl Store {
 
             Ok(Some(budget))
         })
-        .await?
+        .await??;
+
+        // See `put_budget`: a grown allocation has to be announced.
+        self.wake_budgeted_jobs(now, BUDGET_WAKE_LIMIT);
+
+        Ok(budget)
     }
 
     /// Load a budget's policy, or `None` if it does not exist.
@@ -219,6 +236,46 @@ impl Store {
                 .collect()
         })
         .await?
+    }
+
+    /// Tell workers about budgeted jobs that can now be dispatched, and
+    /// report when to look again.
+    ///
+    /// A throttled job sits in its budget's group with nothing to
+    /// announce it. The events that normally rouse a blocked take stream
+    /// are about jobs *arriving*, and no job arrives when a bucket
+    /// refills or a slot frees — so without this the work waits for the
+    /// next unrelated enqueue to knock on the door. On a busy server
+    /// that is imperceptible; on a quiet one it is unbounded.
+    ///
+    /// Emits [`StoreEvent::JobDispatchable`] per job rather than one
+    /// blanket signal, which is what makes the existing take-stream
+    /// machinery apply unchanged: each event carries the queue, so a
+    /// worker filtering on `emails` is not woken for a job in `reports`,
+    /// and each carries a single-use claim token, so one freed slot
+    /// rouses one worker instead of every idle connection.
+    ///
+    /// Returns the earliest time a still-parked job becomes affordable
+    /// on the clock alone, or `None` when no timer would help — the
+    /// caller then waits for an event instead. See
+    /// [`Budgets::wakeup`](super::registry::Budgets::wakeup).
+    ///
+    /// Synchronous and allocation-light: this reads in-memory state
+    /// only, never the keyspace, so it does not need `spawn_blocking`
+    /// and is cheap enough to call from a completion path. When nothing
+    /// is parked it costs one relaxed atomic load.
+    pub fn wake_budgeted_jobs(&self, now: u64, limit: usize) -> Option<u64> {
+        let wakeup = self.budgets.wakeup(now, limit);
+
+        for (id, queue) in wakeup.dispatchable {
+            let _ = self.event_tx.send(StoreEvent::JobDispatchable {
+                id,
+                queue,
+                token: Arc::new(AtomicBool::new(false)),
+            });
+        }
+
+        wakeup.next_refill
     }
 
     /// Delete a budget.
@@ -309,6 +366,14 @@ impl Store {
 /// No creations are staged behind this one — the caller writes the
 /// budget as soon as the check passes.
 const NOTHING_PLANNED: usize = 0;
+
+/// How many jobs a policy change will announce as newly dispatchable.
+///
+/// Matches the waker's own batch size in spirit: an operator widening a
+/// budget can release a lot of work at once, and one pass should not
+/// flood the broadcast channel. Anything skipped is picked up by the
+/// waker on its next pass.
+const BUDGET_WAKE_LIMIT: usize = 128;
 
 pub(in crate::store) fn check_budget_capacity(
     reader: &impl Readable,
@@ -1209,6 +1274,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(patched.allocation, 100);
+    }
+
+    // --- announcing capacity that a policy change created ---
+
+    /// Widening a concurrency budget frees capacity that no clock and no
+    /// job event will ever report. Without an announcement here the
+    /// parked work waits for unrelated traffic — a `time_based` budget
+    /// would recover at its next drip, but this one has no drip.
+    #[tokio::test]
+    async fn growing_a_budget_announces_the_jobs_it_unblocks() {
+        use super::super::super::store::StoreEvent;
+
+        let store = test_store();
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        let running = enqueue_drawing(&store, "solo", 1).await;
+        let waiting = enqueue_drawing(&store, "solo", 1).await;
+
+        // Occupy the only slot.
+        let taken = store
+            .take_next_job(NOW, &Default::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, running);
+
+        let mut rx = store.subscribe();
+
+        store
+            .patch_budget("solo", patch(Some(5), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut announced = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StoreEvent::JobDispatchable { id, .. } = event {
+                announced.push(id);
+            }
+        }
+
+        assert!(
+            announced.contains(&waiting),
+            "the widened budget did not announce its parked job: {announced:?}"
+        );
     }
 
     // --- the same protections, for jobs rather than cron entries ---

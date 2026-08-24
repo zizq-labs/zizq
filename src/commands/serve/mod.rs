@@ -17,6 +17,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+mod budget_waker;
 mod cron_scheduler;
 mod reaper;
 mod scheduler;
@@ -536,6 +537,17 @@ fn spawn_background_tasks(args: &Args, state: &Arc<AppState>) {
         crate::time::now_millis,
         scheduler_batch_size,
         scheduler_shutdown,
+    ));
+
+    // Budget waker: tells workers when a throttled job can run, which
+    // no other event covers — a refilled bucket or a freed slot creates
+    // no job for the usual notifications to be about.
+    let budget_waker_shutdown = state.shutdown.clone();
+    tokio::spawn(budget_waker::run(
+        state.store.clone(),
+        crate::time::now_millis,
+        budget_waker::DEFAULT_BATCH_SIZE,
+        budget_waker_shutdown,
     ));
 
     // Reaper: purges expired completed/dead jobs.

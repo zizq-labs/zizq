@@ -143,8 +143,33 @@ impl Limiter {
     pub(super) fn adopt(&mut self, budget: &Budget, now: u64) {
         self.refill(now);
 
+        let was_concurrency = self.drip.is_none();
+        let old_capacity = self.capacity;
+
         self.capacity = budget.allocation;
         self.drip = Self::drip(budget);
+
+        // Widening a concurrency budget hands the extra slots over at
+        // once, because nothing else ever would. A rate limit gets its
+        // increase from the drip — re-rated just above, so it applies
+        // from this instant — but a concurrency budget has no drip, and
+        // its tokens only ever come back from jobs finishing. Left to
+        // that, a budget widened from one to five would rise to one
+        // token when the running job released and be pushed straight
+        // back to zero by the next acquire: pinned at its old
+        // allocation for the life of the process.
+        //
+        // Only when it was already a concurrency budget and still is.
+        // Across a strategy change the tokens mean something different
+        // before and after, and carrying a delta between the two would
+        // be inventing capacity rather than delivering it.
+        if was_concurrency
+            && self.drip.is_none()
+            && let Some(extra) = self.capacity.checked_sub(old_capacity)
+        {
+            self.tokens = self.tokens.saturating_add(extra);
+        }
+
         self.tokens = self.tokens.min(self.capacity);
 
         // Banked progress was measured against the old period, so it
@@ -543,6 +568,40 @@ mod tests {
         limiter.refill(NOW + 60_000);
 
         assert_eq!(limiter.tokens(), 100);
+    }
+
+    /// A rate limit gets its increase from the drip, but a concurrency
+    /// budget has no drip and its tokens only come back from jobs
+    /// finishing. Without handing the extra slots over here, widening
+    /// one from one to five would leave it running one job at a time
+    /// for the life of the process: the release would take it to one
+    /// token and the next acquire straight back to zero.
+    #[test]
+    fn widening_a_concurrency_budget_hands_over_the_extra_slots() {
+        let mut limiter = Limiter::new(&concurrency(1), NOW);
+
+        // A job takes the only slot.
+        assert!(limiter.try_acquire(1, NOW));
+        assert_eq!(limiter.tokens(), 0);
+
+        limiter.adopt(&concurrency(5), NOW);
+
+        // Four more may run alongside the one still going.
+        assert_eq!(limiter.tokens(), 4);
+    }
+
+    /// The tokens either side of a strategy change do not mean the same
+    /// thing, so no delta is carried across one.
+    #[test]
+    fn widening_across_a_strategy_change_hands_over_nothing() {
+        let mut limiter = Limiter::new(&per_minute(1), NOW);
+
+        assert!(limiter.try_acquire(1, NOW));
+        assert_eq!(limiter.tokens(), 0);
+
+        limiter.adopt(&concurrency(5), NOW);
+
+        assert_eq!(limiter.tokens(), 0);
     }
 
     /// Tightening a budget applies at once rather than after the
