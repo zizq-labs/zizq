@@ -3374,6 +3374,23 @@ async fn reset(AcceptFormat(fmt): AcceptFormat, State(state): State<Arc<AppState
         );
     }
 
+    // Last of the three, and the order is what makes it simple. Cron
+    // entries and unfinished jobs are the only things that can reference
+    // a budget, and both are gone by now — so the deletion rule that
+    // refuses a referenced budget is honoured here without ever firing.
+    // No force flag, and no exception carved into the rule for one
+    // caller.
+    if let Err(e) = state.store.delete_budgets().await {
+        tracing::error!(%e, "reset: delete_budgets failed");
+        return respond(
+            fmt,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: "internal error".into(),
+            },
+        );
+    }
+
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -9919,6 +9936,90 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["crons"], serde_json::json!([]));
+    }
+
+    /// Reset exists to give a test suite a clean slate, so a budget
+    /// surviving it would leak throttling between one suite's run and
+    /// the next — and an allocation half-spent by jobs that no longer
+    /// exist is worse than a stale one, because nothing will ever
+    /// release it.
+    ///
+    /// Also covers the ordering: a budget referenced by both a cron
+    /// entry and a queued job would refuse deletion on its own, and
+    /// reset only gets away with removing it because both are gone by
+    /// the time it tries.
+    #[tokio::test]
+    async fn reset_clears_budgets_that_jobs_and_crons_referenced() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // A job drawing on it.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{ "key": "stripe", "cost": 2 }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // And a cron entry drawing on it.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                "/crons/default",
+                &serde_json::json!({
+                    "entries": [{
+                        "name": "nightly",
+                        "expression": "0 3 * * *",
+                        "timezone": "UTC",
+                        "job": {
+                            "type": "t",
+                            "queue": "q",
+                            "payload": {},
+                            "budgets": [{ "key": "stripe", "cost": 1 }],
+                        },
+                    }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Deleting it directly is refused while both reference it.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "DELETE",
+                "/budgets/stripe",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let req = empty_request("POST", "/reset");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let req = empty_request("GET", "/budgets");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["budgets"], serde_json::json!([]));
     }
 
     #[tokio::test]

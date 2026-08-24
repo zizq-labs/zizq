@@ -307,33 +307,7 @@ impl Store {
                 return Ok(false);
             }
 
-            if let Some(usage) = cron_budget_usage(&tx, &ks, &key)? {
-                let plural = if usage.entries == 1 {
-                    "entry"
-                } else {
-                    "entries"
-                };
-                return Err(StoreError::Conflict(format!(
-                    "budget '{key}' is referenced by {} cron {plural}, including '{}'. \
-                     Remove them before deleting it.",
-                    usage.entries, usage.example
-                )));
-            }
-
-            // Unlike cron entries, jobs go away on their own, so waiting
-            // is a remedy — and the deletion this refuses would be worse
-            // than it looks. `forget` discards the group along with the
-            // budget, so every job waiting on it leaves dispatch and
-            // does not come back: a restart cannot recover them, because
-            // the budget they park on genuinely no longer exists.
-            let tracked = live.tracked(&key);
-            if tracked > 0 {
-                let plural = if tracked == 1 { "job" } else { "jobs" };
-                return Err(StoreError::Conflict(format!(
-                    "budget '{key}' is referenced by {tracked} unfinished {plural}. \
-                     Delete them or wait for them to finish before deleting it."
-                )));
-            }
+            check_unreferenced(&tx, &ks, &live, &key)?;
 
             tx.remove(&ks.data, &budget_key);
             ks.commit(tx, ks.default_commit_mode)?;
@@ -344,6 +318,108 @@ impl Store {
         })
         .await?
     }
+
+    /// Delete every budget, for `POST /reset`.
+    ///
+    /// Returns how many were removed.
+    ///
+    /// Two things have to happen, not one: the records leave the data
+    /// keyspace *and* the live registry is cleared. Dropping only the
+    /// records would leave groups holding allocations for budgets that
+    /// no longer exist.
+    ///
+    /// Honours the same refusal as [`Store::delete_budget`], applied to
+    /// each budget, rather than taking a shortcut past it — but by
+    /// construction it never fires. Cron entries and unfinished jobs are
+    /// the only two things that can reference a budget, and `reset`
+    /// deletes cron groups and then jobs before calling this. The rule
+    /// is therefore free to keep, and keeping it means there is no
+    /// second deletion path that could strand work if the order ever
+    /// changed.
+    pub async fn delete_budgets(&self) -> Result<usize, StoreError> {
+        let ks = self.ks.clone();
+        let live = self.budgets.clone();
+
+        task::spawn_blocking(move || -> Result<usize, StoreError> {
+            let mut tx = ks.write_tx();
+
+            let start = vec![RecordKind::Budget as u8, 0];
+            let end = vec![RecordKind::Budget as u8, 1];
+
+            let keys: Vec<String> = tx
+                .range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
+                .map(|guard| {
+                    let (key, _) = guard.into_inner()?;
+                    // Skip the `B\0` prefix to recover the budget key.
+                    String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                        StoreError::Corruption(format!("budget key is not valid UTF-8: {e}"))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Checked for all before removing any, so a refusal leaves
+            // the keyspace untouched rather than half-wiped.
+            for key in &keys {
+                check_unreferenced(&tx, &ks, &live, key)?;
+            }
+
+            for key in &keys {
+                tx.remove(&ks.data, make_budget_key(key));
+            }
+
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            live.clear();
+
+            Ok(keys.len())
+        })
+        .await?
+    }
+}
+
+/// Reject deleting a budget that something still draws on.
+///
+/// The two referrers are reported separately rather than as one count,
+/// because they have different ways out: a cron entry is a standing
+/// claim that has to be edited, where a job will finish on its own.
+///
+/// Shared by the single and bulk deletes so the rule cannot drift into
+/// two versions, one of which is laxer than the other.
+fn check_unreferenced(
+    reader: &impl Readable,
+    ks: &Keyspaces,
+    live: &Budgets,
+    key: &str,
+) -> Result<(), StoreError> {
+    if let Some(usage) = cron_budget_usage(reader, ks, key)? {
+        let plural = if usage.entries == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        return Err(StoreError::Conflict(format!(
+            "budget '{key}' is referenced by {} cron {plural}, including '{}'. \
+             Remove them before deleting it.",
+            usage.entries, usage.example
+        )));
+    }
+
+    // Unlike cron entries, jobs go away on their own, so waiting is a
+    // remedy — and the deletion this refuses would be worse than it
+    // looks. `forget` discards the group along with the budget, so every
+    // job waiting on it leaves dispatch and does not come back: a
+    // restart cannot recover them, because the budget they park on
+    // genuinely no longer exists.
+    let tracked = live.tracked(key);
+    if tracked > 0 {
+        let plural = if tracked == 1 { "job" } else { "jobs" };
+        return Err(StoreError::Conflict(format!(
+            "budget '{key}' is referenced by {tracked} unfinished {plural}. \
+             Delete them or wait for them to finish before deleting it."
+        )));
+    }
+
+    Ok(())
 }
 
 /// Reject a create that would take the server past `max_budgets`.
@@ -1274,6 +1350,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(patched.allocation, 100);
+    }
+
+    // --- wiping every budget, for reset ---
+
+    /// The registry has to go with the records. Leaving groups behind
+    /// would keep throttling against budgets that no longer exist —
+    /// invisible, since every read-back API answers from the keyspace.
+    #[tokio::test]
+    async fn deleting_every_budget_clears_the_live_registry_too() {
+        let store = test_store();
+        for key in ["stripe", "mailgun"] {
+            store
+                .create_budget(key, 10, BudgetStrategy::WhileInFlight, NOW)
+                .await
+                .unwrap();
+        }
+
+        // Spend from one, so a surviving group would be observable as a
+        // budget that is already partly drained.
+        let id = enqueue_drawing(&store, "stripe", 4).await;
+        store
+            .take_next_job(NOW, &Default::default())
+            .await
+            .unwrap()
+            .unwrap();
+        store.delete_job(&id).await.unwrap();
+
+        assert_eq!(store.delete_budgets().await.unwrap(), 2);
+
+        assert!(store.list_budgets().await.unwrap().is_empty());
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+        assert_eq!(store.budgets.max_cost("stripe"), None);
+
+        // Recreating starts from a clean allocation rather than
+        // inheriting whatever the old group had spent.
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 10).await;
+        assert!(
+            store
+                .take_next_job(NOW, &Default::default())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_every_budget_reports_nothing_on_an_empty_store() {
+        let store = test_store();
+        assert_eq!(store.delete_budgets().await.unwrap(), 0);
+    }
+
+    /// The rule is kept rather than bypassed. `reset` never trips it,
+    /// because it removes cron entries and jobs first — but the bulk
+    /// path must not be a way around a refusal the single delete makes.
+    #[tokio::test]
+    async fn deleting_every_budget_is_refused_while_one_is_referenced() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        store
+            .create_budget("mailgun", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 1).await;
+
+        let result = store.delete_budgets().await;
+        assert!(matches!(result, Err(StoreError::Conflict(_))));
+
+        // Checked for all before removing any, so the unreferenced one
+        // survives too rather than the store being left half-wiped.
+        assert_eq!(store.list_budgets().await.unwrap().len(), 2);
     }
 
     // --- announcing capacity that a policy change created ---

@@ -813,7 +813,10 @@ impl Budgets {
     }
 
     /// Forget every budget and everything waiting on one.
-    #[allow(dead_code, reason = "used once POST /reset wipes budgets too")]
+    ///
+    /// Paired with removing the records themselves — the registry alone
+    /// would leave live groups holding allocations for budgets that no
+    /// longer exist, and the records alone would leave the opposite.
     pub(in crate::store) fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.groups.clear();
