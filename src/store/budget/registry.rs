@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::ready_index::ReadyIndex;
 use super::costs::CostCounts;
-use super::limiter::Limiter;
+use super::limiter::{Availability, Limiter};
 use super::{Budget, BudgetRef};
 
 /// Everything the mutex guards.
@@ -109,6 +109,29 @@ struct Inner {
     /// lives under the same mutex as the groups and is written by the
     /// same two functions, so the two cannot disagree.
     refs: HashMap<String, Vec<BudgetRef>>,
+}
+
+/// What the budget registry has for a dispatcher, and when to ask again.
+///
+/// The two fields answer different questions and are not alternatives: a
+/// pass can find one budget with work ready to go and another that will
+/// not be affordable for an hour.
+#[derive(Debug, Default)]
+#[allow(dead_code, reason = "consumed by the budget waker task")]
+pub(in crate::store) struct BudgetWakeup {
+    /// Parked jobs affordable at the time asked about, best first, as
+    /// `(job_id, queue)`. The queue comes along because a waker has to
+    /// tell workers *which* queue woke up — one filtering on `emails`
+    /// should not be roused for a job in `reports`.
+    pub(in crate::store) dispatchable: Vec<(String, String)>,
+
+    /// The earliest a still-parked job becomes affordable on the clock
+    /// alone.
+    ///
+    /// `None` means no timer would help: either nothing is parked, or
+    /// everything parked is waiting on a release rather than a drip.
+    /// Those callers wake on an event instead.
+    pub(in crate::store) next_refill: Option<u64>,
 }
 
 /// The jobs waiting on one budget, and its tokens.
@@ -488,6 +511,100 @@ impl Budgets {
         // A job at the head of several budgets is one candidate.
         candidates.dedup();
         candidates
+    }
+
+    /// What a job is waiting for, across every budget it draws on.
+    ///
+    /// A job needs *all* of its budgets, so the answer is the most
+    /// blocking of their individual answers. The ordering is
+    /// `Never` > `OnRelease` > `At` > `Now`, and two of those pairings
+    /// deserve saying out loud:
+    ///
+    /// - Two `At`s take the **later**. Being affordable on one budget
+    ///   early does not help; the job goes when the last one catches up.
+    /// - `OnRelease` beats `At`, so a job needing both a release and a
+    ///   drip sets no timer. That is deliberate: a timer would fire
+    ///   while the release was still outstanding and achieve nothing.
+    ///   The release itself provokes a fresh look, and by then the
+    ///   answer is a plain `At` that can be timed properly.
+    ///
+    /// A budget with no group answers `Never` rather than being skipped.
+    /// Skipping would quietly treat the job as affordable on the budgets
+    /// that *do* exist, and the install-time and deletion guards exist
+    /// precisely so this cannot arise.
+    fn availability_of(inner: &Inner, refs: &[BudgetRef], now: u64) -> Availability {
+        let mut worst = Availability::Now;
+
+        for reference in refs {
+            let Some(group) = inner.groups.get(&reference.key) else {
+                return Availability::Never;
+            };
+
+            worst = match (worst, group.limiter.next_available(reference.cost, now)) {
+                (Availability::Never, _) | (_, Availability::Never) => Availability::Never,
+                (Availability::OnRelease, _) | (_, Availability::OnRelease) => {
+                    Availability::OnRelease
+                }
+                (Availability::At(a), Availability::At(b)) => Availability::At(a.max(b)),
+                (Availability::At(t), Availability::Now)
+                | (Availability::Now, Availability::At(t)) => Availability::At(t),
+                (Availability::Now, Availability::Now) => Availability::Now,
+            };
+        }
+
+        worst
+    }
+
+    /// What is dispatchable now, and when to look again.
+    ///
+    /// Answers both halves in one pass under one lock, because they are
+    /// two views of the same question and a caller acting on
+    /// inconsistent answers would either dispatch nothing or arm a timer
+    /// for work it had already been handed.
+    ///
+    /// Only the head of each occupied budget is considered, matching
+    /// `claim_next`: within a budget the order is strict FIFO, so a job
+    /// behind the head cannot go first however cheap it is.
+    ///
+    /// Nothing is acquired. This reports what *could* happen, and the
+    /// claim that follows may still lose a race to another worker —
+    /// which is fine, since the caller's job is to provoke an attempt,
+    /// not to guarantee it succeeds.
+    #[allow(dead_code, reason = "consumed by the budget waker task")]
+    pub(in crate::store) fn wakeup(&self, now: u64, limit: usize) -> BudgetWakeup {
+        let mut out = BudgetWakeup::default();
+
+        // The same lock-free hint the dispatch fast path uses. It reads
+        // high rather than low, so a zero here really does mean nothing
+        // is parked.
+        if self.waiting.load(Ordering::Relaxed) == 0 {
+            return out;
+        }
+
+        let inner = self.inner.lock().unwrap();
+        let anywhere = HashSet::new();
+
+        for (_, id, queue) in Self::candidates(&inner, &anywhere) {
+            let Some(refs) = inner.refs.get(&id) else {
+                continue;
+            };
+
+            match Self::availability_of(&inner, refs, now) {
+                Availability::Now => {
+                    if out.dispatchable.len() < limit {
+                        out.dispatchable.push((id, queue));
+                    }
+                }
+                Availability::At(at) => {
+                    out.next_refill = Some(out.next_refill.map_or(at, |soonest| soonest.min(at)));
+                }
+                // Neither is worth a timer: one waits on an event, the
+                // other on nothing at all.
+                Availability::OnRelease | Availability::Never => {}
+            }
+        }
+
+        out
     }
 
     /// The next job a budget would offer, if any.
@@ -1285,5 +1402,189 @@ mod tests {
 
         assert_eq!(budgets.tracked("stripe"), 0);
         assert_eq!(budgets.max_cost("stripe"), None);
+    }
+
+    // --- what the waker asks for ---
+
+    const NO_LIMIT: usize = usize::MAX;
+
+    #[test]
+    fn an_empty_registry_wants_no_wakeup() {
+        let budgets = Budgets::new();
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert!(wakeup.dispatchable.is_empty());
+        assert_eq!(wakeup.next_refill, None);
+    }
+
+    #[test]
+    fn an_affordable_job_is_reported_with_its_queue() {
+        let budgets = registry_with(&[("stripe", concurrency(10))]);
+        budgets.park(&[draws("stripe", 1)], "emails", 0, "a");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert_eq!(
+            wakeup.dispatchable,
+            vec![("a".to_string(), "emails".to_string())]
+        );
+        assert_eq!(wakeup.next_refill, None);
+    }
+
+    /// A drained rate limit is answerable by the clock, so the waker
+    /// gets a time to come back at rather than a job.
+    #[test]
+    fn a_drained_rate_limit_reports_when_it_recovers() {
+        let budgets = registry_with(&[("stripe", per_minute(1))]);
+        let refs = [draws("stripe", 1)];
+
+        assert!(budgets.try_acquire_all(&refs, NOW));
+        budgets.park(&refs, "q", 0, "a");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert!(wakeup.dispatchable.is_empty());
+        assert_eq!(wakeup.next_refill, Some(NOW + 60_000));
+    }
+
+    /// A drained concurrency budget is not answerable by any clock. No
+    /// timer would help, so none is asked for — the waker has to be
+    /// roused by the release instead.
+    #[test]
+    fn a_drained_concurrency_budget_asks_for_no_timer() {
+        let budgets = registry_with(&[("stripe", concurrency(1))]);
+        let refs = [draws("stripe", 1)];
+
+        assert!(budgets.try_acquire_all(&refs, NOW));
+        budgets.park(&refs, "q", 0, "a");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert!(wakeup.dispatchable.is_empty());
+        assert_eq!(wakeup.next_refill, None);
+    }
+
+    /// Waiting on two clocks means waiting for the later one. Reporting
+    /// the earlier would wake to find the job still unaffordable.
+    #[test]
+    fn a_job_on_two_rate_limits_waits_for_the_slower() {
+        let budgets = Budgets::new();
+        budgets.sync("fast", &per_minute(1), NOW);
+        budgets.sync(
+            "slow",
+            &Budget::new(
+                1,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 600_000,
+                },
+                NOW,
+            )
+            .unwrap(),
+            NOW,
+        );
+
+        let refs = [draws("fast", 1), draws("slow", 1)];
+        assert!(budgets.try_acquire_all(&refs, NOW));
+        budgets.park(&refs, "q", 0, "a");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert_eq!(wakeup.next_refill, Some(NOW + 600_000));
+    }
+
+    /// A job needing both a release and a drip sets no timer: one that
+    /// fired while the release was still outstanding would achieve
+    /// nothing. The release provokes a fresh look, and by then the
+    /// answer is a plain time.
+    #[test]
+    fn a_release_outranks_a_drip_and_suppresses_the_timer() {
+        let budgets = Budgets::new();
+        budgets.sync("rate", &per_minute(1), NOW);
+        budgets.sync("slots", &concurrency(1), NOW);
+
+        let refs = [draws("rate", 1), draws("slots", 1)];
+        assert!(budgets.try_acquire_all(&refs, NOW));
+        budgets.park(&refs, "q", 0, "a");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert!(wakeup.dispatchable.is_empty());
+        assert_eq!(wakeup.next_refill, None);
+
+        // Once the slot comes back, the drip is all that is left and it
+        // can be timed.
+        budgets.release_concurrency(&refs);
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert_eq!(wakeup.next_refill, Some(NOW + 60_000));
+    }
+
+    /// One starved budget must not hide another that is ready, and the
+    /// pass has to report both halves rather than stopping at the first
+    /// thing it finds.
+    #[test]
+    fn a_single_pass_reports_the_ready_and_the_waiting() {
+        let budgets = Budgets::new();
+        budgets.sync("ready", &concurrency(10), NOW);
+        budgets.sync("starved", &per_minute(1), NOW);
+
+        let starved = [draws("starved", 1)];
+        assert!(budgets.try_acquire_all(&starved, NOW));
+        budgets.park(&starved, "q", 0, "waits");
+        budgets.park(&[draws("ready", 1)], "q", 9, "goes");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        assert_eq!(
+            wakeup.dispatchable,
+            vec![("goes".to_string(), "q".to_string())]
+        );
+        assert_eq!(wakeup.next_refill, Some(NOW + 60_000));
+    }
+
+    /// The limit caps how many jobs come back, but must not stop the
+    /// scan — the timer is the half that keeps the waker armed, and
+    /// losing it would leave a drained budget waiting on nothing.
+    #[test]
+    fn a_limit_caps_the_jobs_without_losing_the_timer() {
+        let budgets = Budgets::new();
+        budgets.sync("a", &concurrency(10), NOW);
+        budgets.sync("b", &concurrency(10), NOW);
+        budgets.sync("starved", &per_minute(1), NOW);
+
+        budgets.park(&[draws("a", 1)], "q", 0, "one");
+        budgets.park(&[draws("b", 1)], "q", 1, "two");
+
+        let starved = [draws("starved", 1)];
+        assert!(budgets.try_acquire_all(&starved, NOW));
+        budgets.park(&starved, "q", 2, "waits");
+
+        let wakeup = budgets.wakeup(NOW, 1);
+
+        assert_eq!(wakeup.dispatchable.len(), 1);
+        assert_eq!(wakeup.next_refill, Some(NOW + 60_000));
+    }
+
+    /// Only heads are considered, matching `claim_next`. A cheap job
+    /// behind a head that cannot currently be paid for is not
+    /// dispatchable, because FIFO within a budget is the deliberate
+    /// behaviour — otherwise a stream of small jobs could starve a
+    /// large one indefinitely.
+    #[test]
+    fn a_job_behind_an_unaffordable_head_is_not_reported() {
+        let budgets = registry_with(&[("stripe", concurrency(5))]);
+
+        // Something already running holds two of the five.
+        assert!(budgets.try_acquire_all(&[draws("stripe", 2)], NOW));
+
+        budgets.park(&[draws("stripe", 5)], "q", 0, "dear");
+        budgets.park(&[draws("stripe", 1)], "q", 1, "cheap");
+
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+
+        // `cheap` could be paid for, but it is not the head.
+        assert!(wakeup.dispatchable.is_empty());
+        // Concurrency, so no clock will help.
+        assert_eq!(wakeup.next_refill, None);
     }
 }

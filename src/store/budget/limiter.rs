@@ -48,7 +48,6 @@ use super::{Budget, BudgetStrategy};
 /// handed would set a timer for the current instant, wake immediately,
 /// and spin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "wired up when budgeted jobs reach dispatch")]
 pub(super) enum Availability {
     /// Enough tokens are there. Acquire, do not park.
     Now,
