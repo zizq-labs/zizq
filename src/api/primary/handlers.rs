@@ -2806,6 +2806,15 @@ async fn delete_budget(
                 error: format!("budget '{key}' not found"),
             },
         ),
+        // Refused because something still references the budget. The
+        // message names what, and how to clear it, so it has to reach
+        // the caller rather than being swallowed as a 500.
+        // Refused because something still references the budget. The
+        // message names what, and how to clear it, so it has to reach
+        // the caller rather than being swallowed as a 500.
+        Err(StoreError::Conflict(msg)) => {
+            respond(fmt, StatusCode::CONFLICT, &ErrorResponse { error: msg })
+        }
         Err(e) => {
             tracing::error!(%e, "delete_budget failed");
             respond(
@@ -8525,6 +8534,59 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["allocation"], 100);
+    }
+
+    /// A refused delete is the caller's problem to fix, not a server
+    /// fault — and the message says which jobs and how to clear them,
+    /// so reporting it as a 500 would throw away the only part that
+    /// helps. This handler was the one budget route not mapping its
+    /// store errors.
+    #[tokio::test]
+    async fn budget_delete_conflicts_while_a_job_references_it() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{ "key": "stripe", "cost": 2 }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "DELETE",
+                "/budgets/stripe",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("unfinished job"), "unhelpful: {error}");
+
+        // Refusing changed nothing.
+        let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

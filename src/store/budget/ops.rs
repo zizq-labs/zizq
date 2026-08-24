@@ -106,7 +106,7 @@ impl Store {
                 Some(bytes) => {
                     let existing: Budget = rmp_serde::from_slice(&bytes)?;
                     budget.created_at = existing.created_at;
-                    check_cron_costs_fit(&tx, &ks, &key, budget.allocation)?;
+                    check_costs_fit(&tx, &ks, &live, &key, budget.allocation)?;
                 }
                 // Replacing a budget cannot push the server over its
                 // cap; only creating one can.
@@ -158,7 +158,7 @@ impl Store {
             )?;
             budget.created_at = existing.created_at;
 
-            check_cron_costs_fit(&tx, &ks, &key, budget.allocation)?;
+            check_costs_fit(&tx, &ks, &live, &key, budget.allocation)?;
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
@@ -225,14 +225,17 @@ impl Store {
     ///
     /// Returns `true` if it existed, `false` otherwise.
     ///
-    /// Refused with [`StoreError::Conflict`] while any cron entry's
-    /// job template references it — an entry is a standing claim that
-    /// never drains, so deleting out from under one would strand a
-    /// schedule.
+    /// Refused with [`StoreError::Conflict`] while anything still
+    /// references it, which is two separate questions:
     ///
-    /// The equivalent guard for *jobs* referencing the budget needs the
-    /// per-budget accounting that arrives with dispatch; until then a
-    /// budget referenced only by queued jobs can still be deleted.
+    /// - **A cron entry's job template.** An entry is a standing claim
+    ///   that never drains, so deleting out from under one would strand
+    ///   a schedule with no remedy but editing the entry.
+    /// - **An unfinished job.** These do drain, so the operator has the
+    ///   extra option of simply waiting.
+    ///
+    /// Reported separately rather than as one count, because the two
+    /// have different ways out.
     pub async fn delete_budget(&self, key: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
         let live = self.budgets.clone();
@@ -257,6 +260,21 @@ impl Store {
                     "budget '{key}' is referenced by {} cron {plural}, including '{}'. \
                      Remove them before deleting it.",
                     usage.entries, usage.example
+                )));
+            }
+
+            // Unlike cron entries, jobs go away on their own, so waiting
+            // is a remedy — and the deletion this refuses would be worse
+            // than it looks. `forget` discards the group along with the
+            // budget, so every job waiting on it leaves dispatch and
+            // does not come back: a restart cannot recover them, because
+            // the budget they park on genuinely no longer exists.
+            let tracked = live.tracked(&key);
+            if tracked > 0 {
+                let plural = if tracked == 1 { "job" } else { "jobs" };
+                return Err(StoreError::Conflict(format!(
+                    "budget '{key}' is referenced by {tracked} unfinished {plural}. \
+                     Delete them or wait for them to finish before deleting it."
                 )));
             }
 
@@ -331,28 +349,56 @@ pub(in crate::store) fn check_budget_capacity(
     Ok(())
 }
 
-/// Reject an allocation that a cron entry's template could never fit
-/// inside.
+/// Reject an allocation that something already committed to the budget
+/// could never fit inside.
 ///
-/// A cron entry is a standing claim: unlike a job it never drains, so
-/// there is no "wait for it to finish" remedy. Shrinking below what a
-/// template costs would leave an entry that is installed, valid on its
-/// face, and permanently unable to fire.
-fn check_cron_costs_fit(
+/// A job or entry costing more than the whole allocation is not merely
+/// delayed — no amount of waiting makes it affordable, so it stalls
+/// silently until an operator notices. Enqueue rejects that at the door;
+/// this is the other direction, where the allocation moves instead of
+/// the cost.
+///
+/// Consults both halves of the tracked set, which are counted by
+/// different machinery: cron entries by a scan of the keyspace inside
+/// `reader`, jobs by the in-memory aggregate. Cron is checked first
+/// because its complaint can name the entry at fault, where the jobs one
+/// can only give a number.
+///
+/// Call under the write lock. The job side reads the live registry, and
+/// enqueue stages its accounting inside that same lock, so holding it is
+/// what stops a job appearing between this check and the write it
+/// guards.
+fn check_costs_fit(
     reader: &impl Readable,
     ks: &Keyspaces,
+    live: &Budgets,
     key: &str,
     allocation: u32,
 ) -> Result<(), StoreError> {
-    let Some(usage) = cron_budget_usage(reader, ks, key)? else {
-        return Ok(());
-    };
-
-    if allocation < usage.max_cost {
+    // A cron entry is a standing claim: unlike a job it never drains,
+    // so there is no "wait for it to finish" remedy. Shrinking below
+    // what a template costs would leave an entry that is installed,
+    // valid on its face, and permanently unable to fire.
+    if let Some(usage) = cron_budget_usage(reader, ks, key)?
+        && allocation < usage.max_cost
+    {
         return Err(StoreError::InvalidOperation(format!(
             "budget '{key}' cannot allocate {allocation}: cron entry '{}' draws {} from it. \
              Lower the entry's cost or remove it first.",
             usage.example, usage.max_cost
+        )));
+    }
+
+    // Jobs do drain, so waiting is a real remedy here and worth saying.
+    if let Some(max) = live.max_cost(key)
+        && allocation < max
+    {
+        let tracked = live.tracked(key);
+        let plural = if tracked == 1 { "job" } else { "jobs" };
+        return Err(StoreError::InvalidOperation(format!(
+            "budget '{key}' cannot allocate {allocation}: {tracked} unfinished {plural} \
+             draw up to {max} from it. Raise the allocation, delete them, or wait for \
+             them to drain."
         )));
     }
 
@@ -1163,5 +1209,170 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(patched.allocation, 100);
+    }
+
+    // --- the same protections, for jobs rather than cron entries ---
+
+    /// Enqueue a job drawing `cost` from `budget`, which must exist.
+    async fn enqueue_drawing(store: &Store, budget: &str, cost: u32) -> String {
+        use super::super::super::options::EnqueueOptions;
+        use super::super::BudgetBinding;
+
+        store
+            .enqueue(
+                NOW,
+                EnqueueOptions::new("t", "q", serde_json::json!({}))
+                    .budget(BudgetBinding::new(budget).cost(cost)),
+            )
+            .await
+            .unwrap()
+            .into_job()
+            .id
+    }
+
+    /// Deleting here is worse than it sounds: dropping the budget drops
+    /// the group with it, and every job waiting on that group leaves
+    /// dispatch for good — a restart cannot bring them back, because the
+    /// budget they would park on no longer exists.
+    #[tokio::test]
+    async fn delete_is_refused_while_a_job_references_it() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 1).await;
+
+        let result = store.delete_budget("stripe").await;
+        assert!(matches!(result, Err(StoreError::Conflict(_))));
+
+        assert!(store.get_budget("stripe").await.unwrap().is_some());
+    }
+
+    /// Jobs drain, so the refusal should point at waiting as a way out —
+    /// which is the one remedy the cron message must never offer.
+    #[tokio::test]
+    async fn a_job_refusal_offers_waiting_as_a_remedy() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 1).await;
+
+        let Err(StoreError::Conflict(msg)) = store.delete_budget("stripe").await else {
+            panic!("expected a conflict");
+        };
+        assert!(msg.contains("1 unfinished job"), "unhelpful message: {msg}");
+        assert!(msg.contains("wait"), "unhelpful message: {msg}");
+    }
+
+    #[tokio::test]
+    async fn delete_is_allowed_once_the_job_is_gone() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        let id = enqueue_drawing(&store, "stripe", 1).await;
+
+        assert!(store.delete_job(&id).await.unwrap());
+
+        assert!(store.delete_budget("stripe").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_is_unaffected_by_jobs_on_other_budgets() {
+        let store = test_store();
+        for key in ["stripe", "mailgun"] {
+            store
+                .create_budget(key, 10, BudgetStrategy::WhileInFlight, NOW)
+                .await
+                .unwrap();
+        }
+        enqueue_drawing(&store, "mailgun", 1).await;
+
+        assert!(store.delete_budget("stripe").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn patch_cannot_shrink_below_a_queued_job_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 5).await;
+
+        let result = store
+            .patch_budget("stripe", patch(Some(4), None), NOW + 1)
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// A job costing exactly the allocation can still run, so the shrink
+    /// that lands on it is allowed. Only going below strands anything.
+    #[tokio::test]
+    async fn patch_may_shrink_exactly_to_a_queued_job_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 5).await;
+
+        let patched = store
+            .patch_budget("stripe", patch(Some(5), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(patched.allocation, 5);
+    }
+
+    #[tokio::test]
+    async fn put_cannot_shrink_below_a_queued_job_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 5).await;
+
+        let result = store
+            .put_budget("stripe", 4, BudgetStrategy::WhileInFlight, NOW + 1)
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// Both halves of the tracked set are consulted, and the tighter one
+    /// wins regardless of which it is. Here the job is dearer than the
+    /// cron template, so a shrink that the cron check alone would wave
+    /// through still has to fail.
+    #[tokio::test]
+    async fn the_dearer_of_a_job_and_a_cron_entry_decides() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 20, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install_cron_drawing(&store, "stripe", 3).await;
+        enqueue_drawing(&store, "stripe", 9).await;
+
+        // Fits the cron template, but not the job.
+        let result = store
+            .patch_budget("stripe", patch(Some(5), None), NOW + 1)
+            .await;
+        let Err(StoreError::InvalidOperation(msg)) = result else {
+            panic!("expected the job to block the shrink");
+        };
+        assert!(msg.contains("9"), "should cite the job's cost: {msg}");
+
+        // Above both, so it is allowed.
+        let patched = store
+            .patch_budget("stripe", patch(Some(9), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(patched.allocation, 9);
     }
 }
