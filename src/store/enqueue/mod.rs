@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_broadcasts_job_created() {
+    async fn enqueue_broadcasts_job_dispatchable() {
         let store = test_store();
         let mut rx = store.subscribe();
 
@@ -657,8 +657,8 @@ mod tests {
             .into_job();
 
         match rx.recv().await.unwrap() {
-            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
-            other => panic!("expected JobCreated, got {other:?}"),
+            StoreEvent::JobDispatchable { queue, .. } => assert_eq!(queue, "default"),
+            other => panic!("expected JobDispatchable, got {other:?}"),
         }
     }
 
@@ -965,8 +965,8 @@ mod tests {
             .unwrap();
 
         match rx.recv().await.unwrap() {
-            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "q1"),
-            other => panic!("expected JobCreated, got {other:?}"),
+            StoreEvent::JobDispatchable { queue, .. } => assert_eq!(queue, "q1"),
+            other => panic!("expected JobDispatchable, got {other:?}"),
         }
         match rx.recv().await.unwrap() {
             StoreEvent::JobScheduled { .. } => {}

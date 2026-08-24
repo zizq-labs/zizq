@@ -390,7 +390,7 @@ async fn process_store_event(
     conn: &mut ConnectionState,
 ) -> Vec<AdminEvent> {
     match event {
-        StoreEvent::JobCreated { .. } => {
+        StoreEvent::JobDispatchable { .. } => {
             // Covers both fresh enqueues and `requeue` calls. A requeue
             // also dropped an entry from the server-side InFlightIndex,
             // so we re-diff all three windows. Fresh enqueues will see
@@ -1205,11 +1205,11 @@ mod tests {
 
     /// Regression: when a worker disconnects, the take handler calls
     /// `store.requeue(id)` for each in-flight job, which emits a
-    /// `JobCreated` event. The admin handler used to only diff ready and
-    /// scheduled on `JobCreated`, leaving stale in-flight rows in the
+    /// `JobDispatchable` event. The admin handler used to only diff ready and
+    /// scheduled on `JobDispatchable`, leaving stale in-flight rows in the
     /// `zizq top` tab even though `store.requeue` had removed them from
     /// the server-side `InFlightIndex`. The handler now always re-runs
-    /// `diff_in_flight` on `JobCreated`, so the removal surfaces as an
+    /// `diff_in_flight` on `JobDispatchable`, so the removal surfaces as an
     /// `in_flight_removed` event.
     #[tokio::test]
     async fn requeue_emits_in_flight_removed_and_ready() {

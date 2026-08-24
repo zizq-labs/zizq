@@ -71,7 +71,7 @@ impl Store {
     /// status from Scheduled to Ready, and inserts it into the priority
     /// indexes so it becomes takeable.
     ///
-    /// Subscribers are notified with `StoreEvent::JobCreated`.
+    /// Subscribers are notified with `StoreEvent::JobDispatchable`.
     pub async fn promote_scheduled(&self, job: &Job) -> Result<(), StoreError> {
         let ks = self.ks.clone();
         let dispatch = self.dispatch.clone();
@@ -151,7 +151,7 @@ impl Store {
         })
         .await??;
 
-        let _ = self.event_tx.send(StoreEvent::JobCreated {
+        let _ = self.event_tx.send(StoreEvent::JobDispatchable {
             id: event_id,
             queue: event_queue,
             token: Arc::new(AtomicBool::new(false)),
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_scheduled_fires_job_created_event() {
+    async fn promote_scheduled_fires_job_dispatchable_event() {
         let store = test_store();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -339,8 +339,8 @@ mod tests {
         store.promote_scheduled(&batch[0]).await.unwrap();
 
         match rx.recv().await.unwrap() {
-            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "q"),
-            other => panic!("expected JobCreated, got {other:?}"),
+            StoreEvent::JobDispatchable { queue, .. } => assert_eq!(queue, "q"),
+            other => panic!("expected JobDispatchable, got {other:?}"),
         }
     }
 

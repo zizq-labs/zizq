@@ -85,7 +85,7 @@ pub async fn run(
         // event arrives with an earlier ready_at, reset the timer — this
         // avoids a database round-trip when the new job isn't due any
         // sooner than what we're already waiting for. We ignore
-        // JobCreated, JobCompleted, and JobFailed events since they're
+        // JobDispatchable, JobCompleted, and JobFailed events since they're
         // only relevant to workers.
         //
         // When there are no scheduled jobs at all (next_ready_at is
@@ -133,7 +133,7 @@ pub async fn run(
                             tracing::debug!("scheduler stopped");
                             return;
                         }
-                        _ => {} // Ignore JobCreated, JobCompleted, JobFailed
+                        _ => {} // Ignore JobDispatchable, JobCompleted, JobFailed
                     }
                 }
                 _ = shutdown.changed() => {
@@ -172,7 +172,7 @@ mod tests {
         (time, move || t.load(Ordering::Relaxed))
     }
 
-    /// Wait for `n` `JobCreated` events on the store's broadcast channel.
+    /// Wait for `n` `JobDispatchable` events on the store's broadcast channel.
     /// Deterministic — no timing-based flakes. Panics after 5 seconds
     /// (simulated time) if the expected events don't arrive.
     async fn wait_for_n_promoted(store: &Store, n: usize) {
@@ -183,7 +183,7 @@ mod tests {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Ok(StoreEvent::JobCreated { .. }) => count += 1,
+                        Ok(StoreEvent::JobDispatchable { .. }) => count += 1,
                         Err(broadcast::error::RecvError::Closed) => {
                             panic!("event channel closed after {count}/{n} promotions");
                         }

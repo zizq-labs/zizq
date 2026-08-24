@@ -94,7 +94,7 @@ impl Store {
 
         if let Some((queue, dequeued_at)) = result {
             self.in_flight_index.remove(dequeued_at, &event_id);
-            let _ = self.event_tx.send(StoreEvent::JobCreated {
+            let _ = self.event_tx.send(StoreEvent::JobDispatchable {
                 id: event_id,
                 queue,
                 token: Arc::new(AtomicBool::new(false)),
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requeue_broadcasts_job_created() {
+    async fn requeue_broadcasts_job_dispatchable() {
         let store = test_store();
         store
             .enqueue(
@@ -323,8 +323,8 @@ mod tests {
         store.requeue(&taken.id).await.unwrap();
 
         match rx.recv().await.unwrap() {
-            StoreEvent::JobCreated { queue, .. } => assert_eq!(queue, "default"),
-            other => panic!("expected JobCreated, got {other:?}"),
+            StoreEvent::JobDispatchable { queue, .. } => assert_eq!(queue, "default"),
+            other => panic!("expected JobDispatchable, got {other:?}"),
         }
     }
 

@@ -42,7 +42,7 @@ use super::types::{BackoffConfig, CommitMode, StoreError};
 ///
 /// Workers use these events to decide when to check for new work:
 ///
-/// - `JobCreated`: a job became ready. Workers check the queue name, then
+/// - `JobDispatchable`: a job became ready. Workers check the queue name, then
 ///   try to atomically claim the one-shot `token`. Only the winner calls
 ///   `take_next_job`, avoiding thundering-herd DB contention.
 /// - `JobCompleted` / `JobFailed`: workers prune their in-flight set;
@@ -55,13 +55,24 @@ use super::types::{BackoffConfig, CommitMode, StoreError};
 
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
-    /// A job became ready for processing (newly enqueued, requeued, or
-    /// promoted from the scheduled index).
+    /// A job can be handed to a worker that could not have been a
+    /// moment ago.
+    ///
+    /// Emitted when a job is newly enqueued, requeued after a worker
+    /// disconnected, or promoted out of the scheduled index — and none
+    /// of those is a creation, which is what the old name got wrong.
+    ///
+    /// Nor is it quite "became ready". Those three are all transitions
+    /// into the Ready state, but a job throttled by a budget is already
+    /// Ready and stays Ready while it waits; what changes when its
+    /// budget refills is only that it can now be dispatched. Naming the
+    /// event for that keeps the one thing every emitter has in common:
+    /// **look again, there is work.**
     ///
     /// Contains the queue name so workers can cheaply filter irrelevant
     /// events, and a single-use claim token (`Arc<AtomicBool>`) so that
     /// only one worker per event hits the database.
-    JobCreated {
+    JobDispatchable {
         id: String,
         queue: String,
         token: Arc<AtomicBool>,
@@ -103,7 +114,7 @@ pub enum StoreEvent {
     /// The admin layer uses this to re-diff all tabs (ready, scheduled,
     /// in-flight) since a patch can change queue, priority, status, or
     /// any combination. Workers and the scheduler ignore this — they
-    /// receive `JobCreated`/`JobScheduled` separately when a status
+    /// receive `JobDispatchable`/`JobScheduled` separately when a status
     /// transition occurs.
     JobPatched { id: String },
 

@@ -188,7 +188,7 @@ impl PatchDiff {
                 });
             }
             (JobStatus::Scheduled, JobStatus::Ready) => {
-                let _ = event_tx.send(StoreEvent::JobCreated {
+                let _ = event_tx.send(StoreEvent::JobDispatchable {
                     id: self.id.clone(),
                     queue: self.new_queue.clone(),
                     token: Arc::new(AtomicBool::new(false)),
@@ -1126,11 +1126,11 @@ mod tests {
         store.patch_job(now, &job.id, patch).await.unwrap();
 
         match rx.try_recv() {
-            Ok(StoreEvent::JobCreated { id, queue, .. }) => {
+            Ok(StoreEvent::JobDispatchable { id, queue, .. }) => {
                 assert_eq!(id, job.id);
                 assert_eq!(queue, "q");
             }
-            other => panic!("expected JobCreated, got {:?}", other),
+            other => panic!("expected JobDispatchable, got {:?}", other),
         }
         assert!(matches!(rx.try_recv(), Ok(StoreEvent::JobPatched { .. })));
     }

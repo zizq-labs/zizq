@@ -2,7 +2,7 @@
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Post-commit phase of enqueue: update the in-memory ready/scheduled
-//! index and broadcast the corresponding `JobCreated` / `JobScheduled`
+//! index and broadcast the corresponding `JobDispatchable` / `JobScheduled`
 //! event. Called by the auto-batcher after a successful commit, and by
 //! `cron::promote_cron_entry` for the cron-driven enqueue path.
 
@@ -31,7 +31,7 @@ pub(in crate::store) fn finalize_enqueue(
         match JobStatus::try_from(job.status) {
             Ok(JobStatus::Ready) => {
                 dispatch.insert(Placement::of(job));
-                let _ = event_tx.send(StoreEvent::JobCreated {
+                let _ = event_tx.send(StoreEvent::JobDispatchable {
                     id: job.id.clone(),
                     queue: job.queue.clone(),
                     token: Arc::new(AtomicBool::new(false)),

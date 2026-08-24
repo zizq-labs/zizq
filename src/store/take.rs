@@ -238,7 +238,7 @@ impl Store {
                         dispatch.refund(&pre.job.budgets);
                         dispatch.insert(Placement::of(&pre.job));
 
-                        let _ = event_tx.send(StoreEvent::JobCreated {
+                        let _ = event_tx.send(StoreEvent::JobDispatchable {
                             id: pre.job_id.clone(),
                             queue: pre.job.queue.clone(),
                             token: Arc::new(AtomicBool::new(false)),
@@ -986,7 +986,7 @@ mod tests {
             .into_job();
 
         // Drain the enqueue events.
-        while let Ok(StoreEvent::JobCreated { .. }) = rx.try_recv() {}
+        while let Ok(StoreEvent::JobDispatchable { .. }) = rx.try_recv() {}
 
         let jobs = store
             .take_next_n_jobs(now_millis(), &HashSet::new(), 2)

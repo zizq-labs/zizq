@@ -208,24 +208,24 @@ mod tests {
         }
     }
 
-    /// Wait for a `JobCreated` event on the store's broadcast channel.
+    /// Wait for a `JobDispatchable` event on the store's broadcast channel.
     /// Times out after 5 seconds (real time) to avoid hanging on failure.
-    async fn wait_for_job_created(store: &Store) {
+    async fn wait_for_job_dispatchable(store: &Store) {
         let mut rx = store.subscribe();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Ok(StoreEvent::JobCreated { .. }) => return,
+                        Ok(StoreEvent::JobDispatchable { .. }) => return,
                         Err(broadcast::error::RecvError::Closed) => {
-                            panic!("store event channel closed while waiting for JobCreated");
+                            panic!("store event channel closed while waiting for JobDispatchable");
                         }
                         _ => continue,
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    panic!("timed out waiting for JobCreated event");
+                    panic!("timed out waiting for JobDispatchable event");
                 }
             }
         }
@@ -275,7 +275,7 @@ mod tests {
         // Advance past the due time and wait for the job to be created.
         clock.store(due_at + 1, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(due_at - t + 1)).await;
-        wait_for_job_created(&store).await;
+        wait_for_job_dispatchable(&store).await;
 
         let jobs = store
             .list_jobs(ListJobsOptions::new().queues(["cron-q".to_string()].into()))
@@ -370,7 +370,7 @@ mod tests {
         // have already woken the scheduler.
         clock.store(due_at + 1, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(due_at - t + 1)).await;
-        wait_for_job_created(&store).await;
+        wait_for_job_dispatchable(&store).await;
 
         let jobs = store
             .list_jobs(ListJobsOptions::new().queues(["cron-q".to_string()].into()))

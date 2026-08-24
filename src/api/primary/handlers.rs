@@ -2073,7 +2073,7 @@ async fn take_jobs(
             // successful take we mint a new local unclaimed token so
             // the drain continues. When the queue is empty the CAS
             // leaves the token claimed (true) and can_take becomes
-            // false — we sit idle until a JobCreated event overwrites
+            // false — we sit idle until a JobDispatchable event overwrites
             // the token with a fresh one.
             //
             // This keeps reserve(), the capacity check, and the token
@@ -2266,11 +2266,11 @@ async fn take_jobs(
                     //
                     // If we're not draining, we're waiting for events from the
                     // store. We only go back to the drain phase if we got a
-                    // JobCreated event we care about. Other events are handled
+                    // JobDispatchable event we care about. Other events are handled
                     // without going back to the top of the loop.
                     event = event_rx.recv() => {
                         match event {
-                            Ok(StoreEvent::JobCreated { queue, token, .. }) => {
+                            Ok(StoreEvent::JobDispatchable { queue, token, .. }) => {
                                 // Store the latest matching token. We
                                 // don't CAS yet — we'll claim it when
                                 // reserve() tells us the client can
@@ -2341,7 +2341,7 @@ async fn take_jobs(
                                     &mut in_flight,
                                 ).await;
                                 // After reconciliation we may have missed
-                                // JobCreated events — mint an unclaimed
+                                // JobDispatchable events — mint an unclaimed
                                 // token to trigger a drain.
                                 claim_token =
                                     Arc::new(AtomicBool::new(false));
