@@ -513,6 +513,31 @@ impl Budgets {
         candidates
     }
 
+    /// The head of every queue of every budget that has work.
+    ///
+    /// [`candidates`](Self::candidates) answers for a dispatcher acting
+    /// on behalf of a worker, which names the queues it serves and wants
+    /// one job. This answers for a caller with nobody in particular in
+    /// mind, so it cannot collapse the queues: within a budget they
+    /// progress independently — `claim_next` peeks per queue — and a job
+    /// in a queue nobody serves must not hide the ones behind it.
+    ///
+    /// Bounded by the number of (budget, queue) pairs holding work, not
+    /// by the jobs in them.
+    fn queue_candidates(inner: &Inner) -> Vec<(u16, String, String)> {
+        let mut candidates: Vec<(u16, String, String)> = inner
+            .occupied
+            .iter()
+            .filter_map(|key| inner.groups.get(key))
+            .flat_map(|group| group.jobs.peek_each_queue())
+            .collect();
+
+        candidates.sort();
+        // A job at the head of several budgets is one candidate.
+        candidates.dedup();
+        candidates
+    }
+
     /// What a job is waiting for, across every budget it draws on.
     ///
     /// A job needs *all* of its budgets, so the answer is the most
@@ -562,9 +587,17 @@ impl Budgets {
     /// inconsistent answers would either dispatch nothing or arm a timer
     /// for work it had already been handed.
     ///
-    /// Only the head of each occupied budget is considered, matching
-    /// `claim_next`: within a budget the order is strict FIFO, so a job
-    /// behind the head cannot go first however cheap it is.
+    /// Considers the head of each *queue* of each occupied budget, not
+    /// just the budget's overall head. Within one queue the order is
+    /// strict FIFO, so a job behind that queue's head cannot go first
+    /// however cheap it is — but queues do not block each other, which
+    /// is exactly what `claim_next` does for a worker naming its queues.
+    ///
+    /// Collapsing to one head per budget was a bug: a costly job in a
+    /// queue nobody serves became the only candidate, so every
+    /// affordable job behind it went unannounced, the timer was set
+    /// against the wrong cost, and the eventual announcement named a
+    /// queue no worker had asked for.
     ///
     /// Nothing is acquired. This reports what *could* happen, and the
     /// claim that follows may still lose a race to another worker —
@@ -582,9 +615,8 @@ impl Budgets {
         }
 
         let inner = self.inner.lock().unwrap();
-        let anywhere = HashSet::new();
 
-        for (_, id, queue) in Self::candidates(&inner, &anywhere) {
+        for (_, id, queue) in Self::queue_candidates(&inner) {
             let Some(refs) = inner.refs.get(&id) else {
                 continue;
             };
@@ -1566,6 +1598,44 @@ mod tests {
 
         assert_eq!(wakeup.dispatchable.len(), 1);
         assert_eq!(wakeup.next_refill, Some(NOW + 60_000));
+    }
+
+    /// Queues within one budget progress independently, because that is
+    /// what `claim_next` already does: a worker naming a queue peeks
+    /// that queue's view, so a job in a queue nobody serves does not
+    /// hold up the others.
+    ///
+    /// The waker has to see the same thing. Reporting only the budget's
+    /// global head means an expensive job in an unserved queue hides
+    /// every affordable job behind it, times the wakeup against its own
+    /// cost, and — when it finally is affordable — announces a queue no
+    /// worker asked for. The work stalls until unrelated traffic
+    /// happens to provoke a claim.
+    #[test]
+    fn each_queue_in_a_budget_is_considered_separately() {
+        let budgets = registry_with(&[("b", per_minute(10))]);
+
+        // Drain the bucket, as an initial burst of dispatches would.
+        assert!(budgets.try_acquire_all(&[draws("b", 10)], NOW));
+
+        // Costly, high priority, in a queue no worker takes from.
+        budgets.park(&[draws("b", 9)], "q", 10, "blocker");
+        // Cheap, low priority, in the queue being served.
+        budgets.park(&[draws("b", 1)], "test", 1000, "wanted");
+
+        // One token covers `wanted` after 6s; `blocker` needs nine, so
+        // 54s. Timing against the blocker would idle the worker for the
+        // other 48.
+        let wakeup = budgets.wakeup(NOW, NO_LIMIT);
+        assert_eq!(wakeup.next_refill, Some(NOW + 6_000));
+
+        // And once that token lands, the announcement has to name the
+        // queue the job is actually in.
+        let wakeup = budgets.wakeup(NOW + 6_000, NO_LIMIT);
+        assert_eq!(
+            wakeup.dispatchable,
+            vec![("wanted".to_string(), "test".to_string())]
+        );
     }
 
     /// Only heads are considered, matching `claim_next`. A cheap job

@@ -143,6 +143,27 @@ impl ReadyIndex {
             .min()
     }
 
+    /// The job each queue would offer next, one per queue.
+    ///
+    /// [`peek`](Self::peek) answers for a *worker*, who names the queues
+    /// it serves and wants the single best job across them. This answers
+    /// for a caller with no worker in mind — a waker deciding what to
+    /// announce — which is a different question: every queue is somebody
+    /// else's best job, and collapsing them to one loses all but one.
+    ///
+    /// Bounded by the number of queues with work rather than by how many
+    /// jobs are waiting, since each queue is peeked rather than walked.
+    pub(super) fn peek_each_queue(&self) -> Vec<(u16, String, String)> {
+        self.by_queue
+            .iter()
+            .filter_map(|entry| {
+                let front = entry.value().front()?;
+                let (priority, job_id) = front.value();
+                Some((*priority, job_id.clone(), entry.key().clone()))
+            })
+            .collect()
+    }
+
     /// Atomically claim the highest-priority (lowest number), oldest ready job.
     ///
     /// Returns `(priority, job_id, queue)` if a job was claimed, or `None` if
