@@ -8493,6 +8493,90 @@ mod tests {
         })
     }
 
+    /// A caller that cannot see what a job is bound to has no way to
+    /// tell "throttled" from "stuck". Covers all three surfaces a job
+    /// comes back on: the enqueue response, a single fetch, and a
+    /// listing.
+    #[tokio::test]
+    async fn budget_refs_come_back_on_every_read_of_a_job() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // Enqueue response.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [
+                        { "key": "stripe", "cost": 3 },
+                        { "key": "mailgun", "create_with": {
+                            "allocation": 5,
+                            "strategy": { "type": "while_in_flight" }
+                        }},
+                    ],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let id = body["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            body["budgets"],
+            serde_json::json!([
+                { "key": "stripe", "cost": 3 },
+                // Resolved: the request omitted a cost, and
+                // `create_with` was an instruction rather than job state.
+                { "key": "mailgun", "cost": 1 },
+            ])
+        );
+
+        // Single fetch.
+        let req = empty_request("GET", &format!("/jobs/{id}"));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["budgets"][0]["key"], "stripe");
+        assert_eq!(body["budgets"][0]["cost"], 3);
+
+        // Listing.
+        let req = empty_request("GET", "/jobs");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"][0]["budgets"][1]["key"], "mailgun");
+    }
+
+    /// An unthrottled job pays nothing for the feature, on the wire as
+    /// everywhere else — the field is absent, not an empty array.
+    #[tokio::test]
+    async fn an_unbudgeted_job_omits_the_field_entirely() {
+        let app = pro_app();
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({ "type": "t", "queue": "q", "payload": {} }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body.get("budgets").is_none(), "unexpected: {body}");
+    }
+
     #[tokio::test]
     async fn budget_post_creates_and_returns_201() {
         let req = budget_post("stripe", &while_in_flight(100));

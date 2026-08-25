@@ -352,6 +352,50 @@ pub struct Job {
     /// being evaluated rather than guessing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws from, as resolved at enqueue.
+    ///
+    /// Exposed on reads for the same reason `batch` is: a caller that
+    /// cannot see what a job is bound to has no way to explain why it
+    /// has not run, and "throttled" is precisely the state that looks
+    /// indistinguishable from "stuck" from the outside.
+    ///
+    /// Resolved rather than echoed. `cost` is the value that applies —
+    /// filled in with the default where the request omitted it — and
+    /// `create_with` is absent because it was an instruction about a
+    /// budget, not a property of this job. What it created, if anything,
+    /// is visible at `GET /budgets/{key}`.
+    ///
+    /// Omitted entirely for an unthrottled job rather than sent as an
+    /// empty array, so a job that uses none of this pays nothing for it
+    /// on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetBindingResponse>,
+}
+
+/// One budget a job draws from, as stored.
+///
+/// Distinct from [`BudgetBindingRequest`] because the two are not the
+/// same shape: a request may omit `cost` and may carry `create_with` and
+/// `bucket`, none of which survive into what the job actually holds.
+/// Reusing the request type would advertise fields a read can never
+/// populate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BudgetBindingResponse {
+    /// Key of the budget this job draws from.
+    pub key: String,
+
+    /// Tokens consumed from that budget when the job dispatches.
+    pub cost: u32,
+}
+
+impl From<store::BudgetRef> for BudgetBindingResponse {
+    fn from(reference: store::BudgetRef) -> Self {
+        Self {
+            key: reference.key,
+            cost: reference.cost,
+        }
+    }
 }
 
 /// Convert a store job to an HTTP job, failing if the status byte is invalid.
@@ -418,6 +462,7 @@ impl Job {
             duplicate,
             folded,
             batch: job.batch.map(Into::into),
+            budgets: job.budgets.into_iter().map(Into::into).collect(),
         })
     }
 }
