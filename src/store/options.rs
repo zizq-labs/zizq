@@ -60,6 +60,19 @@ pub struct JobFilter {
     /// Applied as a post-hydration check on each candidate job.
     pub attempts: Option<RangeInclusive<u32>>,
 
+    /// Optional budget filter. When non-empty, only jobs drawing on one
+    /// of these budgets are returned.
+    ///
+    /// A job may draw on several budgets, so this matches if *any* of
+    /// its bindings names one of these keys — the same "belongs to"
+    /// reading the queue and type filters have.
+    ///
+    /// Applied as a post-hydration check, since there is no index from
+    /// budget key to job. Combined with an index-backed filter it
+    /// narrows within that scan; on its own it is a full scan, the same
+    /// cost profile the payload filter already carries.
+    pub budget_keys: HashSet<String>,
+
     /// Optional jq-style payload filter. When provided, only jobs whose
     /// payload matches the filter are returned. Payloads are hydrated and
     /// checked after the index scan narrows the candidate set.
@@ -96,6 +109,14 @@ impl JobFilter {
     /// Filter by job type and return `self`.
     pub fn types(mut self, types: HashSet<String>) -> Self {
         self.types = types;
+        self
+    }
+
+    /// Filter by budget membership and return `self`.
+    ///
+    /// Matches a job drawing on any of these budgets.
+    pub fn budget_keys(mut self, keys: HashSet<String>) -> Self {
+        self.budget_keys = keys;
         self
     }
 
@@ -210,6 +231,14 @@ impl ListJobsOptions {
     /// Filter by job type and return `self`.
     pub fn types(mut self, types: HashSet<String>) -> Self {
         self.filter.types = types;
+        self
+    }
+
+    /// Filter by budget membership and return `self`.
+    ///
+    /// Matches a job drawing on any of these budgets.
+    pub fn budget_keys(mut self, keys: HashSet<String>) -> Self {
+        self.filter.budget_keys = keys;
         self
     }
 

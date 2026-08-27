@@ -1302,6 +1302,9 @@ async fn bulk_delete_jobs(
     if !params.job_type.is_empty() {
         opts.filter.types = params.job_type.0;
     }
+    if !params.budgets_key.is_empty() {
+        opts.filter.budget_keys = params.budgets_key.0;
+    }
     opts.filter.priority = params.priority.0;
     opts.filter.ready_at = params.ready_at.0;
     opts.filter.attempts = params.attempts.0;
@@ -1474,6 +1477,11 @@ async fn bulk_patch_jobs(
             } else {
                 params.job_type.0
             },
+            budget_keys: if params.budgets_key.is_empty() {
+                HashSet::new()
+            } else {
+                params.budgets_key.0
+            },
             priority: params.priority.0,
             ready_at: params.ready_at.0,
             attempts: params.attempts.0,
@@ -1555,6 +1563,9 @@ async fn list_jobs(
     }
     if !params.job_type.is_empty() {
         opts = opts.types(params.job_type.0.clone());
+    }
+    if !params.budgets_key.is_empty() {
+        opts = opts.budget_keys(params.budgets_key.0.clone());
     }
     if !params.id.is_empty() {
         for id in params.id.iter() {
@@ -1768,6 +1779,9 @@ async fn count_jobs(
     }
     if !params.job_type.is_empty() {
         opts = opts.types(params.job_type.0.clone());
+    }
+    if !params.budgets_key.is_empty() {
+        opts = opts.budget_keys(params.budgets_key.0.clone());
     }
     if !params.id.is_empty() {
         for id in params.id.iter() {
@@ -2453,6 +2467,10 @@ fn parse_budget_bindings(
     budgets
         .into_iter()
         .map(|entry| {
+            // Validated here as well as on the budget endpoints, because
+            // `create_with` makes this a creation path too.
+            validate_name("budget key", &entry.key)?;
+
             if entry.bucket.is_some() {
                 return Err(format!(
                     "budget '{}' sets bucket, which is reserved and not yet supported",
@@ -8567,6 +8585,163 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["jobs"][0]["budgets"][1]["key"], "mailgun");
+    }
+
+    /// `create_with` makes enqueue a budget *creation* path, so it needs
+    /// the same name validation the budget endpoints apply — otherwise a
+    /// key could be stored that `POST /budgets/{key}` would have
+    /// refused.
+    ///
+    /// A comma is the one that bites hardest: `?budgets.key=` is
+    /// comma-delimited, so a key containing one could never be filtered
+    /// for, and the job holding a budget open would be unfindable.
+    #[tokio::test]
+    async fn enqueue_rejects_a_budget_key_with_reserved_characters() {
+        for key in ["a,b", "a*b", "a?b", "a{b}"] {
+            let req = json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{
+                        "key": key,
+                        "create_with": {
+                            "allocation": 10,
+                            "strategy": { "type": "while_in_flight" }
+                        }
+                    }],
+                }),
+            );
+            let res = pro_app().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected {key:?} to be rejected"
+            );
+        }
+    }
+
+    /// Filtering jobs by budget is what makes the `409` from deleting a
+    /// busy budget actionable: without it an operator is told to remove
+    /// the jobs holding a budget open, with no way to find them.
+    ///
+    /// Covers all four endpoints that take a job filter, since a filter
+    /// that works on `GET /jobs` but silently does nothing on
+    /// `DELETE /jobs` is worse than one that does not exist.
+    #[tokio::test]
+    async fn jobs_can_be_filtered_by_budget() {
+        let app = pro_app();
+
+        for key in ["stripe", "mailgun"] {
+            let res = app
+                .clone()
+                .oneshot(budget_post(key, &while_in_flight(10)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+        }
+
+        // Two on `stripe`, one on `mailgun`, one unthrottled.
+        for budgets in [
+            serde_json::json!([{ "key": "stripe" }]),
+            serde_json::json!([{ "key": "stripe" }]),
+            serde_json::json!([{ "key": "mailgun" }]),
+            serde_json::json!([]),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/jobs",
+                    &serde_json::json!({
+                        "type": "t",
+                        "queue": "q",
+                        "payload": {},
+                        "budgets": budgets,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+        }
+
+        // GET /jobs
+        let req = empty_request("GET", "/jobs?budgets.key=stripe");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        // GET /jobs/count
+        let req = empty_request("GET", "/jobs/count?budgets.key=stripe");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 2);
+
+        // Several keys at once, comma-delimited like every other filter.
+        let req = empty_request("GET", "/jobs/count?budgets.key=stripe,mailgun");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 3);
+
+        // PATCH /jobs
+        let req = json_request(
+            "PATCH",
+            "/jobs?budgets.key=mailgun",
+            &serde_json::json!({ "priority": 5 }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["patched"], 1);
+
+        // DELETE /jobs — the remediation path the 409 points at.
+        let req = empty_request("DELETE", "/jobs?budgets.key=stripe");
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["deleted"], 2);
+
+        // And with them gone, the budget deletes cleanly.
+        let req = json_request("DELETE", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Combined with an index-backed filter it narrows within that scan
+    /// rather than replacing it, so the two intersect.
+    #[tokio::test]
+    async fn a_budget_filter_intersects_with_a_queue_filter() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        for queue in ["a", "b"] {
+            let res = app
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/jobs",
+                    &serde_json::json!({
+                        "type": "t",
+                        "queue": queue,
+                        "payload": {},
+                        "budgets": [{ "key": "stripe" }],
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+        }
+
+        let req = empty_request("GET", "/jobs/count?budgets.key=stripe&queue=a");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 1);
     }
 
     /// An unthrottled job pays nothing for the feature, on the wire as

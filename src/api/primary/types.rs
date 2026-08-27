@@ -831,6 +831,14 @@ pub struct ListJobsParams {
     #[serde(default)]
     pub attempts: RangeQuery<u32>,
 
+    /// Budget filter, comma-delimited (e.g. "stripe,mailgun").
+    ///
+    /// Matches a job drawing on any of the named budgets. Dotted to
+    /// mirror the `budgets` array on a job rather than inventing a
+    /// separate name for the same thing.
+    #[serde(default, rename = "budgets.key")]
+    pub budgets_key: CommaSet<String>,
+
     /// jq expression to filter jobs by payload (e.g. ".user_id == 42").
     pub filter: Option<String>,
 }
@@ -866,6 +874,14 @@ pub struct CountJobsParams {
     /// `attempts` range (inclusive). Same syntax as `priority`.
     #[serde(default)]
     pub attempts: RangeQuery<u32>,
+
+    /// Budget filter, comma-delimited (e.g. "stripe,mailgun").
+    ///
+    /// Matches a job drawing on any of the named budgets. Dotted to
+    /// mirror the `budgets` array on a job rather than inventing a
+    /// separate name for the same thing.
+    #[serde(default, rename = "budgets.key")]
+    pub budgets_key: CommaSet<String>,
 
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
@@ -903,6 +919,14 @@ pub struct DeleteJobsParams {
     #[serde(default)]
     pub attempts: RangeQuery<u32>,
 
+    /// Budget filter, comma-delimited (e.g. "stripe,mailgun").
+    ///
+    /// Matches a job drawing on any of the named budgets. Dotted to
+    /// mirror the `budgets` array on a job rather than inventing a
+    /// separate name for the same thing.
+    #[serde(default, rename = "budgets.key")]
+    pub budgets_key: CommaSet<String>,
+
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
 }
@@ -938,6 +962,14 @@ pub struct PatchJobsParams {
     /// `attempts` range (inclusive). Same syntax as `priority`.
     #[serde(default)]
     pub attempts: RangeQuery<u32>,
+
+    /// Budget filter, comma-delimited (e.g. "stripe,mailgun").
+    ///
+    /// Matches a job drawing on any of the named budgets. Dotted to
+    /// mirror the `budgets` array on a job rather than inventing a
+    /// separate name for the same thing.
+    #[serde(default, rename = "budgets.key")]
+    pub budgets_key: CommaSet<String>,
 
     /// jq expression to filter jobs by payload.
     pub filter: Option<String>,
