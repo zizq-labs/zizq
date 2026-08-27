@@ -108,7 +108,7 @@ impl Store {
                 Some(bytes) => {
                     let existing: Budget = rmp_serde::from_slice(&bytes)?;
                     budget.created_at = existing.created_at;
-                    check_costs_fit(&tx, &ks, &live, &key, budget.allocation)?;
+                    check_costs_fit(&tx, &ks, &live, &key, budget.capacity())?;
                 }
                 // Replacing a budget cannot push the server over its
                 // cap; only creating one can.
@@ -170,7 +170,7 @@ impl Store {
             )?;
             budget.created_at = existing.created_at;
 
-            check_costs_fit(&tx, &ks, &live, &key, budget.allocation)?;
+            check_costs_fit(&tx, &ks, &live, &key, budget.capacity())?;
 
             tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
             ks.commit(tx, ks.default_commit_mode)?;
@@ -624,10 +624,15 @@ where
         // Costing more than the budget can ever hold would never
         // dispatch, so it is refused rather than accepted into a
         // permanent stall.
-        if binding.cost > budget.allocation {
+        // Capacity rather than allocation: a burst-capped budget can
+        // never hold more than its burst however large its allocation,
+        // so that is the number a cost has to fit inside.
+        if binding.cost > budget.capacity() {
             return Ok(BudgetPlan::Reject(StoreError::InvalidOperation(format!(
-                "cost {} exceeds budget '{}', which only allocates {}",
-                binding.cost, binding.key, budget.allocation
+                "cost {} exceeds budget '{}', which holds at most {}",
+                binding.cost,
+                binding.key,
+                budget.capacity()
             ))));
         }
     }
@@ -838,6 +843,7 @@ mod tests {
                 50,
                 BudgetStrategy::TimeBased {
                     duration_ms: 60_000,
+                    burst: None,
                 },
                 NOW,
             )
@@ -861,7 +867,10 @@ mod tests {
             .put_budget(
                 "stripe",
                 10,
-                BudgetStrategy::TimeBased { duration_ms: 1_000 },
+                BudgetStrategy::TimeBased {
+                    duration_ms: 1_000,
+                    burst: None,
+                },
                 NOW + 5_000,
             )
             .await
@@ -870,7 +879,10 @@ mod tests {
         assert_eq!(replaced.allocation, 10);
         assert_eq!(
             replaced.strategy,
-            BudgetStrategy::TimeBased { duration_ms: 1_000 }
+            BudgetStrategy::TimeBased {
+                duration_ms: 1_000,
+                burst: None,
+            }
         );
         // Identity is unchanged; only the policy moved.
         assert_eq!(replaced.created_at, NOW);
@@ -886,6 +898,7 @@ mod tests {
                 100,
                 BudgetStrategy::TimeBased {
                     duration_ms: 60_000,
+                    burst: None,
                 },
                 NOW,
             )
@@ -903,7 +916,8 @@ mod tests {
         assert_eq!(
             patched.strategy,
             BudgetStrategy::TimeBased {
-                duration_ms: 60_000
+                duration_ms: 60_000,
+                burst: None,
             }
         );
         assert_eq!(patched.created_at, NOW);
@@ -925,6 +939,7 @@ mod tests {
                     None,
                     Some(BudgetStrategy::TimeBased {
                         duration_ms: 30_000,
+                        burst: None,
                     }),
                 ),
                 NOW + 1,
@@ -937,7 +952,8 @@ mod tests {
         assert_eq!(
             patched.strategy,
             BudgetStrategy::TimeBased {
-                duration_ms: 30_000
+                duration_ms: 30_000,
+                burst: None,
             }
         );
     }
@@ -1111,6 +1127,7 @@ mod tests {
                 100,
                 BudgetStrategy::TimeBased {
                     duration_ms: 60_000,
+                    burst: None,
                 },
                 NOW,
             )
@@ -1125,7 +1142,8 @@ mod tests {
         assert_eq!(
             listed[0].1.strategy,
             BudgetStrategy::TimeBased {
-                duration_ms: 60_000
+                duration_ms: 60_000,
+                burst: None,
             }
         );
         assert_eq!(listed[0].1.created_at, NOW);
@@ -1427,6 +1445,98 @@ mod tests {
         // Checked for all before removing any, so the unreferenced one
         // survives too rather than the store being left half-wiped.
         assert_eq!(store.list_budgets().await.unwrap().len(), 2);
+    }
+
+    // --- shrink protection against the burst, not the allocation ---
+
+    fn bursting(duration_ms: u64, burst: u32) -> BudgetStrategy {
+        BudgetStrategy::TimeBased {
+            duration_ms,
+            burst: Some(burst),
+        }
+    }
+
+    /// With a burst set it is the burst that bounds what a job can
+    /// cost, so narrowing it below a committed cost strands that job —
+    /// however large the allocation still is. Reading `allocation` here
+    /// would wave this through.
+    #[tokio::test]
+    async fn patch_cannot_narrow_the_burst_below_a_queued_job_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 100, bursting(60_000, 10), NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 6).await;
+
+        let result = store
+            .patch_budget("stripe", patch(None, Some(bursting(60_000, 5))), NOW + 1)
+            .await;
+
+        let Err(StoreError::InvalidOperation(msg)) = result else {
+            panic!("expected the job to block the narrowed burst");
+        };
+        assert!(msg.contains('6'), "should cite the job's cost: {msg}");
+    }
+
+    /// The other direction, and the one that shows the guard is not
+    /// simply reading the allocation: dropping the *rate* below a
+    /// committed cost is fine, because the bucket can still bank enough
+    /// to pay for it — it just takes longer to get there.
+    #[tokio::test]
+    async fn patch_may_drop_the_allocation_below_a_cost_the_burst_still_covers() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 100, bursting(60_000, 10), NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 6).await;
+
+        // Three tokens a minute, banked up to ten: a job costing six
+        // waits about two minutes rather than never running.
+        let patched = store
+            .patch_budget("stripe", patch(Some(3), None), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patched.allocation, 3);
+        assert_eq!(patched.capacity(), 10);
+    }
+
+    #[tokio::test]
+    async fn patch_may_narrow_the_burst_to_exactly_the_job_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 100, bursting(60_000, 10), NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 6).await;
+
+        let patched = store
+            .patch_budget("stripe", patch(None, Some(bursting(60_000, 6))), NOW + 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(patched.capacity(), 6);
+    }
+
+    /// `put` replaces the policy whole and runs the same guard.
+    #[tokio::test]
+    async fn put_cannot_narrow_the_burst_below_a_queued_job_cost() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 100, bursting(60_000, 10), NOW)
+            .await
+            .unwrap();
+        enqueue_drawing(&store, "stripe", 6).await;
+
+        let result = store
+            .put_budget("stripe", 100, bursting(60_000, 5), NOW + 1)
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
     }
 
     // --- announcing capacity that a policy change created ---

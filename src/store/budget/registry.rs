@@ -888,6 +888,7 @@ mod tests {
             allocation,
             BudgetStrategy::TimeBased {
                 duration_ms: 60_000,
+                burst: None,
             },
             NOW,
         )
@@ -1511,6 +1512,7 @@ mod tests {
                 1,
                 BudgetStrategy::TimeBased {
                     duration_ms: 600_000,
+                    burst: None,
                 },
                 NOW,
             )

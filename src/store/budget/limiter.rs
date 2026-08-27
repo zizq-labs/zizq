@@ -113,9 +113,15 @@ impl Limiter {
     /// dispatch to defend against a case that only arises on an
     /// unclean restart.
     pub(super) fn new(budget: &Budget, now: u64) -> Self {
+        // Capacity, not allocation. For a burst-capped budget the two
+        // differ: the allocation is how fast tokens arrive, the
+        // capacity is how many may be banked before the rest are
+        // dropped on the floor.
+        let capacity = budget.capacity();
+
         Self {
-            capacity: budget.allocation,
-            tokens: budget.allocation,
+            capacity,
+            tokens: capacity,
             credit: 0,
             drip: Self::drip(budget),
             last_refill: now,
@@ -125,7 +131,10 @@ impl Limiter {
     /// The clock-driven refill rate for a policy, if it has one.
     fn drip(budget: &Budget) -> Option<Drip> {
         match budget.strategy {
-            BudgetStrategy::TimeBased { duration_ms } => Some(Drip {
+            // The drip is the *rate*, so it always uses the
+            // allocation. A burst only changes how much of that rate
+            // can accumulate unspent.
+            BudgetStrategy::TimeBased { duration_ms, .. } => Some(Drip {
                 allocation: budget.allocation,
                 duration_ms,
             }),
@@ -146,7 +155,7 @@ impl Limiter {
         let was_concurrency = self.drip.is_none();
         let old_capacity = self.capacity;
 
-        self.capacity = budget.allocation;
+        self.capacity = budget.capacity();
         self.drip = Self::drip(budget);
 
         // Widening a concurrency budget hands the extra slots over at
@@ -319,6 +328,7 @@ mod tests {
             allocation,
             BudgetStrategy::TimeBased {
                 duration_ms: 60_000,
+                burst: None,
             },
             NOW,
         )
@@ -647,6 +657,7 @@ mod tests {
             crate::store::MAX_BUDGET_ALLOCATION,
             BudgetStrategy::TimeBased {
                 duration_ms: u64::MAX,
+                burst: None,
             },
             NOW,
         )
@@ -657,5 +668,105 @@ mod tests {
 
         limiter.refill(u64::MAX);
         assert_ne!(limiter.next_available(1, NOW), Availability::Never);
+    }
+
+    // --- burst ---
+
+    fn per_minute_bursting(allocation: u32, burst: u32) -> Budget {
+        Budget::new(
+            allocation,
+            BudgetStrategy::TimeBased {
+                duration_ms: 60_000,
+                burst: Some(burst),
+            },
+            NOW,
+        )
+        .unwrap()
+    }
+
+    /// The overshoot the burst field exists to remove. A bucket that
+    /// starts full pays out a whole allocation before the drip has
+    /// delivered anything, so "ten a minute" really does permit twenty
+    /// in the first minute.
+    #[test]
+    fn an_uncapped_bucket_allows_twice_the_rate_in_the_first_period() {
+        let mut limiter = Limiter::new(&per_minute(10), NOW);
+
+        // Ten immediately, from the full bucket.
+        for _ in 0..10 {
+            assert!(limiter.try_acquire(1, NOW));
+        }
+        assert!(!limiter.try_acquire(1, NOW));
+
+        // Ten more dripped across the minute: twenty inside [0, 60s].
+        let mut dripped = 0;
+        for tick in 1..=10 {
+            if limiter.try_acquire(1, NOW + tick * 6_000) {
+                dripped += 1;
+            }
+        }
+
+        assert_eq!(dripped, 10, "expected the drip to deliver a second ten");
+    }
+
+    /// With the ceiling capped, the same budget cannot front-load
+    /// anything: one token is all it ever holds, so dispatches pace out
+    /// at the drip rate from the very first one.
+    #[test]
+    fn a_burst_of_one_paces_evenly_with_no_overshoot() {
+        let mut limiter = Limiter::new(&per_minute_bursting(10, 1), NOW);
+
+        // The bucket starts full — but full is one.
+        assert!(limiter.try_acquire(1, NOW));
+        assert!(!limiter.try_acquire(1, NOW));
+
+        // One per six seconds, and never two.
+        for tick in 1..=10 {
+            let at = NOW + tick * 6_000;
+            assert!(
+                limiter.try_acquire(1, at),
+                "expected a token at tick {tick}"
+            );
+            assert!(
+                !limiter.try_acquire(1, at),
+                "expected only one at tick {tick}"
+            );
+        }
+    }
+
+    /// The long-run rate is unchanged by the cap: the burst governs how
+    /// many tokens may be *banked*, not how fast they arrive.
+    #[test]
+    fn a_burst_does_not_change_the_refill_rate() {
+        let mut limiter = Limiter::new(&per_minute_bursting(10, 1), NOW);
+
+        // Drain the single token, then let a full minute pass.
+        assert!(limiter.try_acquire(1, NOW));
+        limiter.refill(NOW + 60_000);
+
+        // A minute's worth of drip arrived, but only one could be held.
+        assert_eq!(limiter.tokens(), 1);
+    }
+
+    /// Idling does not bank more than the ceiling, which is the whole
+    /// point — an hour of quiet must not become an hour's worth of
+    /// dispatches the moment work arrives.
+    #[test]
+    fn idling_banks_no_more_than_the_burst() {
+        let mut limiter = Limiter::new(&per_minute_bursting(10, 3), NOW);
+
+        limiter.refill(NOW + 3_600_000);
+
+        assert_eq!(limiter.tokens(), 3);
+    }
+
+    /// A cost above the ceiling can never be paid however long anyone
+    /// waits, and says so rather than parking the job forever.
+    #[test]
+    fn a_cost_above_the_burst_can_never_be_afforded() {
+        let limiter = Limiter::new(&per_minute_bursting(100, 5), NOW);
+
+        assert_eq!(limiter.next_available(6, NOW), Availability::Never);
+        assert_eq!(limiter.next_available(5, NOW), Availability::Now);
     }
 }

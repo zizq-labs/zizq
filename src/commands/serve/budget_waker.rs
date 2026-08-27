@@ -258,7 +258,10 @@ mod tests {
             .create_budget(
                 "brief",
                 1,
-                BudgetStrategy::TimeBased { duration_ms: 100 },
+                BudgetStrategy::TimeBased {
+                    duration_ms: 100,
+                    burst: None,
+                },
                 now,
             )
             .await

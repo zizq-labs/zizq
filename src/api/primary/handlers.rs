@@ -2488,9 +2488,21 @@ fn parse_budget_bindings(
 fn parse_budget_strategy(req: BudgetStrategyRequest) -> Result<store::BudgetStrategy, String> {
     match req.kind.as_str() {
         "time_based" => match req.duration_ms {
-            Some(duration_ms) => Ok(store::BudgetStrategy::TimeBased { duration_ms }),
+            Some(duration_ms) => Ok(store::BudgetStrategy::TimeBased {
+                duration_ms,
+                burst: req.burst,
+            }),
             None => Err("time_based budget requires strategy.duration_ms".into()),
         },
+        // Both clock-shaped fields are refused rather than ignored, on
+        // the same reasoning: a caller who set one believes the throttle
+        // is something it is not.
+        "while_in_flight" if req.burst.is_some() => {
+            Err("while_in_flight budget must not set strategy.burst — \
+             it has no drip to burst ahead of, so its allocation is \
+             already the most that can run at once"
+                .into())
+        }
         "while_in_flight" => match req.duration_ms {
             None => Ok(store::BudgetStrategy::WhileInFlight),
             Some(_) => Err(
@@ -8608,6 +8620,98 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["strategy"]["type"], "time_based");
         assert_eq!(body["strategy"]["duration_ms"], 60000);
+
+        // Absent rather than echoed as the allocation, so a read cannot
+        // be mistaken for a setting the operator made.
+        assert!(
+            body["strategy"].get("burst").is_none(),
+            "unexpected: {body}"
+        );
+    }
+
+    /// The knob that caps the front-loaded spike a full bucket allows.
+    #[tokio::test]
+    async fn budget_post_accepts_a_burst() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 100,
+                "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 5 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 100);
+        assert_eq!(body["strategy"]["burst"], 5);
+    }
+
+    /// A concurrency budget has no drip to burst ahead of, so the field
+    /// is refused rather than ignored — the same treatment
+    /// `duration_ms` gets there, and for the same reason: a caller who
+    /// set it believes the throttle is something it is not.
+    #[tokio::test]
+    async fn budget_post_rejects_a_burst_on_while_in_flight() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "while_in_flight", "burst": 5 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_post_rejects_a_zero_burst() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 100,
+                "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 0 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A job costing more than the bucket can ever hold would never
+    /// dispatch. With a burst set it is the burst that decides, not the
+    /// allocation — so a cost well inside the allocation is still
+    /// refused.
+    #[tokio::test]
+    async fn enqueue_rejects_a_cost_above_the_burst() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 5 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{ "key": "stripe", "cost": 50 }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// The whole point of `POST` over `PUT`: it refuses rather than

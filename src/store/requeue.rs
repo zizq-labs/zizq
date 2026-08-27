@@ -172,6 +172,7 @@ mod tests {
                 1,
                 BudgetStrategy::TimeBased {
                     duration_ms: 3_600_000,
+                    burst: None,
                 },
                 now,
             )

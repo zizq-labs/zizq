@@ -1191,6 +1191,17 @@ pub struct BudgetStrategyRequest {
     /// `time_based`, rejected for `while_in_flight`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+
+    /// Most tokens the bucket may hold at once. Optional for
+    /// `time_based`, rejected for `while_in_flight`.
+    ///
+    /// Defaults to the allocation, which is the standard token-bucket
+    /// behaviour: a bucket that has been idle is full, so the first
+    /// work to arrive gets a whole allocation at once and only then
+    /// settles to the drip. Set this lower to cap that spike — `1`
+    /// paces dispatches evenly with no overshoot at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
 }
 
 impl BudgetBindingRequest {
@@ -1255,18 +1266,26 @@ pub struct BudgetStrategyResponse {
     /// Present for `time_based` only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+
+    /// Present only when explicitly set. Absent means the ceiling is
+    /// the allocation, so echoing a value here would report a setting
+    /// the operator never made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
 }
 
 impl BudgetResponse {
     pub fn from_store(key: String, budget: store::Budget) -> Self {
         let strategy = match budget.strategy {
-            store::BudgetStrategy::TimeBased { duration_ms } => BudgetStrategyResponse {
+            store::BudgetStrategy::TimeBased { duration_ms, burst } => BudgetStrategyResponse {
                 kind: "time_based",
                 duration_ms: Some(duration_ms),
+                burst,
             },
             store::BudgetStrategy::WhileInFlight => BudgetStrategyResponse {
                 kind: "while_in_flight",
                 duration_ms: None,
+                burst: None,
             },
         };
 

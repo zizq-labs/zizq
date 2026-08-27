@@ -2,6 +2,83 @@
 
 ## 0.7.0 (Unreleased)
 
+- Added **budgets**, a server-side throttle on how fast jobs are
+  dispatched. A budget is a named token bucket that jobs draw from; a
+  job whose budgets have no capacity waits until they replenish.
+  Workers are unaware of any of it — a throttled job looks like any
+  other when it finally arrives. Pro tier, alongside unique jobs, cron
+  and batching.
+
+  Two strategies, covering the two things people mean by "rate limit":
+
+  - `time_based` refills the whole allocation every `duration_ms`, as a
+    continuous drip rather than in fixed windows. A counter that reset
+    on the minute would allow the allocation at 59.9s and again at
+    60.0s — twice the configured rate across the boundary, every
+    boundary. Accrual is computed lazily from elapsed time, so an idle
+    budget costs nothing.
+  - `while_in_flight` returns a token when the job leaves the in-flight
+    state, by acknowledgement, failure, deletion or worker disconnect.
+    This is a concurrency limit, of which a mutex is the
+    `allocation: 1` case.
+
+  Budgets are managed at `GET /budgets`, and `GET` / `POST` / `PUT` /
+  `PATCH` / `DELETE` on `/budgets/{key}`. `POST` creates and returns
+  `409` if the key is taken, so an application can declare the budgets
+  it expects on every boot without clobbering an allocation an operator
+  tightened during an incident; `PUT` replaces a policy whole and
+  `PATCH` merges named fields. A budget's `created_at` survives both.
+
+  Jobs bind to budgets with a `budgets` array on enqueue, each entry
+  naming a `key` and an optional `cost` (default 1). A job may draw on
+  several, and acquires from all of them or none. An entry may carry a
+  `create_with` policy, which creates the budget if it does not exist
+  and is ignored if it does — the server stays authoritative, so an
+  enqueue can never quietly restate a throttle. Referencing a budget
+  that does not exist without a `create_with` is rejected with `422`
+  rather than dispatching unthrottled. Bindings are returned on every
+  read of a job for visibility.
+
+  `time_based` also takes an optional `burst` alongside `duration_ms`,
+  capping how many tokens may be banked without changing how fast they
+  arrive. A bucket starts full, so the first work after an idle period
+  draws a whole allocation at once and only then settles to the drip —
+  meaning `10 per minute` permits twenty in the first minute. That
+  overshoot is a one-off and the long-run rate is unaffected, but it is
+  visible, and `burst: 1` removes it entirely by pacing dispatches
+  evenly. A burst above the allocation is allowed, and banks several
+  idle periods. Note that where a burst is set it is the burst, not the
+  allocation, that a job's `cost` must fit inside.
+
+  Cron entries may reference budgets in their job template. Budgets a
+  template needs are created when the entry is installed rather than
+  when it first fires, so an entry cannot be accepted into a schedule
+  and then turn out to be unfireable because the server has since
+  reached its budget cap.
+
+  A budget cannot be deleted, or have its allocation shrunk below a
+  cost already committed to it, while anything still draws on it —
+  unfinished jobs or a cron entry's template. Both are reported
+  separately, because the remedies differ: a job will drain on its own,
+  where a cron entry is a standing claim that has to be edited. A
+  budget referenced only by finished jobs deletes cleanly.
+
+  The number of budgets a server will hold is capped by
+  `--max-budgets` / `ZIZQ_MAX_BUDGETS`, defaulting to 8192. The limit
+  exists because budget keys can be generated from application data,
+  and remain peristed indefinitely. Future releases will enable more
+  dynamic sub-buckets within budgets.
+
+  `POST /reset` now clears budgets along with jobs and cron groups.
+
+  Token state is deliberately not persisted, so a server restart brings
+  every bucket back full. For a concurrency budget that is simply
+  accurate — recovery returns in-flight jobs to the queue, so nothing
+  holds a slot. For a rate limit it means a restart forgives whatever
+  the previous process had spent, which is the trade-off between an
+  efficient lazily computed in-memory solution vs a slower one that
+  constantly writes to disk to record state.
+
 - Added a **group-level cron timezone**. `PUT /crons/{group}` and
   `PATCH /crons/{group}` now accept a `timezone` field alongside
   `paused`, and it is returned on every cron group response. Entries
