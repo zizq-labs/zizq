@@ -13,12 +13,17 @@ use std::ops::Bound;
 use fjall::{Readable, Slice};
 use tokio::task;
 
+use super::super::budget::{
+    Budget, BudgetPlan, plan_budgets, stage_budgets, sync_created_budgets, unstage_budgets,
+    write_created_budgets,
+};
 use super::super::enqueue::{
-    apply_enqueue, finalize_enqueue, prepare_enqueue, validate_batch_config,
+    apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue, validate_batch_config,
 };
 use super::super::keys::RecordKind;
 use super::super::options::{CronEntryOptions, PatchCronGroupOptions, ReplaceCronGroupOptions};
-use super::super::store::{Store, StoreEvent};
+use super::super::results::EnqueueResult;
+use super::super::store::{Keyspaces, Store, StoreEvent};
 use super::super::types::StoreError;
 use super::{CronEntry, CronGroup};
 
@@ -38,6 +43,7 @@ impl Store {
         now: u64,
     ) -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -163,6 +169,27 @@ impl Store {
                 }
             }
 
+            let created_budgets: Vec<(String, Budget)>;
+
+            // Resolve every entry's budgets, creating any the templates
+            // ask for. Done at install rather than at first firing so
+            // that an entry accepted into a schedule is guaranteed to
+            // be fireable: deferring creation would leave a window in
+            // which the server reaches its budget cap and the entry can
+            // never run.
+            match plan_budgets(
+                &tx,
+                &ks,
+                new_entries.iter().flat_map(|e| e.job.budgets.iter()),
+                now,
+            )? {
+                BudgetPlan::Proceed(planned) => {
+                    write_created_budgets(&mut tx, &ks, &planned)?;
+                    created_budgets = planned;
+                }
+                BudgetPlan::Reject(e) => return Err(e),
+            }
+
             // Write new/updated entries.
             for entry in &new_entries {
                 let entry_key = make_cron_entry_key(&group, &entry.name);
@@ -171,6 +198,7 @@ impl Store {
             }
 
             ks.commit(tx, ks.default_commit_mode)?;
+            sync_created_budgets(&live, &created_budgets, now);
 
             // ---- outside tx: update in-memory cron index ----
 
@@ -303,6 +331,7 @@ impl Store {
         now: u64,
     ) -> Result<CronEntry, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -355,9 +384,20 @@ impl Store {
                 last_enqueue_at: None,
             };
 
+            let created_budgets: Vec<(String, Budget)>;
+
+            match plan_budgets(&tx, &ks, entry.job.budgets.iter(), now)? {
+                BudgetPlan::Proceed(planned) => {
+                    write_created_budgets(&mut tx, &ks, &planned)?;
+                    created_budgets = planned;
+                }
+                BudgetPlan::Reject(e) => return Err(e),
+            }
+
             tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
 
             ks.commit(tx, ks.default_commit_mode)?;
+            sync_created_budgets(&live, &created_budgets, now);
 
             // ---- outside tx: update in-memory cron index ----
             if let Some(next) = entry.next_enqueue_at {
@@ -384,6 +424,7 @@ impl Store {
         now: u64,
     ) -> Result<CronEntry, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -430,9 +471,20 @@ impl Store {
                 group_meta.timezone.as_deref(),
             );
 
+            let created_budgets: Vec<(String, Budget)>;
+
+            match plan_budgets(&tx, &ks, entry.job.budgets.iter(), now)? {
+                BudgetPlan::Proceed(planned) => {
+                    write_created_budgets(&mut tx, &ks, &planned)?;
+                    created_budgets = planned;
+                }
+                BudgetPlan::Reject(e) => return Err(e),
+            }
+
             tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
 
             ks.commit(tx, ks.default_commit_mode)?;
+            sync_created_budgets(&live, &created_budgets, now);
 
             // ---- outside tx: update in-memory cron index ----
             if let Some(old) = &old_entry {
@@ -840,8 +892,9 @@ impl Store {
         now: u64,
     ) -> Result<Option<CronEntry>, StoreError> {
         let ks = self.ks.clone();
+        let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let event_tx = self.event_tx.clone();
         let group = group.to_string();
@@ -881,22 +934,69 @@ impl Store {
                 let tz = entry.timezone.as_deref().or(group_timezone.as_deref());
                 let next = cron_next_after(&entry.expression, now, tz)?;
 
-                // Prepare the job enqueue (unless paused).
+                // Prepare the job enqueue (unless paused). Pure — the
+                // entry is not mutated until the budget pre-pass below
+                // has said whether this tick actually fires.
                 let prepared = if !is_paused {
-                    entry.last_enqueue_at = Some(now);
                     Some(prepare_enqueue(entry.job.clone(), now)?)
                 } else {
                     None
                 };
 
-                // Advance the schedule (time moves forward regardless of pause).
+                // ---- inside tx: CAS + enqueue ----
+                let mut tx = ks.write_tx();
+
+                // Cron fires through `apply_enqueue` directly rather
+                // than the batcher, so it runs the budget pre-pass
+                // itself — otherwise a scheduled job would reference
+                // budgets nobody resolved, and a `create_with` on the
+                // template would never create anything.
+                //
+                // Resolution succeeding is an invariant, not a hope: an
+                // entry is validated before it enters a schedule, and a
+                // budget it references cannot be deleted or shrunk out
+                // from under it. A rejection here therefore means one of
+                // those protections has a hole, which is why it is
+                // logged as an error rather than treated as a normal
+                // outcome.
+                let mut budget_creations: Vec<(String, Budget)> = Vec::new();
+                let mut fires = prepared.is_some();
+
+                if let Some(ref p) = prepared {
+                    match plan_op_budgets(&tx, &ks, std::slice::from_ref(p))? {
+                        BudgetPlan::Proceed(creations) => budget_creations = creations,
+                        BudgetPlan::Reject(e) => {
+                            // Skip the tick rather than failing the
+                            // promotion. Returning an error would
+                            // discard the schedule advance with it,
+                            // leaving the entry perpetually due and the
+                            // scheduler spinning on it — a far worse
+                            // way to surface a bug than a gap and a
+                            // log line.
+                            tracing::error!(
+                                group = %group,
+                                entry = %entry_name,
+                                error = %e,
+                                "cron entry references budgets that no longer resolve — \
+                                 this should be impossible, as entries are validated on \
+                                 install and their budgets protected from deletion and \
+                                 shrinking. Skipping this tick."
+                            );
+                            fires = false;
+                        }
+                    }
+                }
+
+                if fires {
+                    entry.last_enqueue_at = Some(now);
+                }
+
+                // Advance the schedule (time moves forward regardless of
+                // pause, or of a tick that could not fire).
                 let old_next = entry.next_enqueue_at;
                 entry.next_enqueue_at = next;
 
                 let updated_entry_bytes: Slice = rmp_serde::to_vec_named(&entry)?.into();
-
-                // ---- inside tx: CAS + enqueue ----
-                let mut tx = ks.write_tx();
 
                 // CAS the cron entry — retry if it changed since pre-read.
                 let prev =
@@ -907,14 +1007,30 @@ impl Store {
                     continue; // Entry changed — retry.
                 }
 
-                // Enqueue the job if not paused.
-                let enqueue_result = if let Some(ref p) = prepared {
-                    Some(apply_enqueue(&mut tx, &ks, p)?)
-                } else {
-                    None
+                // Enqueue the job if this tick fires.
+                let enqueue_result = match (fires, prepared.as_ref()) {
+                    (true, Some(p)) => {
+                        write_created_budgets(&mut tx, &ks, &budget_creations)?;
+                        Some(apply_enqueue(&mut tx, &ks, p)?)
+                    }
+                    _ => None,
                 };
 
-                ks.commit(tx, ks.enqueue_commit_mode)?;
+                // Staged before the commit, while the write lock still
+                // excludes every other writer — see `stage_budgets`.
+                // Cron fires jobs like any other enqueue, so it needs
+                // the same protection against a budget being deleted in
+                // the gap between durability and accounting.
+                let fired = enqueue_result.as_ref().and_then(|r| match r {
+                    EnqueueResult::Created(job) => Some(job),
+                    EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
+                });
+                stage_budgets(&live, &budget_creations, fired, now);
+
+                if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
+                    unstage_budgets(&live, &budget_creations, fired);
+                    return Err(e);
+                }
 
                 // ---- outside tx: update in-memory indexes ----
 
@@ -928,7 +1044,7 @@ impl Store {
 
                 // Finalize job enqueue (in-memory indexes + events).
                 if let Some(ref result) = enqueue_result {
-                    finalize_enqueue(result, &ready_index, &scheduled_index, &event_tx);
+                    finalize_enqueue(result, &dispatch, &scheduled_index, &event_tx);
                 }
 
                 return Ok(Some(entry));
@@ -984,6 +1100,90 @@ impl Store {
         })
         .await?
     }
+}
+
+/// How a set of cron entries depends on one budget.
+///
+/// A cron entry is a *standing* claim on a budget, unlike a job, which
+/// eventually drains. That is why deleting or shrinking a budget has to
+/// consult the schedule and not just the queue.
+pub(in crate::store) struct CronBudgetUsage {
+    /// Largest cost any referencing template draws from it.
+    pub(in crate::store) max_cost: u32,
+
+    /// How many entries reference it.
+    pub(in crate::store) entries: usize,
+
+    /// One of them, as `group/entry`, so an error can name something
+    /// concrete for the operator to go and look at.
+    pub(in crate::store) example: String,
+}
+
+/// Find how the installed schedule depends on a budget, or `None` if
+/// no cron entry references it.
+///
+/// Scans the cron keyspace, which is small by design — the number of
+/// entries is expected to be in the hundreds — and is only consulted
+/// when a budget is deleted or its allocation changed, both
+/// operator-scale events rather than per-job ones.
+///
+/// `reader` should be the open write transaction, so the answer cannot
+/// shift between the check and the write it guards.
+pub(in crate::store) fn cron_budget_usage(
+    reader: &impl Readable,
+    ks: &Keyspaces,
+    budget_key: &str,
+) -> Result<Option<CronBudgetUsage>, StoreError> {
+    let start = vec![RecordKind::Cron as u8];
+    let end = vec![RecordKind::Cron as u8 + 1];
+
+    let mut usage: Option<CronBudgetUsage> = None;
+
+    for guard in
+        reader.range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
+    {
+        let (key, value) = guard.into_inner()?;
+
+        // Group metadata keys end with \0 and carry no entry name.
+        let Some(sep) = key.iter().position(|&b| b == 0) else {
+            continue;
+        };
+        if sep + 1 >= key.len() {
+            continue;
+        }
+
+        let entry: CronEntry = rmp_serde::from_slice(&value)?;
+
+        let Some(cost) = entry
+            .job
+            .budgets
+            .iter()
+            .filter(|b| b.key == budget_key)
+            .map(|b| b.cost)
+            .max()
+        else {
+            continue;
+        };
+
+        let group = String::from_utf8(key[1..sep].to_vec()).map_err(|e| {
+            StoreError::Corruption(format!("cron group name is not valid UTF-8: {e}"))
+        })?;
+
+        usage = Some(match usage {
+            None => CronBudgetUsage {
+                max_cost: cost,
+                entries: 1,
+                example: format!("{group}/{}", entry.name),
+            },
+            Some(prev) => CronBudgetUsage {
+                max_cost: prev.max_cost.max(cost),
+                entries: prev.entries + 1,
+                example: prev.example,
+            },
+        });
+    }
+
+    Ok(usage)
 }
 
 /// Build a cron group metadata key: `C{group}\0`.
@@ -2725,5 +2925,244 @@ mod tests {
             .await
             .unwrap();
         assert!(entry.job.batch.is_some());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::super::super::budget::{
+        BudgetBinding, BudgetPolicy, BudgetStrategy, make_budget_key,
+    };
+    use super::super::super::options::{
+        CronEntryOptions, EnqueueOptions, ListJobsOptions, ReplaceCronGroupOptions,
+    };
+    use super::super::super::test_support::test_store;
+    use crate::store::{Store, StoreError};
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn entry_with(job: EnqueueOptions) -> CronEntryOptions {
+        CronEntryOptions {
+            name: "nightly".to_string(),
+            // Every minute, so it is due almost immediately.
+            expression: "* * * * *".to_string(),
+            timezone: Some("UTC".to_string()),
+            paused: None,
+            job,
+        }
+    }
+
+    async fn install(store: &Store, job: EnqueueOptions) {
+        store
+            .replace_cron_group(
+                "g",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![entry_with(job)],
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Cron fires through `apply_enqueue` directly, so it has to run
+    /// the budget pre-pass itself or a `create_with` on the template
+    /// would never create anything.
+    #[tokio::test]
+    async fn firing_creates_a_budget_from_the_template() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({})).budget(
+            BudgetBinding::new("stripe").create_with(BudgetPolicy {
+                allocation: 10,
+                strategy: BudgetStrategy::WhileInFlight,
+            }),
+        );
+        install(&store, job).await;
+
+        let fired = store
+            .promote_cron_entry("g", "nightly", NOW + 120_000)
+            .await
+            .unwrap();
+        assert!(fired.is_some());
+
+        let budget = store.get_budget("stripe").await.unwrap().unwrap();
+        assert_eq!(budget.allocation, 10);
+    }
+
+    /// A cron firing is an enqueue like any other, so the job it
+    /// creates counts against its budgets. Installing the entry alone
+    /// must not — an entry is a standing claim guarded separately, and
+    /// counting it here would double-count every schedule.
+    #[tokio::test]
+    async fn firing_tracks_the_job_it_enqueues() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({})).budget(
+            BudgetBinding::new("stripe")
+                .cost(6)
+                .create_with(BudgetPolicy {
+                    allocation: 10,
+                    strategy: BudgetStrategy::WhileInFlight,
+                }),
+        );
+        install(&store, job).await;
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+
+        store
+            .promote_cron_entry("g", "nightly", NOW + 120_000)
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(6));
+    }
+
+    /// Defence in depth for a state the install-time and deletion
+    /// protections are supposed to make unreachable.
+    ///
+    /// There is deliberately no API route into it — installing
+    /// validates, and deleting a referenced budget is refused — so the
+    /// store is corrupted directly to reach the branch. The property
+    /// under test is not that skipping is *correct*; it is that an
+    /// invariant violation degrades into a gap rather than a wedged
+    /// scheduler. Failing the promotion would discard the schedule
+    /// advance with it, leaving the entry perpetually due and the
+    /// scheduler spinning on it.
+    #[tokio::test]
+    async fn an_unresolvable_budget_degrades_to_a_skipped_tick() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        // No `create_with`, so the entry has no way to reconstitute the
+        // budget — install accepts it only because the budget exists.
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({}))
+            .budget(BudgetBinding::new("stripe"));
+        install(&store, job).await;
+
+        // Rip the budget out from under the entry, behind the
+        // protections that exist precisely to stop this.
+        let ks = store.ks.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            tx.remove(&ks.data, make_budget_key("stripe"));
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let before = store
+            .get_cron_entry("g", "nightly")
+            .await
+            .unwrap()
+            .unwrap()
+            .next_enqueue_at
+            .unwrap();
+
+        let entry = store
+            .promote_cron_entry("g", "nightly", before)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Advanced, so the scheduler moves on rather than retrying.
+        assert!(entry.next_enqueue_at.unwrap() > before);
+        // Did not fire.
+        assert_eq!(entry.last_enqueue_at, None);
+        assert_eq!(store.count_jobs(ListJobsOptions::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn installing_creates_a_budget_from_the_template() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({})).budget(
+            BudgetBinding::new("stripe").create_with(BudgetPolicy {
+                allocation: 10,
+                strategy: BudgetStrategy::WhileInFlight,
+            }),
+        );
+
+        install(&store, job).await;
+
+        // Created at install, not deferred to the first firing — so the
+        // entry cannot be accepted and then become unfireable because
+        // the server hit its budget cap in the meantime.
+        let budget = store.get_budget("stripe").await.unwrap().unwrap();
+        assert_eq!(budget.allocation, 10);
+    }
+
+    #[tokio::test]
+    async fn installing_rejects_an_unknown_budget_without_create_with() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({}))
+            .budget(BudgetBinding::new("absent"));
+
+        let result = store
+            .replace_cron_group(
+                "g",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![entry_with(job)],
+                },
+                NOW,
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+        // The whole install is refused, entry included.
+        assert!(store.get_cron_group("g").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn installing_rejects_a_cost_above_the_allocation() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({}))
+            .budget(BudgetBinding::new("stripe").cost(11));
+
+        let result = store
+            .replace_cron_group(
+                "g",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![entry_with(job)],
+                },
+                NOW,
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    #[tokio::test]
+    async fn adding_a_single_entry_resolves_its_budgets() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({}))
+            .budget(BudgetBinding::new("absent"));
+
+        let result = store.add_cron_entry("g", entry_with(job), NOW).await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    #[tokio::test]
+    async fn putting_a_single_entry_resolves_its_budgets() {
+        let store = test_store();
+        let job = EnqueueOptions::new("t", "q", serde_json::json!({}))
+            .budget(BudgetBinding::new("absent"));
+
+        let result = store.put_cron_entry("g", entry_with(job), NOW).await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
     }
 }

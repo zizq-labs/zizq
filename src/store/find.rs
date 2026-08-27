@@ -126,7 +126,7 @@ fn window_offset_around(matched_position: usize, limit: usize, total: usize) -> 
 }
 
 impl Store {
-    /// Search the in-memory `ReadyIndex` for the first job matching
+    /// Search the in-memory `Dispatch` for the first job matching
     /// `queues` and `types` per `direction`, starting from `anchor_id`
     /// (or the natural start/end when `None`). See module docs.
     pub async fn find_ready(
@@ -137,7 +137,7 @@ impl Store {
         types: Vec<String>,
         limit: usize,
     ) -> Result<Option<FindOutcome>, StoreError> {
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let ks = self.ks.clone();
 
         task::spawn_blocking(move || {
@@ -146,7 +146,7 @@ impl Store {
             // and build the window without re-walking. This is one
             // allocation of `n * (u16 + String)` — acceptable for the
             // Ready index (ephemeral, typically small).
-            let entries: Vec<(u16, String)> = ready_index.iter().collect();
+            let entries: Vec<(u16, String)> = dispatch.iter().collect();
             walk_and_window(&ks, entries, anchor_id, direction, &queues, &types, limit)
         })
         .await?
@@ -190,7 +190,7 @@ impl Store {
         .await?
     }
 
-    /// Return a window of jobs from the `ReadyIndex` anchored per
+    /// Return a window of jobs from the `Dispatch` anchored per
     /// `anchor`. See `WindowAnchor` for anchor semantics and
     /// `WindowFallback` for the "anchor not found" fallback.
     pub async fn list_window_ready(
@@ -199,11 +199,11 @@ impl Store {
         fallback: WindowFallback,
         limit: usize,
     ) -> Result<WindowOutcome, StoreError> {
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let ks = self.ks.clone();
 
         task::spawn_blocking(move || {
-            let entries: Vec<(u16, String)> = ready_index.iter().collect();
+            let entries: Vec<(u16, String)> = dispatch.iter().collect();
             resolve_window(&ks, entries, anchor, fallback, limit)
         })
         .await?

@@ -11,7 +11,7 @@
 //! - `index`: status (`S` tag), queue (`Q` tag), type (`T` tag), and purge-at
 //!   (`A` tag) secondary indexes. No bloom filters, smaller memtable. See
 //!   `IndexKind` for key layouts.
-//! - In-memory `ReadyIndex`: lock-free crossbeam skip-list priority index of
+//! - In-memory `Dispatch`: lock-free crossbeam skip-list priority index of
 //!   ready jobs, rebuilt from the status index on startup.
 //! - In-memory `ScheduledIndex`: lock-free crossbeam skip-set chronological
 //!   index of scheduled jobs, rebuilt from the status index on startup.
@@ -27,12 +27,13 @@ use fjall::config::{FilterPolicy, PinningPolicy};
 use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use tokio::sync::broadcast;
 
+use super::budget::Budgets;
 use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
+use super::dispatch::Dispatch;
 use super::enqueue::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::in_flight_index::InFlightIndex;
-use super::ready_index::ReadyIndex;
 use super::scheduled_index::ScheduledIndex;
 use super::storage_config::StorageConfig;
 use super::types::{BackoffConfig, CommitMode, StoreError};
@@ -41,7 +42,7 @@ use super::types::{BackoffConfig, CommitMode, StoreError};
 ///
 /// Workers use these events to decide when to check for new work:
 ///
-/// - `JobCreated`: a job became ready. Workers check the queue name, then
+/// - `JobDispatchable`: a job became ready. Workers check the queue name, then
 ///   try to atomically claim the one-shot `token`. Only the winner calls
 ///   `take_next_job`, avoiding thundering-herd DB contention.
 /// - `JobCompleted` / `JobFailed`: workers prune their in-flight set;
@@ -54,13 +55,24 @@ use super::types::{BackoffConfig, CommitMode, StoreError};
 
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
-    /// A job became ready for processing (newly enqueued, requeued, or
-    /// promoted from the scheduled index).
+    /// A job can be handed to a worker that could not have been a
+    /// moment ago.
+    ///
+    /// Emitted when a job is newly enqueued, requeued after a worker
+    /// disconnected, or promoted out of the scheduled index — and none
+    /// of those is a creation, which is what the old name got wrong.
+    ///
+    /// Nor is it quite "became ready". Those three are all transitions
+    /// into the Ready state, but a job throttled by a budget is already
+    /// Ready and stays Ready while it waits; what changes when its
+    /// budget refills is only that it can now be dispatched. Naming the
+    /// event for that keeps the one thing every emitter has in common:
+    /// **look again, there is work.**
     ///
     /// Contains the queue name so workers can cheaply filter irrelevant
     /// events, and a single-use claim token (`Arc<AtomicBool>`) so that
     /// only one worker per event hits the database.
-    JobCreated {
+    JobDispatchable {
         id: String,
         queue: String,
         token: Arc<AtomicBool>,
@@ -102,7 +114,7 @@ pub enum StoreEvent {
     /// The admin layer uses this to re-diff all tabs (ready, scheduled,
     /// in-flight) since a patch can change queue, priority, status, or
     /// any combination. Workers and the scheduler ignore this — they
-    /// receive `JobCreated`/`JobScheduled` separately when a status
+    /// receive `JobDispatchable`/`JobScheduled` separately when a status
     /// transition occurs.
     JobPatched { id: String },
 
@@ -135,7 +147,14 @@ pub struct Store {
     ///
     /// Uses `crossbeam-skiplist` SkipMap + `dashmap` DashMap internally —
     /// no external mutex needed.
-    pub(super) ready_index: Arc<ReadyIndex>,
+    pub(super) dispatch: Arc<Dispatch>,
+
+    /// Live budget state — token buckets and the jobs waiting on them.
+    ///
+    /// Shared with `dispatch`, which parks jobs into it. Held here too
+    /// because it is the store that learns when a policy changes and
+    /// has to bring the running state in line.
+    pub(super) budgets: Arc<Budgets>,
 
     /// In-memory chronological index of scheduled jobs.
     ///
@@ -223,6 +242,9 @@ pub(super) struct Keyspaces {
     /// Commit mode for enqueue operations (resolved at construction;
     /// inherits the default when not overridden).
     pub(super) enqueue_commit_mode: CommitMode,
+
+    /// Cap on how many budgets may exist. Enforced when creating one.
+    pub(super) max_budgets: usize,
 }
 
 impl Keyspaces {
@@ -327,8 +349,10 @@ impl Store {
             group_committer,
             default_commit_mode,
             enqueue_commit_mode,
+            max_budgets: config.max_budgets,
         });
-        let ready_index = Arc::new(ReadyIndex::new());
+        let budgets = Arc::new(Budgets::new());
+        let dispatch = Arc::new(Dispatch::new(budgets.clone()));
         let scheduled_index = Arc::new(ScheduledIndex::new());
         let in_flight_index = Arc::new(InFlightIndex::new());
 
@@ -339,7 +363,8 @@ impl Store {
         // SyncSender closes, the worker drains remaining ops and exits.
         let enqueue_batcher = Arc::new(EnqueueBatcher::start(
             ks.clone(),
-            ready_index.clone(),
+            dispatch.clone(),
+            budgets.clone(),
             scheduled_index.clone(),
             event_tx.clone(),
             config.enqueue_batch_size,
@@ -349,7 +374,7 @@ impl Store {
         // batcher, coalesces concurrent completion (ack) requests.
         let complete_batcher = Arc::new(CompleteBatcher::start(
             ks.clone(),
-            ready_index.clone(),
+            dispatch.clone(),
             in_flight_index.clone(),
             event_tx.clone(),
             config.default_completed_retention_ms,
@@ -359,7 +384,8 @@ impl Store {
         Ok(Self {
             config: config.clone(),
             ks,
-            ready_index,
+            dispatch,
+            budgets,
             scheduled_index,
             in_flight_index,
             cron_index: Arc::new(CronScheduleIndex::new()),
@@ -380,7 +406,7 @@ impl Store {
 
     /// Total number of ready jobs across all queues.
     pub fn ready_count(&self) -> usize {
-        self.ready_index.len()
+        self.dispatch.len()
     }
 
     /// Total number of in-flight jobs across all connections.

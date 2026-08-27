@@ -12,6 +12,8 @@
 
 use tokio::task;
 
+use super::budget::BudgetRef;
+use super::dispatch::Placement;
 use super::keys::{
     error_keys, make_batch_key, make_job_key, make_payload_key, make_purge_key, make_queue_key,
     make_status_key, make_type_key, make_unique_key,
@@ -28,7 +30,7 @@ impl Store {
     /// job was found and deleted, `false` if already purged.
     pub async fn purge_job(&self, id: &str) -> Result<bool, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let in_flight_index = self.in_flight_index.clone();
         let id = id.to_string();
@@ -56,15 +58,29 @@ impl Store {
             // Remove from in-memory indexes based on the job's status.
             match status {
                 JobStatus::Ready => {
-                    ready_index.remove(&job.queue, job.priority, &id);
+                    dispatch.remove(Placement::of(&job));
                 }
                 JobStatus::Scheduled => {
                     scheduled_index.remove(job.ready_at, &id);
                 }
                 JobStatus::InFlight => {
                     in_flight_index.remove(job.dequeued_at.unwrap_or(0), &id);
+                    // Only an in-flight job is holding capacity. A ready
+                    // or scheduled one was never dispatched, so it has
+                    // no slot to give back and crediting one would
+                    // invent capacity out of nothing.
+                    dispatch.release_concurrency(&job.budgets);
                 }
                 _ => {}
+            }
+
+            // Only a job that was still unfinished is still counted. One
+            // deleted after completing or dying stopped counting when it
+            // got there, and untracking it again would take the budget
+            // below the work it actually holds — which reads as capacity
+            // that is not there.
+            if !status.is_terminal() {
+                dispatch.untrack(&job.budgets);
             }
 
             Ok(true)
@@ -98,7 +114,7 @@ impl Store {
     /// Emits `StoreEvent::JobDeleted` for each deleted job.
     pub async fn delete_jobs(&self, opts: BulkDeleteOptions) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let scheduled_index = self.scheduled_index.clone();
         let in_flight_index = self.in_flight_index.clone();
         let event_tx = self.event_tx.clone();
@@ -148,6 +164,10 @@ impl Store {
                 priority: u16,
                 ready_at: u64,
                 dequeued_at: u64,
+                /// Carried from the pre-read so the post-commit index
+                /// cleanup can describe the job's placement without
+                /// reading it again.
+                budgets: Vec<BudgetRef>,
             }
 
             let mut deleted: Vec<Deleted> = Vec::new();
@@ -171,6 +191,7 @@ impl Store {
                     priority: job.priority,
                     ready_at: job.ready_at,
                     dequeued_at: job.dequeued_at.unwrap_or(0),
+                    budgets: job.budgets,
                 });
             }
 
@@ -184,15 +205,27 @@ impl Store {
             for d in &deleted {
                 match d.status {
                     JobStatus::Ready => {
-                        ready_index.remove(&d.queue, d.priority, &d.id);
+                        dispatch.remove(Placement {
+                            queue: &d.queue,
+                            priority: d.priority,
+                            id: &d.id,
+                            budgets: &d.budgets,
+                        });
                     }
                     JobStatus::Scheduled => {
                         scheduled_index.remove(d.ready_at, &d.id);
                     }
                     JobStatus::InFlight => {
                         in_flight_index.remove(d.dequeued_at, &d.id);
+                        // See `purge_job`: only in-flight holds capacity.
+                        dispatch.release_concurrency(&d.budgets);
                     }
                     _ => {}
+                }
+
+                // See `purge_job`: terminal jobs are already uncounted.
+                if !d.status.is_terminal() {
+                    dispatch.untrack(&d.budgets);
                 }
             }
 
@@ -223,12 +256,12 @@ impl Store {
     /// skipped.
     pub async fn purge_batch(&self, ids: &[String]) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let ids = ids.to_vec();
 
         let result = task::spawn_blocking(move || -> Result<_, StoreError> {
             // ---- outside tx: prepare all deletions ----
-            let mut deletions: Vec<(JobDeletion, String, u16)> = Vec::new();
+            let mut deletions: Vec<(JobDeletion, String, u16, Vec<BudgetRef>)> = Vec::new();
 
             for id in &ids {
                 let job_key = make_job_key(id);
@@ -247,20 +280,38 @@ impl Store {
 
                 let priority = job.priority;
                 let queue = job.queue.clone();
-                deletions.push((prepare_job_deletion(&job, status, &ks), queue, priority));
+                deletions.push((
+                    prepare_job_deletion(&job, status, &ks),
+                    queue,
+                    priority,
+                    job.budgets,
+                ));
             }
 
             // ---- inside tx (writes only) ----
             let count = deletions.len();
             let mut tx = ks.write_tx();
-            for (del, _, _) in &deletions {
+            for (del, _, _, _) in &deletions {
                 apply_job_deletion(&mut tx, del, &ks);
             }
             ks.commit(tx, ks.default_commit_mode)?;
 
-            // Defensive: remove from ready_index in case of inconsistency.
-            for (del, queue, priority) in deletions {
-                ready_index.remove(&queue, priority, &del.id);
+            // Defensive: remove from dispatch in case of inconsistency.
+            //
+            // Deliberately no `untrack` to match it. The reaper only
+            // reaches jobs past their retention, which means they went
+            // terminal — and stopped counting against their budgets —
+            // some time ago. Untracking defensively here would
+            // double-decrement every reaped job, and unlike a stray
+            // dispatch entry, an under-count is not self-correcting: it
+            // reads as capacity the budget does not have.
+            for (del, queue, priority, budgets) in deletions {
+                dispatch.remove(Placement {
+                    queue: &queue,
+                    priority,
+                    id: &del.id,
+                    budgets: &budgets,
+                });
             }
 
             Ok(count)
@@ -351,12 +402,209 @@ mod tests {
 
     use crate::filter::PayloadFilter;
 
+    use super::super::budget::{BudgetBinding, BudgetStrategy};
     use super::super::options::{BulkDeleteOptions, EnqueueOptions, ListJobsOptions};
     use super::super::storage_config::StorageConfig;
     use super::super::store::{Store, StoreEvent};
     use super::super::test_support::{enqueue_and_take, test_store, test_store_with_retention};
     use super::super::types::JobStatus;
     use crate::time::now_millis;
+
+    /// Enqueue a job drawing `cost` from a budget created for the test.
+    async fn budgeted(store: &Store, cost: u32) -> String {
+        let now = now_millis();
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("stripe").cost(cost)),
+            )
+            .await
+            .unwrap()
+            .into_job()
+            .id
+    }
+
+    /// Deleting unfinished work releases the claim it had on the budget.
+    #[tokio::test]
+    async fn deleting_a_queued_job_untracks_it() {
+        let store = test_store();
+        let id = budgeted(&store, 5).await;
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+
+        assert!(store.delete_job(&id).await.unwrap());
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+    }
+
+    /// A job deleted after it finished was uncounted when it finished.
+    /// Decrementing a second time would take the budget below the work
+    /// it actually holds, which reads as capacity that is not there —
+    /// and in a debug build trips the assertion in `CostCounts::remove`.
+    ///
+    /// Needs a retention window: under the default of zero, completion
+    /// hard-deletes the job and there is nothing left to delete twice.
+    #[tokio::test]
+    async fn deleting_a_finished_job_does_not_untrack_twice() {
+        let store = test_store_with_retention(60_000, 60_000);
+        let id = budgeted(&store, 5).await;
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, id);
+        store.mark_completed(now_millis(), &id).await.unwrap();
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+
+        assert!(store.delete_job(&id).await.unwrap());
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+    }
+
+    /// Deleting a job out from under a worker is the one exit from
+    /// in-flight the worker never gets to report, so nothing else will
+    /// ever hand the slot back.
+    #[tokio::test]
+    async fn deleting_an_in_flight_job_returns_its_slot() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+        for payload in ["a", "b"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("solo")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(store.delete_job(&taken.id).await.unwrap());
+
+        let next = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, taken.id);
+    }
+
+    /// A queued job never acquired anything, so deleting it must not
+    /// credit a slot — that would invent capacity and let the budget
+    /// run two jobs at once on an allocation of one.
+    #[tokio::test]
+    async fn deleting_a_queued_job_does_not_invent_a_slot() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+        for payload in ["a", "b", "c"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("solo")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let running = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Delete one of the two still waiting.
+        let waiting = store
+            .list_jobs(ListJobsOptions::new().statuses([JobStatus::Ready].into()))
+            .await
+            .unwrap()
+            .jobs;
+        assert_eq!(waiting.len(), 2);
+        assert!(store.delete_job(&waiting[0].id).await.unwrap());
+
+        // The one still running holds the only slot.
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // And it still works normally once that one finishes.
+        store
+            .mark_completed(now_millis(), &running.id)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The bulk path counts down per job, on the same terminal-state
+    /// rule as the single-job one.
+    #[tokio::test]
+    async fn bulk_delete_untracks_each_unfinished_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        for payload in ["a", "b", "c"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("stripe").cost(2)),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.budgets.tracked("stripe"), 3);
+
+        let deleted = store.delete_jobs(BulkDeleteOptions::new()).await.unwrap();
+        assert_eq!(deleted, 3);
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+        assert_eq!(store.budgets.max_cost("stripe"), None);
+    }
 
     // --- delete_job ---
 

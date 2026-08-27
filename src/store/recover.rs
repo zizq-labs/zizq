@@ -15,9 +15,11 @@ use std::sync::atomic::Ordering;
 use fjall::{Readable, Slice};
 use tokio::task;
 
+use super::dispatch::Placement;
 use super::keys::{IndexKind, make_job_key, make_status_key, make_unique_key};
 use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueWhile};
+use crate::time::now_millis;
 
 impl Store {
     /// Recover state after startup.
@@ -41,8 +43,16 @@ impl Store {
     pub async fn rebuild_indexes(&self) -> Result<(usize, usize, usize), StoreError> {
         self.index_ready.store(false, Ordering::Release);
 
+        // Sequenced before the rebuilds rather than joined with them:
+        // `rebuild_dispatch` parks budgeted jobs into their groups, and
+        // those groups have to exist by the time it does.
+        let loaded = self.load_budgets().await?;
+        if loaded > 0 {
+            tracing::info!(count = loaded, "budget policies loaded");
+        }
+
         let (ready, scheduled, cron) = tokio::try_join!(
-            self.rebuild_ready_index(),
+            self.rebuild_dispatch(),
             self.rebuild_scheduled_index(),
             self.rebuild_cron_index(),
         )?;
@@ -52,11 +62,39 @@ impl Store {
         Ok((ready, scheduled, cron))
     }
 
+    /// Load every stored budget policy into the live registry.
+    ///
+    /// Must run before the ready index is rebuilt. A budgeted job is
+    /// dispatched from its budget's group rather than from the ready
+    /// index, and `Budgets::park` skips a group that does not exist —
+    /// deliberately, since conjuring one would invent an allocation to
+    /// go with it. Loading after the rebuild would therefore drop every
+    /// budgeted job out of dispatch until something happened to
+    /// re-insert it.
+    ///
+    /// Allocations come back full, and for concurrency budgets that is
+    /// simply accurate: `recover_in_flight_jobs` has already returned
+    /// every in-flight job to Ready, so nothing holds a slot. Time-based
+    /// budgets also come back full, which does mean a restart forgives
+    /// whatever the previous process had spent — an acceptable trade-off.
+    /// Any other implementation would require heavy disk access to
+    /// persist budget state (token usage etc).
+    async fn load_budgets(&self) -> Result<usize, StoreError> {
+        let budgets = self.list_budgets().await?;
+        let now = now_millis();
+
+        for (key, budget) in &budgets {
+            self.budgets.sync(key, budget, now);
+        }
+
+        Ok(budgets.len())
+    }
+
     /// Move orphaned in-flight jobs back to Ready in the LSM indexes.
     ///
     /// Runs synchronously so it completes before any API requests are
     /// accepted. Does not touch the in-memory ready index — that's
-    /// handled by `rebuild_ready_index`, which runs immediately after.
+    /// handled by `rebuild_dispatch`, which runs immediately after.
     fn recover_in_flight_jobs(&self) -> Result<usize, StoreError> {
         let ks = &self.ks;
 
@@ -126,9 +164,15 @@ impl Store {
     /// Scans for all Ready jobs, reads their metadata to get queue and
     /// priority, and inserts each entry into the skip list. No mutex needed —
     /// each `insert()` is lock-free, and recovery runs before any consumers.
-    async fn rebuild_ready_index(&self) -> Result<usize, StoreError> {
+    ///
+    /// Also counts each job against its budgets. That accounting is
+    /// memory-only, so it has to be rebuilt from the same scan rather
+    /// than surviving the restart; folding it in here avoids a third
+    /// pass over the job records purely to re-derive it.
+    async fn rebuild_dispatch(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
+        let budgets = self.budgets.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Ready jobs.
@@ -155,7 +199,8 @@ impl Store {
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
-                ready_index.insert(&job.queue, job.priority, job_id);
+                budgets.track(&job.budgets);
+                dispatch.insert(Placement::of(&job));
                 count += 1;
             }
 
@@ -168,9 +213,15 @@ impl Store {
     ///
     /// Scans for all Scheduled jobs, reads their metadata to get `ready_at`,
     /// and inserts each entry into the SkipSet.
+    ///
+    /// Counts each job against its budgets too. A scheduled job is not
+    /// queued for dispatch and holds no tokens, but it is unfinished
+    /// work already committed to the budget — shrinking an allocation
+    /// below what one costs would strand it the moment it came due.
     async fn rebuild_scheduled_index(&self) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
+        let budgets = self.budgets.clone();
 
         task::spawn_blocking(move || -> Result<usize, StoreError> {
             // Scan the status index for all Scheduled jobs.
@@ -202,6 +253,7 @@ impl Store {
                 })?;
                 let job: Job = rmp_serde::from_slice(&job_bytes)?;
 
+                budgets.track(&job.budgets);
                 scheduled_index.insert(job.ready_at, job_id);
                 count += 1;
             }
@@ -217,6 +269,7 @@ mod tests {
     use std::collections::HashSet;
     use std::time::SystemTime;
 
+    use super::super::budget::{BudgetBinding, BudgetStrategy};
     use super::super::options::EnqueueOptions;
     use super::super::test_support::test_store;
     use super::super::types::JobStatus;
@@ -392,5 +445,187 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched.status, JobStatus::Scheduled as u8);
+    }
+
+    /// A budgeted job is dispatched from its budget's group rather than
+    /// from the ready index, so the rebuild has to put it back there.
+    /// Parking into a group that has not been loaded yet is a no-op,
+    /// which would leave the job queued on disk but invisible to any
+    /// worker.
+    ///
+    /// `budgets.clear()` stands in for a process restart: the registry
+    /// is memory-only, so emptying it leaves exactly what a new process
+    /// starts with — populated keyspaces and no live budget state.
+    #[tokio::test]
+    async fn a_budgeted_job_is_dispatchable_after_a_rebuild() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("emails", 10, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("emails")),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        store.budgets.clear();
+
+        let (indexed, _scheduled, _cron) = store.rebuild_indexes().await.unwrap();
+        assert_eq!(indexed, 1);
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, job.id);
+    }
+
+    /// The allocation has to come back with the group. Groups restored
+    /// without their policy would make every budgeted job dispatchable
+    /// at once, which looks like success right up until the throttle is
+    /// the thing being relied on.
+    #[tokio::test]
+    async fn a_reloaded_budget_still_throttles() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("one-at-a-time", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        for payload in ["a", "b"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("one-at-a-time")),
+                )
+                .await
+                .unwrap();
+        }
+
+        store.budgets.clear();
+
+        let (indexed, _scheduled, _cron) = store.rebuild_indexes().await.unwrap();
+        assert_eq!(indexed, 2);
+
+        // The allocation of one survives the reload.
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The cost accounting is memory-only, so a restart has to re-derive
+    /// it or every budget comes back looking unreferenced — and the
+    /// guards would then happily delete one out from under a full queue.
+    ///
+    /// Covers both scans: a ready job and a scheduled one. The scheduled
+    /// job is the easier one to miss, since it is not queued for
+    /// dispatch and holds no tokens, but shrinking below its cost would
+    /// strand it the moment it came due.
+    #[tokio::test]
+    async fn a_rebuild_restores_the_cost_accounting() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("ready"))
+                    .budget(BudgetBinding::new("stripe").cost(3)),
+            )
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("later"))
+                    .budget(BudgetBinding::new("stripe").cost(8))
+                    .ready_at(now + 600_000),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 2);
+
+        store.budgets.clear();
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+
+        store.rebuild_indexes().await.unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 2);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(8));
+    }
+
+    /// A job that was mid-flight when the process died holds no token in
+    /// the new one: recovery returns it to Ready, so the concurrency it
+    /// was occupying is genuinely free. A budget of one that failed to
+    /// notice would deadlock on its own orphan.
+    #[tokio::test]
+    async fn an_orphaned_budgeted_job_does_not_hold_its_own_slot() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("solo", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("solo")),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        // Take it, leaving it in flight and holding the only slot.
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, job.id);
+
+        store.budgets.clear();
+
+        assert_eq!(store.recover_in_flight().await.unwrap(), 1);
+        store.rebuild_indexes().await.unwrap();
+
+        let retaken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retaken.id, job.id);
     }
 }

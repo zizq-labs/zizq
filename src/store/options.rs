@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::PayloadFilter;
 
+use super::budget::{BudgetBinding, BudgetStrategy};
 use super::types::{
     BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile,
 };
@@ -440,6 +441,13 @@ pub struct EnqueueOptions {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws from when it dispatches. Empty means the
+    /// job is unthrottled and never touches the budget machinery.
+    #[serde(rename = "G")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetBinding>,
 }
 
 impl EnqueueOptions {
@@ -462,6 +470,7 @@ impl EnqueueOptions {
             unique_key: None,
             unique_while: None,
             batch: None,
+            budgets: Vec::new(),
         }
     }
 
@@ -517,6 +526,15 @@ impl EnqueueOptions {
         self.batch = Some(batch);
         self
     }
+
+    /// Bind this job to a budget and return `self`.
+    ///
+    /// Call once per budget — a job may draw from several, and they are
+    /// acquired all-or-nothing at dispatch.
+    pub fn budget(mut self, budget: BudgetBinding) -> Self {
+        self.budgets.push(budget);
+        self
+    }
 }
 
 /// Options for replacing an entire cron group via `Store::replace_cron_group`.
@@ -544,6 +562,19 @@ pub struct PatchCronGroupOptions {
     /// The group's default timezone. `Some(None)` clears it, which falls
     /// the group's un-scoped entries back to the server's local timezone.
     pub timezone: Option<Option<String>>,
+}
+
+/// Options for `Store::patch_budget`.
+///
+/// Follows JSON Merge Patch semantics: `None` leaves a field alone.
+/// Neither field is nullable — a budget with no allocation or no
+/// strategy is not a budget, so there is nothing to clear them to.
+pub struct PatchBudgetOptions {
+    /// Tokens the bucket holds when full.
+    pub allocation: Option<u32>,
+
+    /// How tokens replenish.
+    pub strategy: Option<BudgetStrategy>,
 }
 
 /// A single entry in a `replace_cron_group` request.

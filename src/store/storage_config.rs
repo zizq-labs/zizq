@@ -81,6 +81,16 @@ pub struct StorageConfig {
     /// compaction can leave large pockets of garbage in the upper levels
     /// for a long time on quiet databases. Set to 0 to disable.
     pub auto_compact_threshold: u64,
+
+    /// Maximum number of budgets that may exist on the server.
+    ///
+    /// Creating a budget beyond this is rejected. Budgets are listed
+    /// whole by `GET /budgets`, and that response is buffered in memory,
+    /// so an unbounded count is an unbounded response. The cap also
+    /// makes a budget-per-customer pattern fail loudly rather than
+    /// degrade quietly — that shape is better served by one shared
+    /// budget.
+    pub max_budgets: usize,
 }
 
 /// Default block cache capacity (256 MiB).
@@ -122,6 +132,13 @@ pub const DEFAULT_DEAD_RETENTION_MS: u64 = 604_800_000;
 /// compaction once they commit.
 pub const DEFAULT_AUTO_COMPACT_THRESHOLD: u64 = 10_000;
 
+/// Default cap on the number of budgets (8192).
+///
+/// Far above any schedule of named throttles a system realistically
+/// needs, while keeping a full `GET /budgets` response comfortably
+/// small.
+pub const DEFAULT_MAX_BUDGETS: usize = 8192;
+
 /// Default maximum number of concurrent single-job enqueues coalesced
 /// into one auto-batched commit. Also the bounded channel capacity.
 pub const DEFAULT_ENQUEUE_BATCH_SIZE: usize = 1000;
@@ -152,6 +169,7 @@ impl Default for StorageConfig {
             enqueue_batch_size: DEFAULT_ENQUEUE_BATCH_SIZE,
             complete_batch_size: DEFAULT_COMPLETE_BATCH_SIZE,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+            max_budgets: DEFAULT_MAX_BUDGETS,
         }
     }
 }
@@ -173,6 +191,7 @@ impl StorageConfig {
     /// | `ZIZQ_ENQUEUE_BATCH_SIZE` | `enqueue_batch_size` |
     /// | `ZIZQ_COMPLETE_BATCH_SIZE` | `complete_batch_size` |
     /// | `ZIZQ_AUTO_COMPACT_THRESHOLD` | `auto_compact_threshold` |
+    /// | `ZIZQ_MAX_BUDGETS`        | `max_budgets`      |
     pub fn from_env() -> Result<Self, EnvConfigError> {
         let defaults = Self::default();
         Ok(Self {
@@ -214,6 +233,7 @@ impl StorageConfig {
                 .unwrap_or(defaults.complete_batch_size),
             auto_compact_threshold: env_parse("ZIZQ_AUTO_COMPACT_THRESHOLD")?
                 .unwrap_or(defaults.auto_compact_threshold),
+            max_budgets: env_parse("ZIZQ_MAX_BUDGETS")?.unwrap_or(defaults.max_budgets),
         })
     }
 }

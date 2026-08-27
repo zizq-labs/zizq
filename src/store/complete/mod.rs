@@ -55,7 +55,7 @@ impl Store {
         }
 
         // Route through the auto-batcher. Per-op dedup happens inside
-        // the batcher; ready_index updates, in_flight_count decrement,
+        // the batcher; dispatch updates, in_flight_count decrement,
         // and JobCompleted event broadcasts are all performed once per
         // unique completed job in the batcher thread.
         let batcher = self.complete_batcher.clone();
@@ -72,6 +72,7 @@ impl Store {
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::budget::{BudgetBinding, BudgetStrategy};
     use super::super::keys::error_keys;
     use super::super::options::EnqueueOptions;
     use super::super::store::StoreEvent;
@@ -79,6 +80,93 @@ mod tests {
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retention,
     };
     use crate::time::now_millis;
+
+    /// The point of a concurrency budget: one job at a time, and the
+    /// next one goes as soon as the last is acknowledged. Without the
+    /// release, an allocation of one dispatches exactly once in the
+    /// lifetime of the process and then withholds forever.
+    #[tokio::test]
+    async fn acknowledging_frees_the_slot_for_the_next_job() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("one-at-a-time", 1, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        for payload in ["a", "b"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("one-at-a-time")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The allocation is spent while it runs.
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        store.mark_completed(now_millis(), &first.id).await.unwrap();
+
+        let second = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    /// Completion is terminal, so the job stops counting against the
+    /// budget — otherwise the budget would accumulate a permanent debt
+    /// of finished work and eventually refuse every change to itself.
+    #[tokio::test]
+    async fn completing_a_job_untracks_it_from_its_budgets() {
+        let store = test_store();
+        let now = now_millis();
+
+        store
+            .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, now)
+            .await
+            .unwrap();
+
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(BudgetBinding::new("stripe").cost(4)),
+            )
+            .await
+            .unwrap();
+
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Dispatched but unfinished — still counted.
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+
+        store.mark_completed(now_millis(), &taken.id).await.unwrap();
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+        assert_eq!(store.budgets.max_cost("stripe"), None);
+    }
 
     #[tokio::test]
     async fn mark_completed_removes_job() {

@@ -223,7 +223,7 @@ impl Store {
 
     /// List ready jobs in priority order from the in-memory index.
     ///
-    /// Iterates the `ReadyIndex` SkipMap and hydrates job metadata from
+    /// Iterates the `Dispatch` SkipMap and hydrates job metadata from
     /// the `jobs` keyspace. Skips jobs whose metadata is missing (claimed
     /// between index scan and disk read — next snapshot corrects). Does
     /// NOT hydrate payloads.
@@ -236,12 +236,12 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let ks = self.ks.clone();
 
         task::spawn_blocking(move || {
             let mut jobs = Vec::with_capacity(limit);
-            for (_priority, job_id) in ready_index.iter().skip(offset) {
+            for (_priority, job_id) in dispatch.iter().skip(offset) {
                 if jobs.len() >= limit {
                     break;
                 }
@@ -256,7 +256,7 @@ impl Store {
         .await?
     }
 
-    /// Scan the in-memory ReadyIndex and return up to `limit` priority keys.
+    /// Scan the in-memory Dispatch and return up to `limit` priority keys.
     ///
     /// Returns `Vec<(priority, job_id)>` in priority order — zero disk I/O.
     /// Used by the admin event handler to diff capped ready windows.
@@ -265,9 +265,9 @@ impl Store {
             return Vec::new();
         }
 
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
 
-        task::spawn_blocking(move || ready_index.iter().skip(offset).take(limit).collect())
+        task::spawn_blocking(move || dispatch.iter().skip(offset).take(limit).collect())
             .await
             .unwrap_or_default()
     }

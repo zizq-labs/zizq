@@ -7,6 +7,7 @@ use fjall::Slice;
 use tokio::task;
 
 use super::delete::{apply_job_deletion, prepare_job_deletion};
+use super::dispatch::Placement;
 use super::keys::{make_error_key, make_job_key, make_purge_key, make_status_key, make_unique_key};
 use super::options::FailureOptions;
 use super::store::{Store, StoreEvent};
@@ -31,7 +32,7 @@ impl Store {
     ) -> Result<Option<Job>, StoreError> {
         let ks = self.ks.clone();
         let scheduled_index = self.scheduled_index.clone();
-        let ready_index = self.ready_index.clone();
+        let dispatch = self.dispatch.clone();
         let default_dead_retention_ms = self.default_dead_retention_ms;
         let default_retry_limit = self.default_retry_limit;
         let default_backoff = self.default_backoff.clone();
@@ -134,6 +135,12 @@ impl Store {
 
                     ks.commit(tx, ks.default_commit_mode)?;
 
+                    // The attempt is over even though the job is not:
+                    // it waits out its backoff holding no capacity, and
+                    // acquires again when the retry is dispatched. It
+                    // stays *tracked* throughout, being unfinished work
+                    // the budget still owes room to.
+                    dispatch.release_concurrency(&job.budgets);
                     scheduled_index.insert(job.ready_at, id.clone());
 
                     break job;
@@ -161,7 +168,9 @@ impl Store {
                     job.status = JobStatus::Dead.into();
                     ks.commit(tx, ks.default_commit_mode)?;
 
-                    ready_index.remove(&job.queue, job.priority, &id);
+                    dispatch.remove(Placement::of(&job));
+                    dispatch.release_concurrency(&job.budgets);
+                    dispatch.untrack(&job.budgets);
 
                     break job;
                 }
@@ -204,7 +213,9 @@ impl Store {
 
                 ks.commit(tx, ks.default_commit_mode)?;
 
-                ready_index.remove(&job.queue, job.priority, &id);
+                dispatch.remove(Placement::of(&job));
+                dispatch.release_concurrency(&job.budgets);
+                dispatch.untrack(&job.budgets);
 
                 break job;
             };
@@ -274,7 +285,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::keys::{error_keys, make_error_key, make_payload_key};
-    use super::super::options::{EnqueueOptions, ListJobsOptions};
+    use super::super::options::{EnqueueOptions, FailureOptions, ListJobsOptions};
     use super::super::store::StoreEvent;
     use super::super::test_support::{
         enqueue_and_take, test_failure_opts, test_store, test_store_with_retry_limit,
@@ -282,6 +293,166 @@ mod tests {
     use super::super::types::{BackoffConfig, ErrorRecord, JobStatus};
     use super::compute_backoff;
     use crate::time::now_millis;
+
+    /// Enqueue a job drawing `cost` from a fresh budget, and take it.
+    async fn budgeted_in_flight(store: &super::Store, cost: u32) -> String {
+        let now = now_millis();
+        store
+            .create_budget(
+                "stripe",
+                100,
+                super::super::budget::BudgetStrategy::WhileInFlight,
+                now,
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "default", serde_json::json!("a"))
+                    .budget(super::super::budget::BudgetBinding::new("stripe").cost(cost)),
+            )
+            .await
+            .unwrap();
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    /// Enqueue `count` jobs each drawing one token from a concurrency
+    /// budget of `allocation`.
+    async fn contending_for(store: &super::Store, allocation: u32, count: usize) {
+        let now = now_millis();
+        store
+            .create_budget(
+                "slot",
+                allocation,
+                super::super::budget::BudgetStrategy::WhileInFlight,
+                now,
+            )
+            .await
+            .unwrap();
+        for i in 0..count {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("test", "default", serde_json::json!(i))
+                        .budget(super::super::budget::BudgetBinding::new("slot")),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A failed attempt is over even though the job is not. Holding the
+    /// slot through the backoff would mean one flaky job blocking a
+    /// concurrency budget for as long as it keeps failing — and with a
+    /// growing backoff, for longer each time.
+    #[tokio::test]
+    async fn a_retry_returns_the_slot_it_was_holding() {
+        let store = test_store();
+        contending_for(&store, 1, 2).await;
+
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let failed = store
+            .record_failure(now_millis(), &first.id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, JobStatus::Scheduled as u8);
+
+        let second = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn killing_a_job_returns_the_slot_it_was_holding() {
+        let store = test_store();
+        contending_for(&store, 1, 2).await;
+
+        let first = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let opts = FailureOptions {
+            kill: true,
+            ..test_failure_opts()
+        };
+        store
+            .record_failure(now_millis(), &first.id, opts)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store
+                .take_next_job(now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A retry is not terminal. The job goes back to Scheduled and will
+    /// run again, so it is still work the budget owes capacity to —
+    /// untracking here would let the allocation shrink below a cost the
+    /// job still needs when it comes due.
+    #[tokio::test]
+    async fn a_retry_leaves_the_job_tracked() {
+        let store = test_store();
+        let id = budgeted_in_flight(&store, 7).await;
+
+        let job = store
+            .record_failure(now_millis(), &id, test_failure_opts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Scheduled as u8);
+
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(7));
+    }
+
+    /// Killing a job is terminal, so it stops counting.
+    #[tokio::test]
+    async fn killing_a_job_untracks_it() {
+        let store = test_store();
+        let id = budgeted_in_flight(&store, 7).await;
+
+        let opts = FailureOptions {
+            kill: true,
+            ..test_failure_opts()
+        };
+        let job = store
+            .record_failure(now_millis(), &id, opts)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Dead as u8);
+
+        assert_eq!(store.budgets.tracked("stripe"), 0);
+    }
 
     // --- compute_backoff tests ---
 

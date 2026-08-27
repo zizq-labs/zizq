@@ -14,13 +14,19 @@
 //!
 //! Both singular `enqueue` and `enqueue_bulk` calls flow through this
 //! batcher. Each op carries a `Vec<PreparedEnqueue>` — Vec-of-1 for
-//! singles, Vec-of-N for bulks. The batcher flat-maps them into one
-//! contiguous slice for `apply_enqueue_batch`, runs one commit, then
-//! slices the per-job results back into per-op chunks for fan-out to
-//! each waiter's oneshot.
+//! singles, Vec-of-N for bulks. The ops stay separate through
+//! `apply_enqueue_batch`, which returns one outcome per op, so each
+//! waiter's oneshot resolves with exactly its own jobs' results.
 //!
 //! Atomicity is preserved: a bulk's "all-or-nothing" contract holds
-//! because the entire coalesced commit succeeds or fails as a unit.
+//! because the entire coalesced commit succeeds or fails as a unit,
+//! and because an op that is rejected fails whole rather than
+//! per-job.
+//!
+//! An op can be rejected on its own without disturbing the rest of the
+//! batch — the other ops still commit. That is what lets validation
+//! needing a database read (resolving a job's budgets, say) reject one
+//! request without failing unrelated concurrent ones.
 //! The channel is op-count bounded — a bulk counts as one op against
 //! the channel/batch budget regardless of how many jobs it carries,
 //! so a single in-flight bulk can be of any size. Memory pressure
@@ -55,12 +61,13 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use super::super::ready_index::ReadyIndex;
+use super::super::budget::{Budgets, stage_budgets, unstage_budgets};
+use super::super::dispatch::Dispatch;
 use super::super::results::EnqueueResult;
 use super::super::scheduled_index::ScheduledIndex;
 use super::super::store::{Keyspaces, StoreEvent};
-use super::super::types::StoreError;
-use super::apply::apply_enqueue_batch;
+use super::super::types::{Job, StoreError};
+use super::apply::{OpOutcome, apply_enqueue_batch};
 use super::finalize::finalize_enqueue;
 use super::prepare::PreparedEnqueue;
 
@@ -90,7 +97,8 @@ impl EnqueueBatcher {
     /// one op regardless of how many jobs it carries.
     pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
-        ready_index: Arc<ReadyIndex>,
+        dispatch: Arc<Dispatch>,
+        budgets: Arc<Budgets>,
         scheduled_index: Arc<ScheduledIndex>,
         event_tx: broadcast::Sender<StoreEvent>,
         batch_size: usize,
@@ -120,7 +128,7 @@ impl EnqueueBatcher {
                         }
                     }
 
-                    process_batch(&ks, &ready_index, &scheduled_index, &event_tx, batch);
+                    process_batch(&ks, &dispatch, &budgets, &scheduled_index, &event_tx, batch);
                 }
             })
             .expect("failed to spawn enqueue-batcher thread");
@@ -155,25 +163,28 @@ impl EnqueueBatcher {
 /// corresponding to the jobs they submitted.
 fn process_batch(
     ks: &Keyspaces,
-    ready_index: &ReadyIndex,
+    dispatch: &Dispatch,
+    budgets: &Budgets,
     scheduled_index: &ScheduledIndex,
     event_tx: &broadcast::Sender<StoreEvent>,
     batch: Vec<EnqueueOp>,
 ) {
-    // Flatten per-op `Vec<PreparedEnqueue>`s into one contiguous slice
-    // for `apply_enqueue_batch`, recording each op's job count so we
-    // can slice the result Vec back into per-op chunks afterwards.
+    // Split the coalesced batch into per-op job lists and their reply
+    // slots. Ops stay separate all the way through, so one op failing
+    // validation does not disturb the others.
     let ops_count = batch.len();
-    let mut sizes: Vec<usize> = Vec::with_capacity(ops_count);
     let mut replies: Vec<tokio::sync::oneshot::Sender<_>> = Vec::with_capacity(ops_count);
-    let mut prepared: Vec<PreparedEnqueue> = Vec::new();
+    let mut ops: Vec<Vec<PreparedEnqueue>> = Vec::with_capacity(ops_count);
 
     for op in batch {
-        sizes.push(op.prepared.len());
         replies.push(op.reply);
-        prepared.extend(op.prepared);
+        ops.push(op.prepared);
     }
-    let jobs_count = prepared.len();
+    let jobs_count: usize = ops.iter().map(Vec::len).sum();
+
+    // Every op carries its caller's clock reading; any of them will do
+    // for stamping budgets this batch creates.
+    let now = ops.iter().flatten().next().map(|p| p.now);
 
     tracing::debug!(
         ops = ops_count,
@@ -182,7 +193,7 @@ fn process_batch(
     );
 
     let mut tx = ks.write_tx();
-    let results = match apply_enqueue_batch(&mut tx, ks, &prepared) {
+    let (outcomes, created_budgets) = match apply_enqueue_batch(&mut tx, ks, &ops) {
         Ok(r) => r,
         Err(e) => {
             // apply_enqueue_batch failed for the whole batch (e.g. a
@@ -203,18 +214,33 @@ fn process_batch(
         }
     };
 
-    // Skip the commit when every result was a duplicate —
-    // `apply_enqueue` makes zero tx writes in that case so committing
-    // would be wasteful. `Folded(_)` writes to the tx too, so it also
-    // counts as "needs commit".
-    let writes = results
+    // Skip the commit when nothing was written — `apply_enqueue` makes
+    // zero tx writes for a duplicate, and an op that failed wrote
+    // nothing at all. `Folded(_)` writes to the tx too, so it counts as
+    // "needs commit".
+    let writes: usize = outcomes
         .iter()
+        .filter_map(|o| o.as_ref().ok())
+        .flatten()
         .filter(|r| !matches!(r, EnqueueResult::Duplicate(_)))
         .count();
+    let failed_ops = outcomes.iter().filter(|o| o.is_err()).count();
     let duplicate = jobs_count - writes;
 
     if writes > 0 {
+        // Staged before the commit, while the write lock still excludes
+        // every other writer. Doing it afterwards would leave a window
+        // in which the jobs are durable but unaccounted for, and a
+        // concurrent budget delete would see them as absent.
+        if let Some(now) = now {
+            stage_budgets(budgets, &created_budgets, created_jobs(&outcomes), now);
+        }
+
         if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
+            // Nothing became durable, so nothing may go on referencing
+            // it — including the groups this batch would have created.
+            unstage_budgets(budgets, &created_budgets, created_jobs(&outcomes));
+
             tracing::error!(
                 ops = ops_count,
                 jobs = jobs_count,
@@ -227,11 +253,13 @@ fn process_batch(
             }
             return;
         }
+
         tracing::debug!(
             ops = ops_count,
             jobs = jobs_count,
             writes,
             duplicate,
+            failed_ops,
             "enqueue auto-batcher: committed batch"
         );
     } else {
@@ -240,18 +268,42 @@ fn process_batch(
             ops = ops_count,
             jobs = jobs_count,
             duplicate,
-            "enqueue auto-batcher: skipped commit (all duplicates)"
+            failed_ops,
+            "enqueue auto-batcher: skipped commit (nothing written)"
         );
     }
 
-    // Finalize each result (index updates, events), then slice the
-    // flat result Vec back into per-op chunks and reply.
-    let mut result_iter = results.into_iter();
-    for (size, reply) in sizes.into_iter().zip(replies) {
-        let chunk: Vec<EnqueueResult> = result_iter.by_ref().take(size).collect();
-        for r in &chunk {
-            finalize_enqueue(r, ready_index, scheduled_index, event_tx);
+    // Finalize each committed result (index updates, events) and reply
+    // to each op with its own outcome. A failed op wrote nothing, so
+    // there is nothing to finalize for it — its waiter just gets the
+    // error that rejected it.
+    for (outcome, reply) in outcomes.into_iter().zip(replies) {
+        if let Ok(ref results) = outcome {
+            for r in results {
+                finalize_enqueue(r, dispatch, scheduled_index, event_tx);
+            }
         }
-        let _ = reply.send(Ok(chunk));
+        let _ = reply.send(outcome);
     }
+}
+
+/// The jobs a batch actually brought into existence.
+///
+/// Only `Created` counts. A `Duplicate` returns a job that was already
+/// enqueued, and a `Folded` merges a payload into a batched job that
+/// already exists — in both cases the job was tracked when it was first
+/// created, and counting it again would leave the budget permanently
+/// holding a reference to work that has already finished.
+///
+/// Borrows rather than collects, so the staging and unwinding calls can
+/// each walk the same outcomes without either of them owning a copy.
+fn created_jobs(outcomes: &[OpOutcome]) -> impl Iterator<Item = &Job> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .flatten()
+        .filter_map(|result| match result {
+            EnqueueResult::Created(job) => Some(job),
+            EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
+        })
 }

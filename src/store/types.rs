@@ -12,6 +12,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use tokio::task;
 
+use super::budget::BudgetRef;
+
 /// Error type returned by store operations.
 #[derive(Debug)]
 pub enum StoreError {
@@ -102,6 +104,30 @@ pub enum JobStatus {
 
     /// The job failed too many times and exhausted its retry policy.
     Dead = 4,
+}
+
+impl JobStatus {
+    /// Whether the job has finished, for better or worse.
+    ///
+    /// `Completed` and `Dead` are the two ends a job can reach and not
+    /// leave. Everything else is work the server still owes something
+    /// to: a scheduled job will become ready, a ready job will be
+    /// dispatched, and an in-flight job will be acknowledged, fail into
+    /// a retry, or be returned by a disconnect.
+    ///
+    /// The distinction decides who may still act on a job. A patch
+    /// cannot revive a finished one, and the budget accounting stops
+    /// counting it — so the same question is asked from several places
+    /// and is worth asking in one voice.
+    ///
+    /// Matched exhaustively rather than with a wildcard: a new status
+    /// should not silently inherit an answer.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Completed | Self::Dead => true,
+            Self::Scheduled | Self::Ready | Self::InFlight => false,
+        }
+    }
 }
 
 impl From<JobStatus> for u8 {
@@ -344,6 +370,13 @@ pub struct Job {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws from when it dispatches. Empty means the
+    /// job is unthrottled and never touches the budget machinery.
+    #[serde(rename = "G")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetRef>,
 }
 
 impl Job {

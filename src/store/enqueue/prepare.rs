@@ -5,8 +5,11 @@
 //! `EnqueueOptions` without touching the database. Used both by the
 //! enqueue auto-batcher and by `cron::promote_cron_entry`.
 
+use std::collections::HashSet;
+
 use crate::batch::BatchExpr;
 
+use super::super::budget::BudgetBinding;
 use super::super::keys::{
     make_batch_key, make_job_key, make_payload_key, make_queue_key, make_status_key, make_type_key,
     make_unique_key,
@@ -31,6 +34,46 @@ pub(in crate::store) fn validate_batch_config(
         .map_err(|e| StoreError::InvalidOperation(format!("batch dry-run: {e}")))
 }
 
+/// Reject budget bindings that are malformed regardless of what the
+/// budgets themselves look like.
+///
+/// Whether a referenced budget exists, and whether the cost fits its
+/// allocation, both need a database read and so are settled inside the
+/// transaction. These checks need neither, so they run here where a
+/// rejection costs one request rather than reaching the shared batch.
+fn validate_budget_bindings(budgets: &[BudgetBinding]) -> Result<(), StoreError> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(budgets.len());
+
+    for binding in budgets {
+        if binding.key.is_empty() {
+            return Err(StoreError::InvalidOperation(
+                "budget key must not be empty".into(),
+            ));
+        }
+
+        // Zero would mean "draws on this budget without consuming any
+        // of it", which is indistinguishable from not naming it.
+        if binding.cost == 0 {
+            return Err(StoreError::InvalidOperation(format!(
+                "budget '{}' cost must be at least 1",
+                binding.key
+            )));
+        }
+
+        // Two bindings to one budget would have to either sum or
+        // shadow, and neither reading is obviously right — so the
+        // request is wrong rather than ambiguous.
+        if !seen.insert(binding.key.as_str()) {
+            return Err(StoreError::InvalidOperation(format!(
+                "budget '{}' is named more than once by the same job",
+                binding.key
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Pre-computed data for inserting a job into the store.
 ///
 /// Built by `prepare_enqueue` from `EnqueueOptions`, consumed by
@@ -50,6 +93,16 @@ pub(in crate::store) struct PreparedEnqueue {
     /// `B\0<batch.key>` for batched enqueues (`Some`). When the fold path
     /// is not taken, this is inserted pointing at the newly created job.
     pub(super) batch_idx_key: Option<Vec<u8>>,
+    /// Budget bindings as supplied by the caller, including any
+    /// `create_with` policies. Kept alongside the job (which carries
+    /// only key and cost) because resolving them needs a database read
+    /// and therefore happens inside the transaction.
+    pub(super) budgets: Vec<BudgetBinding>,
+    /// The caller's clock reading for this request. Used to stamp any
+    /// budget `create_with` brings into existence, so budget creation
+    /// honours an injected clock rather than reading the wall clock
+    /// from inside the batcher thread.
+    pub(super) now: u64,
     /// Pre-computed scru128 for the merged payload key if this enqueue
     /// ends up folding into an existing batched job. Discarded (i.e.
     /// unused) if the enqueue creates a new job instead, so first-time
@@ -61,7 +114,7 @@ pub(in crate::store) struct PreparedEnqueue {
 ///
 /// Pure computation — no IO, no transaction needed.
 pub(in crate::store) fn prepare_enqueue(
-    opts: EnqueueOptions,
+    mut opts: EnqueueOptions,
     now: u64,
 ) -> Result<PreparedEnqueue, StoreError> {
     if opts.unique_key.is_some() && opts.batch.is_some() {
@@ -73,6 +126,14 @@ pub(in crate::store) fn prepare_enqueue(
     if let Some(ref cfg) = opts.batch {
         validate_batch_config(cfg, &opts.payload)?;
     }
+
+    validate_budget_bindings(&opts.budgets)?;
+
+    // Taken out of `opts` so the job can carry the narrow refs while
+    // the prepared enqueue keeps the full bindings, without cloning
+    // either.
+    let budgets = std::mem::take(&mut opts.budgets);
+    let budget_refs: Vec<_> = budgets.iter().map(BudgetBinding::to_ref).collect();
 
     let unique_while_scope = match (opts.unique_key.as_ref(), opts.unique_while) {
         (Some(_), Some(scope)) => Some(scope),
@@ -139,6 +200,7 @@ pub(in crate::store) fn prepare_enqueue(
         }),
         payload_key: None,
         batch: opts.batch,
+        budgets: budget_refs,
     };
 
     let mut meta = job.clone();
@@ -146,6 +208,8 @@ pub(in crate::store) fn prepare_enqueue(
     let meta_bytes = rmp_serde::to_vec_named(&meta)?;
 
     Ok(PreparedEnqueue {
+        budgets,
+        now,
         job_key: make_job_key(&id),
         payload_key: make_payload_key(job.payload_key()),
         queue_key: make_queue_key(&job.queue, &id),

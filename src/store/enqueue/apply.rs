@@ -12,6 +12,7 @@ use fjall::Readable;
 
 use crate::batch::BatchExpr;
 
+use super::super::budget::{Budget, BudgetPlan, plan_budgets, write_created_budgets};
 use super::super::keys::{make_job_key, make_payload_key};
 use super::super::results::EnqueueResult;
 use super::super::store::Keyspaces;
@@ -209,8 +210,56 @@ fn try_apply_fold(
     Ok(Some(EnqueueResult::Folded(updated_meta)))
 }
 
-/// Apply a batch of prepared enqueues to an open write transaction with
-/// intra-batch unique-key dedup.
+/// Resolve every budget an op's jobs reference, planning any that
+/// `create_with` asks to bring into existence.
+///
+/// Runs before a single one of the op's jobs is written, and writes
+/// nothing itself — a rejected op must leave no trace, and a shared
+/// transaction cannot be partially rolled back. The caller applies the
+/// planned creations only once the whole op has resolved.
+///
+/// The rules themselves live in `plan_budgets`, shared with cron
+/// installation and firing.
+pub(in crate::store) fn plan_op_budgets(
+    tx: &fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    op: &[PreparedEnqueue],
+) -> Result<BudgetPlan, StoreError> {
+    // Every job in an op comes from one request, so they share its
+    // clock reading.
+    let Some(now) = op.first().map(|p| p.now) else {
+        return Ok(BudgetPlan::Proceed(Vec::new()));
+    };
+
+    plan_budgets(tx, ks, op.iter().flat_map(|p| p.budgets.iter()), now)
+}
+
+/// Per-op outcome: every job's result, or the one error that failed the
+/// op as a whole.
+///
+/// An op is a single request — one `enqueue`, or one `enqueue_bulk` of
+/// any size. Failing an op whole is what preserves bulk's
+/// all-or-nothing contract while letting unrelated ops sharing the
+/// coalesced transaction commit regardless.
+pub(super) type OpOutcome = Result<Vec<EnqueueResult>, StoreError>;
+
+/// Apply a batch of coalesced enqueue ops to an open write transaction
+/// with intra-batch unique-key dedup.
+///
+/// Each element of `ops` is one request's prepared jobs. Results come
+/// back per op, in the same order.
+///
+/// # Two kinds of failure
+///
+/// - The **outer** `Err` is fatal to the batch: a database or
+///   corruption error, where no waiter can be told anything useful.
+/// - An **inner** `Err` fails one op and leaves the rest to commit.
+///
+/// A shared transaction cannot be partially rolled back (see the note
+/// in `take_next_n_jobs` about `fetch_update` writing into the tx
+/// buffer). So an op that fails must not have written anything first:
+/// any check that can reject an op belongs in a pre-pass over that op's
+/// jobs, before the first of them is applied.
 ///
 /// When two prepared jobs in the same batch share a `unique` key, the
 /// second one returns `EnqueueResult::Duplicate(...)` referring to the
@@ -222,34 +271,160 @@ fn try_apply_fold(
 pub(super) fn apply_enqueue_batch(
     tx: &mut fjall::SingleWriterWriteTx<'_>,
     ks: &Keyspaces,
-    prepared: &[PreparedEnqueue],
-) -> Result<Vec<EnqueueResult>, StoreError> {
-    // Maps unique_key -> index in `results` for intra-batch conflicts.
-    let mut batch_unique_keys: HashMap<String, usize> = HashMap::new();
-    let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
+    ops: &[Vec<PreparedEnqueue>],
+) -> Result<(Vec<OpOutcome>, Vec<(String, Budget)>), StoreError> {
+    // Maps unique_key -> (op index, job index) for conflicts against ops
+    // already applied in this batch. Only successful ops are registered:
+    // a failed op writes nothing, so its keys must not shadow a later
+    // op's legitimate enqueue.
+    let mut batch_unique_keys: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut outcomes: Vec<OpOutcome> = Vec::with_capacity(ops.len());
 
-    for p in prepared {
-        // Intra-batch unique conflict check (no DB read needed).
-        if let Some(ref uc) = p.job.unique {
-            if let Some(&existing_idx) = batch_unique_keys.get(&uc.key) {
-                results.push(EnqueueResult::Duplicate(
-                    results[existing_idx].job().clone(),
-                ));
+    // Budgets brought into existence by a `create_with` somewhere in
+    // this batch. Handed back so the caller can sync them into the live
+    // registry once the commit is durable — a job parking on a budget
+    // with no group vanishes from dispatch.
+    let mut created: Vec<(String, Budget)> = Vec::new();
+
+    for (op_idx, prepared) in ops.iter().enumerate() {
+        // Resolve budgets before writing anything for this op, so a
+        // rejection leaves the transaction untouched.
+        match plan_op_budgets(tx, ks, prepared)? {
+            BudgetPlan::Proceed(planned) => {
+                write_created_budgets(tx, ks, &planned)?;
+                created.extend(planned);
+            }
+            BudgetPlan::Reject(e) => {
+                outcomes.push(Err(e));
                 continue;
             }
         }
 
-        let result = apply_enqueue(tx, ks, p)?;
+        // Maps unique_key -> index within this op's own results.
+        let mut op_unique_keys: HashMap<String, usize> = HashMap::new();
+        let mut results: Vec<EnqueueResult> = Vec::with_capacity(prepared.len());
 
-        // Track unique keys for intra-batch dedup.
-        if let EnqueueResult::Created(ref job) = result {
-            if let Some(ref uc) = job.unique {
-                batch_unique_keys.insert(uc.key.clone(), results.len());
+        for p in prepared {
+            // Intra-batch unique conflict check (no DB read needed).
+            // Check this op's own jobs first, then earlier ops'.
+            if let Some(ref uc) = p.job.unique {
+                let existing = op_unique_keys
+                    .get(&uc.key)
+                    .map(|&job_idx| results[job_idx].job().clone())
+                    .or_else(|| {
+                        batch_unique_keys.get(&uc.key).map(|&(prev_op, job_idx)| {
+                            // Registered only for successful ops, so the
+                            // outcome is always `Ok` here.
+                            outcomes[prev_op].as_ref().expect("registered op succeeded")[job_idx]
+                                .job()
+                                .clone()
+                        })
+                    });
+
+                if let Some(job) = existing {
+                    results.push(EnqueueResult::Duplicate(job));
+                    continue;
+                }
             }
+
+            // A `StoreError` from `apply_enqueue` is a database or
+            // corruption failure, not a rejection of this op — it stays
+            // fatal to the whole batch.
+            let result = apply_enqueue(tx, ks, p)?;
+
+            // Track unique keys for intra-batch dedup.
+            if let EnqueueResult::Created(ref job) = result
+                && let Some(ref uc) = job.unique
+            {
+                op_unique_keys.insert(uc.key.clone(), results.len());
+            }
+
+            results.push(result);
         }
 
-        results.push(result);
+        for (key, job_idx) in op_unique_keys {
+            batch_unique_keys.insert(key, (op_idx, job_idx));
+        }
+        outcomes.push(Ok(results));
     }
 
-    Ok(results)
+    Ok((outcomes, created))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::options::EnqueueOptions;
+    use super::super::super::test_support::test_store;
+    use super::super::prepare::prepare_enqueue;
+    use super::*;
+
+    /// Two *separate* ops in one coalesced batch sharing a unique key.
+    ///
+    /// Driving this through `enqueue`/`enqueue_bulk` would depend on
+    /// two concurrent requests happening to land in the same batch, so
+    /// it is exercised directly. The within-one-bulk case is covered by
+    /// `unique_bulk_dedup_within_batch`; this is the cross-op branch,
+    /// which resolves the winner out of an earlier op's outcome.
+    #[tokio::test]
+    async fn dedups_a_unique_key_across_two_ops_in_one_batch() {
+        let store = test_store();
+        let now = crate::time::now_millis();
+
+        let opts = || EnqueueOptions::new("task", "q", serde_json::json!(null)).unique_key("same");
+        let ops = vec![
+            vec![prepare_enqueue(opts(), now).unwrap()],
+            vec![prepare_enqueue(opts(), now).unwrap()],
+        ];
+
+        let ks = store.ks.clone();
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            let (outcomes, _created) = apply_enqueue_batch(&mut tx, &ks, &ops).unwrap();
+            drop(tx);
+            outcomes
+        })
+        .await
+        .unwrap();
+
+        let first = outcomes[0].as_ref().unwrap();
+        let second = outcomes[1].as_ref().unwrap();
+
+        assert!(!first[0].is_duplicate());
+        assert!(second[0].is_duplicate());
+        // The second op is told about the job the first one created.
+        assert_eq!(second[0].job().id, first[0].job().id);
+    }
+
+    /// Each op gets its own result list, in submission order, rather
+    /// than one flat list the caller has to slice.
+    #[tokio::test]
+    async fn returns_one_outcome_per_op() {
+        let store = test_store();
+        let now = crate::time::now_millis();
+
+        let opts = |t: &str| EnqueueOptions::new(t, "q", serde_json::json!(null));
+        let ops = vec![
+            vec![prepare_enqueue(opts("a"), now).unwrap()],
+            vec![
+                prepare_enqueue(opts("b"), now).unwrap(),
+                prepare_enqueue(opts("c"), now).unwrap(),
+            ],
+        ];
+
+        let ks = store.ks.clone();
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            let (outcomes, _created) = apply_enqueue_batch(&mut tx, &ks, &ops).unwrap();
+            drop(tx);
+            outcomes
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].as_ref().unwrap().len(), 1);
+        assert_eq!(outcomes[1].as_ref().unwrap().len(), 2);
+        assert_eq!(outcomes[0].as_ref().unwrap()[0].job().job_type, "a");
+        assert_eq!(outcomes[1].as_ref().unwrap()[1].job().job_type, "c");
+    }
 }

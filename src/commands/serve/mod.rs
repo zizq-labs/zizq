@@ -17,6 +17,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+mod budget_waker;
 mod cron_scheduler;
 mod reaper;
 mod scheduler;
@@ -191,6 +192,14 @@ pub struct Args {
     /// regardless of how many jobs it carries.
     #[arg(long, default_value_t = store::DEFAULT_ENQUEUE_BATCH_SIZE, value_name = "NUMBER", env = "ZIZQ_ENQUEUE_BATCH_SIZE")]
     enqueue_batch_size: usize,
+
+    /// Maximum number of budgets that may exist on the server.
+    /// Creating a budget beyond this is rejected. Budgets are listed
+    /// whole by `GET /budgets`, so an unbounded count means an
+    /// unbounded response; the cap also makes a budget-per-customer
+    /// pattern fail loudly rather than degrade quietly.
+    #[arg(long, default_value_t = store::DEFAULT_MAX_BUDGETS, value_name = "NUMBER", env = "ZIZQ_MAX_BUDGETS")]
+    max_budgets: usize,
 
     /// Maximum number of concurrent completion (ack) requests coalesced
     /// into one auto-batched commit. Same shape as `--enqueue-batch-size`:
@@ -530,6 +539,17 @@ fn spawn_background_tasks(args: &Args, state: &Arc<AppState>) {
         scheduler_shutdown,
     ));
 
+    // Budget waker: tells workers when a throttled job can run, which
+    // no other event covers — a refilled bucket or a freed slot creates
+    // no job for the usual notifications to be about.
+    let budget_waker_shutdown = state.shutdown.clone();
+    tokio::spawn(budget_waker::run(
+        state.store.clone(),
+        crate::time::now_millis,
+        budget_waker::DEFAULT_BATCH_SIZE,
+        budget_waker_shutdown,
+    ));
+
     // Reaper: purges expired completed/dead jobs.
     let reaper_shutdown = state.shutdown.clone();
     tokio::spawn(reaper::run(
@@ -569,6 +589,7 @@ async fn init_store(
     storage_config.default_commit_mode = args.default_commit_mode;
     storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
     storage_config.enqueue_batch_size = args.enqueue_batch_size;
+    storage_config.max_budgets = args.max_budgets;
     storage_config.complete_batch_size = args.complete_batch_size;
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
     tracing::info!(root_dir = %root.display(), "store opened");

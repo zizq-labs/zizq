@@ -32,12 +32,13 @@ use crate::filter::PayloadFilter;
 use crate::state::AppState;
 
 use super::types::{
-    BulkEnqueueRequest, BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest,
-    CommaSet, CountJobsParams, CountJobsResponse, CronEntryRequest, CronEntryResponse,
-    CronGroupResponse, DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse,
-    FailureRequest, HealthResponse, Job, JobStatus, ListCronGroupsResponse, ListErrorsPages,
-    ListErrorsParams, ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse,
-    ListQueuesResponse, Order, PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody,
+    BudgetBindingRequest, BudgetRequest, BudgetResponse, BudgetStrategyRequest, BulkEnqueueRequest,
+    BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest, CommaSet,
+    CountJobsParams, CountJobsResponse, CronEntryRequest, CronEntryResponse, CronGroupResponse,
+    DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse,
+    Job, JobStatus, ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
+    ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse, ListQueuesResponse, Order,
+    PatchBudgetRequest, PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody,
     PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
     VersionResponse, parse_unique_while,
 };
@@ -421,6 +422,15 @@ pub fn app(state: Arc<AppState>) -> Router {
                 .patch(patch_cron_entry)
                 .delete(delete_cron_entry),
         )
+        .route("/budgets", get(list_budgets))
+        .route(
+            "/budgets/{key}",
+            get(get_budget)
+                .post(create_budget)
+                .put(put_budget)
+                .patch(patch_budget)
+                .delete(delete_budget),
+        )
         .route("/reset", post(reset))
         .fallback(not_found)
         .layer(axum::middleware::from_fn(
@@ -567,6 +577,18 @@ async fn enqueue(
         }
     }
 
+    if !enqueue_req.budgets.is_empty() {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .read()
+            .unwrap()
+            .require(now_ms, crate::license::Feature::Budgets)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
     let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
 
     let mut opts =
@@ -598,6 +620,20 @@ async fn enqueue(
     }
     if let Some(batch) = enqueue_req.batch {
         opts = opts.batch(batch.into());
+    }
+    match parse_budget_bindings(enqueue_req.budgets) {
+        Ok(bindings) => {
+            for binding in bindings {
+                opts = opts.budget(binding);
+            }
+        }
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
     }
 
     let now = (state.clock)();
@@ -655,6 +691,7 @@ async fn bulk_enqueue(
     // Validate all jobs up front.
     let mut has_unique = false;
     let mut has_batch = false;
+    let mut has_budgets = false;
     for (i, job) in req.jobs.iter().enumerate() {
         if let Err(msg) = validate_name("type", &job.job_type) {
             return respond(
@@ -700,6 +737,9 @@ async fn bulk_enqueue(
         if job.batch.is_some() {
             has_batch = true;
         }
+        if !job.budgets.is_empty() {
+            has_budgets = true;
+        }
         if job.unique_key.is_some() && job.batch.is_some() {
             return respond(
                 fmt,
@@ -737,11 +777,25 @@ async fn bulk_enqueue(
         }
     }
 
+    // License check for budgets (once for the whole batch).
+    if has_budgets {
+        let now_ms = (state.clock)();
+        if let Err(e) = state
+            .license
+            .read()
+            .unwrap()
+            .require(now_ms, crate::license::Feature::Budgets)
+        {
+            return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+        }
+    }
+
     // Convert to store options.
-    let opts: Vec<store::EnqueueOptions> = req
+    let opts: Result<Vec<store::EnqueueOptions>, String> = req
         .jobs
         .into_iter()
-        .map(|enqueue_req| {
+        .enumerate()
+        .map(|(i, enqueue_req)| {
             let priority = enqueue_req.priority.unwrap_or(DEFAULT_PRIORITY);
             let mut opts = store::EnqueueOptions::new(
                 enqueue_req.job_type,
@@ -772,9 +826,25 @@ async fn bulk_enqueue(
             if let Some(batch) = enqueue_req.batch {
                 opts = opts.batch(batch.into());
             }
-            opts
+            for binding in parse_budget_bindings(enqueue_req.budgets)
+                .map_err(|msg| format!("jobs[{i}]: {msg}"))?
+            {
+                opts = opts.budget(binding);
+            }
+            Ok(opts)
         })
         .collect();
+
+    let opts = match opts {
+        Ok(opts) => opts,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
 
     let now = (state.clock)();
     match state.store.enqueue_bulk(now, opts).await {
@@ -2003,7 +2073,7 @@ async fn take_jobs(
             // successful take we mint a new local unclaimed token so
             // the drain continues. When the queue is empty the CAS
             // leaves the token claimed (true) and can_take becomes
-            // false — we sit idle until a JobCreated event overwrites
+            // false — we sit idle until a JobDispatchable event overwrites
             // the token with a fresh one.
             //
             // This keeps reserve(), the capacity check, and the token
@@ -2196,11 +2266,11 @@ async fn take_jobs(
                     //
                     // If we're not draining, we're waiting for events from the
                     // store. We only go back to the drain phase if we got a
-                    // JobCreated event we care about. Other events are handled
+                    // JobDispatchable event we care about. Other events are handled
                     // without going back to the top of the loop.
                     event = event_rx.recv() => {
                         match event {
-                            Ok(StoreEvent::JobCreated { queue, token, .. }) => {
+                            Ok(StoreEvent::JobDispatchable { queue, token, .. }) => {
                                 // Store the latest matching token. We
                                 // don't CAS yet — we'll claim it when
                                 // reserve() tells us the client can
@@ -2271,7 +2341,7 @@ async fn take_jobs(
                                     &mut in_flight,
                                 ).await;
                                 // After reconciliation we may have missed
-                                // JobCreated events — mint an unclaimed
+                                // JobDispatchable events — mint an unclaimed
                                 // token to trigger a drain.
                                 claim_token =
                                     Arc::new(AtomicBool::new(false));
@@ -2354,6 +2424,14 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
     if let Some(batch) = entry.job.batch {
         opts = opts.batch(batch.into());
     }
+    // A scheduled job is throttleable like any other. `create_with`
+    // stays on the stored template because an entry may be installed
+    // before its budget exists — an application declaring its whole
+    // schedule on boot should not have to order budget creation first.
+    // The budget is created the first time the entry fires.
+    for binding in parse_budget_bindings(entry.job.budgets)? {
+        opts = opts.budget(binding);
+    }
 
     Ok(store::CronEntryOptions {
         name: entry.name,
@@ -2362,6 +2440,404 @@ fn validate_cron_entry(entry: CronEntryRequest) -> Result<store::CronEntryOption
         paused: entry.paused,
         job: opts,
     })
+}
+
+/// Convert an enqueue's `budgets` array into its store form.
+///
+/// `bucket` is rejected rather than dropped: it is reserved for
+/// sub-buckets, and silently accepting it now would mean a request that
+/// works today quietly changes meaning once the field does something.
+fn parse_budget_bindings(
+    budgets: Vec<BudgetBindingRequest>,
+) -> Result<Vec<store::BudgetBinding>, String> {
+    budgets
+        .into_iter()
+        .map(|entry| {
+            if entry.bucket.is_some() {
+                return Err(format!(
+                    "budget '{}' sets bucket, which is reserved and not yet supported",
+                    entry.key
+                ));
+            }
+
+            let mut binding = store::BudgetBinding::new(entry.key);
+
+            if let Some(cost) = entry.cost {
+                binding = binding.cost(cost);
+            }
+
+            if let Some(policy) = entry.create_with {
+                let allocation = policy.allocation;
+                let strategy = parse_budget_strategy(policy.strategy)?;
+                binding = binding.create_with(store::BudgetPolicy {
+                    allocation,
+                    strategy,
+                });
+            }
+
+            Ok(binding)
+        })
+        .collect()
+}
+
+/// Convert a wire strategy into its store form.
+///
+/// The tag is parsed by hand so that a refill period supplied for a
+/// strategy that has none is rejected rather than quietly dropped —
+/// see [`BudgetStrategyRequest`].
+fn parse_budget_strategy(req: BudgetStrategyRequest) -> Result<store::BudgetStrategy, String> {
+    match req.kind.as_str() {
+        "time_based" => match req.duration_ms {
+            Some(duration_ms) => Ok(store::BudgetStrategy::TimeBased {
+                duration_ms,
+                burst: req.burst,
+            }),
+            None => Err("time_based budget requires strategy.duration_ms".into()),
+        },
+        // Both clock-shaped fields are refused rather than ignored, on
+        // the same reasoning: a caller who set one believes the throttle
+        // is something it is not.
+        "while_in_flight" if req.burst.is_some() => {
+            Err("while_in_flight budget must not set strategy.burst — \
+             it has no drip to burst ahead of, so its allocation is \
+             already the most that can run at once"
+                .into())
+        }
+        "while_in_flight" => match req.duration_ms {
+            None => Ok(store::BudgetStrategy::WhileInFlight),
+            Some(_) => Err(
+                "while_in_flight budget must not set strategy.duration_ms — \
+                 its tokens return on acknowledgement, not on a clock"
+                    .into(),
+            ),
+        },
+        other => Err(format!(
+            "unknown budget strategy: {other:?} (expected \"time_based\" or \"while_in_flight\")"
+        )),
+    }
+}
+
+/// Reject a budget request the store would not accept, returning the
+/// validated key and strategy.
+fn validate_budget_request(key: &str, req: BudgetRequest) -> Result<store::BudgetStrategy, String> {
+    validate_name("budget key", key)?;
+    parse_budget_strategy(req.strategy)
+}
+
+/// Handle `GET /budgets` — list every budget with its policy.
+async fn list_budgets(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.list_budgets().await {
+        Ok(budgets) => {
+            let budgets = budgets
+                .into_iter()
+                .map(|(key, budget)| BudgetResponse::from_store(key, budget))
+                .collect();
+            respond(fmt, StatusCode::OK, &ListBudgetsResponse { budgets })
+        }
+        Err(e) => {
+            tracing::error!(%e, "list_budgets failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `GET /budgets/{key}` — fetch a single budget's policy.
+async fn get_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.get_budget(&key).await {
+        Ok(Some(budget)) => respond(
+            fmt,
+            StatusCode::OK,
+            &BudgetResponse::from_store(key, budget),
+        ),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("budget '{key}' not found"),
+            },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "get_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /budgets/{key}` — create a budget, failing if it exists.
+///
+/// The create-only counterpart to `PUT`: an application can declare the
+/// budgets it expects on every boot without overwriting an allocation an
+/// operator has since adjusted.
+async fn create_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<BudgetRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let allocation = req.allocation;
+    let strategy = match validate_budget_request(&key, req) {
+        Ok(strategy) => strategy,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
+
+    match state
+        .store
+        .create_budget(&key, allocation, strategy, now_ms)
+        .await
+    {
+        Ok(budget) => respond(
+            fmt,
+            StatusCode::CREATED,
+            &BudgetResponse::from_store(key, budget),
+        ),
+        Err(StoreError::Conflict(msg)) => {
+            respond(fmt, StatusCode::CONFLICT, &ErrorResponse { error: msg })
+        }
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "create_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PUT /budgets/{key}` — create a budget or replace its policy.
+///
+/// Unlike `POST`, this overwrites an existing policy — including one an
+/// operator adjusted. `created_at` is preserved either way.
+async fn put_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<BudgetRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let allocation = req.allocation;
+    let strategy = match validate_budget_request(&key, req) {
+        Ok(strategy) => strategy,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
+
+    match state
+        .store
+        .put_budget(&key, allocation, strategy, now_ms)
+        .await
+    {
+        Ok(budget) => respond(
+            fmt,
+            StatusCode::OK,
+            &BudgetResponse::from_store(key, budget),
+        ),
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "put_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `PATCH /budgets/{key}` — update named fields of a policy.
+///
+/// Absent fields are left alone. A patch has nothing to merge into when
+/// the budget does not exist, so this 404s rather than creating one.
+async fn patch_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<PatchBudgetRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let strategy = match req.strategy.map(parse_budget_strategy).transpose() {
+        Ok(strategy) => strategy,
+        Err(msg) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error: msg },
+            );
+        }
+    };
+
+    let opts = store::PatchBudgetOptions {
+        allocation: req.allocation,
+        strategy,
+    };
+
+    match state.store.patch_budget(&key, opts, now_ms).await {
+        Ok(Some(budget)) => respond(
+            fmt,
+            StatusCode::OK,
+            &BudgetResponse::from_store(key, budget),
+        ),
+        Ok(None) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("budget '{key}' not found"),
+            },
+        ),
+        Err(StoreError::InvalidOperation(msg)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error: msg },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `DELETE /budgets/{key}` — remove a budget.
+async fn delete_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    match state.store.delete_budget(&key).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("budget '{key}' not found"),
+            },
+        ),
+        // Refused because something still references the budget. The
+        // message names what, and how to clear it, so it has to reach
+        // the caller rather than being swallowed as a 500.
+        // Refused because something still references the budget. The
+        // message names what, and how to clear it, so it has to reach
+        // the caller rather than being swallowed as a 500.
+        Err(StoreError::Conflict(msg)) => {
+            respond(fmt, StatusCode::CONFLICT, &ErrorResponse { error: msg })
+        }
+        Err(e) => {
+            tracing::error!(%e, "delete_budget failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
 }
 
 /// Handle `GET /crons` — list all cron group names.
@@ -2901,6 +3377,23 @@ async fn reset(AcceptFormat(fmt): AcceptFormat, State(state): State<Arc<AppState
         .await
     {
         tracing::error!(%e, "reset: delete_jobs failed");
+        return respond(
+            fmt,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &ErrorResponse {
+                error: "internal error".into(),
+            },
+        );
+    }
+
+    // Last of the three, and the order is what makes it simple. Cron
+    // entries and unfinished jobs are the only things that can reference
+    // a budget, and both are gone by now — so the deletion rule that
+    // refuses a referenced budget is honoured here without ever firing.
+    // No force flag, and no exception carved into the rule for one
+    // caller.
+    if let Err(e) = state.store.delete_budgets().await {
+        tracing::error!(%e, "reset: delete_budgets failed");
         return respond(
             fmt,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -7999,6 +8492,570 @@ mod tests {
         );
     }
 
+    // --- Budgets ---
+
+    fn budget_post(key: &str, body: &serde_json::Value) -> Request {
+        json_request("POST", &format!("/budgets/{key}"), body)
+    }
+
+    fn while_in_flight(allocation: u32) -> serde_json::Value {
+        serde_json::json!({
+            "allocation": allocation,
+            "strategy": { "type": "while_in_flight" }
+        })
+    }
+
+    /// A caller that cannot see what a job is bound to has no way to
+    /// tell "throttled" from "stuck". Covers all three surfaces a job
+    /// comes back on: the enqueue response, a single fetch, and a
+    /// listing.
+    #[tokio::test]
+    async fn budget_refs_come_back_on_every_read_of_a_job() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // Enqueue response.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [
+                        { "key": "stripe", "cost": 3 },
+                        { "key": "mailgun", "create_with": {
+                            "allocation": 5,
+                            "strategy": { "type": "while_in_flight" }
+                        }},
+                    ],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let id = body["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            body["budgets"],
+            serde_json::json!([
+                { "key": "stripe", "cost": 3 },
+                // Resolved: the request omitted a cost, and
+                // `create_with` was an instruction rather than job state.
+                { "key": "mailgun", "cost": 1 },
+            ])
+        );
+
+        // Single fetch.
+        let req = empty_request("GET", &format!("/jobs/{id}"));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["budgets"][0]["key"], "stripe");
+        assert_eq!(body["budgets"][0]["cost"], 3);
+
+        // Listing.
+        let req = empty_request("GET", "/jobs");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["jobs"][0]["budgets"][1]["key"], "mailgun");
+    }
+
+    /// An unthrottled job pays nothing for the feature, on the wire as
+    /// everywhere else — the field is absent, not an empty array.
+    #[tokio::test]
+    async fn an_unbudgeted_job_omits_the_field_entirely() {
+        let app = pro_app();
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({ "type": "t", "queue": "q", "payload": {} }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert!(body.get("budgets").is_none(), "unexpected: {body}");
+    }
+
+    #[tokio::test]
+    async fn budget_post_creates_and_returns_201() {
+        let req = budget_post("stripe", &while_in_flight(100));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["key"], "stripe");
+        assert_eq!(body["allocation"], 100);
+        assert_eq!(body["strategy"]["type"], "while_in_flight");
+        // A concurrency limit has no refill period to report.
+        assert!(body["strategy"]["duration_ms"].is_null());
+        assert!(body["created_at"].is_number());
+        assert!(body["updated_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn budget_post_accepts_a_time_based_strategy() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 100,
+                "strategy": { "type": "time_based", "duration_ms": 60000 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["strategy"]["type"], "time_based");
+        assert_eq!(body["strategy"]["duration_ms"], 60000);
+
+        // Absent rather than echoed as the allocation, so a read cannot
+        // be mistaken for a setting the operator made.
+        assert!(
+            body["strategy"].get("burst").is_none(),
+            "unexpected: {body}"
+        );
+    }
+
+    /// The knob that caps the front-loaded spike a full bucket allows.
+    #[tokio::test]
+    async fn budget_post_accepts_a_burst() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 100,
+                "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 5 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 100);
+        assert_eq!(body["strategy"]["burst"], 5);
+    }
+
+    /// A concurrency budget has no drip to burst ahead of, so the field
+    /// is refused rather than ignored — the same treatment
+    /// `duration_ms` gets there, and for the same reason: a caller who
+    /// set it believes the throttle is something it is not.
+    #[tokio::test]
+    async fn budget_post_rejects_a_burst_on_while_in_flight() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "while_in_flight", "burst": 5 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_post_rejects_a_zero_burst() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 100,
+                "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 0 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A job costing more than the bucket can ever hold would never
+    /// dispatch. With a burst set it is the burst that decides, not the
+    /// allocation — so a cost well inside the allocation is still
+    /// refused.
+    #[tokio::test]
+    async fn enqueue_rejects_a_cost_above_the_burst() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 5 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{ "key": "stripe", "cost": 50 }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The whole point of `POST` over `PUT`: it refuses rather than
+    /// overwriting a policy an operator may have adjusted.
+    #[tokio::test]
+    async fn budget_post_conflicts_with_an_existing_budget() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(5)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // The original allocation survived.
+        let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 100);
+    }
+
+    /// A refused delete is the caller's problem to fix, not a server
+    /// fault — and the message says which jobs and how to clear them,
+    /// so reporting it as a 500 would throw away the only part that
+    /// helps. This handler was the one budget route not mapping its
+    /// store errors.
+    #[tokio::test]
+    async fn budget_delete_conflicts_while_a_job_references_it() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{ "key": "stripe", "cost": 2 }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "DELETE",
+                "/budgets/stripe",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("unfinished job"), "unhelpful: {error}");
+
+        // Refusing changed nothing.
+        let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn budget_post_rejects_a_zero_allocation() {
+        let req = budget_post("stripe", &while_in_flight(0));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_post_rejects_an_unknown_strategy() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "on_a_wednesday" }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_post_rejects_a_time_based_strategy_without_a_duration() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "time_based" }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Accepting this would read as though it set a refill period when
+    /// `while_in_flight` has none — tokens return on acknowledgement.
+    #[tokio::test]
+    async fn budget_post_rejects_a_duration_on_while_in_flight() {
+        let req = budget_post(
+            "stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "while_in_flight", "duration_ms": 1000 }
+            }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_post_rejects_a_key_with_reserved_characters() {
+        let req = budget_post("stripe*", &while_in_flight(10));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_get_returns_404_for_a_missing_budget() {
+        let req = json_request("GET", "/budgets/absent", &serde_json::json!({}));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_list_returns_keys() {
+        let app = pro_app();
+
+        for key in ["stripe", "ses"] {
+            let res = app
+                .clone()
+                .oneshot(budget_post(key, &while_in_flight(10)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+        }
+
+        let req = json_request("GET", "/budgets", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Whole policies, so an operator listing budgets does not then
+        // need a request per budget to see any of their allocations.
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        let budgets = body["budgets"].as_array().unwrap();
+
+        assert_eq!(budgets.len(), 2);
+        assert_eq!(budgets[0]["key"], "ses");
+        assert_eq!(budgets[0]["allocation"], 10);
+        assert_eq!(budgets[0]["strategy"]["type"], "while_in_flight");
+        assert_eq!(budgets[1]["key"], "stripe");
+    }
+
+    #[tokio::test]
+    async fn budget_list_is_empty_without_any_budgets() {
+        let req = json_request("GET", "/budgets", &serde_json::json!({}));
+        let res = pro_app().oneshot(req).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body, serde_json::json!({ "budgets": [] }));
+    }
+
+    #[tokio::test]
+    async fn budget_put_creates_when_absent() {
+        let req = json_request("PUT", "/budgets/stripe", &while_in_flight(100));
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 100);
+    }
+
+    #[tokio::test]
+    async fn budget_put_replaces_an_existing_policy() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+
+        let req = json_request(
+            "PUT",
+            "/budgets/stripe",
+            &serde_json::json!({
+                "allocation": 10,
+                "strategy": { "type": "time_based", "duration_ms": 1000 }
+            }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 10);
+        assert_eq!(body["strategy"]["type"], "time_based");
+        // A replace changes the policy, not the budget's identity.
+        assert_eq!(body["created_at"], created["created_at"]);
+    }
+
+    #[tokio::test]
+    async fn budget_patch_changes_only_the_named_field() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "allocation": 25 }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 25);
+        // Untouched by a patch that did not mention it.
+        assert_eq!(body["strategy"]["type"], "time_based");
+        assert_eq!(body["strategy"]["duration_ms"], 60000);
+    }
+
+    #[tokio::test]
+    async fn budget_patch_returns_404_for_a_missing_budget() {
+        let req = json_request(
+            "PATCH",
+            "/budgets/absent",
+            &serde_json::json!({ "allocation": 10 }),
+        );
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_patch_rejects_an_invalid_merged_policy() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(100)))
+            .await
+            .unwrap();
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "allocation": 0 }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn budget_delete_removes_and_returns_204() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+
+        let req = empty_request("DELETE", "/budgets/stripe");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_delete_returns_404_for_a_missing_budget() {
+        let req = empty_request("DELETE", "/budgets/absent");
+        let res = pro_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_endpoints_return_403_on_free_tier() {
+        let app = test_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = json_request("GET", "/budgets", &serde_json::json!({}));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = json_request("GET", "/budgets/stripe", &serde_json::json!({}));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = json_request("PUT", "/budgets/stripe", &while_in_flight(10));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "allocation": 10 }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let res = app
+            .oneshot(empty_request("DELETE", "/budgets/stripe"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
     // --- Cron scheduling ---
 
     fn cron_put(name: &str, body: &serde_json::Value) -> Request {
@@ -9067,6 +10124,90 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["crons"], serde_json::json!([]));
+    }
+
+    /// Reset exists to give a test suite a clean slate, so a budget
+    /// surviving it would leak throttling between one suite's run and
+    /// the next — and an allocation half-spent by jobs that no longer
+    /// exist is worse than a stale one, because nothing will ever
+    /// release it.
+    ///
+    /// Also covers the ordering: a budget referenced by both a cron
+    /// entry and a queued job would refuse deletion on its own, and
+    /// reset only gets away with removing it because both are gone by
+    /// the time it tries.
+    #[tokio::test]
+    async fn reset_clears_budgets_that_jobs_and_crons_referenced() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // A job drawing on it.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t",
+                    "queue": "q",
+                    "payload": {},
+                    "budgets": [{ "key": "stripe", "cost": 2 }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // And a cron entry drawing on it.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                "/crons/default",
+                &serde_json::json!({
+                    "entries": [{
+                        "name": "nightly",
+                        "expression": "0 3 * * *",
+                        "timezone": "UTC",
+                        "job": {
+                            "type": "t",
+                            "queue": "q",
+                            "payload": {},
+                            "budgets": [{ "key": "stripe", "cost": 1 }],
+                        },
+                    }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Deleting it directly is refused while both reference it.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "DELETE",
+                "/budgets/stripe",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let req = empty_request("POST", "/reset");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let req = empty_request("GET", "/budgets");
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["budgets"], serde_json::json!([]));
     }
 
     #[tokio::test]

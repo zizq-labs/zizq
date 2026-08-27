@@ -352,6 +352,50 @@ pub struct Job {
     /// being evaluated rather than guessing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws from, as resolved at enqueue.
+    ///
+    /// Exposed on reads for the same reason `batch` is: a caller that
+    /// cannot see what a job is bound to has no way to explain why it
+    /// has not run, and "throttled" is precisely the state that looks
+    /// indistinguishable from "stuck" from the outside.
+    ///
+    /// Resolved rather than echoed. `cost` is the value that applies —
+    /// filled in with the default where the request omitted it — and
+    /// `create_with` is absent because it was an instruction about a
+    /// budget, not a property of this job. What it created, if anything,
+    /// is visible at `GET /budgets/{key}`.
+    ///
+    /// Omitted entirely for an unthrottled job rather than sent as an
+    /// empty array, so a job that uses none of this pays nothing for it
+    /// on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetBindingResponse>,
+}
+
+/// One budget a job draws from, as stored.
+///
+/// Distinct from [`BudgetBindingRequest`] because the two are not the
+/// same shape: a request may omit `cost` and may carry `create_with` and
+/// `bucket`, none of which survive into what the job actually holds.
+/// Reusing the request type would advertise fields a read can never
+/// populate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BudgetBindingResponse {
+    /// Key of the budget this job draws from.
+    pub key: String,
+
+    /// Tokens consumed from that budget when the job dispatches.
+    pub cost: u32,
+}
+
+impl From<store::BudgetRef> for BudgetBindingResponse {
+    fn from(reference: store::BudgetRef) -> Self {
+        Self {
+            key: reference.key,
+            cost: reference.cost,
+        }
+    }
 }
 
 /// Convert a store job to an HTTP job, failing if the status byte is invalid.
@@ -418,6 +462,7 @@ impl Job {
             duplicate,
             folded,
             batch: job.batch.map(Into::into),
+            budgets: job.budgets.into_iter().map(Into::into).collect(),
         })
     }
 }
@@ -521,6 +566,37 @@ pub struct EnqueueRequest {
     /// into an existing pending job sharing the same `batch.key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchConfig>,
+
+    /// Budgets this job draws on when it dispatches. Empty (or absent)
+    /// means the job is unthrottled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<BudgetBindingRequest>,
+}
+
+/// One entry in an enqueue's `budgets` array.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetBindingRequest {
+    /// Key of the budget to draw from.
+    pub key: String,
+
+    /// Tokens to consume on dispatch. Defaults to 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u32>,
+
+    /// Policy to create the budget with if it does not exist yet.
+    ///
+    /// Ignored when it does — the server stays authoritative, so an
+    /// enqueue cannot restate a throttle an operator has configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_with: Option<BudgetRequest>,
+
+    /// Reserved for sub-buckets, which partition one budget by a
+    /// discriminator. Not implemented, and rejected rather than
+    /// ignored — a request that works today must not change meaning
+    /// when the field starts doing something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
 }
 
 /// Request shape for bulk job enqueue.
@@ -1069,6 +1145,160 @@ pub fn default_prefetch() -> usize {
     DEFAULT_PREFETCH
 }
 
+// --- Budget types ---
+
+/// Response shape for `GET /budgets`.
+///
+/// Carries whole policies rather than bare keys, unlike `GET /crons`.
+/// A budget's policy is a handful of scalars that the listing scan has
+/// already read, so inlining it saves the caller a request per budget;
+/// a cron group's entries are large enough that the same choice would
+/// not be free.
+#[derive(Serialize)]
+pub struct ListBudgetsResponse {
+    pub budgets: Vec<BudgetResponse>,
+}
+
+/// Request shape for `POST /budgets/{key}` and `PUT /budgets/{key}`.
+///
+/// Also serialised, because a cron entry's job template is reported
+/// back in this same shape.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetRequest {
+    /// Tokens the bucket holds when full.
+    pub allocation: u32,
+
+    /// How tokens replenish.
+    pub strategy: BudgetStrategyRequest,
+}
+
+/// Wire form of a budget strategy.
+///
+/// Deliberately not a tagged enum. Serde ignores surplus fields on a
+/// unit variant of an internally-tagged enum, which would silently
+/// accept `duration_ms` on a `while_in_flight` budget — a request that
+/// reads as if it set a refill period but did not. Parsing the tag by
+/// hand (see `parse_budget_strategy`) makes that a 422.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetStrategyRequest {
+    /// `"time_based"` or `"while_in_flight"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+
+    /// Period over which the full allocation replenishes. Required for
+    /// `time_based`, rejected for `while_in_flight`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+
+    /// Most tokens the bucket may hold at once. Optional for
+    /// `time_based`, rejected for `while_in_flight`.
+    ///
+    /// Defaults to the allocation, which is the standard token-bucket
+    /// behaviour: a bucket that has been idle is full, so the first
+    /// work to arrive gets a whole allocation at once and only then
+    /// settles to the drip. Set this lower to cap that spike — `1`
+    /// paces dispatches evenly with no overshoot at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+}
+
+impl BudgetBindingRequest {
+    /// Report a stored binding, as carried by a cron entry's job
+    /// template.
+    ///
+    /// `create_with` is not reported: it is consumed when the entry
+    /// fires, and echoing it would suggest the budget's policy is
+    /// whatever the template asked for rather than whatever the server
+    /// currently holds.
+    pub fn from_store(binding: &store::BudgetBinding) -> Self {
+        Self {
+            key: binding.key.clone(),
+            cost: Some(binding.cost),
+            create_with: None,
+            bucket: None,
+        }
+    }
+}
+
+/// Request shape for `PATCH /budgets/{key}`.
+///
+/// Absent fields are left unchanged. Neither is nullable — a budget
+/// with no allocation or no strategy is not a budget, so there is
+/// nothing to clear them to, and plain `Option` says exactly that.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchBudgetRequest {
+    /// Tokens the bucket holds when full.
+    pub allocation: Option<u32>,
+
+    /// How tokens replenish. Replaced whole when given — a strategy is
+    /// only meaningful with the fields its kind implies.
+    pub strategy: Option<BudgetStrategyRequest>,
+}
+
+/// Response shape for a single budget.
+#[derive(Serialize)]
+pub struct BudgetResponse {
+    /// The budget's key.
+    pub key: String,
+
+    /// Tokens the bucket holds when full.
+    pub allocation: u32,
+
+    /// How tokens replenish.
+    pub strategy: BudgetStrategyResponse,
+
+    /// When the budget was created (ms since epoch).
+    pub created_at: u64,
+
+    /// When the policy was last changed (ms since epoch).
+    pub updated_at: u64,
+}
+
+/// Wire form of a stored strategy, mirroring `BudgetStrategyRequest`.
+#[derive(Serialize)]
+pub struct BudgetStrategyResponse {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+
+    /// Present for `time_based` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+
+    /// Present only when explicitly set. Absent means the ceiling is
+    /// the allocation, so echoing a value here would report a setting
+    /// the operator never made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+}
+
+impl BudgetResponse {
+    pub fn from_store(key: String, budget: store::Budget) -> Self {
+        let strategy = match budget.strategy {
+            store::BudgetStrategy::TimeBased { duration_ms, burst } => BudgetStrategyResponse {
+                kind: "time_based",
+                duration_ms: Some(duration_ms),
+                burst,
+            },
+            store::BudgetStrategy::WhileInFlight => BudgetStrategyResponse {
+                kind: "while_in_flight",
+                duration_ms: None,
+                burst: None,
+            },
+        };
+
+        Self {
+            key,
+            allocation: budget.allocation,
+            strategy,
+            created_at: budget.created_at,
+            updated_at: budget.updated_at,
+        }
+    }
+}
+
 // --- Cron scheduling types ---
 
 /// Response shape for `GET /crons`.
@@ -1254,6 +1484,12 @@ impl CronEntryResponse {
                 unique_key: entry.job.unique_key,
                 unique_while,
                 batch: entry.job.batch.map(Into::into),
+                budgets: entry
+                    .job
+                    .budgets
+                    .iter()
+                    .map(BudgetBindingRequest::from_store)
+                    .collect(),
             },
             next_enqueue_at: entry.next_enqueue_at,
             last_enqueue_at: entry.last_enqueue_at,

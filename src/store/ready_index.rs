@@ -97,6 +97,73 @@ impl ReadyIndex {
         })
     }
 
+    /// Whether an entry is present.
+    pub(super) fn contains(&self, priority: u16, job_id: &str) -> bool {
+        self.global.contains_key(&(priority, job_id.to_string()))
+    }
+
+    /// Iterate every entry, yielding `(priority, job_id, queue)`.
+    ///
+    /// The queue-bearing counterpart of [`iter`](Self::iter), for
+    /// callers that need to address entries in another index.
+    pub(super) fn iter_with_queue(&self) -> impl Iterator<Item = (u16, String, String)> + '_ {
+        self.global.iter().map(|entry| {
+            let (priority, job_id) = entry.key();
+            (*priority, job_id.clone(), entry.value().clone())
+        })
+    }
+
+    /// Drop every entry.
+    pub(super) fn clear(&self) {
+        self.global.clear();
+        self.by_queue.clear();
+    }
+
+    /// The job this index would offer next, without taking it.
+    ///
+    /// Same selection as [`claim`](Self::claim) but non-destructive, for
+    /// callers that must decide whether they can accept a job before
+    /// committing to removing it — a budgeted job cannot be taken until
+    /// its budgets have been debited, and that can fail.
+    pub(super) fn peek(&self, queues: &HashSet<String>) -> Option<(u16, String, String)> {
+        if queues.is_empty() {
+            let entry = self.global.front()?;
+            let (priority, job_id) = entry.key();
+            return Some((*priority, job_id.clone(), entry.value().clone()));
+        }
+
+        queues
+            .iter()
+            .filter_map(|queue| {
+                let set = self.by_queue.get(queue)?;
+                let entry = set.front()?;
+                let (priority, job_id) = entry.value();
+                Some((*priority, job_id.clone(), queue.clone()))
+            })
+            .min()
+    }
+
+    /// The job each queue would offer next, one per queue.
+    ///
+    /// [`peek`](Self::peek) answers for a *worker*, who names the queues
+    /// it serves and wants the single best job across them. This answers
+    /// for a caller with no worker in mind — a waker deciding what to
+    /// announce — which is a different question: every queue is somebody
+    /// else's best job, and collapsing them to one loses all but one.
+    ///
+    /// Bounded by the number of queues with work rather than by how many
+    /// jobs are waiting, since each queue is peeked rather than walked.
+    pub(super) fn peek_each_queue(&self) -> Vec<(u16, String, String)> {
+        self.by_queue
+            .iter()
+            .filter_map(|entry| {
+                let front = entry.value().front()?;
+                let (priority, job_id) = front.value();
+                Some((*priority, job_id.clone(), entry.key().clone()))
+            })
+            .collect()
+    }
+
     /// Atomically claim the highest-priority (lowest number), oldest ready job.
     ///
     /// Returns `(priority, job_id, queue)` if a job was claimed, or `None` if

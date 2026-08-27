@@ -1,9 +1,11 @@
 // Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
+mod budget;
 mod complete;
 mod cron;
 mod delete;
+mod dispatch;
 mod enqueue;
 mod fail;
 mod find;
@@ -31,8 +33,8 @@ mod test_support;
 
 pub use options::{
     BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
-    JobFilter, ListErrorsOptions, ListJobsOptions, PatchCronGroupOptions, PatchJobOptions,
-    ReplaceCronGroupOptions, RetentionConfigPatch,
+    JobFilter, ListErrorsOptions, ListJobsOptions, PatchBudgetOptions, PatchCronGroupOptions,
+    PatchJobOptions, ReplaceCronGroupOptions, RetentionConfigPatch,
 };
 
 pub use find::{FindDirection, FindOutcome, WindowAnchor, WindowFallback, WindowOutcome};
@@ -43,10 +45,15 @@ pub use storage_config::{
     DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_EXPONENT, DEFAULT_BACKOFF_JITTER_MS,
     DEFAULT_CACHE_SIZE, DEFAULT_COMPLETE_BATCH_SIZE, DEFAULT_COMPLETED_RETENTION_MS,
     DEFAULT_DATA_TABLE_SIZE, DEFAULT_DEAD_RETENTION_MS, DEFAULT_ENQUEUE_BATCH_SIZE,
-    DEFAULT_INDEX_TABLE_SIZE, DEFAULT_JOURNAL_SIZE, DEFAULT_L0_THRESHOLD, DEFAULT_RETRY_LIMIT,
-    StorageConfig,
+    DEFAULT_INDEX_TABLE_SIZE, DEFAULT_JOURNAL_SIZE, DEFAULT_L0_THRESHOLD, DEFAULT_MAX_BUDGETS,
+    DEFAULT_RETRY_LIMIT, StorageConfig,
 };
 pub use store::{Store, StoreEvent};
+
+pub use budget::{
+    Budget, BudgetBinding, BudgetPolicy, BudgetRef, BudgetStrategy, DEFAULT_BUDGET_COST,
+    MAX_BUDGET_ALLOCATION,
+};
 
 pub use cron::{CronEntry, CronGroup};
 
