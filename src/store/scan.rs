@@ -717,6 +717,36 @@ impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for PayloadFilteredIt
     }
 }
 
+/// Wraps a job iterator and keeps only jobs drawing on one of the given
+/// budgets.
+///
+/// A job may name several budgets, so this matches on *any* of them —
+/// asking "does this job draw on `stripe`?" rather than "is `stripe` its
+/// only budget". Jobs with no bindings never match, which is what makes
+/// `?budgets.key=x` mean "throttled by x" rather than "not throttled by
+/// anything else".
+pub(super) struct BudgetFilteredIter<I> {
+    pub(super) inner: I,
+    pub(super) keys: HashSet<String>,
+}
+
+impl<I: Iterator<Item = Result<Job, StoreError>>> Iterator for BudgetFilteredIter<I> {
+    type Item = Result<Job, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let job = match self.inner.next()? {
+                Ok(j) => j,
+                Err(e) => return Some(Err(e)),
+            };
+
+            if job.budgets.iter().any(|b| self.keys.contains(&b.key)) {
+                return Some(Ok(job));
+            }
+        }
+    }
+}
+
 /// Build an `IdStream` from a `JobFilter`'s index-backed fields.
 ///
 /// Returns `None` when no index-backed filter is active (caller should use
@@ -808,6 +838,19 @@ pub(super) fn apply_filters<'a, R: Readable + 'a>(
             })
         } else {
             Box::new(inner)
+        };
+
+    // Before the payload filter, which is the expensive one: budget
+    // membership is a field comparison on an already-hydrated job,
+    // where a jq filter has to evaluate a program against a payload.
+    let stream: Box<dyn Iterator<Item = Result<Job, StoreError>> + 'a> =
+        if filter.budget_keys.is_empty() {
+            stream
+        } else {
+            Box::new(BudgetFilteredIter {
+                inner: stream,
+                keys: filter.budget_keys.clone(),
+            })
         };
 
     if let Some(payload_filter) = &filter.payload_filter {

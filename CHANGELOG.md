@@ -69,6 +69,16 @@
   and remain peristed indefinitely. Future releases will enable more
   dynamic sub-buckets within budgets.
 
+  Jobs can be filtered by budget with `?budgets.key=`, comma-delimited
+  like `queue` and `type`, on `GET /jobs`, `GET /jobs/count`,
+  `PATCH /jobs` and `DELETE /jobs`. It matches a job drawing on any of
+  the named budgets. This is what makes the refusal above actionable:
+  `DELETE /jobs?budgets.key=stripe` clears the jobs holding a budget
+  open so it can then be deleted. There is no index from budget to job,
+  so combined with a `status`, `queue`, `type` or `id` filter it narrows
+  within that scan, and on its own it is a full scan — the same cost
+  profile the existing payload filter carries.
+
   `POST /reset` now clears budgets along with jobs and cron groups.
 
   Token state is deliberately not persisted, so a server restart brings
