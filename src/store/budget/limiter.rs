@@ -95,6 +95,20 @@ pub(super) struct Limiter {
     /// would never accrue at all.
     credit: u64,
 
+    /// Slots owed back before any release frees capacity again.
+    ///
+    /// Only a concurrency budget can be over-committed, and only by
+    /// being shrunk while jobs are running: six in flight against an
+    /// allocation cut to one leaves five more outstanding than the
+    /// budget now permits. Those five have to be surrendered before a
+    /// completion means a slot is genuinely free — otherwise every
+    /// completion hands one straight back and the old concurrency
+    /// persists for as long as work keeps arriving.
+    ///
+    /// Always zero for a `time_based` budget, whose tokens are spent
+    /// rather than held: nothing is outstanding to be owed.
+    debt: u32,
+
     /// `None` for a strategy whose tokens return on acknowledgement
     /// rather than on a clock — an absent rate rather than a zero one.
     drip: Option<Drip>,
@@ -123,6 +137,7 @@ impl Limiter {
             capacity,
             tokens: capacity,
             credit: 0,
+            debt: 0,
             drip: Self::drip(budget),
             last_refill: now,
         }
@@ -159,25 +174,40 @@ impl Limiter {
         self.capacity = budget.capacity();
         self.drip = Self::drip(budget);
 
-        // Widening a concurrency budget hands the extra slots over at
-        // once, because nothing else ever would. A rate limit gets its
-        // increase from the drip — re-rated just above, so it applies
-        // from this instant — but a concurrency budget has no drip, and
-        // its tokens only ever come back from jobs finishing. Left to
-        // that, a budget widened from one to five would rise to one
-        // token when the running job released and be pushed straight
-        // back to zero by the next acquire: pinned at its old
-        // allocation for the life of the process.
+        // A concurrency budget's ceiling has to be re-applied against
+        // the work already running, in both directions, because nothing
+        // else ever will: it has no drip, so its tokens move only when
+        // jobs start and finish.
+        //
+        // What is running does not change here, so it is the fixed point
+        // to reason from. `tokens - debt` is how many slots were spare
+        // before (negative when over-committed), and shifting the
+        // ceiling by `delta` shifts that by the same amount. A positive
+        // result is free slots, handed over at once; a negative one is
+        // an over-commitment to be surrendered as jobs finish.
+        //
+        // Widening without this leaves a budget pinned at its old
+        // allocation: it would rise by one token when a job released and
+        // be pushed straight back to zero by the next acquire.
+        // Narrowing without it is worse — six jobs running against an
+        // allocation cut to one would keep six running, since each
+        // completion would hand a slot straight to a replacement.
         //
         // Only when it was already a concurrency budget and still is.
         // Across a strategy change the tokens mean something different
-        // before and after, and carrying a delta between the two would
-        // be inventing capacity rather than delivering it.
-        if was_concurrency
-            && self.drip.is_none()
-            && let Some(extra) = self.capacity.checked_sub(old_capacity)
-        {
-            self.tokens = self.tokens.saturating_add(extra);
+        // before and after, so carrying anything between the two would
+        // be inventing capacity rather than moving it.
+        if was_concurrency && self.drip.is_none() {
+            let delta = i64::from(self.capacity) - i64::from(old_capacity);
+            let spare = i64::from(self.tokens) - i64::from(self.debt) + delta;
+
+            if spare >= 0 {
+                self.tokens = spare.min(i64::from(self.capacity)) as u32;
+                self.debt = 0;
+            } else {
+                self.tokens = 0;
+                self.debt = (-spare) as u32;
+            }
         }
 
         self.tokens = self.tokens.min(self.capacity);
@@ -283,11 +313,20 @@ impl Limiter {
 
     /// Give `cost` tokens back.
     ///
-    /// Capped at capacity, which matters after a budget is shrunk: jobs
-    /// acquired under the old allocation return more than the new
-    /// bucket holds, and the excess is simply dropped.
+    /// Pays down any over-commitment first. A budget shrunk while jobs
+    /// were running owes those slots back, and until they are, a
+    /// completion means "one fewer job over the limit" rather than "a
+    /// slot is free" — crediting it would let the old concurrency
+    /// continue indefinitely, since each completion would immediately
+    /// admit a replacement.
+    ///
+    /// Whatever is left over is capped at capacity, which covers the
+    /// simultaneous case: several jobs finishing at once cannot fill the
+    /// bucket past its ceiling.
     pub(super) fn release(&mut self, cost: u32) {
-        self.tokens = self.tokens.saturating_add(cost).min(self.capacity);
+        let owed = cost.min(self.debt);
+        self.debt -= owed;
+        self.tokens = self.tokens.saturating_add(cost - owed).min(self.capacity);
     }
 
     /// When `cost` tokens could next be afforded.
@@ -611,6 +650,83 @@ mod tests {
 
         // Four more may run alongside the one still going.
         assert_eq!(limiter.tokens(), 4);
+    }
+
+    /// The reported sequence: serialise at one, widen to six, then
+    /// narrow back to one. Without paying down the over-commitment the
+    /// budget stays at six indefinitely, because each completion hands
+    /// its slot straight to a replacement.
+    #[test]
+    fn narrowing_a_concurrency_budget_surrenders_the_excess() {
+        let mut limiter = Limiter::new(&concurrency(1), NOW);
+
+        // One job running.
+        assert!(limiter.try_acquire(1, NOW));
+        assert!(!limiter.try_acquire(1, NOW));
+
+        // Widen to six: five more may start, so six are running.
+        limiter.adopt(&concurrency(6), NOW);
+        for _ in 0..5 {
+            assert!(limiter.try_acquire(1, NOW));
+        }
+        assert!(!limiter.try_acquire(1, NOW));
+
+        // Narrow back to one while all six are still in flight.
+        limiter.adopt(&concurrency(1), NOW);
+
+        // The first five completions pay down the excess: each means
+        // "one fewer over the limit", not "a slot is free".
+        for i in 0..5 {
+            limiter.release(1);
+            assert!(
+                !limiter.try_acquire(1, NOW),
+                "a replacement started after completion {i}, so the old \
+                 concurrency would persist"
+            );
+        }
+
+        // The sixth leaves nothing running, and the budget is back to
+        // admitting exactly one at a time.
+        limiter.release(1);
+        assert!(limiter.try_acquire(1, NOW));
+        assert!(!limiter.try_acquire(1, NOW));
+    }
+
+    /// Widening again before the debt is paid should cancel it rather
+    /// than leave the budget owing slots it no longer owes.
+    #[test]
+    fn widening_again_cancels_an_outstanding_debt() {
+        let mut limiter = Limiter::new(&concurrency(6), NOW);
+
+        for _ in 0..6 {
+            assert!(limiter.try_acquire(1, NOW));
+        }
+
+        // Six running, ceiling cut to two: four over.
+        limiter.adopt(&concurrency(2), NOW);
+        // Back to six with all six still running: square again, and
+        // still nothing spare.
+        limiter.adopt(&concurrency(6), NOW);
+
+        assert!(!limiter.try_acquire(1, NOW));
+
+        // One finishes, so exactly one slot is free — not five.
+        limiter.release(1);
+        assert!(limiter.try_acquire(1, NOW));
+        assert!(!limiter.try_acquire(1, NOW));
+    }
+
+    /// Narrowing with nothing running owes nothing: the ceiling simply
+    /// applies.
+    #[test]
+    fn narrowing_an_idle_concurrency_budget_owes_nothing() {
+        let mut limiter = Limiter::new(&concurrency(6), NOW);
+
+        limiter.adopt(&concurrency(2), NOW);
+
+        assert!(limiter.try_acquire(1, NOW));
+        assert!(limiter.try_acquire(1, NOW));
+        assert!(!limiter.try_acquire(1, NOW));
     }
 
     /// The tokens either side of a strategy change do not mean the same
