@@ -153,6 +153,7 @@ impl Limiter {
         self.refill(now);
 
         let was_concurrency = self.drip.is_none();
+        let old_period = self.drip.map(|drip| drip.duration_ms);
         let old_capacity = self.capacity;
 
         self.capacity = budget.capacity();
@@ -181,10 +182,22 @@ impl Limiter {
 
         self.tokens = self.tokens.min(self.capacity);
 
-        // Banked progress was measured against the old period, so it
-        // means nothing under the new one. At most a fraction of a
-        // token is lost.
-        self.credit = 0;
+        // Banked progress is measured in token-milliseconds against the
+        // period, so it survives a change of *rate* but not a change of
+        // *period*. Keeping it across a re-rate is worth doing: someone
+        // who has waited most of a slow minute should not have that
+        // waiting thrown away for speeding the budget up.
+        //
+        // Discarding it across a period change is not merely tidiness.
+        // `credit` is a remainder modulo `duration_ms`, so it is always
+        // smaller than the period it was computed against — which is
+        // exactly what stops `next_available` underflowing when it
+        // subtracts the credit from a shortfall's worth of the new
+        // period. Carry a remainder from a minute into a one-second
+        // budget and that invariant is gone.
+        if old_period != self.drip.map(|drip| drip.duration_ms) {
+            self.credit = 0;
+        }
     }
 
     /// What the bucket would hold at `now`, without mutating it.
@@ -612,6 +625,59 @@ mod tests {
         limiter.adopt(&concurrency(5), NOW);
 
         assert_eq!(limiter.tokens(), 0);
+    }
+
+    /// Speeding a budget up should credit the waiting already done, not
+    /// restart it. Half a minute spent waiting on a one-a-minute budget
+    /// is half a token's worth of progress, and it means the same thing
+    /// under any rate sharing that period.
+    #[test]
+    fn adopting_a_faster_rate_keeps_banked_progress() {
+        let mut limiter = Limiter::new(&per_minute(1), NOW);
+
+        // Spend the token, then wait half the period.
+        assert!(limiter.try_acquire(1, NOW));
+        limiter.refill(NOW + 30_000);
+
+        limiter.adopt(&per_minute(120), NOW + 30_000);
+
+        // Thirty seconds of the minute are already banked, so the next
+        // token needs 30_000 more token-milliseconds at 120 a minute —
+        // a quarter of a second, not the half it would be from scratch.
+        assert_eq!(
+            limiter.next_available(1, NOW + 30_000),
+            Availability::At(NOW + 30_250)
+        );
+    }
+
+    /// A period change makes the remainder meaningless — and unsafe.
+    /// `credit` is a remainder modulo the period, which is what keeps
+    /// `next_available` from underflowing; carrying a minute's worth
+    /// into a one-second budget would break that.
+    #[test]
+    fn adopting_a_new_period_discards_banked_progress() {
+        let mut limiter = Limiter::new(&per_minute(1), NOW);
+
+        assert!(limiter.try_acquire(1, NOW));
+        limiter.refill(NOW + 30_000);
+
+        let per_second = Budget::new(
+            1,
+            BudgetStrategy::TimeBased {
+                duration_ms: 1_000,
+                burst: None,
+            },
+            NOW,
+        )
+        .unwrap();
+        limiter.adopt(&per_second, NOW + 30_000);
+
+        // A full second from scratch, not an instant token from a
+        // remainder measured against a minute.
+        assert_eq!(
+            limiter.next_available(1, NOW + 30_000),
+            Availability::At(NOW + 31_000)
+        );
     }
 
     /// Tightening a budget applies at once rather than after the

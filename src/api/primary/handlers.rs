@@ -2336,6 +2336,10 @@ async fn take_jobs(
                             Ok(StoreEvent::JobScheduled { .. }) => {}
                             Ok(StoreEvent::JobPatched { .. }) => {}
                             Ok(StoreEvent::CronScheduleChanged) => {}
+                            // A worker's view is unchanged by a policy
+                            // change: whether it can take a job is
+                            // answered by the claim, not by the policy.
+                            Ok(StoreEvent::BudgetPolicyChanged) => {}
                             Ok(StoreEvent::IndexRebuilt) => {
                                 // Indexes just became available — mint
                                 // an unclaimed token so the drain phase

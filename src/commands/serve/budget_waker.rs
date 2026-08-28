@@ -148,6 +148,15 @@ pub async fn run(
                         // different world.
                         Ok(StoreEvent::IndexRebuilt) => break,
 
+                        // A policy change moves when a parked job next
+                        // becomes affordable, so the armed timer is
+                        // stale. Speeding a budget up is the case that
+                        // needs this: nothing becomes dispatchable at
+                        // the moment of the change, so there is no
+                        // announcement to ride on — only a sooner
+                        // future to re-arm for.
+                        Ok(StoreEvent::BudgetPolicyChanged) => break,
+
                         // Missing events cannot be recovered, but the
                         // remedy for having missed them is the same as
                         // for hearing them.
@@ -442,6 +451,101 @@ mod tests {
             listening.await.unwrap(),
             "the second job was never announced, so nothing but the \
              first job finishing would have released it"
+        );
+    }
+
+    /// Speeding a budget up has to take effect now, not at the end of
+    /// the old period. This is the case `wake_budgeted_jobs` alone
+    /// cannot cover: at the instant of the change nothing has become
+    /// affordable, so there is no job to announce — only a sooner
+    /// future, which is useless to a waker asleep on the old one.
+    #[tokio::test]
+    async fn speeding_a_budget_up_re_arms_the_waker() {
+        let store = test_store();
+        let now = now_millis();
+        let (_tx, shutdown) = watch::channel(());
+
+        // One a minute: slow enough that the old timer would outlast
+        // any plausible test.
+        store
+            .create_budget(
+                "slow",
+                1,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 60_000,
+                    burst: None,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        for payload in ["a", "b"] {
+            store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("t", "q", serde_json::json!(payload))
+                        .budget(BudgetBinding::new("slow")),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Spend the only token, leaving the second job parked behind a
+        // full minute of waiting.
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::spawn(run(
+            store.clone(),
+            crate::time::now_millis,
+            DEFAULT_BATCH_SIZE,
+            shutdown,
+        ));
+        tokio::task::yield_now().await;
+
+        let listening = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let mut rx = store.subscribe();
+                let wait = async {
+                    loop {
+                        match rx.recv().await {
+                            Ok(StoreEvent::JobDispatchable { .. }) => return true,
+                            Ok(_) => continue,
+                            Err(_) => return false,
+                        }
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(5), wait)
+                    .await
+                    .unwrap_or(false)
+            }
+        });
+        tokio::task::yield_now().await;
+
+        // Six hundred a minute — a token every 100ms. If the waker
+        // ignored the policy change it would still be asleep on the
+        // minute it armed for, and the listener would time out.
+        store
+            .patch_budget(
+                "slow",
+                crate::store::PatchBudgetOptions {
+                    allocation: Some(600),
+                    strategy: Default::default(),
+                },
+                now_millis(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            listening.await.unwrap(),
+            "the waker slept through the policy change"
         );
     }
 

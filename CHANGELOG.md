@@ -79,6 +79,14 @@
   within that scan, and on its own it is a full scan — the same cost
   profile the existing payload filter carries.
 
+  Policy changes take effect immediately, including on jobs already
+  waiting. Speeding a rate limit up re-arms the dispatcher rather than
+  leaving parked jobs to wait out the old period, and progress already
+  accrued toward the next token is kept across a change of rate — half a
+  minute spent waiting on a one-a-minute budget still counts when it
+  becomes two a second. Changing the *period* discards that progress,
+  since it is measured against the period it was accrued under.
+
   `POST /reset` now clears budgets along with jobs and cron groups.
 
   Token state is deliberately not persisted, so a server restart brings
