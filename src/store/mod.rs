@@ -32,9 +32,10 @@ mod types;
 mod test_support;
 
 pub use options::{
-    BulkDeleteOptions, BulkPatchOptions, CronEntryOptions, EnqueueOptions, FailureOptions,
-    JobFilter, ListErrorsOptions, ListJobsOptions, PatchBudgetOptions, PatchCronGroupOptions,
-    PatchJobOptions, ReplaceCronGroupOptions, RetentionConfigPatch,
+    BudgetStrategyKind, BudgetStrategyPatch, BulkDeleteOptions, BulkPatchOptions, CronEntryOptions,
+    EnqueueOptions, FailureOptions, JobFilter, ListErrorsOptions, ListJobsOptions,
+    PatchBudgetOptions, PatchCronGroupOptions, PatchJobOptions, ReplaceCronGroupOptions,
+    RetentionConfigPatch,
 };
 
 pub use find::{FindDirection, FindOutcome, WindowAnchor, WindowFallback, WindowOutcome};

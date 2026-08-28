@@ -1265,9 +1265,35 @@ pub struct PatchBudgetRequest {
     /// Tokens the bucket holds when full.
     pub allocation: Option<u32>,
 
-    /// How tokens replenish. Replaced whole when given — a strategy is
-    /// only meaningful with the fields its kind implies.
-    pub strategy: Option<BudgetStrategyRequest>,
+    /// Changes to how tokens replenish, merged onto the stored strategy.
+    pub strategy: Option<PatchBudgetStrategyRequest>,
+}
+
+/// A merge patch over a budget's strategy.
+///
+/// Every field is optional, because merge patch recurses into nested
+/// objects: `{"strategy": {"burst": 5}}` sets the burst and leaves the
+/// kind and period alone, rather than requiring all three be restated.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchBudgetStrategyRequest {
+    /// `"time_based"` or `"while_in_flight"`. Absent keeps the current
+    /// strategy.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+
+    /// Absent keeps the current period. Required only when switching a
+    /// budget to `time_based`, which has none to inherit.
+    pub duration_ms: Option<u64>,
+
+    /// Absent keeps the current ceiling; `null` clears it back to the
+    /// allocation.
+    ///
+    /// The one nullable field here, because it is the one that has a
+    /// meaningful "unset" — a strategy with no kind or a `time_based`
+    /// one with no period is not a strategy at all.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    pub burst: Option<Option<u32>>,
 }
 
 /// Response shape for a single budget.
