@@ -38,9 +38,9 @@ use super::types::{
     DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse,
     Job, JobStatus, ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
     ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse, ListQueuesResponse, Order,
-    PatchBudgetRequest, PatchCronEntryRequest, PatchCronGroupRequest, PatchJobBody,
-    PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams, UnsupportedFormatResponse,
-    VersionResponse, parse_unique_while,
+    PatchBudgetRequest, PatchBudgetStrategyRequest, PatchCronEntryRequest, PatchCronGroupRequest,
+    PatchJobBody, PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams,
+    UnsupportedFormatResponse, VersionResponse, parse_unique_while,
 };
 
 /// Default priority for jobs that don't specify one.
@@ -2535,6 +2535,33 @@ fn parse_budget_strategy(req: BudgetStrategyRequest) -> Result<store::BudgetStra
     }
 }
 
+/// Convert a wire strategy patch into its store form.
+///
+/// Only the tag is checked here. Everything else — whether a period is
+/// required, whether a burst is meaningful — depends on the strategy the
+/// budget already has, so it is resolved by the merge inside the
+/// transaction rather than guessed at from the request alone.
+fn parse_budget_strategy_patch(
+    req: PatchBudgetStrategyRequest,
+) -> Result<store::BudgetStrategyPatch, String> {
+    let kind = match req.kind.as_deref() {
+        None => None,
+        Some("time_based") => Some(store::BudgetStrategyKind::TimeBased),
+        Some("while_in_flight") => Some(store::BudgetStrategyKind::WhileInFlight),
+        Some(other) => {
+            return Err(format!(
+                "unknown strategy type {other:?} (expected \"time_based\" or \"while_in_flight\")"
+            ));
+        }
+    };
+
+    Ok(store::BudgetStrategyPatch {
+        kind,
+        duration_ms: req.duration_ms,
+        burst: req.burst,
+    })
+}
+
 /// Reject a budget request the store would not accept, returning the
 /// validated key and strategy.
 fn validate_budget_request(key: &str, req: BudgetRequest) -> Result<store::BudgetStrategy, String> {
@@ -2764,8 +2791,8 @@ async fn patch_budget(
         return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
     }
 
-    let strategy = match req.strategy.map(parse_budget_strategy).transpose() {
-        Ok(strategy) => strategy,
+    let strategy = match req.strategy.map(parse_budget_strategy_patch).transpose() {
+        Ok(strategy) => strategy.unwrap_or_default(),
         Err(msg) => {
             return respond(
                 fmt,
@@ -8585,6 +8612,176 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
         assert_eq!(body["jobs"][0]["budgets"][1]["key"], "mailgun");
+    }
+
+    /// The strategy is a nested object, so merge patch recurses into
+    /// it: naming one field leaves the others alone. Requiring the kind
+    /// and period to be restated just to adjust a burst is what merge
+    /// patch exists to avoid.
+    #[tokio::test]
+    async fn patching_a_budget_strategy_merges_rather_than_replaces() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // Burst alone, with no `type` and no `duration_ms`.
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "burst": 5 } }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["allocation"], 100);
+        assert_eq!(body["strategy"]["type"], "time_based");
+        assert_eq!(body["strategy"]["duration_ms"], 60000);
+        assert_eq!(body["strategy"]["burst"], 5);
+
+        // And the period alone, leaving the burst in place.
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "duration_ms": 30000 } }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["strategy"]["duration_ms"], 30000);
+        assert_eq!(body["strategy"]["burst"], 5);
+    }
+
+    /// `null` clears, which is what merge patch means by it — distinct
+    /// from an absent field, which leaves the value alone.
+    #[tokio::test]
+    async fn patching_a_null_burst_clears_it() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 5 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "burst": null } }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        // Absent means the ceiling is the allocation again.
+        assert!(
+            body["strategy"].get("burst").is_none(),
+            "unexpected: {body}"
+        );
+    }
+
+    /// Switching to a strategy with no drip drops the period and burst
+    /// rather than carrying them across — they describe a drip, and a
+    /// strategy without one cannot hold them.
+    #[tokio::test]
+    async fn patching_to_while_in_flight_drops_the_drip_fields() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "stripe",
+                &serde_json::json!({
+                    "allocation": 100,
+                    "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 5 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "type": "while_in_flight" } }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["strategy"]["type"], "while_in_flight");
+        assert!(body["strategy"].get("duration_ms").is_none());
+        assert!(body["strategy"].get("burst").is_none());
+    }
+
+    /// Going the other way has nothing to inherit, so the period has to
+    /// be supplied — a rate limit with no period is not a rate limit.
+    #[tokio::test]
+    async fn patching_to_time_based_requires_a_duration() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "type": "time_based" } }),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // With one, it converts.
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "type": "time_based", "duration_ms": 1000 } }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A burst is meaningless without a drip, so setting one on a
+    /// concurrency budget is refused rather than stored and ignored.
+    #[tokio::test]
+    async fn patching_a_burst_onto_a_concurrency_budget_is_refused() {
+        let app = pro_app();
+
+        let res = app
+            .clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let req = json_request(
+            "PATCH",
+            "/budgets/stripe",
+            &serde_json::json!({ "strategy": { "burst": 5 } }),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// `create_with` makes enqueue a budget *creation* path, so it needs

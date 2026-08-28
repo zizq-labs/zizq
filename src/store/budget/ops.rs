@@ -163,9 +163,15 @@ impl Store {
             // Re-validated through `Budget::new`, since a patch can
             // reach a combination neither the stored policy nor the
             // patch alone would have been rejected for.
+            // Merged rather than replaced: the strategy is a nested
+            // object, and merge patch recurses into those. Applied here
+            // rather than in the API layer because it needs the stored
+            // policy, and reading that outside this transaction would
+            // leave a window for a concurrent write between the read and
+            // the merge.
             let mut budget = Budget::new(
                 opts.allocation.unwrap_or(existing.allocation),
-                opts.strategy.unwrap_or(existing.strategy),
+                opts.strategy.apply(existing.strategy)?,
                 now,
             )?;
             budget.created_at = existing.created_at;
@@ -767,7 +773,9 @@ pub(in crate::store) fn make_budget_key(key: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::options::PatchBudgetOptions;
+    use super::super::super::options::{
+        BudgetStrategyKind, BudgetStrategyPatch, PatchBudgetOptions,
+    };
     use super::super::super::test_support::{test_store, test_store_with_max_budgets};
     use super::super::BudgetStrategy;
     use crate::store::Store;
@@ -775,7 +783,24 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000_000;
 
+    /// A patch that replaces the strategy wholesale, for the tests that
+    /// predate merge semantics and care about the end state rather than
+    /// which fields were named.
     fn patch(allocation: Option<u32>, strategy: Option<BudgetStrategy>) -> PatchBudgetOptions {
+        let strategy = match strategy {
+            None => BudgetStrategyPatch::default(),
+            Some(BudgetStrategy::TimeBased { duration_ms, burst }) => BudgetStrategyPatch {
+                kind: Some(BudgetStrategyKind::TimeBased),
+                duration_ms: Some(duration_ms),
+                burst: Some(burst),
+            },
+            Some(BudgetStrategy::WhileInFlight) => BudgetStrategyPatch {
+                kind: Some(BudgetStrategyKind::WhileInFlight),
+                duration_ms: None,
+                burst: None,
+            },
+        };
+
         PatchBudgetOptions {
             allocation,
             strategy,

@@ -16,7 +16,7 @@ use crate::filter::PayloadFilter;
 
 use super::budget::{BudgetBinding, BudgetStrategy};
 use super::types::{
-    BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, UniqueWhile,
+    BackoffConfig, BatchConfig, JobStatus, RetentionConfig, ScanDirection, StoreError, UniqueWhile,
 };
 
 /// Predicate that selects which jobs an operation acts on.
@@ -593,17 +593,121 @@ pub struct PatchCronGroupOptions {
     pub timezone: Option<Option<String>>,
 }
 
+/// Which way a budget's tokens come back, without the fields that go
+/// with it.
+///
+/// Exists so a patch can say "make this a rate limit" without also
+/// having to restate the period, which the merge takes from whatever is
+/// already stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetStrategyKind {
+    TimeBased,
+    WhileInFlight,
+}
+
+/// A JSON merge patch over a budget's [`BudgetStrategy`].
+///
+/// Every field absent means "leave the strategy alone". A strategy is a
+/// nested object on the wire, and merge patch recurses into those — so
+/// `{"strategy": {"burst": 5}}` sets the burst and keeps the kind and
+/// period, rather than demanding all three be restated.
+///
+/// Applied inside the transaction that reads the existing policy, since
+/// merging needs it. Doing that in the API layer would mean a read
+/// followed by a write with no lock between them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BudgetStrategyPatch {
+    /// Change which strategy this is. Absent keeps the current one.
+    pub kind: Option<BudgetStrategyKind>,
+
+    /// Change the refill period. Absent keeps the current one.
+    pub duration_ms: Option<u64>,
+
+    /// Change the bucket ceiling. Absent keeps the current one;
+    /// `Some(None)` clears it back to the allocation, which is what
+    /// merge patch means by an explicit `null`.
+    pub burst: Option<Option<u32>>,
+}
+
+impl BudgetStrategyPatch {
+    /// Whether this patch asks for any change at all.
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_none() && self.duration_ms.is_none() && self.burst.is_none()
+    }
+
+    /// Merge onto the stored strategy.
+    ///
+    /// The kind decides which other fields are meaningful, so it is
+    /// resolved first and the rest are read against *that* rather than
+    /// against whatever the budget used to be.
+    ///
+    /// Switching to `while_in_flight` drops the period and burst rather
+    /// than carrying them across. Merge patch keeps absent fields, but
+    /// those two describe a drip, and a strategy with no drip cannot
+    /// hold them — so keeping them would produce a value the type system
+    /// does not admit. Supplying either *while* switching is a
+    /// contradiction and is rejected.
+    pub fn apply(&self, existing: BudgetStrategy) -> Result<BudgetStrategy, StoreError> {
+        let kind = self.kind.unwrap_or(match existing {
+            BudgetStrategy::TimeBased { .. } => BudgetStrategyKind::TimeBased,
+            BudgetStrategy::WhileInFlight => BudgetStrategyKind::WhileInFlight,
+        });
+
+        match kind {
+            BudgetStrategyKind::TimeBased => {
+                let (existing_duration, existing_burst) = match existing {
+                    BudgetStrategy::TimeBased { duration_ms, burst } => (Some(duration_ms), burst),
+                    // Becoming a rate limit for the first time: there is
+                    // no period to inherit, so one has to be supplied.
+                    BudgetStrategy::WhileInFlight => (None, None),
+                };
+
+                let Some(duration_ms) = self.duration_ms.or(existing_duration) else {
+                    return Err(StoreError::InvalidOperation(
+                        "changing a budget to time_based requires strategy.duration_ms".to_string(),
+                    ));
+                };
+
+                Ok(BudgetStrategy::TimeBased {
+                    duration_ms,
+                    burst: self.burst.unwrap_or(existing_burst),
+                })
+            }
+            BudgetStrategyKind::WhileInFlight => {
+                if self.duration_ms.is_some() {
+                    return Err(StoreError::InvalidOperation(
+                        "while_in_flight budget must not set strategy.duration_ms — \
+                         its tokens return on acknowledgement, not on a clock"
+                            .to_string(),
+                    ));
+                }
+
+                if self.burst.is_some_and(|burst| burst.is_some()) {
+                    return Err(StoreError::InvalidOperation(
+                        "while_in_flight budget must not set strategy.burst — \
+                         it has no drip to burst ahead of"
+                            .to_string(),
+                    ));
+                }
+
+                Ok(BudgetStrategy::WhileInFlight)
+            }
+        }
+    }
+}
+
 /// Options for `Store::patch_budget`.
 ///
-/// Follows JSON Merge Patch semantics: `None` leaves a field alone.
-/// Neither field is nullable — a budget with no allocation or no
-/// strategy is not a budget, so there is nothing to clear them to.
+/// Follows JSON Merge Patch semantics: an absent field is left alone.
+/// `allocation` is not nullable — a budget without one is not a budget,
+/// so there is nothing to clear it to — and neither is the strategy as a
+/// whole, though fields *within* it may be.
 pub struct PatchBudgetOptions {
     /// Tokens the bucket holds when full.
     pub allocation: Option<u32>,
 
-    /// How tokens replenish.
-    pub strategy: Option<BudgetStrategy>,
+    /// Changes to how tokens replenish, merged onto the stored strategy.
+    pub strategy: BudgetStrategyPatch,
 }
 
 /// A single entry in a `replace_cron_group` request.
