@@ -5672,19 +5672,30 @@ mod tests {
 
         drop(body);
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let mut ids = Vec::new();
-        while let Some(job) = state
-            .store
-            .take_next_job(crate::time::now_millis(), &HashSet::new())
-            .await
-            .unwrap()
-        {
-            ids.push(job.id);
+        // Wait for the requeue rather than guessing how long it takes.
+        // Dropping the body does not requeue anything by itself: the
+        // spawned take task has to be scheduled, notice, and commit the
+        // requeue, and under a loaded test run that is not reliably
+        // within any fixed sleep. Bounded so a genuine failure still
+        // fails, and fast when it works.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut requeued = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(job) = state
+                .store
+                .take_next_job(crate::time::now_millis(), &HashSet::new())
+                .await
+                .unwrap()
+            {
+                requeued = Some(job.id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            ids.contains(&enqueued.id),
+
+        assert_eq!(
+            requeued.as_deref(),
+            Some(enqueued.id.as_str()),
             "stalled-then-dropped take should still requeue its in-flight job"
         );
     }
