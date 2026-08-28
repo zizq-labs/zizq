@@ -451,6 +451,13 @@ async fn process_store_event(
             // TODO: emit cron-specific admin events for `zizq top`.
             Vec::new()
         }
+        StoreEvent::BudgetPolicyChanged => {
+            // Nothing to diff: a policy change moves no job between the
+            // ready, scheduled and in-flight windows this connection
+            // tracks. Per-budget stats are their own admin surface and
+            // do not exist yet.
+            Vec::new()
+        }
     }
 }
 

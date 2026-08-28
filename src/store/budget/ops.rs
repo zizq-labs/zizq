@@ -131,6 +131,7 @@ impl Store {
         // rather than inside the closure, which holds the keyspace and
         // the registry but not the event channel.
         self.wake_budgeted_jobs(now, BUDGET_WAKE_LIMIT);
+        self.announce_budget_change();
 
         Ok(budget)
     }
@@ -189,8 +190,22 @@ impl Store {
 
         // See `put_budget`: a grown allocation has to be announced.
         self.wake_budgeted_jobs(now, BUDGET_WAKE_LIMIT);
+        self.announce_budget_change();
 
         Ok(budget)
+    }
+
+    /// Tell the waker its armed timer may be stale.
+    ///
+    /// Distinct from [`Store::wake_budgeted_jobs`], and both are needed.
+    /// That one announces work that is affordable *now*, which is what a
+    /// widened concurrency budget produces. This one says only that the
+    /// future has moved — which is all a faster rate limit produces,
+    /// since its parked jobs are still unaffordable at the instant the
+    /// policy changes. Without it, a budget patched from one a minute to
+    /// two a second keeps its jobs waiting out the old minute.
+    fn announce_budget_change(&self) {
+        let _ = self.event_tx.send(StoreEvent::BudgetPolicyChanged);
     }
 
     /// Load a budget's policy, or `None` if it does not exist.

@@ -123,6 +123,21 @@ pub enum StoreEvent {
     /// The cron scheduler listens for this to recalculate its sleep timer.
     CronScheduleChanged,
 
+    /// A budget's policy was created or changed.
+    ///
+    /// The budget waker listens for this to recalculate its sleep timer.
+    /// Changing an allocation or a period changes when a parked job
+    /// next becomes affordable, which invalidates whatever the waker is
+    /// currently sleeping until — and nothing else would tell it. Making
+    /// a budget faster is the case that matters: the jobs waiting on it
+    /// are not dispatchable yet, so there is nothing to announce, only a
+    /// sooner future to re-arm for.
+    ///
+    /// Carries no key, like `CronScheduleChanged`. The waker recomputes
+    /// across every occupied budget anyway, so naming one would be
+    /// detail the only listener discards.
+    BudgetPolicyChanged,
+
     /// Recovery and index rebuilding completed.
     ///
     /// Emitted once when `rebuild_indexes()` finishes. Wakes sleeping
