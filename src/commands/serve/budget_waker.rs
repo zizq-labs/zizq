@@ -34,6 +34,32 @@
 //! Lagging the broadcast channel is harmless here: the response to
 //! missing events is the same as the response to receiving them — look
 //! again — so a lag is treated as a wake rather than an error.
+//!
+//! # The dispatch loop terminates, and why
+//!
+//! Waking on a dispatch makes this recursive: announcing a job leads to
+//! it being taken, which is an event that provokes another look. That is
+//! the intended shape — it paces announcements at exactly the rate work
+//! is actually being consumed — but it is worth being explicit that it
+//! stops.
+//!
+//! Two independent counters bound it. Every turn spends at least one
+//! token, since a binding's cost is validated to be at least 1
+//! (`enqueue/prepare.rs`), and nothing replenishes the bucket inside the
+//! loop — so it is bounded by the bucket's depth, after which the head
+//! reports `At` and the timer takes over. Every turn also removes a job
+//! from its group, so it is bounded by the parked work, after which the
+//! group empties and the lock-free `waiting` check short-circuits the
+//! scan entirely.
+//!
+//! **The zero-cost rejection is load-bearing here, not merely tidy.** A
+//! job costing nothing would dispatch without decreasing the bucket, and
+//! this loop would have nothing to consume.
+//!
+//! The cost of the shape is broadcast traffic: draining a burst of N
+//! puts roughly 2N events through the channel, an in-flight and an
+//! announcement per job. It degrades gracefully, since every subscriber
+//! handles `Lagged`, but it is the real price of not polling a clock.
 
 use tokio::sync::{broadcast, watch};
 
@@ -97,6 +123,25 @@ pub async fn run(
                         Ok(StoreEvent::JobCompleted { .. })
                         | Ok(StoreEvent::JobFailed { .. })
                         | Ok(StoreEvent::JobDeleted { .. }) => break,
+
+                        // A dispatch is the only thing that spends a
+                        // rate limit's tokens, so it is the only thing
+                        // that can turn an affordable head into an
+                        // unaffordable one. Without this the loop has no
+                        // reason to look again: the pass that announced
+                        // the job found it affordable, so it set no
+                        // timer, and the next job then waits for an
+                        // unrelated event — in practice for the
+                        // announced job to *finish*, which reads as a
+                        // concurrency limit of one however fast the rate.
+                        //
+                        // Deliberately not a clock tick. Re-checking on
+                        // dispatch costs one scan per job actually
+                        // dispatched; re-checking on the accrual
+                        // interval would cost one per token whether or
+                        // not anybody wanted it, and a fast budget's
+                        // interval is measured in microseconds.
+                        Ok(StoreEvent::JobInFlight { .. }) => break,
 
                         // The registry was rebuilt from disk, so
                         // whatever was last computed described a
@@ -316,6 +361,88 @@ mod tests {
         ));
 
         assert!(listening.await.unwrap(), "no announcement after the refill");
+    }
+
+    /// The case a small burst exposes. When the announcing pass finds
+    /// the head affordable it sets no timer, because nothing is waiting
+    /// on a clock at that moment — so once a worker spends the token,
+    /// only the dispatch itself can say the situation has changed.
+    ///
+    /// Without waking on it, the next job waits for an unrelated event.
+    /// In practice that means waiting for the announced job to *finish*,
+    /// which turns a 300-per-minute budget with `burst: 1` into one job
+    /// per job-duration: a concurrency limit wearing a rate limit's
+    /// configuration.
+    #[tokio::test]
+    async fn a_dispatch_provokes_the_next_announcement() {
+        let store = test_store();
+        let now = now_millis();
+        let (_tx, shutdown) = watch::channel(());
+
+        // Five tokens a second, but only one may be banked.
+        store
+            .create_budget(
+                "paced",
+                300,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 60_000,
+                    burst: Some(1),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for payload in ["a", "b"] {
+            ids.push(
+                store
+                    .enqueue(
+                        now,
+                        EnqueueOptions::new("t", "q", serde_json::json!(payload))
+                            .budget(BudgetBinding::new("paced")),
+                    )
+                    .await
+                    .unwrap()
+                    .into_job()
+                    .id,
+            );
+        }
+
+        // The waker scans first, while the bucket still has its token —
+        // so it announces the head and arms no timer. This ordering is
+        // the whole point of the test.
+        // Real clock, like the refill test: the drip is what releases the
+        // second job, and a frozen clock would never deliver it.
+        tokio::spawn(run(
+            store.clone(),
+            crate::time::now_millis,
+            DEFAULT_BATCH_SIZE,
+            shutdown,
+        ));
+        tokio::task::yield_now().await;
+
+        let listening = tokio::spawn({
+            let store = store.clone();
+            let second = ids[1].clone();
+            async move { expect_dispatchable(&store, &second).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Spend the token. Deliberately never acknowledged: the second
+        // job must go out on the drip, not on this one finishing.
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, ids[0]);
+
+        assert!(
+            listening.await.unwrap(),
+            "the second job was never announced, so nothing but the \
+             first job finishing would have released it"
+        );
     }
 
     /// The task hears its own announcements on the same channel it
