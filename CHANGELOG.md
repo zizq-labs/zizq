@@ -79,8 +79,15 @@
   within that scan, and on its own it is a full scan — the same cost
   profile the existing payload filter carries.
 
-  Policy changes take effect immediately, including on jobs already
-  waiting. Speeding a rate limit up re-arms the dispatcher rather than
+  Policy changes take effect immediately, including on work already
+  running. Narrowing a `while_in_flight` budget below what is currently
+  in flight leaves it over-committed, and those slots are surrendered as
+  jobs finish rather than handed straight to replacements — so cutting
+  an allocation from six to one while six are running settles back to
+  one, instead of staying at six for as long as work keeps arriving.
+
+  Policy changes also take effect immediately on jobs already waiting.
+  Speeding a rate limit up re-arms the dispatcher rather than
   leaving parked jobs to wait out the old period, and progress already
   accrued toward the next token is kept across a change of rate — half a
   minute spent waiting on a one-a-minute budget still counts when it
