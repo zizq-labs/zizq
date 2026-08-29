@@ -21,6 +21,7 @@
 //! sibling `ops` submodule.
 
 mod costs;
+mod job_ops;
 mod limiter;
 mod mutation;
 mod ops;
