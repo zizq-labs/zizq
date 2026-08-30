@@ -29,14 +29,6 @@
 //! the cost accounting are all the transaction's problem, and are tested
 //! separately from the question of what the caller asked for.
 
-// Everything here is consumed by the store operation that applies a
-// mutation inside a transaction, and by the routes over it. Staged as
-// one attribute rather than six, since it comes off in one go.
-#![allow(
-    dead_code,
-    reason = "consumed by the job-budget store operation and its routes"
-)]
-
 use super::{BudgetBinding, BudgetRef};
 
 /// A change to the set of budgets a job draws on.
@@ -45,7 +37,7 @@ use super::{BudgetBinding, BudgetRef};
 /// value applies correctly to any job regardless of what it is bound to
 /// already.
 #[derive(Debug, Clone)]
-pub(in crate::store) enum BudgetMutation {
+pub enum BudgetMutation {
     /// Replace every binding with these.
     ///
     /// The one whole-set operation, and the reason it is confined to a
@@ -110,6 +102,18 @@ pub(in crate::store) enum BudgetMutationError {
     /// [`BudgetMutation::SetCost`] against one it does not.
     NotBound(String),
 
+    /// A binding was given a cost of zero.
+    ///
+    /// "Draws on this budget without consuming any of it" is
+    /// indistinguishable from not naming it — and worse than useless:
+    /// a job that dispatches without decreasing a bucket is what the
+    /// budget waker's termination argument rules out, since its loop
+    /// spends a token per turn to make progress.
+    ///
+    /// Enqueue rejects this in `prepare_enqueue`; every other way a
+    /// binding can be created goes through here.
+    ZeroCost(String),
+
     /// The requested set names one budget more than once.
     ///
     /// A job draws on a budget once, at one cost; two entries for the
@@ -134,6 +138,7 @@ impl BudgetMutation {
             Self::ReplaceAll(bindings) => to_refs(bindings)?,
 
             Self::Add(binding) => {
+                check_cost(binding)?;
                 if let Some(existing) = find(current, &binding.key) {
                     return Err(BudgetMutationError::AlreadyBound(existing.key.clone()));
                 }
@@ -143,6 +148,7 @@ impl BudgetMutation {
             }
 
             Self::Set(binding) => {
+                check_cost(binding)?;
                 let mut next = current.to_vec();
                 match next.iter_mut().find(|r| r.key == binding.key) {
                     // Replaced whole rather than field by field. The key
@@ -162,6 +168,9 @@ impl BudgetMutation {
             }
 
             Self::SetCost { key, cost } => {
+                if *cost == 0 {
+                    return Err(BudgetMutationError::ZeroCost(key.clone()));
+                }
                 let mut next = current.to_vec();
                 match next.iter_mut().find(|r| &r.key == key) {
                     Some(existing) => existing.cost = *cost,
@@ -186,17 +195,28 @@ impl BudgetMutation {
         }
     }
 
-    /// The bindings this mutation introduces, if any.
+    /// Every binding whose cost this mutation sets.
     ///
-    /// What the transaction has to validate and possibly create: these
-    /// carry `create_with`, which the stored form drops. Removals and
-    /// cost changes introduce nothing, since a job cannot be bound to a
-    /// budget that was never resolved in the first place.
-    pub(in crate::store) fn introduced(&self) -> &[BudgetBinding] {
+    /// What the transaction has to validate: each named budget must
+    /// exist — or be creatable, for those carrying a `create_with` — and
+    /// each cost must fit what that budget's bucket can hold.
+    ///
+    /// **A cost change belongs here even though it introduces nothing.**
+    /// An earlier version asked which bindings were *introduced*, on the
+    /// grounds that a job cannot already be bound to a budget that was
+    /// never resolved. True of existence, and false of cost: raising a
+    /// cost above the bucket's capacity leaves a job that can never be
+    /// afforded however long it waits, which is exactly the stall the
+    /// capacity check exists to prevent.
+    ///
+    /// Removals are genuinely exempt. Unbinding a budget cannot make a
+    /// job unaffordable, and neither can leaving the others alone.
+    pub(in crate::store) fn costed(&self) -> Vec<BudgetBinding> {
         match self {
-            Self::ReplaceAll(bindings) => bindings,
-            Self::Add(binding) | Self::Set(binding) => std::slice::from_ref(binding),
-            Self::SetCost { .. } | Self::Remove { .. } | Self::RemoveAll => &[],
+            Self::ReplaceAll(bindings) => bindings.clone(),
+            Self::Add(binding) | Self::Set(binding) => vec![binding.clone()],
+            Self::SetCost { key, cost } => vec![BudgetBinding::new(key.clone()).cost(*cost)],
+            Self::Remove { .. } | Self::RemoveAll => Vec::new(),
         }
     }
 }
@@ -206,6 +226,7 @@ fn to_refs(bindings: &[BudgetBinding]) -> Result<Vec<BudgetRef>, BudgetMutationE
     let mut refs: Vec<BudgetRef> = Vec::with_capacity(bindings.len());
 
     for binding in bindings {
+        check_cost(binding)?;
         if refs.iter().any(|r| r.key == binding.key) {
             return Err(BudgetMutationError::DuplicateKey(binding.key.clone()));
         }
@@ -213,6 +234,14 @@ fn to_refs(bindings: &[BudgetBinding]) -> Result<Vec<BudgetRef>, BudgetMutationE
     }
 
     Ok(refs)
+}
+
+/// Reject a binding that would consume nothing.
+fn check_cost(binding: &BudgetBinding) -> Result<(), BudgetMutationError> {
+    if binding.cost == 0 {
+        return Err(BudgetMutationError::ZeroCost(binding.key.clone()));
+    }
+    Ok(())
 }
 
 /// The binding to `key`, if the job has one.
@@ -429,43 +458,79 @@ mod tests {
         );
     }
 
+    /// A job that dispatches without decreasing a bucket is what the
+    /// waker's termination argument rules out, so no route may create
+    /// one — enqueue rejects it separately, and this covers the rest.
+    #[test]
+    fn a_zero_cost_is_refused_however_it_arrives() {
+        let current = [drawn("stripe", 1)];
+
+        assert_eq!(
+            BudgetMutation::Add(binding("mailgun", 0)).apply(&current),
+            Err(BudgetMutationError::ZeroCost("mailgun".into()))
+        );
+        assert_eq!(
+            BudgetMutation::Set(binding("mailgun", 0)).apply(&current),
+            Err(BudgetMutationError::ZeroCost("mailgun".into()))
+        );
+        assert_eq!(
+            BudgetMutation::SetCost {
+                key: "stripe".into(),
+                cost: 0
+            }
+            .apply(&current),
+            Err(BudgetMutationError::ZeroCost("stripe".into()))
+        );
+        assert_eq!(
+            BudgetMutation::ReplaceAll(vec![binding("stripe", 0)]).apply(&current),
+            Err(BudgetMutationError::ZeroCost("stripe".into()))
+        );
+    }
+
     // --- introduced ---
 
-    /// The transaction validates and may create only what a mutation
-    /// brings in. Removals and cost changes bring in nothing, so they
-    /// need no budget resolution at all.
+    /// The transaction checks every cost a mutation sets against what
+    /// the budget can hold.
     #[test]
-    fn only_binding_mutations_introduce_budgets() {
-        assert_eq!(
-            BudgetMutation::Add(binding("stripe", 1)).introduced().len(),
-            1
-        );
-        assert_eq!(
-            BudgetMutation::Set(binding("stripe", 1)).introduced().len(),
-            1
-        );
+    fn every_mutation_that_sets_a_cost_offers_it_for_checking() {
+        assert_eq!(BudgetMutation::Add(binding("stripe", 1)).costed().len(), 1);
+        assert_eq!(BudgetMutation::Set(binding("stripe", 1)).costed().len(), 1);
         assert_eq!(
             BudgetMutation::ReplaceAll(vec![binding("a", 1), binding("b", 2)])
-                .introduced()
+                .costed()
                 .len(),
             2
         );
+    }
 
-        assert!(
-            BudgetMutation::SetCost {
-                key: "stripe".into(),
-                cost: 2
-            }
-            .introduced()
-            .is_empty()
-        );
+    /// The one that is easy to miss, and did go missing: a cost change
+    /// introduces no binding, but the new cost still has to fit the
+    /// bucket. Raising it past capacity leaves a job that can never be
+    /// afforded however long it waits.
+    #[test]
+    fn a_cost_change_offers_the_new_cost_for_checking() {
+        let costed = BudgetMutation::SetCost {
+            key: "stripe".into(),
+            cost: 9,
+        }
+        .costed();
+
+        assert_eq!(costed.len(), 1);
+        assert_eq!(costed[0].key, "stripe");
+        assert_eq!(costed[0].cost, 9);
+    }
+
+    /// Removals are genuinely exempt: unbinding cannot make a job
+    /// unaffordable.
+    #[test]
+    fn removals_need_no_checking() {
         assert!(
             BudgetMutation::Remove {
                 key: "stripe".into()
             }
-            .introduced()
+            .costed()
             .is_empty()
         );
-        assert!(BudgetMutation::RemoveAll.introduced().is_empty());
+        assert!(BudgetMutation::RemoveAll.costed().is_empty());
     }
 }

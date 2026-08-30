@@ -69,6 +69,16 @@
   and remain peristed indefinitely. Future releases will enable more
   dynamic sub-buckets within budgets.
 
+  A job's budgets can be changed after it is enqueued, through routes on
+  `/jobs/{id}/budgets`: `POST` a key to bind one (409 if already bound,
+  and `create_with` works here as it does on an enqueue), `PUT` to bind
+  or replace, `PATCH` to change what it draws, `DELETE` to unbind.
+  `PUT /jobs/{id}/budgets` replaces the whole set and
+  `DELETE /jobs/{id}/budgets` clears it. Only queued jobs may change —
+  an in-flight job holds tokens against the bindings it was dispatched
+  under, so moving them would either invent a slot on the new budget or
+  strand one on the old, and the request is refused with 422.
+
   Jobs can be filtered by budget with `?budgets.key=`, comma-delimited
   like `queue` and `type`, on `GET /jobs`, `GET /jobs/count`,
   `PATCH /jobs` and `DELETE /jobs`. It matches a job drawing on any of

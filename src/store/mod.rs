@@ -52,8 +52,8 @@ pub use storage_config::{
 pub use store::{Store, StoreEvent};
 
 pub use budget::{
-    Budget, BudgetBinding, BudgetPolicy, BudgetRef, BudgetStrategy, DEFAULT_BUDGET_COST,
-    MAX_BUDGET_ALLOCATION,
+    Budget, BudgetBinding, BudgetMutation, BudgetPolicy, BudgetRef, BudgetStrategy,
+    DEFAULT_BUDGET_COST, JobBudgetChange, MAX_BUDGET_ALLOCATION,
 };
 
 pub use cron::{CronEntry, CronGroup};

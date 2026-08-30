@@ -21,7 +21,7 @@ use axum::http::{self, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::sse::{Event, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
@@ -36,7 +36,8 @@ use super::types::{
     BulkEnqueueResponse, BulkSuccessNotFoundResponse, BulkSuccessRequest, CommaSet,
     CountJobsParams, CountJobsResponse, CronEntryRequest, CronEntryResponse, CronGroupResponse,
     DeleteJobsParams, EnqueueRequest, ErrorRecord, ErrorResponse, FailureRequest, HealthResponse,
-    Job, JobStatus, ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
+    Job, JobBudgetBindingRequest, JobBudgetCostRequest, JobBudgetsRequest, JobStatus,
+    ListBudgetsResponse, ListCronGroupsResponse, ListErrorsPages, ListErrorsParams,
     ListErrorsResponse, ListJobsPages, ListJobsParams, ListJobsResponse, ListQueuesResponse, Order,
     PatchBudgetRequest, PatchBudgetStrategyRequest, PatchCronEntryRequest, PatchCronGroupRequest,
     PatchJobBody, PatchJobsParams, RangeQuery, ReplaceCronGroupRequest, TakeParams,
@@ -403,6 +404,17 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
         .route("/jobs/{id}/errors/{attempt}", get(get_error))
+        .route(
+            "/jobs/{id}/budgets",
+            put(replace_job_budgets).delete(clear_job_budgets),
+        )
+        .route(
+            "/jobs/{id}/budgets/{key}",
+            post(add_job_budget)
+                .put(set_job_budget)
+                .patch(patch_job_budget)
+                .delete(remove_job_budget),
+        )
         .route(
             "/crons",
             get(list_cron_groups).delete(bulk_delete_cron_groups),
@@ -2536,6 +2548,302 @@ fn parse_budget_strategy(req: BudgetStrategyRequest) -> Result<store::BudgetStra
         other => Err(format!(
             "unknown budget strategy: {other:?} (expected \"time_based\" or \"while_in_flight\")"
         )),
+    }
+}
+
+// --- Job budget bindings ---
+
+/// Turn a [`JobBudgetChange`] into a response.
+///
+/// Shared by every route here, so the mapping from outcome to status is
+/// stated once. `Unchanged` answers `200` alongside `Changed`: the
+/// caller asked for a state and the job is in it, which is a success
+/// however few bytes were written.
+fn job_budget_response(fmt: Format, id: &str, change: store::JobBudgetChange) -> Response {
+    match change {
+        store::JobBudgetChange::Changed(job) | store::JobBudgetChange::Unchanged(job) => {
+            match Job::try_from(job) {
+                Ok(job) => respond(fmt, StatusCode::OK, &job),
+                Err(e) => {
+                    tracing::error!(%e, "job budget change produced an unreadable job");
+                    respond(
+                        fmt,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &ErrorResponse {
+                            error: "internal error".into(),
+                        },
+                    )
+                }
+            }
+        }
+        store::JobBudgetChange::JobNotFound => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("job '{id}' not found"),
+            },
+        ),
+        store::JobBudgetChange::NotBound(key) => respond(
+            fmt,
+            StatusCode::NOT_FOUND,
+            &ErrorResponse {
+                error: format!("job '{id}' does not draw on budget '{key}'"),
+            },
+        ),
+        store::JobBudgetChange::AlreadyBound(key) => respond(
+            fmt,
+            StatusCode::CONFLICT,
+            &ErrorResponse {
+                error: format!(
+                    "job '{id}' already draws on budget '{key}'. \
+                     Use PUT to replace the binding, or PATCH to change its cost."
+                ),
+            },
+        ),
+        // 422 rather than 409: the request is well formed and the job
+        // exists, but its bindings cannot move from where it is. An
+        // in-flight job holds tokens against them, and a finished one
+        // will never run again.
+        store::JobBudgetChange::NotQueued(status) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse {
+                error: format!(
+                    "job '{id}' is {status:?} — only queued jobs may have their budgets changed"
+                ),
+            },
+        ),
+    }
+}
+
+/// Build a binding from a path key and a body, validating both.
+///
+/// Routed through `parse_budget_bindings` rather than constructed
+/// directly, so a key arriving this way gets the same name validation as
+/// one on an enqueue, and `bucket` is refused in the same place.
+fn binding_from_path(
+    key: String,
+    cost: Option<u32>,
+    create_with: Option<BudgetRequest>,
+    bucket: Option<String>,
+) -> Result<store::BudgetBinding, String> {
+    let mut bindings = parse_budget_bindings(vec![BudgetBindingRequest {
+        key,
+        cost,
+        create_with,
+        bucket,
+    }])?;
+
+    bindings
+        .pop()
+        .ok_or_else(|| "budget binding could not be read".to_string())
+}
+
+/// Handle `POST /jobs/{id}/budgets/{key}` — bind a budget the job does
+/// not already draw on.
+async fn add_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetBindingRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let binding = match binding_from_path(key, req.cost, req.create_with, req.bucket) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error },
+            );
+        }
+    };
+
+    run_job_budget_mutation(state, fmt, id, store::BudgetMutation::Add(binding), now_ms).await
+}
+
+/// Handle `PUT /jobs/{id}/budgets/{key}` — bind a budget, replacing any
+/// existing binding to it.
+async fn set_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetBindingRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let binding = match binding_from_path(key, req.cost, req.create_with, req.bucket) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error },
+            );
+        }
+    };
+
+    run_job_budget_mutation(state, fmt, id, store::BudgetMutation::Set(binding), now_ms).await
+}
+
+/// Handle `PATCH /jobs/{id}/budgets/{key}` — change what the job draws.
+async fn patch_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetCostRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    if let Err(error) = validate_name("budget key", &key) {
+        return respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error },
+        );
+    }
+
+    let mutation = store::BudgetMutation::SetCost {
+        key,
+        cost: req.cost,
+    };
+    run_job_budget_mutation(state, fmt, id, mutation, now_ms).await
+}
+
+/// Handle `DELETE /jobs/{id}/budgets/{key}` — unbind one budget.
+async fn remove_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    run_job_budget_mutation(
+        state,
+        fmt,
+        id,
+        store::BudgetMutation::Remove { key },
+        now_ms,
+    )
+    .await
+}
+
+/// Handle `PUT /jobs/{id}/budgets` — replace the whole set.
+///
+/// The one whole-set operation, and single-job only: replacing a set is
+/// sound when the caller knows what is being replaced, which over a
+/// filtered selection they do not.
+async fn replace_job_budgets(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetsRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let bindings = match parse_budget_bindings(req.budgets) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error },
+            );
+        }
+    };
+
+    let mutation = store::BudgetMutation::ReplaceAll(bindings);
+    run_job_budget_mutation(state, fmt, id, mutation, now_ms).await
+}
+
+/// Handle `DELETE /jobs/{id}/budgets` — unbind everything.
+async fn clear_job_budgets(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    run_job_budget_mutation(state, fmt, id, store::BudgetMutation::RemoveAll, now_ms).await
+}
+
+/// Apply a mutation and answer with the outcome.
+async fn run_job_budget_mutation(
+    state: Arc<AppState>,
+    fmt: Format,
+    id: String,
+    mutation: store::BudgetMutation,
+    now_ms: u64,
+) -> Response {
+    match state.store.patch_job_budgets(&id, mutation, now_ms).await {
+        Ok(change) => job_budget_response(fmt, &id, change),
+        // Malformed for any job rather than inapplicable to this one:
+        // an unknown budget, a cost the bucket could never hold, a
+        // repeated key, a cost of zero.
+        Err(store::StoreError::InvalidOperation(error)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_job_budgets failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
     }
 }
 
@@ -8797,6 +9105,343 @@ mod tests {
         );
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // --- job budget bindings ---
+
+    /// Enqueue a job bound to nothing, returning its id.
+    async fn plain_job(app: &Router) -> String {
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({ "type": "t", "queue": "q", "payload": {} }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        body["id"].as_str().unwrap().to_string()
+    }
+
+    async fn budgets_of(app: &Router, id: &str) -> serde_json::Value {
+        let res = app
+            .clone()
+            .oneshot(empty_request("GET", &format!("/jobs/{id}")))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        body["budgets"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_budget_can_be_bound_to_and_unbound_from_a_job() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        let id = plain_job(&app).await;
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/jobs/{id}/budgets/stripe"),
+                &serde_json::json!({ "cost": 4 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["budgets"][0]["key"], "stripe");
+        assert_eq!(body["budgets"][0]["cost"], 4);
+
+        let res = app
+            .clone()
+            .oneshot(empty_request(
+                "DELETE",
+                &format!("/jobs/{id}/budgets/stripe"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        assert!(budgets_of(&app, &id).await.is_null());
+    }
+
+    /// `POST` refuses to overwrite, so a caller adding a binding cannot
+    /// silently change a cost someone else set. `PUT` is the one that
+    /// replaces, and `PATCH` the one that adjusts.
+    #[tokio::test]
+    async fn post_conflicts_where_put_and_patch_succeed() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        let id = plain_job(&app).await;
+
+        let bind = |method: &str, body: serde_json::Value| {
+            json_request(method, &format!("/jobs/{id}/budgets/stripe"), &body)
+        };
+
+        let res = app
+            .clone()
+            .oneshot(bind("POST", serde_json::json!({ "cost": 1 })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(bind("POST", serde_json::json!({ "cost": 9 })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let res = app
+            .clone()
+            .oneshot(bind("PUT", serde_json::json!({ "cost": 5 })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(bind("PATCH", serde_json::json!({ "cost": 7 })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["budgets"][0]["cost"], 7);
+    }
+
+    /// Adjusting a cost will not create a binding: a caller doing so
+    /// believes the job is already throttled.
+    #[tokio::test]
+    async fn patching_a_budget_the_job_lacks_is_404() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        let id = plain_job(&app).await;
+
+        let res = app
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/jobs/{id}/budgets/stripe"),
+                &serde_json::json!({ "cost": 3 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn replacing_the_whole_set_takes_the_body_whole() {
+        let app = pro_app();
+        for key in ["a", "b", "c"] {
+            app.clone()
+                .oneshot(budget_post(key, &while_in_flight(10)))
+                .await
+                .unwrap();
+        }
+        let id = plain_job(&app).await;
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/jobs/{id}/budgets"),
+                &serde_json::json!({ "budgets": [{ "key": "a" }, { "key": "b", "cost": 2 }] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/jobs/{id}/budgets"),
+                &serde_json::json!({ "budgets": [{ "key": "c", "cost": 3 }] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let budgets = budgets_of(&app, &id).await;
+        assert_eq!(budgets.as_array().unwrap().len(), 1);
+        assert_eq!(budgets[0]["key"], "c");
+        assert_eq!(budgets[0]["cost"], 3);
+
+        let res = app
+            .clone()
+            .oneshot(empty_request("DELETE", &format!("/jobs/{id}/budgets")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(budgets_of(&app, &id).await.is_null());
+    }
+
+    /// Binding to a budget nobody has configured is one call, as it is
+    /// on an enqueue.
+    #[tokio::test]
+    async fn create_with_creates_the_budget_while_binding() {
+        let app = pro_app();
+        let id = plain_job(&app).await;
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/jobs/{id}/budgets/fresh"),
+                &serde_json::json!({
+                    "cost": 2,
+                    "create_with": {
+                        "allocation": 20,
+                        "strategy": { "type": "while_in_flight" }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(empty_request("GET", "/budgets/fresh"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// Raising a cost past what the bucket can hold leaves a job that
+    /// never dispatches again, so it is refused rather than accepted
+    /// into a permanent stall.
+    #[tokio::test]
+    async fn raising_a_cost_above_the_burst_is_422() {
+        let app = pro_app();
+        let res = app
+            .clone()
+            .oneshot(budget_post(
+                "per-minute",
+                &serde_json::json!({
+                    "allocation": 10,
+                    "strategy": { "type": "time_based", "duration_ms": 60000, "burst": 1 }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let id = plain_job(&app).await;
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/jobs/{id}/budgets/per-minute"),
+                &serde_json::json!({ "cost": 1 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/jobs/{id}/budgets/per-minute"),
+                &serde_json::json!({ "cost": 2 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Unchanged, so it still dispatches.
+        assert_eq!(budgets_of(&app, &id).await[0]["cost"], 1);
+    }
+
+    /// An in-flight job holds tokens against the bindings it was
+    /// dispatched under, so they may not move.
+    #[tokio::test]
+    async fn an_in_flight_job_is_422() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        let id = plain_job(&app).await;
+
+        let res = app
+            .clone()
+            .oneshot(empty_request("GET", "/jobs/take?prefetch=1"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // Drain one frame so the job is genuinely in flight.
+        let mut body = res.into_body();
+        let _ = next_body_bytes(&mut body).await;
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/jobs/{id}/budgets/stripe"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_job_is_404() {
+        let app = pro_app();
+        let res = app
+            .oneshot(empty_request(
+                "DELETE",
+                "/jobs/0000000000000000000000000/budgets",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A cost of zero would let a job dispatch without decreasing the
+    /// bucket, which is what the waker's termination argument rules out.
+    #[tokio::test]
+    async fn a_zero_cost_is_422() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        let id = plain_job(&app).await;
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/jobs/{id}/budgets/stripe"),
+                &serde_json::json!({ "cost": 0 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn job_budget_routes_are_403_on_free_tier() {
+        let res = test_app()
+            .oneshot(empty_request(
+                "DELETE",
+                "/jobs/0000000000000000000000000/budgets",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     /// `create_with` makes enqueue a budget *creation* path, so it needs

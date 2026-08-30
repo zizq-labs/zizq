@@ -53,12 +53,8 @@ use super::ops::{plan_budgets, stage_budgets, unstage_budgets, write_created_bud
 /// job turns them into status codes; a bulk route over a filtered set
 /// treats the last three as "skip this one" — a job already bound is not
 /// a failure of "add this budget to everything matching".
-#[allow(
-    dead_code,
-    reason = "consumed by the job-budget routes in the next commit"
-)]
 #[derive(Debug)]
-pub(in crate::store) enum JobBudgetChange {
+pub enum JobBudgetChange {
     /// The bindings changed. Carries the job as it now stands.
     Changed(Job),
 
@@ -88,11 +84,7 @@ impl Store {
     /// Budgets named by a `create_with` are created as part of the same
     /// transaction, exactly as an enqueue would, so binding a job to a
     /// budget that does not exist yet is one call rather than two.
-    #[allow(
-        dead_code,
-        reason = "consumed by the job-budget routes in the next commit"
-    )]
-    pub(in crate::store) async fn patch_job_budgets(
+    pub async fn patch_job_budgets(
         &self,
         id: &str,
         mutation: BudgetMutation,
@@ -137,12 +129,19 @@ impl Store {
                     Err(BudgetMutationError::NotBound(key)) => {
                         return Ok(JobBudgetChange::NotBound(key));
                     }
-                    // Malformed rather than inapplicable: the request
-                    // names one budget twice whatever job it is aimed
-                    // at, so it is wrong for all of them.
+                    // Malformed rather than inapplicable: these are
+                    // wrong for every job the request could be aimed at,
+                    // not just this one, so they fail the call rather
+                    // than reporting a per-job outcome a bulk route
+                    // would skip over.
                     Err(BudgetMutationError::DuplicateKey(key)) => {
                         return Err(StoreError::InvalidOperation(format!(
                             "budget '{key}' named more than once"
+                        )));
+                    }
+                    Err(BudgetMutationError::ZeroCost(key)) => {
+                        return Err(StoreError::InvalidOperation(format!(
+                            "budget '{key}' cost must be at least 1"
                         )));
                     }
                 };
@@ -155,12 +154,13 @@ impl Store {
                 // ---- inside tx ----
                 let mut tx = ks.write_tx();
 
-                // Same pre-pass an enqueue runs: every budget the
-                // mutation introduces must exist or be creatable, and
-                // its cost must fit what the bucket can hold. Resolved
-                // under the write lock so the answer cannot change
-                // between the check and the write it guards.
-                let created = match plan_budgets(&tx, &ks, mutation.introduced().iter(), now)? {
+                // Same pre-pass an enqueue runs: every budget whose
+                // cost this mutation sets must exist or be creatable,
+                // and that cost must fit what the bucket can hold.
+                // Resolved under the write lock so the answer cannot
+                // change between the check and the write it guards.
+                let costed = mutation.costed();
+                let created = match plan_budgets(&tx, &ks, costed.iter(), now)? {
                     BudgetPlan::Proceed(created) => created,
                     BudgetPlan::Reject(e) => return Err(e),
                 };
@@ -487,6 +487,93 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+    }
+
+    /// The reported bug. A cost change introduces no binding, so an
+    /// earlier version handed the pre-pass nothing to check and the
+    /// capacity guard never ran — leaving jobs raised past what the
+    /// bucket can hold, which never dispatch again.
+    #[tokio::test]
+    async fn raising_a_cost_above_the_capacity_is_refused() {
+        let store = test_store();
+        store
+            .create_budget(
+                "per-minute",
+                10,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 60_000,
+                    burst: Some(1),
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+        let job = enqueue_bound(&store, &[("per-minute", 1)]).await;
+
+        let result = store
+            .patch_job_budgets(
+                &job.id,
+                BudgetMutation::SetCost {
+                    key: "per-minute".into(),
+                    cost: 2,
+                },
+                now_millis(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+
+        // And the job still draws what it did, so it still dispatches.
+        let stored = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert_eq!(stored.budgets[0].cost, 1);
+    }
+
+    /// The allocation is not the ceiling when a burst is set, so the
+    /// burst is what a cost has to fit inside — a cost well within the
+    /// allocation is still refused.
+    #[tokio::test]
+    async fn a_cost_change_is_measured_against_the_burst() {
+        let store = test_store();
+        store
+            .create_budget(
+                "bursty",
+                1_000,
+                BudgetStrategy::TimeBased {
+                    duration_ms: 60_000,
+                    burst: Some(5),
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+        let job = enqueue_bound(&store, &[("bursty", 1)]).await;
+
+        let result = store
+            .patch_job_budgets(
+                &job.id,
+                BudgetMutation::SetCost {
+                    key: "bursty".into(),
+                    cost: 50,
+                },
+                now_millis(),
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+
+        // Up to the burst is fine.
+        changed(
+            store
+                .patch_job_budgets(
+                    &job.id,
+                    BudgetMutation::SetCost {
+                        key: "bursty".into(),
+                        cost: 5,
+                    },
+                    now_millis(),
+                )
+                .await
+                .unwrap(),
+        );
     }
 
     /// An in-flight job holds tokens against the bindings it was

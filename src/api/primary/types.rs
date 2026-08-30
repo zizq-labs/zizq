@@ -1269,6 +1269,48 @@ pub struct PatchBudgetRequest {
     pub strategy: Option<PatchBudgetStrategyRequest>,
 }
 
+/// Request body for `POST` and `PUT /jobs/{id}/budgets/{key}`.
+///
+/// The key comes from the path, so it is deliberately absent here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobBudgetBindingRequest {
+    /// Tokens this job consumes from the budget. Defaults to 1.
+    pub cost: Option<u32>,
+
+    /// Policy to create the budget with if it does not exist yet.
+    ///
+    /// This allows creating a budget that does not exist atomically and
+    /// without making two calls.
+    pub create_with: Option<BudgetRequest>,
+
+    /// Reserved for sub-buckets. Rejected rather than ignored.
+    pub bucket: Option<String>,
+}
+
+/// Request body for `PATCH /jobs/{id}/budgets/{key}`.
+///
+/// `cost` is required rather than optional: a patch naming no field at
+/// all would be a nonsensical request to change nothing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobBudgetCostRequest {
+    /// The job's new cost against this budget.
+    pub cost: u32,
+}
+
+/// Request body for `PUT /jobs/{id}/budgets`.
+///
+/// Wrapped in an object rather than taking a bare array which leaves
+/// room for the request to accomodate new fields without changing
+/// shape.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobBudgetsRequest {
+    /// The complete set of budgets the job should draw on.
+    pub budgets: Vec<BudgetBindingRequest>,
+}
+
 /// A merge patch over a budget's strategy.
 ///
 /// Every field is optional, because merge patch recurses into nested

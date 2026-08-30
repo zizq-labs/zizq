@@ -27,11 +27,8 @@ mod mutation;
 mod ops;
 mod registry;
 
-#[allow(
-    unused_imports,
-    reason = "consumed by the job-budget store operation and its routes"
-)]
-pub(in crate::store) use mutation::{BudgetMutation, BudgetMutationError, BudgetMutationOutcome};
+pub use job_ops::JobBudgetChange;
+pub use mutation::BudgetMutation;
 pub(in crate::store) use registry::Budgets;
 
 pub(in crate::store) use ops::{
