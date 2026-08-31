@@ -1347,12 +1347,13 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1977,9 +1978,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jaq-core"
-version = "3.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7561783b20275a6c9cb576e39208b0c635f34ef14357f1f05a2927a774f3adec"
+checksum = "f72ba7158fe9fc1bc4baace1b71e6d0d3d27c6839dd87dc1f233dd408f5dd85b"
 dependencies = [
  "dyn-clone",
  "once_cell",
@@ -1988,9 +1989,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-json"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48d801b0b57f10064c4e9f5a4f6c97d0ccf62649b179ff8ac23cd494a3120ee9"
+checksum = "4be2f53207ffb1313a2d2ad819cfa8bfaa7936cb85a110eda10fd5da822cec94"
 dependencies = [
  "bstr",
  "bytes",
@@ -2008,9 +2009,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-std"
-version = "3.0.2"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7941c8de9c591052050550f228c62ef80d3ecbd84c330f5c454bc8ebb7a04089"
+checksum = "9f90e485abfd3189510c996e77be55056a51038b0fa5805e6c97b5dcf0d9ab55"
 dependencies = [
  "aho-corasick",
  "base64",
@@ -2349,9 +2350,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
-version = "0.8.9"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
@@ -5218,6 +5219,12 @@ dependencies = [
  "tui-input",
  "urlencoding",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"
