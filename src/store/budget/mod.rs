@@ -21,10 +21,14 @@
 //! sibling `ops` submodule.
 
 mod costs;
+mod job_ops;
 mod limiter;
+mod mutation;
 mod ops;
 mod registry;
 
+pub use job_ops::JobBudgetChange;
+pub use mutation::BudgetMutation;
 pub(in crate::store) use registry::Budgets;
 
 pub(in crate::store) use ops::{
