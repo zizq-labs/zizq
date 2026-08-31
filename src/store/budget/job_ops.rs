@@ -40,8 +40,10 @@ use tokio::task;
 
 use super::super::dispatch::Placement;
 use super::super::keys::make_job_key;
+use super::super::options::JobFilter;
+use super::super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::super::store::{Store, StoreEvent};
-use super::super::types::{Job, JobStatus, StoreError};
+use super::super::types::{Job, JobStatus, ScanDirection, StoreError};
 use super::BudgetPlan;
 use super::mutation::{BudgetMutation, BudgetMutationError, BudgetMutationOutcome};
 use super::ops::{plan_budgets, stage_budgets, unstage_budgets, write_created_budgets};
@@ -72,6 +74,63 @@ pub enum JobBudgetChange {
 
     /// [`BudgetMutation::SetCost`] against one it does not.
     NotBound(String),
+}
+
+/// A job the bulk pass is about to rewrite.
+///
+/// Carried out of the scan so the placement move and the untracking of
+/// the *old* bindings can happen after the commit.
+///
+/// The two halves of the accounting are deliberately split around it:
+/// the new bindings are tracked *before* the commit by `stage_budgets`,
+/// the old ones untracked *after*. That brackets the change, so in the
+/// window between them both are counted — a cost raised from one to two
+/// reads a maximum of two, and one lowered from five to two reads five.
+/// High in either direction, which costs at worst a delete or shrink
+/// refused that would have been safe. The opposite order would leave the
+/// aggregate briefly reporting less work than exists, and a guard
+/// reading it then would let a budget be shrunk out from under a job.
+struct Rewritten {
+    previous: Vec<super::BudgetRef>,
+    updated: Job,
+    status: JobStatus,
+}
+
+/// What applying a mutation across a matched set did.
+///
+/// Counts what happened and names what was prevented, which are
+/// different questions. A caller wants to know how much moved, and then
+/// wants to be able to *do something* about whatever did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkBudgetChange {
+    /// Jobs whose bindings moved.
+    pub changed: usize,
+
+    /// Jobs the mutation would have changed, but could not, because they
+    /// were in flight.
+    ///
+    /// Named rather than counted, because this is the one outcome a
+    /// caller can act on — wait for the jobs to leave the in-flight
+    /// state and try those ids again.
+    ///
+    /// **Jobs the mutation simply did not apply to are absent**, not
+    /// counted here or anywhere. A `Remove` against a job that never had
+    /// the binding, an `Add` against one already bound, a cost already
+    /// at the requested value: these are the documented behaviour of the
+    /// bulk verbs rather than a shortfall. Counting them would make the
+    /// number roughly "jobs that exist" — an unfiltered unbind would
+    /// report the whole store as skipped, which is both useless and
+    /// alarming.
+    ///
+    /// **Terminal jobs are absent too**, deliberately. A finished job's
+    /// bindings are inert: it will never dispatch, it is already
+    /// untracked from the cost accounting, and it is parked nowhere.
+    /// Nothing can be done about it and nothing needs to be, so listing
+    /// them would reintroduce the unbounded list this exists to avoid.
+    ///
+    /// That leaves a set bounded by how much work is in flight at once,
+    /// which is small enough to name.
+    pub blocked: Vec<String>,
 }
 
 impl Store {
@@ -225,6 +284,197 @@ impl Store {
 
         Ok(change)
     }
+
+    /// Apply a mutation to every job a filter matches.
+    ///
+    /// Skips rather than fails on anything that is true of one job but
+    /// not of the request: already bound, not bound, in flight, finished,
+    /// or already in the requested state. A per-job `409` has nowhere to
+    /// go in an operation over a matched set, and "add this budget to
+    /// everything matching" is not wrong about the ones that have it.
+    ///
+    /// Malformed requests still fail outright — an unknown budget, a
+    /// cost the bucket could never hold, a repeated key, a cost of zero.
+    /// Those are wrong for every job the filter could match, so failing
+    /// half way through would leave the caller worse off than refusing.
+    ///
+    /// One transaction for the whole set, like the other bulk
+    /// operations. The budgets to resolve are the same for every job,
+    /// since the mutation is, so the pre-pass runs once rather than per
+    /// job.
+    pub async fn patch_jobs_budgets(
+        &self,
+        filter: JobFilter,
+        mutation: BudgetMutation,
+        now: u64,
+    ) -> Result<BulkBudgetChange, StoreError> {
+        let ks = self.ks.clone();
+        let dispatch = self.dispatch.clone();
+        let live = self.budgets.clone();
+
+        let (result, rewritten) = task::spawn_blocking(
+            move || -> Result<(BulkBudgetChange, Vec<Rewritten>), StoreError> {
+                // Write lock first, then the snapshot: nothing can commit
+                // while the scan runs, so the set cannot shift underneath
+                // the decisions made about it.
+                let mut tx = ks.write_tx();
+                let snapshot = ks.db.read_tx();
+
+                // Resolved once. Every job takes the same mutation, so
+                // the budgets it names and the costs it sets are the same
+                // whichever job is being looked at.
+                let costed = mutation.costed();
+                let created = match plan_budgets(&tx, &ks, costed.iter(), now)? {
+                    BudgetPlan::Proceed(created) => created,
+                    BudgetPlan::Reject(e) => return Err(e),
+                };
+                write_created_budgets(&mut tx, &ks, &created)?;
+
+                let needs_payload = filter_needs_payload(&filter);
+                let jobs = match build_id_stream(&snapshot, &ks, &filter, &None, ScanDirection::Asc)
+                {
+                    Some((id_stream, source, _)) => apply_filters(
+                        JobStream::by_id(
+                            id_stream,
+                            &snapshot,
+                            &ks.data,
+                            None,
+                            needs_payload,
+                            source,
+                        ),
+                        &filter,
+                    ),
+                    None => apply_filters(
+                        JobStream::full_scan(
+                            &snapshot,
+                            &ks,
+                            &None,
+                            ScanDirection::Asc,
+                            None,
+                            needs_payload,
+                        ),
+                        &filter,
+                    ),
+                };
+
+                let mut rewritten: Vec<Rewritten> = Vec::new();
+                let mut blocked: Vec<String> = Vec::new();
+
+                for job in jobs {
+                    let job = job?;
+                    let status = JobStatus::try_from(job.status).map_err(|v| {
+                        StoreError::Corruption(format!(
+                            "job {} has unrecognized status byte: {v}",
+                            job.id
+                        ))
+                    })?;
+
+                    // Applied before the state is consulted, so that
+                    // "would have changed but could not" can be told
+                    // apart from "there was nothing to do". Only the
+                    // first is worth reporting.
+                    let next = match mutation.apply(&job.budgets) {
+                        Ok(BudgetMutationOutcome::Changed(next)) => next,
+                        // Nothing to do. Not a shortfall, and not
+                        // reported: these are what the bulk verbs
+                        // promise to pass over.
+                        Ok(BudgetMutationOutcome::Unchanged) => continue,
+                        Err(BudgetMutationError::AlreadyBound(_))
+                        | Err(BudgetMutationError::NotBound(_)) => continue,
+                        // Wrong for every job, not just this one.
+                        Err(BudgetMutationError::DuplicateKey(key)) => {
+                            return Err(StoreError::InvalidOperation(format!(
+                                "budget '{key}' named more than once"
+                            )));
+                        }
+                        Err(BudgetMutationError::ZeroCost(key)) => {
+                            return Err(StoreError::InvalidOperation(format!(
+                                "budget '{key}' cost must be at least 1"
+                            )));
+                        }
+                    };
+
+                    match status {
+                        JobStatus::Ready | JobStatus::Scheduled => {}
+                        // Live work whose bindings cannot move while it
+                        // holds tokens against them. The caller can try
+                        // again once it has left the in-flight state.
+                        JobStatus::InFlight => {
+                            blocked.push(job.id);
+                            continue;
+                        }
+                        // Finished, so its bindings are record-keeping: it
+                        // will never dispatch and is already untracked.
+                        // Nothing to do and nothing to report.
+                        JobStatus::Completed | JobStatus::Dead => continue,
+                    }
+
+                    let previous = job.budgets.clone();
+                    let mut updated = job;
+                    updated.budgets = next;
+
+                    tx.insert(
+                        &ks.data,
+                        make_job_key(&updated.id),
+                        rmp_serde::to_vec_named(&updated)?,
+                    );
+
+                    rewritten.push(Rewritten {
+                        previous,
+                        updated,
+                        status,
+                    });
+                }
+
+                let result = BulkBudgetChange {
+                    changed: rewritten.len(),
+                    blocked,
+                };
+
+                // Nothing written and nothing created: no commit to make.
+                if rewritten.is_empty() && created.is_empty() {
+                    drop(tx);
+                    return Ok((result, Vec::new()));
+                }
+
+                stage_budgets(&live, &created, rewritten.iter().map(|r| &r.updated), now);
+
+                if let Err(e) = ks.commit(tx, ks.default_commit_mode) {
+                    unstage_budgets(&live, &created, rewritten.iter().map(|r| &r.updated));
+                    return Err(e);
+                }
+
+                for entry in &rewritten {
+                    live.untrack(&entry.previous);
+
+                    if entry.status == JobStatus::Ready {
+                        dispatch.remove(Placement {
+                            queue: &entry.updated.queue,
+                            priority: entry.updated.priority,
+                            id: &entry.updated.id,
+                            budgets: &entry.previous,
+                        });
+                        dispatch.insert(Placement::of(&entry.updated));
+                    }
+                }
+
+                Ok((result, rewritten))
+            },
+        )
+        .await??;
+
+        for entry in rewritten {
+            if entry.status == JobStatus::Ready {
+                let _ = self.event_tx.send(StoreEvent::JobDispatchable {
+                    id: entry.updated.id,
+                    queue: entry.updated.queue,
+                    token: Arc::new(AtomicBool::new(false)),
+                });
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -232,7 +482,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::super::options::EnqueueOptions;
-    use super::super::super::test_support::test_store;
+    use super::super::super::test_support::{test_store, test_store_with_retention};
     use super::super::{BudgetBinding, BudgetStrategy};
     use super::*;
     use crate::time::now_millis;
@@ -576,6 +826,67 @@ mod tests {
         );
     }
 
+    /// The aggregate has to end up describing the *new* cost and not the
+    /// old, in both directions. The old binding is untracked after the
+    /// commit; forgetting it would leave the previous cost counted
+    /// forever, and a budget permanently unshrinkable on the strength of
+    /// a cost no job draws any more.
+    #[tokio::test]
+    async fn a_cost_change_leaves_only_the_new_cost_counted() {
+        let store = store_with_budgets(&["stripe"]).await;
+        let job = enqueue_bound(&store, &[("stripe", 3)]).await;
+
+        let raise = |cost| BudgetMutation::SetCost {
+            key: "stripe".into(),
+            cost,
+        };
+
+        changed(
+            store
+                .patch_job_budgets(&job.id, raise(7), now_millis())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(7));
+
+        // Downwards is the direction that exposes a lingering old cost:
+        // the maximum would stay at seven.
+        changed(
+            store
+                .patch_job_budgets(&job.id, raise(2), now_millis())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(2));
+    }
+
+    /// The same, through the bulk path, which does its untracking in a
+    /// separate loop after the commit.
+    #[tokio::test]
+    async fn a_bulk_cost_change_leaves_only_the_new_cost_counted() {
+        let store = store_with_budgets(&["stripe"]).await;
+        enqueue_bound(&store, &[("stripe", 9)]).await;
+        enqueue_bound(&store, &[("stripe", 9)]).await;
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::SetCost {
+                    key: "stripe".into(),
+                    cost: 2,
+                },
+                now_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.changed, 2);
+
+        assert_eq!(store.budgets.tracked("stripe"), 2);
+        assert_eq!(store.budgets.max_cost("stripe"), Some(2));
+    }
+
     /// An in-flight job holds tokens against the bindings it was
     /// dispatched under, so moving them would either invent a slot on
     /// the new budget or strand one on the old.
@@ -674,6 +985,347 @@ mod tests {
         assert!(matches!(change, JobBudgetChange::Unchanged(_)));
         assert_eq!(store.budgets.tracked("stripe"), 1);
         assert_eq!(store.budgets.max_cost("stripe"), Some(3));
+    }
+
+    // --- bulk ---
+
+    /// The operator case this exists for: move every job off one budget
+    /// and onto another, without disturbing bindings it was not asked
+    /// about. Two calls, each scoped to one key.
+    #[tokio::test]
+    async fn a_shared_budget_can_be_split_without_losing_other_bindings() {
+        let store = store_with_budgets(&["old", "new", "other"]).await;
+
+        // One job on `old` alone, one on `old` and `other`.
+        let alone = enqueue_bound(&store, &[("old", 1)]).await;
+        let both = enqueue_bound(&store, &[("old", 1), ("other", 2)]).await;
+
+        let filter = JobFilter::new().budget_keys(HashSet::from(["old".to_string()]));
+
+        let added = store
+            .patch_jobs_budgets(
+                filter.clone(),
+                BudgetMutation::Add(BudgetBinding::new("new")),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added.changed, 2);
+        assert!(added.blocked.is_empty());
+
+        let removed = store
+            .patch_jobs_budgets(
+                filter,
+                BudgetMutation::Remove { key: "old".into() },
+                now_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.changed, 2);
+
+        let alone = store
+            .get_job(now_millis(), &alone.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let keys: Vec<_> = alone.budgets.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(keys, vec!["new"]);
+
+        // The binding it was never asked about survived.
+        let both = store
+            .get_job(now_millis(), &both.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut keys: Vec<_> = both.budgets.iter().map(|b| b.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["new", "other"]);
+    }
+
+    /// A job already bound is what `POST` promises to pass over, so it
+    /// is not reported at all — reporting it would make the response say
+    /// the operation fell short when it did exactly what it says.
+    #[tokio::test]
+    async fn already_bound_jobs_are_passed_over_silently() {
+        let store = store_with_budgets(&["stripe"]).await;
+        enqueue_bound(&store, &[("stripe", 1)]).await;
+        enqueue_bound(&store, &[]).await;
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::Add(BudgetBinding::new("stripe")),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 1);
+        assert!(result.blocked.is_empty());
+    }
+
+    /// The number this replaced counted every no-op, so an unfiltered
+    /// unbind reported the whole store as skipped — a figure that grew
+    /// with the database and told the caller nothing.
+    #[tokio::test]
+    async fn jobs_the_mutation_does_not_touch_are_not_reported() {
+        let store = store_with_budgets(&["wanted"]).await;
+        for _ in 0..5 {
+            enqueue_bound(&store, &[]).await;
+        }
+        enqueue_bound(&store, &[("wanted", 1)]).await;
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::Remove {
+                    key: "wanted".into(),
+                },
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 1);
+        assert!(
+            result.blocked.is_empty(),
+            "five untouched jobs should not be reported: {:?}",
+            result.blocked
+        );
+    }
+
+    /// In-flight jobs hold tokens against their current bindings, so a
+    /// filter that sweeps one up passes over it — but this is the one
+    /// outcome the caller can act on, so it comes back by id.
+    #[tokio::test]
+    async fn in_flight_jobs_are_reported_by_id() {
+        let store = store_with_budgets(&["stripe", "mailgun"]).await;
+        enqueue_bound(&store, &[("stripe", 1)]).await;
+        enqueue_bound(&store, &[("stripe", 1)]).await;
+
+        let running = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::Add(BudgetBinding::new("mailgun")),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 1);
+        assert_eq!(result.blocked, vec![running.id.clone()]);
+        assert_eq!(store.budgets.tracked("mailgun"), 1);
+
+        // Once it is no longer in flight, the same call lands.
+        store
+            .mark_completed(now_millis(), &running.id)
+            .await
+            .unwrap();
+    }
+
+    /// An in-flight job the mutation would not have changed anyway is
+    /// not blocked by anything — reporting it would send the caller
+    /// retrying something that will never do anything.
+    #[tokio::test]
+    async fn an_in_flight_job_with_nothing_to_change_is_not_reported() {
+        let store = store_with_budgets(&["stripe"]).await;
+        enqueue_bound(&store, &[("stripe", 1)]).await;
+
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // It already draws on `stripe`, so `Add` had nothing to do
+        // regardless of its state.
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::Add(BudgetBinding::new("stripe")),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 0);
+        assert!(result.blocked.is_empty());
+    }
+
+    /// The other way a mutation can have nothing to do: the job does not
+    /// draw on the budget being removed at all. Being in flight is
+    /// irrelevant to a job the request was never going to touch, so it
+    /// is not reported — otherwise an unfiltered unbind would name every
+    /// running job on the server.
+    #[tokio::test]
+    async fn an_in_flight_job_without_the_budget_is_not_reported() {
+        let store = store_with_budgets(&["targeted", "unrelated"]).await;
+
+        // In flight, and bound only to a budget the request ignores.
+        enqueue_bound(&store, &[("unrelated", 1)]).await;
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Queued, and actually affected.
+        let affected = enqueue_bound(&store, &[("targeted", 1)]).await;
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::Remove {
+                    key: "targeted".into(),
+                },
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 1);
+        assert!(
+            result.blocked.is_empty(),
+            "an in-flight job the request never touched should not be \
+             reported: {:?}",
+            result.blocked
+        );
+
+        let stored = store
+            .get_job(now_millis(), &affected.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.budgets.is_empty());
+    }
+
+    /// A finished job's bindings are inert — it will never dispatch and
+    /// is already untracked — so it is neither changed nor reported.
+    #[tokio::test]
+    async fn terminal_jobs_are_not_reported() {
+        let store = test_store_with_retention(60_000, 60_000);
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        let job = enqueue_bound(&store, &[("stripe", 1)]).await;
+
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        store.mark_completed(now_millis(), &job.id).await.unwrap();
+
+        let result = store
+            .patch_jobs_budgets(JobFilter::new(), BudgetMutation::RemoveAll, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 0);
+        assert!(
+            result.blocked.is_empty(),
+            "a finished job cannot be acted on: {:?}",
+            result.blocked
+        );
+    }
+
+    /// Wrong for every job the filter could match, so it refuses rather
+    /// than getting half way through.
+    #[tokio::test]
+    async fn a_malformed_request_fails_the_whole_batch() {
+        let store = store_with_budgets(&["stripe"]).await;
+        let job = enqueue_bound(&store, &[("stripe", 1)]).await;
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new(),
+                BudgetMutation::Add(BudgetBinding::new("ghost")),
+                now_millis(),
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
+
+        // Nothing moved.
+        let stored = store.get_job(now_millis(), &job.id).await.unwrap().unwrap();
+        assert_eq!(stored.budgets.len(), 1);
+        assert_eq!(store.budgets.tracked("stripe"), 1);
+    }
+
+    /// The filter narrows what is touched, so jobs outside it keep their
+    /// bindings.
+    #[tokio::test]
+    async fn only_matching_jobs_are_changed() {
+        let store = store_with_budgets(&["stripe"]).await;
+        let inside = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("t", "wanted", serde_json::json!({})),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let outside = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("t", "other", serde_json::json!({})),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new().queues(HashSet::from(["wanted".to_string()])),
+                BudgetMutation::Add(BudgetBinding::new("stripe")),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 1);
+        assert!(
+            !store
+                .get_job(now_millis(), &inside.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .budgets
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_job(now_millis(), &outside.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .budgets
+                .is_empty()
+        );
+    }
+
+    /// Matching nothing is a success that did nothing, not an error.
+    #[tokio::test]
+    async fn matching_no_jobs_changes_nothing() {
+        let store = store_with_budgets(&["stripe"]).await;
+
+        let result = store
+            .patch_jobs_budgets(
+                JobFilter::new().queues(HashSet::from(["absent".to_string()])),
+                BudgetMutation::Add(BudgetBinding::new("stripe")),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.changed, 0);
+        assert!(result.blocked.is_empty());
     }
 
     /// Scheduled jobs are not placed for dispatch, but they are counted:

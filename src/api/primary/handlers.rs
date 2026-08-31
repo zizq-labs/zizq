@@ -21,7 +21,7 @@ use axum::http::{self, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::sse::{Event, Sse};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
@@ -404,6 +404,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}/failure", post(report_failure))
         .route("/jobs/{id}/errors", get(list_errors))
         .route("/jobs/{id}/errors/{attempt}", get(get_error))
+        .route("/jobs/budgets", delete(bulk_clear_job_budgets))
+        .route(
+            "/jobs/budgets/{key}",
+            post(bulk_add_job_budget)
+                .put(bulk_set_job_budget)
+                .patch(bulk_patch_job_budget)
+                .delete(bulk_remove_job_budget),
+        )
         .route(
             "/jobs/{id}/budgets",
             put(replace_job_budgets).delete(clear_job_budgets),
@@ -2845,6 +2853,301 @@ async fn run_job_budget_mutation(
             )
         }
     }
+}
+
+/// Build a job filter from bulk query parameters.
+///
+/// Shared by the bulk budget routes so they select exactly the same set
+/// as `DELETE /jobs` does for the same query string — a filter that
+/// meant something different depending on which verb you sent it to
+/// would be a trap.
+fn job_filter_from(params: DeleteJobsParams) -> Result<store::JobFilter, String> {
+    for id in params.id.iter() {
+        if !is_valid_job_id(id) {
+            return Err(format!("invalid job ID: {id:?}"));
+        }
+    }
+
+    let payload_filter = match params.filter {
+        Some(ref expr) => Some(std::sync::Arc::new(
+            PayloadFilter::compile(expr).map_err(|e| format!("invalid filter: {e}"))?,
+        )),
+        None => None,
+    };
+
+    let mut filter = store::JobFilter::new();
+    if !params.id.is_empty() {
+        filter.ids = params.id.0;
+    }
+    if !params.status.is_empty() {
+        filter.statuses = params
+            .status
+            .iter()
+            .map(|s| store::JobStatus::from(*s))
+            .collect();
+    }
+    if !params.queue.is_empty() {
+        filter.queues = params.queue.0;
+    }
+    if !params.job_type.is_empty() {
+        filter.types = params.job_type.0;
+    }
+    if !params.budgets_key.is_empty() {
+        filter.budget_keys = params.budgets_key.0;
+    }
+    filter.priority = params.priority.0;
+    filter.ready_at = params.ready_at.0;
+    filter.attempts = params.attempts.0;
+    filter.payload_filter = payload_filter;
+
+    Ok(filter)
+}
+
+/// Apply a mutation across a filtered set and answer with the counts.
+async fn run_bulk_job_budget_mutation(
+    state: Arc<AppState>,
+    fmt: Format,
+    filter: store::JobFilter,
+    mutation: store::BudgetMutation,
+    now_ms: u64,
+) -> Response {
+    match state
+        .store
+        .patch_jobs_budgets(filter, mutation, now_ms)
+        .await
+    {
+        Ok(result) => respond(
+            fmt,
+            StatusCode::OK,
+            &serde_json::json!({ "changed": result.changed, "blocked": result.blocked }),
+        ),
+        Err(store::StoreError::InvalidOperation(error)) => respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error },
+        ),
+        Err(e) => {
+            tracing::error!(%e, "patch_jobs_budgets failed");
+            respond(
+                fmt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &ErrorResponse {
+                    error: "internal error".into(),
+                },
+            )
+        }
+    }
+}
+
+/// Handle `POST /jobs/budgets/{key}` — bind a budget across a matched
+/// set, passing over jobs that already draw on it.
+async fn bulk_add_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Query(params): Query<DeleteJobsParams>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetBindingRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let binding = match binding_from_path(key, req.cost, req.create_with, req.bucket) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error },
+            );
+        }
+    };
+
+    let filter = match job_filter_from(params) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error });
+        }
+    };
+
+    run_bulk_job_budget_mutation(
+        state,
+        fmt,
+        filter,
+        store::BudgetMutation::Add(binding),
+        now_ms,
+    )
+    .await
+}
+
+/// Handle `PUT /jobs/budgets/{key}` — bind or replace across a matched
+/// set.
+async fn bulk_set_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Query(params): Query<DeleteJobsParams>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetBindingRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let binding = match binding_from_path(key, req.cost, req.create_with, req.bucket) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return respond(
+                fmt,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &ErrorResponse { error },
+            );
+        }
+    };
+
+    let filter = match job_filter_from(params) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error });
+        }
+    };
+
+    run_bulk_job_budget_mutation(
+        state,
+        fmt,
+        filter,
+        store::BudgetMutation::Set(binding),
+        now_ms,
+    )
+    .await
+}
+
+/// Handle `PATCH /jobs/budgets/{key}` — change what a matched set draws,
+/// passing over jobs not bound to it.
+async fn bulk_patch_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Query(params): Query<DeleteJobsParams>,
+    NegotiatedBody(req): NegotiatedBody<JobBudgetCostRequest>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    if let Err(error) = validate_name("budget key", &key) {
+        return respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error },
+        );
+    }
+
+    let filter = match job_filter_from(params) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error });
+        }
+    };
+
+    let mutation = store::BudgetMutation::SetCost {
+        key,
+        cost: req.cost,
+    };
+    run_bulk_job_budget_mutation(state, fmt, filter, mutation, now_ms).await
+}
+
+/// Handle `DELETE /jobs/budgets/{key}` — unbind one budget across a
+/// matched set.
+async fn bulk_remove_job_budget(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Query(params): Query<DeleteJobsParams>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    if let Err(error) = validate_name("budget key", &key) {
+        return respond(
+            fmt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse { error },
+        );
+    }
+
+    let filter = match job_filter_from(params) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error });
+        }
+    };
+
+    run_bulk_job_budget_mutation(
+        state,
+        fmt,
+        filter,
+        store::BudgetMutation::Remove { key },
+        now_ms,
+    )
+    .await
+}
+
+/// Handle `DELETE /jobs/budgets` — unbind everything across a matched
+/// set.
+///
+/// There is deliberately no `PUT` counterpart. Replacing a whole set is
+/// only sound when the caller knows what is being replaced, which over a
+/// filtered selection they do not — a filter naming one budget still
+/// matches jobs drawing on others, and replacing would silently discard
+/// those. Clearing is different: it says exactly what it does.
+async fn bulk_clear_job_budgets(
+    AcceptFormat(fmt): AcceptFormat,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DeleteJobsParams>,
+) -> Response {
+    let now_ms = (state.clock)();
+    if let Err(e) = state
+        .license
+        .read()
+        .unwrap()
+        .require(now_ms, crate::license::Feature::Budgets)
+    {
+        return respond(fmt, StatusCode::FORBIDDEN, &ErrorResponse { error: e });
+    }
+
+    let filter = match job_filter_from(params) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return respond(fmt, StatusCode::BAD_REQUEST, &ErrorResponse { error });
+        }
+    };
+
+    run_bulk_job_budget_mutation(state, fmt, filter, store::BudgetMutation::RemoveAll, now_ms).await
 }
 
 /// Convert a wire strategy patch into its store form.
@@ -9439,6 +9742,234 @@ mod tests {
                 "DELETE",
                 "/jobs/0000000000000000000000000/budgets",
             ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- bulk job budget bindings ---
+
+    /// `/jobs/budgets/{key}` and `/jobs/{id}/budgets` are both three
+    /// segments, so they could in principle shadow each other. Verified
+    /// rather than assumed: a job id is never the literal `budgets`, but
+    /// the router has to prefer the static segment for that to matter.
+    #[tokio::test]
+    async fn bulk_and_single_budget_routes_do_not_shadow_each_other() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+        let id = plain_job(&app).await;
+
+        // Three segments, middle one dynamic: the single-job route.
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "PUT",
+                &format!("/jobs/{id}/budgets"),
+                &serde_json::json!({ "budgets": [{ "key": "stripe" }] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Three segments, middle one literal: the bulk route.
+        let res = app
+            .clone()
+            .oneshot(empty_request("DELETE", "/jobs/budgets/stripe"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["changed"], 1);
+
+        assert!(budgets_of(&app, &id).await.is_null());
+    }
+
+    /// The case the whole endpoint set exists for: move every job off
+    /// one budget onto another, leaving bindings it was not asked about
+    /// alone. Two calls, each scoped to one key.
+    #[tokio::test]
+    async fn a_shared_budget_can_be_split_over_http() {
+        let app = pro_app();
+        for key in ["old", "new", "other"] {
+            app.clone()
+                .oneshot(budget_post(key, &while_in_flight(10)))
+                .await
+                .unwrap();
+        }
+
+        let bind = |budgets: serde_json::Value| {
+            json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t", "queue": "q", "payload": {}, "budgets": budgets
+                }),
+            )
+        };
+        app.clone()
+            .oneshot(bind(serde_json::json!([{ "key": "old" }])))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(bind(
+                serde_json::json!([{ "key": "old" }, { "key": "other", "cost": 2 }]),
+            ))
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs/budgets/new?budgets.key=old",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["changed"], 2);
+
+        let res = app
+            .clone()
+            .oneshot(empty_request("DELETE", "/jobs/budgets/old?budgets.key=old"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Nothing draws on `old` any more, so it deletes cleanly — and
+        // `other` survived on the job that had it.
+        let res = app
+            .clone()
+            .oneshot(empty_request("DELETE", "/budgets/old"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let res = app
+            .oneshot(empty_request("GET", "/jobs/count?budgets.key=other"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["count"], 1);
+    }
+
+    /// Jobs already bound are passed over rather than failing the
+    /// operation — a per-job 409 has nowhere to go here — and are not
+    /// reported, since that is what the verb promises to do.
+    #[tokio::test]
+    async fn bulk_binding_reports_what_it_skipped() {
+        let app = pro_app();
+        app.clone()
+            .oneshot(budget_post("stripe", &while_in_flight(10)))
+            .await
+            .unwrap();
+
+        app.clone()
+            .oneshot(json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t", "queue": "q", "payload": {},
+                    "budgets": [{ "key": "stripe" }]
+                }),
+            ))
+            .await
+            .unwrap();
+        plain_job(&app).await;
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs/budgets/stripe",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["changed"], 1);
+        assert_eq!(body["blocked"], serde_json::json!([]));
+    }
+
+    /// The one outcome a caller can act on comes back by id, so it can
+    /// retry those jobs once they leave the in-flight state.
+    #[tokio::test]
+    async fn bulk_binding_names_the_jobs_it_could_not_touch() {
+        let app = pro_app();
+        for key in ["stripe", "mailgun"] {
+            app.clone()
+                .oneshot(budget_post(key, &while_in_flight(10)))
+                .await
+                .unwrap();
+        }
+
+        let bound = |n: u32| {
+            json_request(
+                "POST",
+                "/jobs",
+                &serde_json::json!({
+                    "type": "t", "queue": "q", "payload": { "n": n },
+                    "budgets": [{ "key": "stripe" }]
+                }),
+            )
+        };
+        app.clone().oneshot(bound(1)).await.unwrap();
+        app.clone().oneshot(bound(2)).await.unwrap();
+
+        // Put one in flight.
+        let res = app
+            .clone()
+            .oneshot(empty_request("GET", "/jobs/take?prefetch=1"))
+            .await
+            .unwrap();
+        let mut body = res.into_body();
+        let bytes = next_body_bytes(&mut body).await;
+        let taken: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        let taken_id = taken["id"].as_str().unwrap().to_string();
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs/budgets/mailgun",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_str(&response_body(res).await).unwrap();
+        assert_eq!(body["changed"], 1);
+        assert_eq!(body["blocked"], serde_json::json!([taken_id]));
+    }
+
+    /// Wrong for every job the filter could match, so it refuses outright
+    /// rather than changing some of them.
+    #[tokio::test]
+    async fn a_bulk_request_naming_an_unknown_budget_is_422() {
+        let app = pro_app();
+        plain_job(&app).await;
+
+        let res = app
+            .oneshot(json_request(
+                "POST",
+                "/jobs/budgets/ghost",
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bulk_job_budget_routes_are_403_on_free_tier() {
+        let res = test_app()
+            .oneshot(empty_request("DELETE", "/jobs/budgets"))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
