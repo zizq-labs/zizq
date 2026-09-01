@@ -289,6 +289,138 @@ endpoint wraps an array of `{"jobs": [...]}`.
                 outputs return <code>422 Unprocessable Entity</code>.
             </td>
         </tr>
+        <tr>
+            <td>
+                <div><code>budgets</code></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+                <strong>Requires a <em>pro</em> license</strong>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be valid UTF-8 and must
+                not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].cost</code></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget. Defaults
+                to 1.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Specification from which to create this budget atomically
+                with the job if it does not already exist. Without this, the
+                budget must exist or a 422 response will be returned. Does not
+                overwrite any existing budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.allocation</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The total number of tokens available in this budget's pool for
+                use by its configured strategy. No jobs can exist bound to this
+                budget with a <code>cost</code> that exceeds the allocation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy</code> <em>required</em></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Details of the specific strategy that is used to manage the
+                tokens available under this budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy.type</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Names the strategy used to manage the tokens within the budget.
+                One of:
+                <dl>
+                    <dt><code>while_in_flight</code></dt>
+                    <dd>
+                        Concurrency control — tokens are spent from the budget
+                        when jobs are dispatched to workers, and returned when
+                        the job completes or fails, or the worker disconnects
+                        uncleanly. For example, for an allocation of 5, at most
+                        5 jobs bound to this budget can be in-flight at any
+                        given time.
+                    </dd>
+                    <dt><code>time_based</code></dt>
+                    <dd>
+                        Rate limit — tokens are spent from the budget when jobs
+                        are dispatched to workers and are only returned after a
+                        configured period of time, regardless of the outcome of
+                        the job.
+                    </dd>
+                </dl>
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy.duration_ms</code></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                Required for <code>time_based</code> strategies. Invalid for
+                <code>while_in_flight</code>. Specifies the period of time in
+                milliseconds over which a <code>time_based</code> rate limit is
+                measured. For example, for an allocation of 1000 and a
+                <code>duration_ms</code> of 60000, the rate limit is
+                <code>1000/minute</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy.burst</code></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The maximum number of tokens that may be accumulated at once
+                for a <code>time_based</code> budget. Defaults to whatever the
+                configured <code>allocation</code> is. So for a
+                <code>1000/hour</code> rate limit, the budget would technically
+                permit a short burst of 1000 jobs if no other jobs have used
+                tokens from the budget for a whole hour. Setting a burst of 1
+                means tokens cannot accumulate and jobs are always paced
+                according to the configured rate limit. It is also possible to
+                intentionally set a burst higher than the configured
+                allocation, such as a burst of 2000 for a
+                <code>1000/hour</code> allocation. In this case if the budget
+                has been idle for 2 hours, it would permit a sudden burst of
+                2000 jobs at any moment. No jobs can exist bound to this
+                budget with a <code>cost</code> that exceeds the burst.
+            </td>
+        </tr>
     </tbody>
 </table>
 
@@ -557,6 +689,111 @@ Unique jobs require a [pro license](https://zizq.io/pricing).
 >     "type": "hello_world",
 >     "unique_key": "hello_world:world",
 >     "unique_while": "queued"
+> }
+> ```
+
+### Enqueue a job against multiple budgets
+
+Budgets are used for rate limiting and concurrency control. In this example
+budgets have already been created and the newly enqueued job is bound to those
+budgets.
+
+> Request:
+> ```sh
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "type": "example",
+>     "queue": "example",
+>     "payload": {},
+>     "budgets": [
+>         {
+>             "key": "schema-bot",
+>             "cost": 2
+>         },
+>         {"key": "image-service"}
+>     ]
+> }'
+> ```
+
+> Response:
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 249
+> content-type: application/json
+> date: Mon, 31 Aug 2026 22:49:49 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "budgets": [
+>         {
+>             "cost": 2,
+>             "key": "schema-bot"
+>         },
+>         {
+>             "cost": 1,
+>             "key": "image-service"
+>         }
+>     ],
+>     "duplicate": false,
+>     "folded": false,
+>     "id": "03gsa8rjaoxgqgnrsnlt7niqb",
+>     "priority": 32768,
+>     "queue": "example",
+>     "ready_at": 1788216589726,
+>     "status": "ready",
+>     "type": "example"
+> }
+> ```
+
+### Enqueue a job against budgets using `create_with`
+
+In this example, the budget for a job need not be created ahead of time. If it
+does not exist, Zizq will create it atomically with the job.
+
+> Request:
+> ```sh
+> http POST http://127.0.0.1:7890/jobs --raw '{
+>     "type": "example",
+>     "queue": "example",
+>     "payload": {},
+>     "budgets": [
+>         {
+>             "key": "cpu-intensive",
+>             "create_with": {
+>                 "allocation": 100,
+>                 "strategy": {
+>                     "type": "while_in_flight"
+>                 }
+>             }
+>         }
+>     ]
+> }'
+> ```
+
+> Response:
+> ```http
+> HTTP/1.1 201 Created
+> content-length: 219
+> content-type: application/json
+> date: Mon, 31 Aug 2026 22:53:01 GMT
+> ```
+> ```json
+> {
+>     "attempts": 0,
+>     "budgets": [
+>         {
+>             "cost": 1,
+>             "key": "cpu-intensive"
+>         }
+>     ],
+>     "duplicate": false,
+>     "folded": false,
+>     "id": "03gsa9e0vd59nf3zgysm1yxd0",
+>     "priority": 32768,
+>     "queue": "example",
+>     "ready_at": 1788216781592,
+>     "status": "ready",
+>     "type": "example"
 > }
 > ```
 

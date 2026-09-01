@@ -8,7 +8,9 @@ Zizq is designed with _visibility_ and _control_ front of mind. A number of
 endpoints exist that allow updating and deleting job data from the server.
 
 Jobs in the `"completed"` and `"dead"` statuses are immutable and cannot be
-modified, though they can be deleted.
+modified, though they can be deleted. Additionally, when modifying
+[budget bindings](./rate-limiting.md) jobs in the `"in_flight"` status cannot
+be updated (the operation can be retried once the job is no longer in-flight).
 
 The following fields are mutable:
 
@@ -18,6 +20,7 @@ The following fields are mutable:
 * `retry_limit`
 * `backoff`
 * `retention`
+* `budgets`
 
 ## `DELETE /jobs/{id}` { #delete-job }
 
@@ -80,53 +83,7 @@ All options are additive.
         </tr>
     </thead>
     <tbody>
-        <tr>
-            <td>
-                <div><code>id</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of job IDs to delete.
-            </td>
-        </tr>
-        <tr>
-            <td>
-                <div><code>queue</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of queue names to filter by.
-            </td>
-        </tr>
-        <tr>
-            <td>
-                <div><code>type</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of job types to filter by.
-            </td>
-        </tr>
-        <tr>
-            <td>
-                <div><code>status</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of job statuses to filter by.
-            </td>
-        </tr>
-        {{#include ./range-params.md}}
-        <tr>
-            <td>
-                <div><code>filter</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional <code>jq</code> expression to filter jobs by
-                <code>payload</code>.
-            </td>
-        </tr>
+        {{#include ./query-filter-parameter-rows.md}}
     </tbody>
 </table>
 
@@ -330,54 +287,7 @@ All filter options are additive.
         </tr>
     </thead>
     <tbody>
-        <tr>
-            <td>
-                <div><code>id</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of job IDs to update.
-            </td>
-        </tr>
-        <tr>
-            <td>
-                <div><code>queue</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of queue names to filter by.
-            </td>
-        </tr>
-        <tr>
-            <td>
-                <div><code>type</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of job types to filter by.
-            </td>
-        </tr>
-        <tr>
-            <td>
-                <div><code>status</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional comma-separated list of job statuses to filter by.
-                Must not include <code>completed</code> or <code>dead</code>.
-            </td>
-        </tr>
-        {{#include ./range-params.md}}
-        <tr>
-            <td>
-                <div><code>filter</code> <em>query</em></div>
-                <div><pre>string</pre></div>
-            </td>
-            <td>
-                Optional <code>jq</code> expression to filter jobs by
-                <code>payload</code>.
-            </td>
-        </tr>
+        {{#include ./query-filter-parameter-rows.md}}
     </tbody>
 </table>
 
@@ -419,6 +329,988 @@ When given invalid input parameters.
 
 When the status filter includes terminal statuses, or invalid field values are
 provided.
+
+{{#include ./error-response.md}}
+
+## `POST /jobs/{id}/budgets/{key}` { #post-jobs-id-budgets-key }
+
+Bind a single job to the named budget.
+
+### Parameters { #post-jobs-id-budgets-key-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job to which the budget will be bound.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be
+                valid UTF-8 and must not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Request Body { #post-jobs-id-budgets-key-body }
+
+{{#include ./bind-budget-parameters.md}}
+
+### Responses { #post-jobs-id-budgets-key-response }
+
+#### `200` OK
+
+Returns the updated job without the payload.
+
+{{#include ./job-response-without-payload.md}}
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
+#### `409` Conflict
+
+When a budget with the named `key` is already bound to this job.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When the job is in a terminal state, is in-flight or invalid values are
+provided.
+
+{{#include ./error-response.md}}
+
+## `PUT /jobs/{id}/budgets/{key}` { #put-jobs-id-budgets-key }
+
+Replace the named budget binding on a single job. Creates it if does not
+already exist.
+
+### Parameters { #put-jobs-id-budgets-key-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job to which the budget will be bound.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be
+                valid UTF-8 and must not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Request Body { #put-jobs-id-budgets-key-body }
+
+{{#include ./bind-budget-parameters.md}}
+
+### Responses { #put-jobs-id-budgets-key-response }
+
+#### `200` OK
+
+Returns the updated job without the payload.
+
+{{#include ./job-response-without-payload.md}}
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
+#### `409` Conflict
+
+When a budget with the named `key` is already bound to this job.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When the job is in a terminal state, is in-flight or invalid values are
+provided.
+
+{{#include ./error-response.md}}
+
+## `PATCH /jobs/{id}/budgets/{key}` { #patch-jobs-id-budgets-key }
+
+Update the named budget binding on a single job. Currently the only patchable
+field is `cost`.
+
+### Parameters { #patch-jobs-id-budgets-key-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job for which the budget is to be patched.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Request Body { #patch-jobs-id-budgets-key-body }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>cost</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens the job takes from the budget.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #patch-jobs-id-budgets-key-response }
+
+#### `200` OK
+
+Returns the updated job without the payload.
+
+{{#include ./job-response-without-payload.md}}
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When the job is in a terminal state, is in-flight or invalid values are
+provided.
+
+{{#include ./error-response.md}}
+
+## `DELETE /jobs/{id}/budgets/{key}` { #delete-jobs-id-budgets-key }
+
+Remove the named budget binding from a single job.
+
+### Parameters { #delete-jobs-id-budgets-key-parameters }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job for which the budget is to be removed.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #delete-jobs-id-budgets-key-response }
+
+#### `200` OK
+
+Returns the updated job without the payload.
+
+{{#include ./job-response-without-payload.md}}
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When the job is in a terminal state or is in-flight.
+
+{{#include ./error-response.md}}
+
+## `PUT /jobs/{id}/budgets` { #put-jobs-id-budgets-bulk }
+
+Replace all budgets on the specified job.
+
+### Parameters { #put-jobs-id-budgets-bulk }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job for which to replace budgets.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Request Body { #put-jobs-id-budgets-bulk-body }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>budgets</code> <em>required</em></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+                <strong>Requires a <em>pro</em> license</strong>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be valid UTF-8 and must
+                not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].cost</code></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget. Defaults
+                to 1.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Specification from which to create this budget atomically
+                with the job if it does not already exist. Without this, the
+                budget must exist or a 422 response will be returned. Does not
+                overwrite any existing budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.allocation</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The total number of tokens available in this budget's pool for
+                use by its configured strategy. No jobs can exist bound to this
+                budget with a <code>cost</code> that exceeds the allocation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy</code> <em>required</em></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Details of the specific strategy that is used to manage the
+                tokens available under this budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy.type</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Names the strategy used to manage the tokens within the budget.
+                One of:
+                <dl>
+                    <dt><code>while_in_flight</code></dt>
+                    <dd>
+                        Concurrency control — tokens are spent from the budget
+                        when jobs are dispatched to workers, and returned when
+                        the job completes or fails, or the worker disconnects
+                        uncleanly. For example, for an allocation of 5, at most
+                        5 jobs bound to this budget can be in-flight at any
+                        given time.
+                    </dd>
+                    <dt><code>time_based</code></dt>
+                    <dd>
+                        Rate limit — tokens are spent from the budget when jobs
+                        are dispatched to workers and are only returned after a
+                        configured period of time, regardless of the outcome of
+                        the job.
+                    </dd>
+                </dl>
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy.duration_ms</code></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                Required for <code>time_based</code> strategies. Invalid for
+                <code>while_in_flight</code>. Specifies the period of time in
+                milliseconds over which a <code>time_based</code> rate limit is
+                measured. For example, for an allocation of 1000 and a
+                <code>duration_ms</code> of 60000, the rate limit is
+                <code>1000/minute</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].create_with.strategy.burst</code></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The maximum number of tokens that may be accumulated at once
+                for a <code>time_based</code> budget. Defaults to whatever the
+                configured <code>allocation</code> is. So for a
+                <code>1000/hour</code> rate limit, the budget would technically
+                permit a short burst of 1000 jobs if no other jobs have used
+                tokens from the budget for a whole hour. Setting a burst of 1
+                means tokens cannot accumulate and jobs are always paced
+                according to the configured rate limit. It is also possible to
+                intentionally set a burst higher than the configured
+                allocation, such as a burst of 2000 for a
+                <code>1000/hour</code> allocation. In this case if the budget
+                has been idle for 2 hours, it would permit a sudden burst of
+                2000 jobs at any moment. No jobs can exist bound to this
+                budget with a <code>cost</code> that exceeds the burst.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #put-jobs-id-budgets-bulk-response }
+
+#### `200` OK
+
+Returns the updated job without the payload.
+
+{{#include ./job-response-without-payload.md}}
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When the job is in a terminal state, is in-flight or invalid values are
+provided.
+
+{{#include ./error-response.md}}
+
+## `DELETE /jobs/{id}/budgets` { #delete-jobs-id-budgets-bulk }
+
+Remove all budgets from the specified job.
+
+### Parameters { #delete-jobs-id-budgets-bulk }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>id</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                ID of the job for which to remove budgets.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #delete-jobs-id-budgets-bulk-response }
+
+#### `200` OK
+
+Returns the updated job without the payload.
+
+{{#include ./job-response-without-payload.md}}
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `404` Not Found
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When the job is in a terminal state, is in-flight or invalid values are
+provided.
+
+{{#include ./error-response.md}}
+
+## `POST /jobs/budgets/{key}` { #post-jobs-budgets-key }
+
+Bind a budget to all matching jobs specified by the filter. Jobs that already
+have the binding are gracefully skipped. Jobs in a terminal status are
+gracefully skipped. Jobs in the `in_flight` status are _blocked_ and reported
+for retry.
+
+### Parameters { #post-jobs-budgets-key-parameters }
+
+All options are additive.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be
+                valid UTF-8 and must not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+        {{#include ./query-filter-parameter-rows.md}}
+    </tbody>
+</table>
+
+### Request Body { #post-jobs-budgets-key-body }
+
+{{#include ./bind-budget-parameters.md}}
+
+### Responses { #post-jobs-budgets-key-response }
+
+#### `200` OK
+
+Returns the number of updated jobs, and the list of any job IDs that could not
+be updated because those jobs were `in_flight` — in which case those specific
+IDs may be retried.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>changed</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of jobs that were modified in the operation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>blocked</code> <em>required</em></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of Job IDs that were not modified because they were
+                <code>in_flight</code>. The operation may be retried, including
+                just those IDs in the <code>id</code> query parameter.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When invalid values are provided.
+
+{{#include ./error-response.md}}
+
+## `PUT /jobs/budgets/{key}` { #put-jobs-budgets-key }
+
+Replace budget to all matching jobs specified by the filter. Jobs that already
+have the binding are updated. Jobs that do not have the binding are given it.
+Jobs in a terminal status are gracefully skipped. Jobs in the `in_flight`
+status are _blocked_ and reported for retry.
+
+### Parameters { #put-jobs-budgets-key-parameters }
+
+All options are additive.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be
+                valid UTF-8 and must not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+        {{#include ./query-filter-parameter-rows.md}}
+    </tbody>
+</table>
+
+### Request Body { #post-jobs-budgets-key-body }
+
+{{#include ./bind-budget-parameters.md}}
+
+### Responses { #post-jobs-budgets-key-response }
+
+#### `200` OK
+
+Returns the number of updated jobs, and the list of any job IDs that could not
+be updated because those jobs were `in_flight` — in which case those specific
+IDs may be retried.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>changed</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of jobs that were modified in the operation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>blocked</code> <em>required</em></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of Job IDs that were not modified because they were
+                <code>in_flight</code>. The operation may be retried, including
+                just those IDs in the <code>id</code> query parameter.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When invalid values are provided.
+
+{{#include ./error-response.md}}
+
+## `PATCH /jobs/budgets/{key}` { #patch-jobs-budgets-key }
+
+Update the details of the named budget on all matching jobs specified by the
+filter. Currently only the `cost` can be patched. Jobs that do not have the
+binding are gracefull skipped. Jobs that have the binding are updated. Jobs in
+a terminal status are gracefully skipped. Jobs in the `in_flight` status are
+_blocked_ and reported for retry.
+
+### Parameters { #patch-jobs-budgets-key-parameters }
+
+All options are additive.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+        {{#include ./query-filter-parameter-rows.md}}
+    </tbody>
+</table>
+
+### Request Body { #patch-jobs-budgets-key-body }
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>cost</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens jobs take from the budget.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+### Responses { #patch-jobs-budgets-key-response }
+
+#### `200` OK
+
+Returns the number of updated jobs, and the list of any job IDs that could not
+be updated because those jobs were `in_flight` — in which case those specific
+IDs may be retried.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>changed</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of jobs that were modified in the operation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>blocked</code> <em>required</em></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of Job IDs that were not modified because they were
+                <code>in_flight</code>. The operation may be retried, including
+                just those IDs in the <code>id</code> query parameter.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When invalid values are provided.
+
+{{#include ./error-response.md}}
+
+## `DELETE /jobs/budgets/{key}` { #delete-jobs-budgets-key }
+
+Remove the named budget from all matching jobs specified by the filter. Jobs
+that do not have the binding are gracefull skipped. Jobs that have the binding
+are updated. Jobs in a terminal status are gracefully skipped. Jobs in the
+`in_flight` status are _blocked_ and reported for retry.
+
+### Parameters { #delete-jobs-budgets-key-parameters }
+
+All options are additive.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>key</code> <em>path</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+        {{#include ./query-filter-parameter-rows.md}}
+    </tbody>
+</table>
+
+### Responses { #delete-jobs-budgets-key-response }
+
+#### `200` OK
+
+Returns the number of updated jobs, and the list of any job IDs that could not
+be updated because those jobs were `in_flight` — in which case those specific
+IDs may be retried.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>changed</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of jobs that were modified in the operation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>blocked</code> <em>required</em></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of Job IDs that were not modified because they were
+                <code>in_flight</code>. The operation may be retried, including
+                just those IDs in the <code>id</code> query parameter.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When invalid values are provided.
+
+{{#include ./error-response.md}}
+
+## `DELETE /jobs/budgets` { #delete-jobs-budgets-bulk }
+
+Remove _all_ budgets from all matching jobs specified by the filter. Jobs in a
+terminal status are gracefully skipped. Jobs in the `in_flight` status are
+_blocked_ and reported for retry.
+
+### Parameters { #delete-jobs-budgets-bulk-parameters }
+
+All options are additive.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{#include ./query-filter-parameter-rows.md}}
+    </tbody>
+</table>
+
+### Responses { #delete-jobs-budgets-bulk-response }
+
+#### `200` OK
+
+Returns the number of updated jobs, and the list of any job IDs that could not
+be updated because those jobs were `in_flight` — in which case those specific
+IDs may be retried.
+
+<table>
+    <thead>
+        <tr>
+            <th>Field</th>
+            <th>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>
+                <div><code>changed</code> <em>required</em></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                The number of jobs that were modified in the operation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>blocked</code> <em>required</em></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of Job IDs that were not modified because they were
+                <code>in_flight</code>. The operation may be retried, including
+                just those IDs in the <code>id</code> query parameter.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+#### `403` Forbidden
+
+When the server is not confiured with a Pro license.
+
+{{#include ./error-response.md}}
+
+#### `422` Unprocessable Entity
+
+When invalid values are provided.
 
 {{#include ./error-response.md}}
 

@@ -118,14 +118,84 @@
                 <div><pre>object</pre></div>
             </td>
             <td>
-                The batched-job configuration attached at enqueue time, if
-                any. Only the first enqueue's config applies for the life
-                of the batch; this field is echoed back on every
-                job-fetch response so callers can observe the exact
-                <code>when</code> / <code>fold</code> expressions the
-                server is evaluating on subsequent folds. See the
-                <a href="./enqueue.html#batched-jobs">Batched jobs</a>
-                section for the field shape.
+                Optional batched-job configuration. When present, subsequent
+                enqueues sharing the same <code>batch.key</code> are
+                <em>folded</em> into this job's pending payload via the
+                <code>when</code> and <code>fold</code> jq expressions,
+                rather than creating separate pending jobs. All three inner
+                fields are required when this field is set. Mutually exclusive
+                with <code>unique_key</code> — supplying both returns
+                <code>400 Bad Request</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch.key</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Identifies the batch. Only one unsealed batched job exists
+                per key at a time. Enqueues sharing this key fold into the
+                existing pending job (or start a new one if none exists or
+                the existing batch was already sealed).
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch.when</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> predicate that
+                decides whether an incoming enqueue folds into the existing
+                pending job. Evaluated with <code>$existing</code> bound to
+                the current pending payload and <code>$new</code> bound to
+                the incoming payload. Truthy means fold; falsy seals the
+                existing batch and starts a fresh one from the incoming
+                enqueue. Invalid jq syntax, or an expression that returns
+                multiple outputs, returns <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>batch.fold</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> expression that
+                produces the merged payload when a fold occurs. Runs with the
+                same <code>$existing</code> and <code>$new</code> bindings as
+                <code>when</code>. Must produce exactly one output; multiple
+                outputs return <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets</code></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].cost</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget.
             </td>
         </tr>
         <tr>
@@ -240,6 +310,35 @@
                 <code>completed</code> jobs after successful processing. When
                 not set, the server's default value (zero) applies. When set to
                 zero, jobs are purged immediately upon completion.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets</code></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].cost</code></div>
+                <div><pre>int32</pre> <em>required</em></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget.
             </td>
         </tr>
     </tbody>

@@ -224,7 +224,6 @@
                 <code>duplicate</code> field set to <code>true</code>. This key
                 is intentionally global across all queues and job types.
                 Clients should prefix it as necessary.
-                <strong>Requires a <em>pro</em> license</strong>.
             </td>
         </tr>
         <tr>
@@ -258,6 +257,92 @@
                     </dd>
                 </dl>
                 The default scope is <code>queued</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Optional batched-job configuration. When present, subsequent
+                enqueues sharing the same <code>batch.key</code> are
+                <em>folded</em> into this job's pending payload via the
+                <code>when</code> and <code>fold</code> jq expressions,
+                rather than creating separate pending jobs. All three inner
+                fields are required when this field is set. Mutually exclusive
+                with <code>unique_key</code> — supplying both returns
+                <code>400 Bad Request</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch.key</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Identifies the batch. Only one unsealed batched job exists
+                per key at a time. Enqueues sharing this key fold into the
+                existing pending job (or start a new one if none exists or
+                the existing batch was already sealed).
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch.when</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> predicate that
+                decides whether an incoming enqueue folds into the existing
+                pending job. Evaluated with <code>$existing</code> bound to
+                the current pending payload and <code>$new</code> bound to
+                the incoming payload. Truthy means fold; falsy seals the
+                existing batch and starts a fresh one from the incoming
+                enqueue. Invalid jq syntax, or an expression that returns
+                multiple outputs, returns <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch.fold</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> expression that
+                produces the merged payload when a fold occurs. Runs with the
+                same <code>$existing</code> and <code>$new</code> bindings as
+                <code>when</code>. Must produce exactly one output; multiple
+                outputs return <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets</code></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].cost</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget.
             </td>
         </tr>
         <tr>
