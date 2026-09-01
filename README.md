@@ -12,11 +12,11 @@ planned soon).
 
 ## Features
 
-Zizq supports a growing number of features.
+Zizq supports a number of powerful features.
 
 * Single self-contained executable— no separate data store required
 * Durable and atomic job queues
-* Easy to use `HTTP/1.1` and `HTTP/2` API with JSON or MsgPack
+* Easy to use `HTTP/1.1` and `HTTP/2` API with JSON or MessagePack
 * Cross-language job enqueueing and execution
 * Unlimited named queues
 * FIFO ordered and granular priority jobs
@@ -24,6 +24,8 @@ Zizq supports a growing number of features.
 * Configurable backoff/retry policies
 * Configurable job retention policies
 * Unique job support (deduplicated enqueues)
+* Job concurrency control (max N jobs running at once)
+* Job rate limiting (max N jobs dispatched over time)
 * Cron (recurring jobs) scheduling
 * Batched job support (folded/merged enqueues)
 * APIs to manage the queue contents, including `jq` expression filters
@@ -174,7 +176,10 @@ each ships a worker that runs jobs with a configurable level of concurrency.
 
 Jobs can be enqueued from one language and processed by a worker in another.
 
-#### Node.js — [repo](https://github.com/zizq-labs/zizq-node) · [docs](https://zizq.io/docs/clients/node/)
+#### Node.js
+
+* [Source](https://github.com/zizq-labs/zizq-node)
+* [Docs](https://zizq.io/docs/clients/node/)
 
 ```ts
 import { Client } from "@zizq-labs/zizq";
@@ -188,7 +193,10 @@ await client.enqueue({
 });
 ```
 
-#### Ruby — [repo](https://github.com/zizq-labs/zizq-ruby) · [docs](https://zizq.io/docs/clients/ruby/)
+#### Ruby
+
+* [Source](https://github.com/zizq-labs/zizq-ruby)
+* [Docs](https://zizq.io/docs/clients/ruby/)
 
 ```ruby
 class SendEmailJob
@@ -204,7 +212,10 @@ end
 Zizq.enqueue(SendEmailJob, 42, template: 'welcome')
 ```
 
-#### Elixir — [repo](https://github.com/zizq-labs/zizq-elixir) · [docs](https://zizq.io/docs/clients/elixir/)
+#### Elixir
+
+* [Source](https://github.com/zizq-labs/zizq-elixir)
+* [Docs](https://zizq.io/docs/clients/elixir/)
 
 ```elixir
 defmodule MyApp.SendEmail do
@@ -218,7 +229,10 @@ MyApp.SendEmail.new(%{"user_id" => 42})
 |> Zizq.enqueue(MyApp.Zizq)
 ```
 
-#### Rust — [repo](https://github.com/zizq-labs/zizq-rust) · [docs](https://zizq.io/docs/clients/rust/)
+#### Rust
+
+* [Source](https://github.com/zizq-labs/zizq-rust)
+* [Docs](https://zizq.io/docs/clients/rust/)
 
 ```rust
 #[derive(Serialize, Deserialize, JobKind)]
@@ -230,8 +244,8 @@ struct SendEmail {
 client.enqueue(SendEmail { user_id: 42 }).await?;
 ```
 
-Want a client for Zizq in a language not currently supported?
-[leave a feature request](https://github.com/zizq-labs/zizq/issues) or
+Looking for a client for Zizq in a language not currently supported?
+[Leave a feature request](https://github.com/zizq-labs/zizq/issues) or
 [build your own](https://zizq.io/docs/api/) easily.
 
 ### Viewing live queue activity

@@ -15,6 +15,11 @@ allocate a dedicated worker for the purpose of processing recurring jobs.
 Collections of _cron entries_ are grouped together into one or more
 _cron groups_. Entire groups, and individual entries can be paused and resumed.
 
+The jobs that a cron schedule can enqueue are just like any other job, with the
+sole exception that they cannot specify `ready_at` — which would be
+nonsensical. They can use unique keys, batched jobs,
+[budgets](./rate-limiting.md) and any future features without restriction.
+
 The API is designed to facilitate clients performing a single `PUT` operation
 to define (or redefine) one or more schedules at application startup time. Many
 clients can all perform this same operation safely. The result is idempotent.
@@ -293,7 +298,6 @@ schedule data unconditionally and Zizq is smart enough to handle it safely.
                 <code>duplicate</code> field set to <code>true</code>. This key
                 is intentionally global across all queues and job types.
                 Clients should prefix it as necessary.
-                <strong>Requires a <em>pro</em> license</strong>.
             </td>
         </tr>
         <tr>
@@ -327,6 +331,194 @@ schedule data unconditionally and Zizq is smart enough to handle it safely.
                     </dd>
                 </dl>
                 The default scope is <code>queued</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Optional batched-job configuration. When present, subsequent
+                enqueues sharing the same <code>batch.key</code> are
+                <em>folded</em> into this job's pending payload via the
+                <code>when</code> and <code>fold</code> jq expressions,
+                rather than creating separate pending jobs. All three inner
+                fields are required when this field is set. Mutually exclusive
+                with <code>unique_key</code> — supplying both returns
+                <code>400 Bad Request</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch.key</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Identifies the batch. Only one unsealed batched job exists
+                per key at a time. Enqueues sharing this key fold into the
+                existing pending job (or start a new one if none exists or
+                the existing batch was already sealed).
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch.when</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> predicate that
+                decides whether an incoming enqueue folds into the existing
+                pending job. Evaluated with <code>$existing</code> bound to
+                the current pending payload and <code>$new</code> bound to
+                the incoming payload. Truthy means fold; falsy seals the
+                existing batch and starts a fresh one from the incoming
+                enqueue. Invalid jq syntax, or an expression that returns
+                multiple outputs, returns <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.batch.fold</code></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                <a href="https://jqlang.org/manual/">jq</a> expression that
+                produces the merged payload when a fold occurs. Runs with the
+                same <code>$existing</code> and <code>$new</code> bindings as
+                <code>when</code>. Must produce exactly one output; multiple
+                outputs return <code>422 Unprocessable Entity</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets</code></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget. Must be valid UTF-8 and must
+                not contain any of the follow reserved
+                characters: <code>,</code>, <code>*</code>, <code>?</code>,
+                <code>[</code>, <code>]</code>, <code>{</code>, <code>}</code>,
+                <code>\</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].cost</code></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget. Defaults
+                to 1.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].create_with</code></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Specification from which to create this budget atomically
+                with the cron entry if it does not already exist. Without this,
+                the budget must exist or a 422 response will be returned. Does
+                not overwrite any existing budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].create_with.allocation</code> <em>required</em></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The total number of tokens available in this budget's pool for
+                use by its configured strategy. No jobs can exist bound to this
+                budget with a <code>cost</code> that exceeds the allocation.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].create_with.strategy</code> <em>required</em></div>
+                <div><pre>object</pre></div>
+            </td>
+            <td>
+                Details of the specific strategy that is used to manage the
+                tokens available under this budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].create_with.strategy.type</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                Names the strategy used to manage the tokens within the budget.
+                One of:
+                <dl>
+                    <dt><code>while_in_flight</code></dt>
+                    <dd>
+                        Concurrency control — tokens are spent from the budget
+                        when jobs are dispatched to workers, and returned when
+                        the job completes or fails, or the worker disconnects
+                        uncleanly. For example, for an allocation of 5, at most
+                        5 jobs bound to this budget can be in-flight at any
+                        given time.
+                    </dd>
+                    <dt><code>time_based</code></dt>
+                    <dd>
+                        Rate limit — tokens are spent from the budget when jobs
+                        are dispatched to workers and are only returned after a
+                        configured period of time, regardless of the outcome of
+                        the job.
+                    </dd>
+                </dl>
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].create_with.strategy.duration_ms</code></div>
+                <div><pre>int64</pre></div>
+            </td>
+            <td>
+                Required for <code>time_based</code> strategies. Invalid for
+                <code>while_in_flight</code>. Specifies the period of time in
+                milliseconds over which a <code>time_based</code> rate limit is
+                measured. For example, for an allocation of 1000 and a
+                <code>duration_ms</code> of 60000, the rate limit is
+                <code>1000/minute</code>.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>entries[*].job.budgets[*].create_with.strategy.burst</code></div>
+                <div><pre>int32</pre></div>
+            </td>
+            <td>
+                The maximum number of tokens that may be accumulated at once
+                for a <code>time_based</code> budget. Defaults to whatever the
+                configured <code>allocation</code> is. So for a
+                <code>1000/hour</code> rate limit, the budget would technically
+                permit a short burst of 1000 jobs if no other jobs have used
+                tokens from the budget for a whole hour. Setting a burst of 1
+                means tokens cannot accumulate and jobs are always paced
+                according to the configured rate limit. It is also possible to
+                intentionally set a burst higher than the configured
+                allocation, such as a burst of 2000 for a
+                <code>1000/hour</code> allocation. In this case if the budget
+                has been idle for 2 hours, it would permit a sudden burst of
+                2000 jobs at any moment. No jobs can exist bound to this
+                budget with a <code>cost</code> that exceeds the burst.
             </td>
         </tr>
         <tr>

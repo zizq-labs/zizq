@@ -5,6 +5,7 @@
 - [Enqueuing Jobs](./enqueue.md)
 - [Taking & Processing Jobs](./processing.md)
 - [Cron Scheduling](./cron.md)
+- [Concurrency Control & Rate Limiting](./rate-limiting.md)
 - [Querying Job Data](./querying.md)
 - [Modifying Job Data](./modifying.md)
 - [Resetting](./resetting.md)

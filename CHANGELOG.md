@@ -1,143 +1,24 @@
 # Changelog
 
-## 0.7.0 (Unreleased)
+## 0.7.0
 
-- Added **budgets**, a server-side throttle on how fast jobs are
-  dispatched. A budget is a named token bucket that jobs draw from; a
-  job whose budgets have no capacity waits until they replenish.
-  Workers are unaware of any of it — a throttled job looks like any
-  other when it finally arrives. Pro tier, alongside unique jobs, cron
-  and batching.
+- Added **budgets**, server-side concurrency control and rate limiting.
+  A budget is a named token bucket that jobs draw from; a job whose
+  budgets have no capacity waits until they replenish. Workers are
+  unaware of any of it — a throttled job looks like any other when it
+  finally arrives.
 
   Two strategies, covering the two things people mean by "rate limit":
 
   - `time_based` refills the whole allocation every `duration_ms`, as a
-    continuous drip rather than in fixed windows. A counter that reset
-    on the minute would allow the allocation at 59.9s and again at
-    60.0s — twice the configured rate across the boundary, every
-    boundary. Accrual is computed lazily from elapsed time, so an idle
-    budget costs nothing.
+    continuous drip rather than in fixed windows. Accrual is computed
+    lazily from elapsed time, so an idle budget costs nothing.
   - `while_in_flight` returns a token when the job leaves the in-flight
     state, by acknowledgement, failure, deletion or worker disconnect.
-    This is a concurrency limit, of which a mutex is the
-    `allocation: 1` case.
+    This is a concurrency limit, of which a mutex is the `allocation: 1`
+    case.
 
-  Budgets are managed at `GET /budgets`, and `GET` / `POST` / `PUT` /
-  `PATCH` / `DELETE` on `/budgets/{key}`. `POST` creates and returns
-  `409` if the key is taken, so an application can declare the budgets
-  it expects on every boot without clobbering an allocation an operator
-  tightened during an incident; `PUT` replaces a policy whole and
-  `PATCH` merges named fields. A budget's `created_at` survives both.
-
-  Jobs bind to budgets with a `budgets` array on enqueue, each entry
-  naming a `key` and an optional `cost` (default 1). A job may draw on
-  several, and acquires from all of them or none. An entry may carry a
-  `create_with` policy, which creates the budget if it does not exist
-  and is ignored if it does — the server stays authoritative, so an
-  enqueue can never quietly restate a throttle. Referencing a budget
-  that does not exist without a `create_with` is rejected with `422`
-  rather than dispatching unthrottled. Bindings are returned on every
-  read of a job for visibility.
-
-  `time_based` also takes an optional `burst` alongside `duration_ms`,
-  capping how many tokens may be banked without changing how fast they
-  arrive. A bucket starts full, so the first work after an idle period
-  draws a whole allocation at once and only then settles to the drip —
-  meaning `10 per minute` permits twenty in the first minute. That
-  overshoot is a one-off and the long-run rate is unaffected, but it is
-  visible, and `burst: 1` removes it entirely by pacing dispatches
-  evenly. A burst above the allocation is allowed, and banks several
-  idle periods. Note that where a burst is set it is the burst, not the
-  allocation, that a job's `cost` must fit inside.
-
-  Cron entries may reference budgets in their job template. Budgets a
-  template needs are created when the entry is installed rather than
-  when it first fires, so an entry cannot be accepted into a schedule
-  and then turn out to be unfireable because the server has since
-  reached its budget cap.
-
-  A budget cannot be deleted, or have its allocation shrunk below a
-  cost already committed to it, while anything still draws on it —
-  unfinished jobs or a cron entry's template. Both are reported
-  separately, because the remedies differ: a job will drain on its own,
-  where a cron entry is a standing claim that has to be edited. A
-  budget referenced only by finished jobs deletes cleanly.
-
-  The number of budgets a server will hold is capped by
-  `--max-budgets` / `ZIZQ_MAX_BUDGETS`, defaulting to 8192. The limit
-  exists because budget keys can be generated from application data,
-  and remain peristed indefinitely. Future releases will enable more
-  dynamic sub-buckets within budgets.
-
-  A job's budgets can be changed after it is enqueued, through routes on
-  `/jobs/{id}/budgets`: `POST` a key to bind one (409 if already bound,
-  and `create_with` works here as it does on an enqueue), `PUT` to bind
-  or replace, `PATCH` to change what it draws, `DELETE` to unbind.
-  `PUT /jobs/{id}/budgets` replaces the whole set and
-  `DELETE /jobs/{id}/budgets` clears it. Only queued jobs may change —
-  an in-flight job holds tokens against the bindings it was dispatched
-  under, so moving them would either invent a slot on the new budget or
-  strand one on the old, and the request is refused with 422.
-
-  The same operations work across a filtered set, taking the same
-  filters as the other bulk job routes: `POST` / `PUT` / `PATCH` /
-  `DELETE /jobs/budgets/{key}` and `DELETE /jobs/budgets`. These skip
-  rather than fail on anything true of one job but not the request,
-  since a per-job 409 has nowhere to go in an operation over a matched
-  set. A malformed request still refuses outright, being wrong for every
-  job it could match.
-
-  The response is `{"changed": N, "blocked": [ids]}`. `blocked` names
-  the jobs the mutation *would* have changed but could not, because they
-  were in flight — the one outcome a caller can act on, by retrying
-  those ids once the jobs finish. Jobs the mutation simply did not apply
-  to are absent: an `Add` against a job already bound, or a `Remove`
-  against one that never had the binding, is the documented behaviour of
-  the verb rather than a shortfall. Terminal jobs are absent too, their
-  bindings being inert.
-
-  There is deliberately no `PUT /jobs/budgets` to replace whole sets
-  across a filter. A filter naming one budget still matches jobs drawing
-  on others, so replacing would silently discard bindings the caller
-  never mentioned. Splitting a shared budget is two scoped calls
-  instead — `POST /jobs/budgets/new?budgets.key=old` then
-  `DELETE /jobs/budgets/old?budgets.key=old` — each of which leaves
-  bindings it was not asked about alone.
-
-  Jobs can be filtered by budget with `?budgets.key=`, comma-delimited
-  like `queue` and `type`, on `GET /jobs`, `GET /jobs/count`,
-  `PATCH /jobs` and `DELETE /jobs`. It matches a job drawing on any of
-  the named budgets. This is what makes the refusal above actionable:
-  `DELETE /jobs?budgets.key=stripe` clears the jobs holding a budget
-  open so it can then be deleted. There is no index from budget to job,
-  so combined with a `status`, `queue`, `type` or `id` filter it narrows
-  within that scan, and on its own it is a full scan — the same cost
-  profile the existing payload filter carries.
-
-  Policy changes take effect immediately, including on work already
-  running. Narrowing a `while_in_flight` budget below what is currently
-  in flight leaves it over-committed, and those slots are surrendered as
-  jobs finish rather than handed straight to replacements — so cutting
-  an allocation from six to one while six are running settles back to
-  one, instead of staying at six for as long as work keeps arriving.
-
-  Policy changes also take effect immediately on jobs already waiting.
-  Speeding a rate limit up re-arms the dispatcher rather than
-  leaving parked jobs to wait out the old period, and progress already
-  accrued toward the next token is kept across a change of rate — half a
-  minute spent waiting on a one-a-minute budget still counts when it
-  becomes two a second. Changing the *period* discards that progress,
-  since it is measured against the period it was accrued under.
-
-  `POST /reset` now clears budgets along with jobs and cron groups.
-
-  Token state is deliberately not persisted, so a server restart brings
-  every bucket back full. For a concurrency budget that is simply
-  accurate — recovery returns in-flight jobs to the queue, so nothing
-  holds a slot. For a rate limit it means a restart forgives whatever
-  the previous process had spent, which is the trade-off between an
-  efficient lazily computed in-memory solution vs a slower one that
-  constantly writes to disk to record state.
+  See https://zizq.io/docs/api/rate-limiting.html for full details.
 
 - Added a **group-level cron timezone**. `PUT /crons/{group}` and
   `PATCH /crons/{group}` now accept a `timezone` field alongside

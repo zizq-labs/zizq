@@ -258,6 +258,35 @@
                 zero, jobs are purged immediately upon completion.
             </td>
         </tr>
+        <tr>
+            <td>
+                <div><code>budgets</code></div>
+                <div><pre>array</pre></div>
+            </td>
+            <td>
+                Array of <a href="./rate-limiting.md">budget bindings</a>
+                used to control concurrency and/or rate limiting of dispatched
+                jobs.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].key</code> <em>required</em></div>
+                <div><pre>string</pre></div>
+            </td>
+            <td>
+                The identifier for the budget.
+            </td>
+        </tr>
+        <tr>
+            <td>
+                <div><code>budgets[*].cost</code></div>
+                <div><pre>int32</pre> <em>required</em></div>
+            </td>
+            <td>
+                The number of tokens this job takes from the budget.
+            </td>
+        </tr>
     </tbody>
 </table>
 
