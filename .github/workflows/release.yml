@@ -1,0 +1,266 @@
+# Publishing, split out from CI on purpose.
+#
+# `release-all-platforms` is gated on `environment: release`, and GitHub
+# fails a job waiting for approval after 30 days. While it lived in
+# `ci.yml` that meant every merge to main left a pending run which
+# eventually failed, turning the README's CI badge red even though every
+# test had passed. The badge tracks `ci.yml`, so moving the release here
+# keeps it honest: green means the tests pass.
+#
+# Unlike the client repos, CI does not build the shipped artifacts — the
+# multi-platform binaries are built here, after approval, because that
+# is where the Apple signing secrets are scoped and because five
+# platform builds are not worth running on every merge. What CI does
+# provide is the guarantee: this workflow refuses to build from a commit
+# whose CI run did not pass.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: >-
+          CI run to release from. Leave blank for the most recent
+          successful run on main.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  # Needed to inspect another workflow's runs.
+  actions: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # --- Resolve which tested commit is being released ---
+
+  ci:
+    name: Resolve CI run
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve the CI run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REQUESTED: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$REQUESTED" ]; then
+            run_id="$REQUESTED"
+          else
+            run_id="$(gh run list --repo "$REPO" \
+                        --workflow ci.yml --branch main \
+                        --status success --limit 1 \
+                        --json databaseId --jq '.[0].databaseId')"
+            if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+              echo "No successful CI run found on main." >&2
+              exit 1
+            fi
+            echo "Using the latest successful CI run on main."
+          fi
+
+          read -r conclusion head_sha head_branch < <(
+            gh run view "$run_id" --repo "$REPO" \
+              --json conclusion,headSha,headBranch \
+              --jq '[.conclusion, .headSha, .headBranch] | @tsv'
+          )
+
+          if [ "$conclusion" != "success" ]; then
+            echo "CI run $run_id concluded '$conclusion', refusing to release from it." >&2
+            exit 1
+          fi
+
+          if [ "$head_branch" != "main" ]; then
+            echo "CI run $run_id is from '$head_branch', not main." >&2
+            exit 1
+          fi
+
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "Releasing from CI run $run_id ($head_sha)."
+
+  # --- Multi-platform release build (requires approval) ---
+
+  release-all-platforms:
+    name: Release (${{ matrix.platform }})
+    needs: [ci]
+    environment: release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            platform: linux-x86_64
+            deps: sudo apt-get install -y musl-tools
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            deps: sudo apt-get install -y musl-tools
+          - target: x86_64-pc-windows-gnu
+            runner: ubuntu-latest
+            platform: windows-x86_64
+            deps: sudo apt-get install -y gcc-mingw-w64-x86-64
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            platform: macos-arm64
+            deps: ""
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            platform: macos-x86_64
+            deps: ""
+    steps:
+      # The commit CI tested, not main's HEAD. `release.sh` builds
+      # from this tree, so it is what actually ships.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.ci.outputs.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + release build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.platform }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.github/workflows/ci.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.platform }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.github/workflows/ci.yml') }}-
+            ${{ runner.os }}-cargo-release-${{ matrix.platform }}-
+
+      - name: Install build dependencies
+        if: matrix.deps != ''
+        run: ${{ matrix.deps }}
+
+      - name: Set up macOS code signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+
+          echo "$APPLE_CERT_P12_BASE64" | base64 -d > "$CERT_PATH"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 -d > "$API_KEY_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          # Prepend our keychain to the user search list so codesign can
+          # find the identity. The ephemeral runner's existing list is
+          # preserved for any subsequent tooling that needs login items.
+          existing=$(security list-keychains -d user | sed -e 's/"//g' -e 's/^[[:space:]]*//')
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $existing
+
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_ISSUER_ID: ${{ secrets.APPLE_API_KEY_ISSUER_ID }}
+        run: |
+          # Clear any stale packaged artifacts a restored `target/`
+          # cache may carry forward from an earlier version's build —
+          # otherwise the upload globs would sweep them into the release.
+          rm -f target/release/zizq-*
+          ./release.sh --target ${{ matrix.target }}
+
+      - name: Clean up macOS keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: zizq-release-${{ matrix.platform }}
+          path: target/release/zizq-*
+
+  # --- Publish GitHub Release (runs after all platforms built) ---
+
+  publish:
+    name: Publish Release
+    needs: [ci, release-all-platforms]
+    runs-on: ubuntu-latest
+    steps:
+      # The commit CI tested, not main's HEAD. `release.sh` builds
+      # from this tree, so it is what actually ships.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.ci.outputs.sha }}
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cargo pkgid | sed 's/.*[#@]//')" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to release a version that already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+
+          if gh release view "v${version}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release v${version} already exists. Bump the version first." >&2
+            exit 1
+          fi
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: zizq-release-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version=${{ steps.version.outputs.version }}
+          # Extract the section for this version (between ## headers).
+          sed -n "/^## ${version}/,/^## /p" CHANGELOG.md | head -n -1 | tail -n +2 > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG section found for ${version}." >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${{ steps.version.outputs.version }}
+          gh release create "v${version}" \
+            --target "${{ needs.ci.outputs.sha }}" \
+            --title "v${version}" \
+            --notes-file release-notes.md \
+            artifacts/zizq-${version}-*
