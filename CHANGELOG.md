@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.1
+
+- Fixed a cron scheduling pass aborting on its first failing entry
+  instead of skipping it. An entry that cannot be promoted stays due,
+  so a single broken entry starved every other due entry on every
+  subsequent tick, rather than just itself. Failures are now logged
+  per entry and the pass continues.
+
+- Updated **tokio** from 1.50 to 1.53.1. This is a candidate fix for a
+  crash observed in production on 0.6.1, where a long-lived
+  `/jobs/take` connection reconnected every ~262 seconds for days
+  before the server aborted inside tokio's intrusive linked list.
+  262.144s is exactly the wrap interval of level 2 of tokio's timer
+  wheel — the level a client's 30-second stream idle timeout occupies,
+  and the only point at which such a timer is physically moved between
+  wheel lists. 1.53 rewrote the timer entry's lazy-registration state and
+  fixed several timer cancellation and insertion races.
+
+  The link between the reconnect cadence and the abort is
+  circumstantial rather than proven, and neither symptom has been
+  reproduced outside production. If you have seen either, please give
+  this release a try.
+
+- Updated **croner** to 4.0, which corrects occurrence ordering across
+  daylight-saving transitions and backward searches through a DST gap.
+  Also updated **fjall** to 3.1.10, **rcgen** to 0.14.10 and
+  **tokio-rustls** to 0.26.5.
+
 ## 0.7.0
 
 - Added **budgets**, server-side concurrency control and rate limiting.
