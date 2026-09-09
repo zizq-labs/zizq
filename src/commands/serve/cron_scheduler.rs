@@ -129,13 +129,17 @@ async fn process_due_entries(
                 // Entry was paused, not due, or deleted — skip silently.
             }
             Err(e) => {
+                // Skip, don't abort. A failure here is specific to one
+                // entry — an expression an older version accepted, a
+                // timezone that no longer resolves — and returning
+                // would drop every remaining due entry in this pass,
+                // every tick, for as long as the bad entry is due.
                 tracing::error!(
                     group = %group,
                     entry = %entry_name,
                     %e,
-                    "failed to enqueue cron job"
+                    "failed to enqueue cron job, skipping entry"
                 );
-                return Err(e);
             }
         }
     }
@@ -238,6 +242,77 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
             tokio::task::yield_now().await;
         }
+    }
+
+    /// An entry that cannot be promoted must not take the rest of the
+    /// pass down with it. The realistic cause is a stored expression an
+    /// older version accepted and this one does not; because that entry
+    /// stays due, aborting the pass would starve every other entry on
+    /// every tick rather than just the broken one.
+    #[tokio::test(start_paused = true)]
+    async fn failing_entry_does_not_block_the_rest_of_the_pass() {
+        let store = test_store();
+        let (clock, _) = test_clock();
+        let t = clock.load(Ordering::Relaxed);
+
+        store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![cron_entry("e1", "* * * * *"), cron_entry("e2", "* * * * *")],
+                },
+                t,
+            )
+            .await
+            .unwrap();
+
+        // Break whichever entry the scheduler will reach first, so the
+        // test fails if the error aborts the pass.
+        let due = store.next_due_cron_entries(u64::MAX);
+        assert_eq!(due.len(), 2);
+        let (_, group, first) = due[0].clone();
+        let (_, _, second) = due[1].clone();
+
+        store
+            .set_cron_expression_unvalidated(&group, &first, "not a cron expression")
+            .await
+            .unwrap();
+
+        let due_at = store
+            .get_cron_entry(&group, &second)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_enqueue_at
+            .unwrap();
+        clock.store(due_at + 1, Ordering::Relaxed);
+
+        // The pass itself succeeds — the broken entry is logged and skipped.
+        process_due_entries(&store, &clock_fn(&clock))
+            .await
+            .unwrap();
+
+        let jobs = store
+            .list_jobs(ListJobsOptions::new().queues(["cron-q".to_string()].into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.jobs.len(),
+            1,
+            "the healthy entry should still have fired"
+        );
+
+        // The broken entry did not advance; the healthy one did.
+        let broken = store.get_cron_entry(&group, &first).await.unwrap().unwrap();
+        assert_eq!(broken.last_enqueue_at, None);
+        let healthy = store
+            .get_cron_entry(&group, &second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(healthy.last_enqueue_at, Some(due_at + 1));
     }
 
     #[tokio::test(start_paused = true)]

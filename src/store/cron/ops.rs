@@ -503,6 +503,47 @@ impl Store {
         .await?
     }
 
+    /// Rewrite a stored entry's expression, bypassing validation.
+    ///
+    /// Reproduces an entry written by an earlier version whose
+    /// expression this version no longer parses. That is the only way a
+    /// stored entry can fail on promotion, so it is the only way to
+    /// exercise the scheduler's skip-and-continue path.
+    #[cfg(test)]
+    pub(crate) async fn set_cron_expression_unvalidated(
+        &self,
+        group: &str,
+        entry_name: &str,
+        expression: &str,
+    ) -> Result<(), StoreError> {
+        let ks = self.ks.clone();
+        let group = group.to_string();
+        let entry_name = entry_name.to_string();
+        let expression = expression.to_string();
+
+        task::spawn_blocking(move || -> Result<(), StoreError> {
+            let entry_key = make_cron_entry_key(&group, &entry_name);
+
+            let mut entry: CronEntry = match ks.data.get(&entry_key)? {
+                Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                None => {
+                    return Err(StoreError::InvalidOperation(format!(
+                        "no such cron entry: {group}/{entry_name}"
+                    )));
+                }
+            };
+
+            entry.expression = expression;
+
+            let mut tx = ks.write_tx();
+            tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
+            ks.commit(tx, ks.default_commit_mode)?;
+
+            Ok(())
+        })
+        .await?
+    }
+
     /// Update a single cron entry's pause state.
     ///
     /// Returns the updated entry, or `None` if the group or entry does
@@ -1318,8 +1359,13 @@ fn cron_next_after(
     now_ms: u64,
     timezone: Option<&str>,
 ) -> Result<Option<u64>, StoreError> {
+    // `sloppy_ranges` keeps single-number step syntax (`0/15`, meaning
+    // "every 15 starting at 0") parsing. It is not OCPS-compliant, but
+    // it is what Quartz and its many descendants emit, and schedules
+    // written that way are already installed in the wild.
     let cron = croner::parser::CronParser::builder()
         .seconds(croner::parser::Seconds::Optional)
+        .sloppy_ranges(true)
         .build()
         .parse(expression)
         .map_err(|e| StoreError::InvalidOperation(format!("invalid cron expression: {e}")))?;
@@ -2440,6 +2486,43 @@ mod tests {
         let next = entries[0].next_enqueue_at.unwrap();
         assert!(next > now);
         assert!(next <= now + 30_000);
+    }
+
+    /// Single-number step syntax (`0/15`, "every 15 starting at 0") is
+    /// what Quartz and its descendants emit, and croner rejects it by
+    /// default from 4.0 onward. Schedules written that way are already
+    /// installed in the wild, so the parser opts into `sloppy_ranges`
+    /// and this pins that decision.
+    #[tokio::test]
+    async fn accepts_single_number_step_expressions() {
+        let store = test_store();
+        let now = CRON_NOW;
+
+        let (_, entries) = store
+            .replace_cron_group(
+                "default",
+                ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![
+                        cron_entry_opts("quarter-hourly", "0/15 * * * *", "q", "test"),
+                        cron_entry_opts("from-five", "5/5 * * * *", "q", "test"),
+                        cron_entry_opts("with-seconds", "10/30 * * * * *", "q", "test"),
+                    ],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert!(
+                entry.next_enqueue_at.is_some_and(|next| next > now),
+                "{} did not schedule a future occurrence",
+                entry.name
+            );
+        }
     }
 
     #[tokio::test]
