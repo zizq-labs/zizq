@@ -1,0 +1,17 @@
+# Windows-only helper for scripts/dead-peer.sh. Not part of the server
+# build: it is built separately, only where the script needs it.
+
+[package]
+name = "wfp-blackhole"
+version = "0.0.0"
+edition = "2024"
+license = "BUSL-1.1"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Security",
+    "Win32_System_Rpc",
+] }

@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/dead-peer.sh [--binary PATH] [--max-wait SECS]
 #                          [--expect-within SECS] [--tcp-retries2 N]
+#                          [--wfp-blackhole PATH]
 #
 # A worker whose *process* dies is noticed immediately, because its kernel
 # closes the socket. A worker whose *host* dies (power loss, kernel panic,
@@ -43,6 +44,16 @@
 # which may prompt for a password. On exit the anchor is flushed and the
 # script's reference to pf being enabled is released.
 #
+# Windows (Git Bash): Windows Firewall does not filter loopback traffic,
+# so packets are dropped by `wfp-blackhole`, a small helper in
+# scripts/wfp-blackhole that adds Windows Filtering Platform filters of
+# its own. Windows removes them as soon as the helper exits. It must be
+# built first, and the script run as administrator:
+#
+#   cargo build --release --manifest-path scripts/wfp-blackhole/Cargo.toml
+#
+# --wfp-blackhole overrides where the script looks for it.
+#
 # --tcp-retries2 (Linux only) sets net.ipv4.tcp_retries2 inside the
 # namespace, which shortens the kernel's give-up time for a quicker run.
 # Leave it unset to measure the kernel default.
@@ -53,6 +64,7 @@
 # Requires curl and jq, plus:
 #   Linux: unshare (util-linux), ip, nft, ss
 #   macOS: pfctl, netstat, sudo
+#   Windows: netstat, and the wfp-blackhole helper
 
 set -euo pipefail
 
@@ -62,6 +74,7 @@ BINARY="$SCRIPT_DIR/../target/release/zizq"
 MAX_WAIT=1200
 EXPECT_WITHIN=""
 TCP_RETRIES2=""
+WFP_BLACKHOLE="$SCRIPT_DIR/wfp-blackhole/target/release/wfp-blackhole.exe"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -69,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --max-wait)      MAX_WAIT="$2"; shift 2 ;;
         --expect-within) EXPECT_WITHIN="$2"; shift 2 ;;
         --tcp-retries2)  TCP_RETRIES2="$2"; shift 2 ;;
+        --wfp-blackhole) WFP_BLACKHOLE="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -85,6 +99,10 @@ OS="$(uname -s)"
 case "$OS" in
     Linux)  REQUIRED=(unshare ip nft ss curl jq) ;;
     Darwin) REQUIRED=(pfctl netstat sudo curl jq) ;;
+    MINGW*|MSYS*)
+        OS=Windows
+        REQUIRED=(netstat curl jq)
+        ;;
     *) echo "Error: unsupported platform: $OS"; exit 1 ;;
 esac
 
@@ -118,7 +136,13 @@ if [[ "$OS" == Linux ]]; then
             [[ -n "$EXPECT_WITHIN" ]] && args+=(--expect-within "$EXPECT_WITHIN")
             [[ -n "$TCP_RETRIES2" ]] && args+=(--tcp-retries2 "$TCP_RETRIES2")
 
-            ZIZQ_DEAD_PEER_NETNS=1 exec unshare --user --map-root-user --net \
+            # Root can create a network namespace without a user namespace,
+            # and must: inside one, root loses its override on files owned
+            # by users the namespace does not map, such as a CI checkout.
+            local userns=(--user --map-root-user)
+            [[ $EUID -eq 0 ]] && userns=()
+
+            ZIZQ_DEAD_PEER_NETNS=1 exec unshare "${userns[@]}" --net \
                 "$0" "${args[@]}"
         fi
 
@@ -165,7 +189,7 @@ if [[ "$OS" == Linux ]]; then
             | tr '\n' ' ' || true
         echo
     }
-else
+elif [[ "$OS" == Darwin ]]; then
     PF_ANCHOR="com.apple/zizq-dead-peer"
     PF_TOKEN=""
 
@@ -224,6 +248,61 @@ else
         out="$(netstat -anp tcp \
             | awk -v l="127.0.0.1.$SERVER_PORT" -v r="127.0.0.1.$WORKER_PORT" \
                 '$4 == l && $5 == r { print "send-q=" $3 }')"
+        echo "${out:-(socket closed)}"
+    }
+else
+    WFP_PID=""
+
+    # The helper's dynamic WFP session is the sandbox: Windows removes its
+    # filters when it exits, however it exits.
+    sandbox_enter() {
+        if [[ ! -x "$WFP_BLACKHOLE" ]]; then
+            echo "Error: wfp-blackhole not found: $WFP_BLACKHOLE"
+            echo "Build it with:"
+            echo "  cargo build --release --manifest-path scripts/wfp-blackhole/Cargo.toml"
+            exit 1
+        fi
+    }
+
+    sandbox_describe() { :; }
+
+    # netstat prints addresses as 127.0.0.1:PORT, with CRLF line endings.
+    worker_port() {
+        netstat -ano -p tcp \
+            | tr -d '\r' \
+            | awk -v s="127.0.0.1:$SERVER_PORT" \
+                '$3 == s && $4 == "ESTABLISHED" { n = split($2, a, ":"); print a[n] }'
+    }
+
+    blackhole() {
+        "$WFP_BLACKHOLE" "$1" > "$WORKDIR/wfp-blackhole.log" 2>&1 &
+        WFP_PID=$!
+
+        local deadline=$((SECONDS + 10))
+        until grep -q '^ready' "$WORKDIR/wfp-blackhole.log" 2>/dev/null; do
+            if ! kill -0 "$WFP_PID" 2>/dev/null || [[ $SECONDS -ge $deadline ]]; then
+                echo "Error: wfp-blackhole did not start:"
+                cat "$WORKDIR/wfp-blackhole.log"
+                exit 1
+            fi
+            sleep 0.1
+        done
+    }
+
+    blackhole_cleanup() {
+        if [[ -n "$WFP_PID" ]] && kill -0 "$WFP_PID" 2>/dev/null; then
+            kill "$WFP_PID" 2>/dev/null
+            wait "$WFP_PID" 2>/dev/null || true
+        fi
+    }
+
+    # Windows' netstat shows no queue sizes or timers, only the state.
+    socket_state() {
+        local out
+        out="$(netstat -ano -p tcp \
+            | tr -d '\r' \
+            | awk -v l="127.0.0.1:$SERVER_PORT" -v r="127.0.0.1:$WORKER_PORT" \
+                '$2 == l && $3 == r { print $4 }')"
         echo "${out:-(socket closed)}"
     }
 fi

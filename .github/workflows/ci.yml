@@ -198,6 +198,112 @@ jobs:
           fi
           echo "Release builds passed on every platform."
 
+  # --- Dead peer detection against the release binaries ---
+  #
+  # Runs scripts/dead-peer.sh, which drops every packet on a live take
+  # stream and times how long the server takes to requeue its job. This
+  # is the only test of the socket options that bound that time actually
+  # firing, rather than merely being set.
+
+  dead-peer:
+    name: Dead Peer (${{ matrix.platform }})
+    needs: release-binary
+    runs-on: ${{ matrix.runner }}
+    # The script is bash on every platform, Git Bash on Windows.
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          - runner: macos-14
+            platform: macos-arm64
+          # GitHub's Intel macOS runners are being retired, so the Intel
+          # binary runs under Rosetta. It still exercises the same
+          # (arm64) kernel's TCP stack.
+          - runner: macos-14
+            platform: macos-x86_64
+          - runner: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.platform == 'linux-x86_64' && format('zizq-binary-v{0}', needs.release-binary.outputs.version) || format('zizq-binary-{0}', matrix.platform) }}
+          path: server
+
+      - name: Unpack server binary
+        if: runner.os != 'Windows'
+        run: tar -xzf server/zizq-*-${{ matrix.platform }}.tar.gz -C server
+
+      - name: Unpack server binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Expand-Archive -Path server/zizq-*-windows-x86_64.zip -DestinationPath server
+
+      - name: Install Rust toolchain
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wfp-blackhole
+        if: runner.os == 'Windows'
+        run: cargo build --release --manifest-path scripts/wfp-blackhole/Cargo.toml
+
+      - name: Install nftables
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y nftables
+
+      - name: Install Rosetta
+        if: matrix.platform == 'macos-x86_64'
+        run: |
+          arch -x86_64 /usr/bin/true 2>/dev/null \
+            || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Load the default pf ruleset
+        if: runner.os == 'macOS'
+        run: |
+          # The script's pf rules live in an anchor under com.apple/,
+          # which only the default /etc/pf.conf evaluates.
+          sudo pfctl -sr 2>/dev/null | grep -q 'anchor "com.apple/\*"' \
+            || sudo pfctl -q -f /etc/pf.conf
+
+      # A short timeout, so passing proves the server's socket option
+      # fired: macOS's own default gives up in ~22s over loopback, which
+      # would pass a test of the 30s default without the option at all.
+      #
+      # Ubuntu 24.04 blocks unprivileged user namespaces, so the Linux
+      # run needs sudo, and `env` carries the variable past it. On macOS
+      # the script calls sudo itself for pfctl. Windows runners already
+      # run as administrator, which wfp-blackhole needs.
+      - name: Run dead peer detection
+        run: |
+          ${{ runner.os == 'Linux' && 'sudo' || '' }} env ZIZQ_TCP_USER_TIMEOUT=5s \
+            ./scripts/dead-peer.sh \
+            --binary server/zizq${{ runner.os == 'Windows' && '.exe' || '' }} \
+            --expect-within 15 \
+            --max-wait 120
+
+  # --- Dead peer gate (stable check name for branch protection) ---
+
+  dead-peer-gate:
+    name: Dead Peer
+    runs-on: ubuntu-latest
+    needs: dead-peer
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.dead-peer.result }}" != "success" ]; then
+            echo "Dead peer detection failed or was skipped: ${{ needs.dead-peer.result }}"
+            exit 1
+          fi
+          echo "Dead peers were detected in time on every platform."
+
   # --- Integration tests against client repos ---
 
   discover-node:
