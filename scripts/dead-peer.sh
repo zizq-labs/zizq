@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/dead-peer.sh [--binary PATH] [--max-wait SECS]
 #                          [--expect-within SECS] [--tcp-retries2 N]
+#                          [--wfp-blackhole PATH]
 #
 # A worker whose *process* dies is noticed immediately, because its kernel
 # closes the socket. A worker whose *host* dies (power loss, kernel panic,
@@ -13,28 +14,57 @@
 # when its own writes go unacknowledged for long enough that its kernel
 # gives up on the connection.
 #
-# To simulate that, this script re-executes itself inside a private user
-# and network namespace (`unshare --user --map-root-user --net`). No root
-# is needed, and nothing outside the namespace is touched: the firewall
-# rules and sysctls below vanish with it when the script exits.
-#
-# Inside the namespace it:
+# The script:
 #
 #   1. Starts a server on loopback and enqueues one job
 #   2. Takes that job with a plain `curl` take stream
-#   3. Drops every packet on that connection with nftables, in both
-#      directions, so the worker is silent but its socket stays open
+#   3. Drops every packet on that connection with the platform's packet
+#      filter, in both directions, so the worker is silent but its socket
+#      stays open
 #   4. Polls the job until it is back in `ready`, reporting how long that
-#      took alongside the server socket's retransmission state from `ss`
+#      took alongside the server socket's state
 #
-# --tcp-retries2 sets net.ipv4.tcp_retries2 inside the namespace only,
-# which shortens the kernel's give-up time for a quicker run. Leave it
-# unset to measure the kernel default.
+# Packets are dropped as they are *received*, not as they are sent. A
+# packet dropped on the way out fails locally and the sender's kernel
+# knows it was never sent, which takes a different path through TCP than
+# a real dead peer. Dropped on the way in, it has left the sender's stack
+# and simply never arrives, so the sender waits for an ACK that never
+# comes, exactly as it would for a host that vanished.
+#
+# Linux: the script re-executes itself inside a private user and network
+# namespace (`unshare --user --map-root-user --net`) and drops packets
+# with nftables. No root is needed, and nothing outside the namespace is
+# touched: the firewall rules and sysctls vanish with it on exit. Where
+# unprivileged user namespaces are disabled (e.g. Ubuntu 24.04), run it
+# with sudo.
+#
+# macOS: there are no network namespaces, so packets are dropped by pf
+# rules in a temporary anchor under `com.apple/`, which the default
+# /etc/pf.conf evaluates. pfctl needs root, so it is run through sudo,
+# which may prompt for a password. On exit the anchor is flushed and the
+# script's reference to pf being enabled is released.
+#
+# Windows (Git Bash): Windows Firewall does not filter loopback traffic,
+# so packets are dropped by `wfp-blackhole`, a small helper in
+# scripts/wfp-blackhole that adds Windows Filtering Platform filters of
+# its own. Windows removes them as soon as the helper exits. It must be
+# built first, and the script run as administrator:
+#
+#   cargo build --release --manifest-path scripts/wfp-blackhole/Cargo.toml
+#
+# --wfp-blackhole overrides where the script looks for it.
+#
+# --tcp-retries2 (Linux only) sets net.ipv4.tcp_retries2 inside the
+# namespace, which shortens the kernel's give-up time for a quicker run.
+# Leave it unset to measure the kernel default.
 #
 # --expect-within makes the script exit non-zero if the job is not
 # requeued within that many seconds.
 #
-# Requires: unshare (util-linux), ip, nft, ss, curl, jq.
+# Requires curl and jq, plus:
+#   Linux: unshare (util-linux), ip, nft, ss
+#   macOS: pfctl, netstat, sudo
+#   Windows: netstat, and the wfp-blackhole helper
 
 set -euo pipefail
 
@@ -44,6 +74,7 @@ BINARY="$SCRIPT_DIR/../target/release/zizq"
 MAX_WAIT=1200
 EXPECT_WITHIN=""
 TCP_RETRIES2=""
+WFP_BLACKHOLE="$SCRIPT_DIR/wfp-blackhole/target/release/wfp-blackhole.exe"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --max-wait)      MAX_WAIT="$2"; shift 2 ;;
         --expect-within) EXPECT_WITHIN="$2"; shift 2 ;;
         --tcp-retries2)  TCP_RETRIES2="$2"; shift 2 ;;
+        --wfp-blackhole) WFP_BLACKHOLE="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -62,29 +94,220 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-for cmd in unshare ip nft ss curl jq; do
+OS="$(uname -s)"
+
+case "$OS" in
+    Linux)  REQUIRED=(unshare ip nft ss curl jq) ;;
+    Darwin) REQUIRED=(pfctl netstat sudo curl jq) ;;
+    MINGW*|MSYS*)
+        OS=Windows
+        REQUIRED=(netstat curl jq)
+        ;;
+    *) echo "Error: unsupported platform: $OS"; exit 1 ;;
+esac
+
+if [[ -n "$TCP_RETRIES2" && "$OS" != Linux ]]; then
+    echo "Error: --tcp-retries2 is only supported on Linux."
+    exit 1
+fi
+
+for cmd in "${REQUIRED[@]}"; do
     if ! command -v "$cmd" > /dev/null; then
         echo "Error: '$cmd' is required but not installed."
         exit 1
     fi
 done
 
-# --- Enter the namespace ---
+# --- Platform specifics ---
+#
+# Each platform defines:
+#
+#   sandbox_enter        isolate the run, where the platform can
+#   sandbox_describe     print any network settings that affect the result
+#   worker_port          local port of the established take stream
+#   blackhole PORT       drop every packet to and from PORT, on receipt
+#   blackhole_cleanup    undo anything blackhole did outside a sandbox
+#   socket_state         one line about the server side of the stream
 
-if [[ -z "${ZIZQ_DEAD_PEER_NETNS:-}" ]]; then
-    args=(--binary "$BINARY" --max-wait "$MAX_WAIT")
-    [[ -n "$EXPECT_WITHIN" ]] && args+=(--expect-within "$EXPECT_WITHIN")
-    [[ -n "$TCP_RETRIES2" ]] && args+=(--tcp-retries2 "$TCP_RETRIES2")
+if [[ "$OS" == Linux ]]; then
+    sandbox_enter() {
+        if [[ -z "${ZIZQ_DEAD_PEER_NETNS:-}" ]]; then
+            local args=(--binary "$BINARY" --max-wait "$MAX_WAIT")
+            [[ -n "$EXPECT_WITHIN" ]] && args+=(--expect-within "$EXPECT_WITHIN")
+            [[ -n "$TCP_RETRIES2" ]] && args+=(--tcp-retries2 "$TCP_RETRIES2")
 
-    ZIZQ_DEAD_PEER_NETNS=1 exec unshare --user --map-root-user --net \
-        "$0" "${args[@]}"
+            # Root can create a network namespace without a user namespace,
+            # and must: inside one, root loses its override on files owned
+            # by users the namespace does not map, such as a CI checkout.
+            local userns=(--user --map-root-user)
+            [[ $EUID -eq 0 ]] && userns=()
+
+            ZIZQ_DEAD_PEER_NETNS=1 exec unshare "${userns[@]}" --net \
+                "$0" "${args[@]}"
+        fi
+
+        ip link set lo up
+
+        if [[ -n "$TCP_RETRIES2" ]]; then
+            echo "$TCP_RETRIES2" > /proc/sys/net/ipv4/tcp_retries2
+        fi
+    }
+
+    sandbox_describe() {
+        echo "    tcp_retries2 = $(cat /proc/sys/net/ipv4/tcp_retries2)"
+    }
+
+    worker_port() {
+        ss -Htn state established "( dport = :$SERVER_PORT )" \
+            | awk '{ split($3, a, ":"); print a[length(a)] }'
+    }
+
+    blackhole() {
+        nft add table inet dead_peer
+        nft add chain inet dead_peer input \
+            '{ type filter hook input priority 0; policy accept; }'
+        nft add rule inet dead_peer input tcp sport "$1" drop
+        nft add rule inet dead_peer input tcp dport "$1" drop
+    }
+
+    # The rules vanish with the namespace.
+    blackhole_cleanup() { :; }
+
+    # The retransmit timer (time to next attempt, attempts so far), the
+    # exponential backoff exponent, and segments sent but unacknowledged.
+    socket_state() {
+        local out
+        out="$(ss -Htino "( sport = :$SERVER_PORT and dport = :$WORKER_PORT )" \
+            | tr -s ' \t\n' ' ')"
+
+        if [[ -z "$out" ]]; then
+            echo "(socket closed)"
+            return
+        fi
+
+        echo "$out" | grep -oE 'timer:\([^)]*\)|backoff:[0-9]+|unacked:[0-9]+' \
+            | tr '\n' ' ' || true
+        echo
+    }
+elif [[ "$OS" == Darwin ]]; then
+    PF_ANCHOR="com.apple/zizq-dead-peer"
+    PF_TOKEN=""
+
+    sandbox_enter() {
+        # Prompt for a password now, rather than midway through the run.
+        sudo -v
+
+        # Rules in our anchor only take effect if the main ruleset
+        # evaluates com.apple/*, as the default /etc/pf.conf does.
+        if ! sudo pfctl -sr 2>/dev/null | grep -q 'anchor "com.apple/\*"'; then
+            echo "Error: pf's main ruleset does not evaluate anchor \"com.apple/*\"."
+            echo "Is /etc/pf.conf loaded? Try: sudo pfctl -f /etc/pf.conf"
+            exit 1
+        fi
+    }
+
+    sandbox_describe() { :; }
+
+    # netstat prints addresses as 127.0.0.1.PORT.
+    worker_port() {
+        netstat -anp tcp \
+            | awk -v s="127.0.0.1.$SERVER_PORT" \
+                '$5 == s && $6 == "ESTABLISHED" { n = split($4, a, "."); print a[n] }'
+    }
+
+    blackhole() {
+        # `pfctl -E` enables pf if it is not already, and returns a token
+        # that later releases just this reference, so pf stays enabled if
+        # something else had enabled it too.
+        PF_TOKEN="$(sudo pfctl -E 2>&1 | awk '/^Token/ { print $3 }')"
+
+        # pfctl warns that -f could flush the main ruleset whenever it is
+        # used, even though -a confines it to our anchor, and -q does not
+        # silence that. Only show its output if loading fails.
+        local out
+        if ! out="$(printf '%s\n' \
+            "block drop in quick on lo0 proto tcp from any port $1 to any" \
+            "block drop in quick on lo0 proto tcp from any to any port $1" \
+            | sudo pfctl -q -a "$PF_ANCHOR" -f - 2>&1)"; then
+            echo "$out"
+            exit 1
+        fi
+    }
+
+    blackhole_cleanup() {
+        sudo pfctl -q -a "$PF_ANCHOR" -F rules 2>/dev/null || true
+        if [[ -n "$PF_TOKEN" ]]; then
+            sudo pfctl -q -X "$PF_TOKEN" 2>/dev/null || true
+        fi
+    }
+
+    # macOS exposes no retransmission timers, but bytes the peer has not
+    # acknowledged accumulate in the send queue.
+    socket_state() {
+        local out
+        out="$(netstat -anp tcp \
+            | awk -v l="127.0.0.1.$SERVER_PORT" -v r="127.0.0.1.$WORKER_PORT" \
+                '$4 == l && $5 == r { print "send-q=" $3 }')"
+        echo "${out:-(socket closed)}"
+    }
+else
+    WFP_PID=""
+
+    # The helper's dynamic WFP session is the sandbox: Windows removes its
+    # filters when it exits, however it exits.
+    sandbox_enter() {
+        if [[ ! -x "$WFP_BLACKHOLE" ]]; then
+            echo "Error: wfp-blackhole not found: $WFP_BLACKHOLE"
+            echo "Build it with:"
+            echo "  cargo build --release --manifest-path scripts/wfp-blackhole/Cargo.toml"
+            exit 1
+        fi
+    }
+
+    sandbox_describe() { :; }
+
+    # netstat prints addresses as 127.0.0.1:PORT, with CRLF line endings.
+    worker_port() {
+        netstat -ano -p tcp \
+            | tr -d '\r' \
+            | awk -v s="127.0.0.1:$SERVER_PORT" \
+                '$3 == s && $4 == "ESTABLISHED" { n = split($2, a, ":"); print a[n] }'
+    }
+
+    blackhole() {
+        "$WFP_BLACKHOLE" "$1" > "$WORKDIR/wfp-blackhole.log" 2>&1 &
+        WFP_PID=$!
+
+        local deadline=$((SECONDS + 10))
+        until grep -q '^ready' "$WORKDIR/wfp-blackhole.log" 2>/dev/null; do
+            if ! kill -0 "$WFP_PID" 2>/dev/null || [[ $SECONDS -ge $deadline ]]; then
+                echo "Error: wfp-blackhole did not start:"
+                cat "$WORKDIR/wfp-blackhole.log"
+                exit 1
+            fi
+            sleep 0.1
+        done
+    }
+
+    blackhole_cleanup() {
+        if [[ -n "$WFP_PID" ]] && kill -0 "$WFP_PID" 2>/dev/null; then
+            kill "$WFP_PID" 2>/dev/null
+            wait "$WFP_PID" 2>/dev/null || true
+        fi
+    }
+
+    # Windows' netstat shows no queue sizes or timers, only the state.
+    socket_state() {
+        local out
+        out="$(netstat -ano -p tcp \
+            | tr -d '\r' \
+            | awk -v l="127.0.0.1:$SERVER_PORT" -v r="127.0.0.1:$WORKER_PORT" \
+                '$2 == l && $3 == r { print $4 }')"
+        echo "${out:-(socket closed)}"
+    }
 fi
 
-ip link set lo up
-
-if [[ -n "$TCP_RETRIES2" ]]; then
-    echo "$TCP_RETRIES2" > /proc/sys/net/ipv4/tcp_retries2
-fi
+sandbox_enter
 
 # --- Set up isolated work directory ---
 
@@ -97,12 +320,13 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    blackhole_cleanup
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 echo "==> Dead peer detection ($("$BINARY" --version))"
-echo "    tcp_retries2 = $(cat /proc/sys/net/ipv4/tcp_retries2)"
+sandbox_describe
 
 # --- Start the server ---
 
@@ -176,8 +400,7 @@ fi
 
 # The take stream is the only connection to the server at this point,
 # since every other curl above has exited.
-WORKER_PORT="$(ss -Htn state established "( dport = :$SERVER_PORT )" \
-    | awk '{ split($3, a, ":"); print a[length(a)] }')"
+WORKER_PORT="$(worker_port)"
 
 if [[ -z "$WORKER_PORT" || "$WORKER_PORT" == *$'\n'* ]]; then
     echo "Error: could not identify the take stream's local port."
@@ -188,39 +411,12 @@ echo "    Job is in_flight on take stream from port $WORKER_PORT"
 
 # --- Make the worker vanish ---
 
-# Drop on input, not output. A packet dropped on output fails locally and
-# the sender's kernel knows it was never sent, which takes a different
-# path through TCP than a real dead peer. Dropped on input, it has left
-# the sender's stack and simply never arrives, so the sender waits for an
-# ACK that never comes, exactly as it would for a host that vanished.
-nft add table inet dead_peer
-nft add chain inet dead_peer input \
-    '{ type filter hook input priority 0; policy accept; }'
-nft add rule inet dead_peer input tcp sport "$WORKER_PORT" drop
-nft add rule inet dead_peer input tcp dport "$WORKER_PORT" drop
+blackhole "$WORKER_PORT"
 
 echo "    Dropping all packets to and from port $WORKER_PORT"
 echo
 
 # --- Wait for the server to notice ---
-
-# One line of the server-side socket's retransmission state: the
-# retransmit timer (time to next attempt, attempts so far), the
-# exponential backoff exponent, and segments sent but unacknowledged.
-socket_state() {
-    local out
-    out="$(ss -Htino "( sport = :$SERVER_PORT and dport = :$WORKER_PORT )" \
-        | tr -s ' \t\n' ' ')"
-
-    if [[ -z "$out" ]]; then
-        echo "(socket closed)"
-        return
-    fi
-
-    echo "$out" | grep -oE 'timer:\([^)]*\)|backoff:[0-9]+|unacked:[0-9]+' \
-        | tr '\n' ' ' || true
-    echo
-}
 
 START=$SECONDS
 while true; do
