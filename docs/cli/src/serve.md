@@ -292,6 +292,35 @@ zizq serve \
 > `--url https://127.0.0.1:8901` and optionally to provide the `--client-cert`
 > and `--client-key` for Mutual TLS.
 
+## Detecting Vanished Workers
+
+When a worker process exits or crashes, its connection closes and Zizq
+immediately returns any jobs it was holding to the queue. When a worker's
+whole _host_ disappears (a power failure, a kernel panic, a network
+partition) nothing closes the connection. Zizq only finds out when the data
+it sends to that worker goes unacknowledged, and left to the operating
+system's defaults that can take around 15 minutes on Linux, during which the
+worker's jobs stay in flight.
+
+Zizq limits this to `30s` by default. The limit can be changed with
+`--tcp-user-timeout` or the environment variable `ZIZQ_TCP_USER_TIMEOUT`,
+using a duration such as `1m`. A value of `0` leaves the operating system
+default in place.
+
+``` shell
+zizq serve --tcp-user-timeout 1m
+```
+
+This applies to every connection, so a client on a link so unreliable that
+nothing it is sent is acknowledged for the whole period will also be
+disconnected. Zizq's clients reconnect automatically.
+
+> [!NOTE]
+> On Windows and macOS the value is rounded up to whole seconds. On macOS
+> the connection is dropped at the first retransmission attempt after the
+> timeout has elapsed, so detection can take somewhat longer than the
+> configured value.
+
 ## Default Backoff Policy
 
 > [!NOTE]

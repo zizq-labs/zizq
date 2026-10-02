@@ -5148,6 +5148,7 @@ dependencies = [
  "scru128",
  "serde",
  "serde_json",
+ "socket2",
  "tar",
  "tempfile",
  "time",
@@ -5161,6 +5162,7 @@ dependencies = [
  "tracing-subscriber",
  "tui-input",
  "urlencoding",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

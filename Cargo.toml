@@ -41,6 +41,7 @@ tracing-appender = "0.2"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
+socket2 = { version = "0.6", features = ["all"] }
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 time = "0.3"
 jaq-core = "3"
@@ -50,6 +51,9 @@ urlencoding = "2.1.3"
 tar = "0.4"
 flate2 = "1"
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
