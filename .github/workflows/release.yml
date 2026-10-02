@@ -7,12 +7,12 @@
 # test had passed. The badge tracks `ci.yml`, so moving the release here
 # keeps it honest: green means the tests pass.
 #
-# Unlike the client repos, CI does not build the shipped artifacts — the
-# multi-platform binaries are built here, after approval, because that
-# is where the Apple signing secrets are scoped and because five
-# platform builds are not worth running on every merge. What CI does
-# provide is the guarantee: this workflow refuses to build from a commit
-# whose CI run did not pass.
+# CI builds every platform's release binary too, but unsigned, so a
+# change that breaks a platform's build fails on its branch rather than
+# here. The binaries that ship are rebuilt here, after approval, because
+# this is where the Apple signing secrets are scoped. What CI provides
+# is the guarantee: this workflow refuses to build from a commit whose
+# CI run did not pass.
 name: Release
 
 on:
