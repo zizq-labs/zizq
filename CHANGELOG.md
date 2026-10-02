@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.2
 
 - Jobs held by a worker whose host vanishes without closing its
   connection (power loss, kernel panic, network partition) are now
