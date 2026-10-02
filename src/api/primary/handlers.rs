@@ -4112,9 +4112,7 @@ mod tests {
 
     fn test_app_state_with_config(config: store::StorageConfig) -> (Arc<AtomicU64>, AppState) {
         let (clock, clock_fn) = mock_clock();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), config).unwrap();
-        std::mem::forget(dir);
+        let store = Store::open_temp(config);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
         let (admin_events, _) = broadcast::channel(64);
@@ -6432,9 +6430,7 @@ mod tests {
 
     #[tokio::test]
     async fn take_respects_in_flight_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
-        std::mem::forget(dir);
+        let store = Store::open_temp(Default::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         std::mem::forget(shutdown_tx);
         let (admin_events, _) = broadcast::channel(64);

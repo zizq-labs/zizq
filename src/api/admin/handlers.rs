@@ -44,9 +44,7 @@ mod tests {
         crate::ensure_test_crypto();
         let (admin_events, _) = broadcast::channel(64);
         let (_, shutdown_rx) = watch::channel(());
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
-        std::mem::forget(dir);
+        let store = Store::open_temp(Default::default());
         let state = Arc::new(AppState {
             license: std::sync::RwLock::new(License::Free),
             store,
