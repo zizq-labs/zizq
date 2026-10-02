@@ -10,6 +10,8 @@
 #![cfg(test)]
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use super::options::{EnqueueOptions, FailureOptions};
 use super::storage_config::StorageConfig;
@@ -17,41 +19,64 @@ use super::store::Store;
 use super::types::{BackoffConfig, Job};
 use crate::time::now_millis;
 
-/// Open a fresh store in a tempdir with default config.
+/// The temporary directory a test store lives in, removed when the store
+/// is dropped.
 ///
-/// The tempdir handle is leaked so the directory survives until the test
-/// process exits — matches the original inline `test_store()`.
+/// Every store preallocates a 64 MB journal. That costs nothing on disk on
+/// Linux and macOS, where the file is sparse, but is fully allocated on
+/// Windows, so leaving every test's store behind fills the disk.
+///
+/// Background threads holding the database can briefly outlive the store,
+/// and Windows will not delete a file that is still open, so removal is
+/// retried for a short while before giving up.
+pub(crate) struct TempStoreDir(PathBuf);
+
+impl Drop for TempStoreDir {
+    fn drop(&mut self) {
+        for _ in 0..50 {
+            match std::fs::remove_dir_all(&self.0) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return,
+            }
+        }
+    }
+}
+
+impl Store {
+    /// Open a fresh store in a temporary directory, which is removed when
+    /// the store's last handle to its keyspaces is dropped.
+    pub(crate) fn open_temp(config: StorageConfig) -> Store {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let store = Store::open(dir.join("data"), config).unwrap();
+        let _ = store.ks.temp_dir.set(TempStoreDir(dir));
+        store
+    }
+}
+
+/// Open a fresh store in a tempdir with default config.
 pub(super) fn test_store() -> Store {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
-    std::mem::forget(dir);
-    store
+    Store::open_temp(Default::default())
 }
 
 /// Open a fresh store with explicit completed/dead retention windows.
 pub(super) fn test_store_with_retention(completed_ms: u64, dead_ms: u64) -> Store {
-    let dir = tempfile::tempdir().unwrap();
     let mut config = StorageConfig::default();
     config.default_completed_retention_ms = completed_ms;
     config.default_dead_retention_ms = dead_ms;
-    let store = Store::open(dir.path().join("data"), config).unwrap();
-    std::mem::forget(dir);
-    store
+    Store::open_temp(config)
 }
 
 /// Open a fresh store with a specific cap on the number of budgets.
 pub(super) fn test_store_with_max_budgets(max_budgets: usize) -> Store {
-    let dir = tempfile::tempdir().unwrap();
     let mut config = StorageConfig::default();
     config.max_budgets = max_budgets;
-    let store = Store::open(dir.path().join("data"), config).unwrap();
-    std::mem::forget(dir);
-    store
+    Store::open_temp(config)
 }
 
 /// Open a fresh store with a specific retry limit and zero-jitter backoff.
 pub(super) fn test_store_with_retry_limit(retry_limit: u32) -> Store {
-    let dir = tempfile::tempdir().unwrap();
     let mut config = StorageConfig::default();
     config.default_retry_limit = retry_limit;
     config.default_backoff = BackoffConfig {
@@ -59,9 +84,7 @@ pub(super) fn test_store_with_retry_limit(retry_limit: u32) -> Store {
         base_ms: 100,
         jitter_ms: 0, // deterministic
     };
-    let store = Store::open(dir.path().join("data"), config).unwrap();
-    std::mem::forget(dir);
-    store
+    Store::open_temp(config)
 }
 
 /// Enqueue a job on the default queue and immediately take it, returning

@@ -79,13 +79,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_store_with_retention(completed_ms: u64, dead_ms: u64) -> Store {
-        let dir = tempfile::tempdir().unwrap();
         let mut config = StorageConfig::default();
         config.default_completed_retention_ms = completed_ms;
         config.default_dead_retention_ms = dead_ms;
-        let store = Store::open(dir.path().join("data"), config).unwrap();
-        std::mem::forget(dir);
-        store
+        Store::open_temp(config)
     }
 
     fn test_clock() -> (Arc<AtomicU64>, impl Fn() -> u64) {

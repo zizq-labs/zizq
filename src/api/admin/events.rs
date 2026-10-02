@@ -987,9 +987,7 @@ mod tests {
     fn test_state_with_license(license: License) -> Arc<AppState> {
         let (admin_events, _) = broadcast::channel(64);
         let (_, shutdown_rx) = watch::channel(());
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
-        std::mem::forget(dir);
+        let store = Store::open_temp(Default::default());
         Arc::new(AppState {
             license: std::sync::RwLock::new(license),
             store,

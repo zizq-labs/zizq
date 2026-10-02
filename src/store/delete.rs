@@ -1010,11 +1010,9 @@ mod tests {
         // We can't easily observe major_compact ran from the public API,
         // so the assertion is that delete_jobs still succeeds and returns
         // the correct count when the auto-compact branch fires.
-        let dir = tempfile::tempdir().unwrap();
         let mut config = StorageConfig::default();
         config.auto_compact_threshold = 5;
-        let store = Store::open(dir.path().join("data"), config).unwrap();
-        std::mem::forget(dir);
+        let store = Store::open_temp(config);
 
         let now = now_millis();
         for _ in 0..5 {
@@ -1030,11 +1028,9 @@ mod tests {
     #[tokio::test]
     async fn delete_jobs_skips_auto_compact_when_disabled() {
         // threshold = 0 disables auto-compact entirely.
-        let dir = tempfile::tempdir().unwrap();
         let mut config = StorageConfig::default();
         config.auto_compact_threshold = 0;
-        let store = Store::open(dir.path().join("data"), config).unwrap();
-        std::mem::forget(dir);
+        let store = Store::open_temp(config);
 
         let now = now_millis();
         for _ in 0..3 {

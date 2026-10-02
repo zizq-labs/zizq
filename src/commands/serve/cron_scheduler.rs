@@ -160,10 +160,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_store() -> Store {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("data"), Default::default()).unwrap();
-        std::mem::forget(dir);
-        store
+        Store::open_temp(Default::default())
     }
 
     fn test_clock() -> (Arc<AtomicU64>, Arc<AtomicU64>) {

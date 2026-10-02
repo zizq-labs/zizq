@@ -260,6 +260,12 @@ pub(super) struct Keyspaces {
 
     /// Cap on how many budgets may exist. Enforced when creating one.
     pub(super) max_budgets: usize,
+
+    /// The temporary directory a test store lives in, removed once the
+    /// last handle to these keyspaces is dropped. Declared last so it is
+    /// dropped after the database.
+    #[cfg(test)]
+    pub(super) temp_dir: std::sync::OnceLock<super::test_support::TempStoreDir>,
 }
 
 impl Keyspaces {
@@ -365,6 +371,8 @@ impl Store {
             default_commit_mode,
             enqueue_commit_mode,
             max_budgets: config.max_budgets,
+            #[cfg(test)]
+            temp_dir: std::sync::OnceLock::new(),
         });
         let budgets = Arc::new(Budgets::new());
         let dispatch = Arc::new(Dispatch::new(budgets.clone()));
