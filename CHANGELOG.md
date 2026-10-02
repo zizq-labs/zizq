@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Jobs held by a worker whose host vanishes without closing its
+  connection (power loss, kernel panic, network partition) are now
+  returned to the queue within about 30 seconds, rather than the ~15
+  minutes Linux takes by default to give up on unacknowledged data.
+  This is the new `--tcp-user-timeout` option (`ZIZQ_TCP_USER_TIMEOUT`),
+  which sets `TCP_USER_TIMEOUT` on Linux, `TCP_MAXRT` on Windows and
+  `TCP_RXT_CONNDROPTIME` on macOS (both rounded up to whole seconds)
+  on every accepted connection. `0` restores the operating system
+  default.
 - Fixed `fsync` commit mode on Windows. Every commit made in that mode
   (`--default-commit-mode fsync` or `--enqueue-commit-mode fsync`)
   failed with "Access is denied", because the journal was synced

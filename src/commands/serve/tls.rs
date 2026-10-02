@@ -11,6 +11,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -101,14 +102,19 @@ pub fn build_server_config(
 pub struct TlsListener {
     tcp: TcpListener,
     acceptor: TlsAcceptor,
+    user_timeout: Duration,
 }
 
 impl TlsListener {
     /// Create a new `TlsListener` wrapping an existing TCP listener.
-    pub fn new(tcp: TcpListener, config: Arc<ServerConfig>) -> Self {
+    ///
+    /// `user_timeout` is applied to each accepted connection, as described
+    /// in [`super::socket::configure_accepted`].
+    pub fn new(tcp: TcpListener, config: Arc<ServerConfig>, user_timeout: Duration) -> Self {
         Self {
             tcp,
             acceptor: TlsAcceptor::from(config),
+            user_timeout,
         }
     }
 }
@@ -130,6 +136,8 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
+
+            super::socket::configure_accepted(&stream, self.user_timeout);
 
             // Perform TLS handshake (retry on failure).
             match self.acceptor.accept(stream).await {

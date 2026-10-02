@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -21,6 +22,7 @@ mod budget_waker;
 mod cron_scheduler;
 mod reaper;
 mod scheduler;
+mod socket;
 mod tls;
 
 use crate::license::{Feature, License};
@@ -119,6 +121,13 @@ pub struct Args {
     /// Interval between heartbeat frames on idle take connections (e.g. 3s, 500ms).
     #[arg(long = "heartbeat-interval", default_value = "3s", value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_HEARTBEAT_INTERVAL")]
     heartbeat_interval_ms: u64,
+
+    /// How long data sent to a client may go unacknowledged before the
+    /// connection is dropped (e.g. 30s). Bounds how long jobs taken by a
+    /// worker whose host has vanished stay in flight. 0 uses the
+    /// operating system default, typically around 15 minutes.
+    #[arg(long = "tcp-user-timeout", default_value_t = socket::DEFAULT_TCP_USER_TIMEOUT_MS, value_name = "DURATION", value_parser = parse_duration_ms, env = "ZIZQ_TCP_USER_TIMEOUT")]
+    tcp_user_timeout_ms: u64,
 
     /// Maximum number of in-flight jobs across all connections.
     /// 0 means no limit.
@@ -329,6 +338,7 @@ async fn start_primary_api(
     let bind_addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let tcp_listener = TcpListener::bind(bind_addr).await?;
     let addr = tcp_listener.local_addr()?;
+    let user_timeout = Duration::from_millis(args.tcp_user_timeout_ms);
 
     let scheme = if args.tls_cert.is_some() {
         "https"
@@ -347,7 +357,7 @@ async fn start_primary_api(
             key.as_ref(),
             args.tls_client_ca.as_deref().map(std::path::Path::new),
         )?;
-        let listener = tls::TlsListener::new(tcp_listener, config);
+        let listener = tls::TlsListener::new(tcp_listener, config, user_timeout);
         axum::serve(listener, crate::api::primary::app(state))
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
@@ -355,7 +365,9 @@ async fn start_primary_api(
             })
             .await?;
     } else {
-        axum::serve(tcp_listener, crate::api::primary::app(state))
+        let listener =
+            tcp_listener.tap_io(move |stream| socket::configure_accepted(stream, user_timeout));
+        axum::serve(listener, crate::api::primary::app(state))
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
                 let _ = shutdown_tx.send(());
@@ -394,6 +406,7 @@ async fn start_admin_api(
         format!("{}:{}", args.admin_host, args.admin_port).parse()?;
     let admin_tcp = TcpListener::bind(admin_bind_addr).await?;
     let admin_addr = admin_tcp.local_addr()?;
+    let user_timeout = Duration::from_millis(args.tcp_user_timeout_ms);
 
     let admin_scheme = if args.admin_tls_cert.is_some() {
         "https"
@@ -427,12 +440,14 @@ async fn start_admin_api(
         };
 
         let result = if let Some(config) = admin_tls_config {
-            let listener = tls::TlsListener::new(admin_tcp, config);
+            let listener = tls::TlsListener::new(admin_tcp, config, user_timeout);
             axum::serve(listener, admin_app)
                 .with_graceful_shutdown(shutdown)
                 .await
         } else {
-            axum::serve(admin_tcp, admin_app)
+            let listener =
+                admin_tcp.tap_io(move |stream| socket::configure_accepted(stream, user_timeout));
+            axum::serve(listener, admin_app)
                 .with_graceful_shutdown(shutdown)
                 .await
         };
