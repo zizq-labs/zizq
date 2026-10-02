@@ -47,6 +47,10 @@ pub(super) struct GroupCommitter {
 /// (which `db.persist(SyncAll)` would hold for the entire fsync duration,
 /// blocking all concurrent `tx.commit()` calls).
 ///
+/// The fd is opened for writing, though nothing is written through it.
+/// Unix will sync a read-only fd, but Windows' `FlushFileBuffers` fails
+/// with "Access is denied" unless the handle has write access.
+///
 /// Safety with respect to journal rotation:
 ///
 /// Rotation is performed by fjall's background worker pool while holding
@@ -63,7 +67,10 @@ fn fsync_journal_files(dir: &std::path::Path) -> std::io::Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("jnl") {
-            std::fs::File::open(&path)?.sync_data()?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .sync_data()?;
         }
     }
     Ok(())

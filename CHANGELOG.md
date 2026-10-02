@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `fsync` commit mode on Windows. Every commit made in that mode
+  (`--default-commit-mode fsync` or `--enqueue-commit-mode fsync`)
+  failed with "Access is denied", because the journal was synced
+  through a read-only handle, which Windows does not allow. The
+  default `buffered` mode was unaffected.
+
 ## 0.7.1
 
 - Fixed a cron scheduling pass aborting on its first failing entry
