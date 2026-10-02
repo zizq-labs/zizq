@@ -18,11 +18,14 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      # Required rather than defaulting to the latest successful run:
+      # GitHub's status-filtered run listing has been seen to return a
+      # months-old run as the newest, which then built an old version.
       run_id:
         description: >-
-          CI run to release from. Leave blank for the most recent
-          successful run on main.
-        required: false
+          CI run to release from: the ID in a successful CI run's URL
+          on main.
+        required: true
         type: string
 
 permissions:
@@ -57,19 +60,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -n "$REQUESTED" ]; then
-            run_id="$REQUESTED"
-          else
-            run_id="$(gh run list --repo "$REPO" \
-                        --workflow ci.yml --branch main \
-                        --status success --limit 1 \
-                        --json databaseId --jq '.[0].databaseId')"
-            if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-              echo "No successful CI run found on main." >&2
-              exit 1
-            fi
-            echo "Using the latest successful CI run on main."
-          fi
+          run_id="$REQUESTED"
 
           read -r conclusion head_sha head_branch < <(
             gh run view "$run_id" --repo "$REPO" \

@@ -214,11 +214,31 @@ if [[ "$TARGET" == *-apple-darwin ]] && [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; 
     /usr/bin/ditto -c -k "$CARGO_BIN" "$NOTARIZE_ZIP"
 
     echo "    Notarizing (typically 1–5 minutes)..."
-    xcrun notarytool submit "$NOTARIZE_ZIP" \
+    NOTARIZE_LOG="$(mktemp)"
+    if ! xcrun notarytool submit "$NOTARIZE_ZIP" \
         --key "$APPLE_API_KEY_PATH" \
         --key-id "$APPLE_API_KEY_ID" \
         --issuer "$APPLE_API_KEY_ISSUER_ID" \
-        --wait
+        --wait 2>&1 | tee "$NOTARIZE_LOG"; then
+        # Apple periodically re-issues its developer agreement, and
+        # notarization is refused until someone accepts it.
+        if grep -q "required agreement is missing or has expired" "$NOTARIZE_LOG"; then
+            echo "::error title=Apple developer agreement::Notarization refused until an updated Apple agreement is accepted. See the job log for steps."
+            echo ""
+            echo "Apple refused notarization because an agreement needs accepting:"
+            echo ""
+            echo "  1. Sign in at https://developer.apple.com/account as the team's"
+            echo "     Account Holder (other roles cannot accept agreements)."
+            echo "  2. Accept the updated Apple Developer Program License Agreement"
+            echo "     shown in the banner on that page."
+            echo "  3. If one is pending, also accept it under Business at"
+            echo "     https://appstoreconnect.apple.com/business"
+            echo "  4. Wait a few minutes, then re-run the failed macOS jobs."
+        fi
+        rm -f "$NOTARIZE_LOG"
+        exit 1
+    fi
+    rm -f "$NOTARIZE_LOG"
 
     rm -f "$NOTARIZE_ZIP"
 fi
