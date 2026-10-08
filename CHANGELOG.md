@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- `ZIZQ_PORT` and `ZIZQ_ADMIN_PORT` are now ignored, with a warning,
+  when they do not hold a port number, rather than failing startup.
+  Kubernetes injects `ZIZQ_PORT=tcp://<ip>:<port>` into every pod in
+  a namespace containing a Service named `zizq` (and
+  `ZIZQ_ADMIN_PORT` for one named `zizq-admin`), which previously
+  stopped the server starting. The warning recommends setting
+  `enableServiceLinks: false` in the pod spec. An invalid `--port` or
+  `--admin-port` on the command line is still an error.
+- Fixed `--root-dir` and `--license-key` being rejected when no
+  subcommand is given (`zizq --root-dir /var/lib/zizq` failed with
+  "unexpected argument"), even though `serve` is the default. They
+  previously worked only as environment variables or after an explicit
+  `serve`.
+
 ## 0.7.2
 
 - Jobs held by a worker whose host vanishes without closing its

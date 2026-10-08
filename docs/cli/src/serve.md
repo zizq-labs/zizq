@@ -82,6 +82,21 @@ zizq serve --host 0.0.0.0 --port 8888
 
 Clients will need configuring to use the correct address.
 
+> [!NOTE]
+> On Kubernetes, set `enableServiceLinks: false` in the pod spec. Otherwise
+> Kubernetes injects `<SERVICE>_PORT=tcp://<ip>:<port>` for every Service in
+> the namespace, so a Service named `zizq` overwrites `ZIZQ_PORT` and one named
+> `zizq-admin` overwrites `ZIZQ_ADMIN_PORT`. Zizq ignores either variable, with
+> a warning, when it does not hold a port number, and falls back to the
+> `--port` or `--admin-port` flag if given, otherwise the default.
+>
+> ``` yaml
+> spec:
+>   template:
+>     spec:
+>       enableServiceLinks: false
+> ```
+
 ## Logging Configuration
 
 The server writes logs to stdout by default. For containerized deployments this

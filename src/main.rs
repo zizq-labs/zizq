@@ -6,17 +6,22 @@
 //! Parses CLI arguments and dispatches to the appropriate subcommand.
 //!
 //! ```text
-//! Usage: zizq [OPTIONS] [COMMAND]
+//! Usage: zizq [OPTIONS]
+//!        zizq <COMMAND>
 //!
 //! Commands:
 //!   serve    Start the server (default)
 //!   top      Launch the interactive terminal UI
+//!   ...
 //!
 //! Options:
 //!      --root-dir <PATH>
 //!  -k, --license-key <KEY>
 //!  -h, --help
 //!  -V, --version
+//!
+//! Serve Options:
+//!      ... (every `serve` option, for when no command is given)
 //! ```
 
 use clap::{Parser, Subcommand};
@@ -26,7 +31,12 @@ use zizq::license::License;
 
 /// Struct used to handle command line arguments.
 #[derive(Parser)]
-#[command(name = "zizq", version, about = "A self-contained job queue server")]
+#[command(
+    name = "zizq",
+    version,
+    about = "A self-contained job queue server",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     /// Root directory for all server data and configuration.
     #[arg(
@@ -53,6 +63,11 @@ struct Cli {
     /// The subcommand that is to be arg parsed and executed.
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Arguments for `serve` when no subcommand is given, since `serve`
+    /// is the default.
+    #[command(flatten, next_help_heading = "Serve Options")]
+    serve: serve::Args,
 }
 
 /// Enum to handle the valid set of subcommands and their arguments.
@@ -136,14 +151,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Backup(args)) => backup::run(args).await,
         Some(Command::Restore(args)) => restore::run(args, &cli.root_dir).await,
         Some(Command::Compact(args)) => compact::run(args).await,
-        None => {
-            serve::run(
-                serve::Args::parse_from(std::env::args()),
-                &cli.root_dir,
-                license,
-                license_key_path,
-            )
-            .await
-        }
+        None => serve::run(cli.serve, &cli.root_dir, license, license_key_path).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn global_args_merge_with_serve_args_without_a_subcommand() {
+        let cli =
+            Cli::try_parse_from(["zizq", "--root-dir", "/data", "--host", "0.0.0.0"]).unwrap();
+        assert_eq!(cli.root_dir, "/data");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn global_args_work_with_an_explicit_serve() {
+        let cli =
+            Cli::try_parse_from(["zizq", "serve", "--root-dir", "/data", "--host", "0.0.0.0"])
+                .unwrap();
+        assert_eq!(cli.root_dir, "/data");
+        assert!(matches!(cli.command, Some(Command::Serve(_))));
+    }
+
+    #[test]
+    fn serve_args_conflict_with_other_subcommands() {
+        assert!(Cli::try_parse_from(["zizq", "--host", "0.0.0.0", "top"]).is_err());
     }
 }
