@@ -1,0 +1,103 @@
+# Builds both variants of the Zizq container image for every platform,
+# and optionally pushes them.
+#
+# `release.yml` runs this twice: once without pushing, before the GitHub
+# Release is created, so a broken Dockerfile or expired registry token
+# fails while nothing has been published; then again with pushing, after
+# the release exists.
+#
+# Expects the Dockerfile in the working directory and the Linux release
+# archives (with their `.sha256` files) in `artifacts/`.
+name: Docker images
+description: Build, and optionally push, the Zizq container images
+
+inputs:
+  version:
+    description: Zizq version being released, e.g. 0.7.2
+    required: true
+  push:
+    description: Whether to push the images
+    required: true
+  dockerhub-token:
+    description: Access token for the zizqlabs Docker Hub account
+    required: true
+  github-token:
+    description: Token with packages access, for GHCR
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compute image tags
+      id: tags
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        DOCKERHUB_IMAGE: docker.io/zizqlabs/zizq
+        GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/zizq
+      run: |
+        set -euo pipefail
+        minor="${VERSION%.*}"
+
+        # `<tag><suffix>` for each of the exact version, the minor
+        # line and the floating tag, on both registries.
+        tags() {
+          local suffix="$1" floating="$2"
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
+            echo "${image}:${VERSION}${suffix}"
+            echo "${image}:${minor}${suffix}"
+            echo "${image}:${floating}"
+          done
+        }
+
+        {
+          echo "minimal<<EOF"
+          tags "" latest
+          echo "EOF"
+          echo "alpine<<EOF"
+          tags "-alpine" alpine
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    # The alpine variant runs `apk add` for each platform, which needs
+    # emulation for the non-native one.
+    - uses: docker/setup-qemu-action@v4
+
+    - uses: docker/setup-buildx-action@v4
+
+    # Logging in even when not pushing checks the credentials before
+    # anything is published.
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v4
+      with:
+        registry: docker.io
+        username: zizqlabs
+        password: ${{ inputs.dockerhub-token }}
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.github-token }}
+
+    - name: Build minimal image
+      uses: docker/build-push-action@v7
+      with:
+        context: artifacts
+        file: Dockerfile
+        platforms: linux/amd64,linux/arm64
+        build-args: ZIZQ_VERSION=${{ inputs.version }}
+        tags: ${{ steps.tags.outputs.minimal }}
+        push: ${{ inputs.push }}
+
+    - name: Build alpine image
+      uses: docker/build-push-action@v7
+      with:
+        context: artifacts
+        file: Dockerfile
+        target: alpine
+        platforms: linux/amd64,linux/arm64
+        build-args: ZIZQ_VERSION=${{ inputs.version }}
+        tags: ${{ steps.tags.outputs.alpine }}
+        push: ${{ inputs.push }}

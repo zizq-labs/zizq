@@ -1,0 +1,6 @@
+# The build context is a directory of release archives, usually
+# `target/release`, which also holds the whole cargo build output. Send
+# only the archives.
+*
+!zizq-*-linux-*.tar.gz
+!zizq-*-linux-*.tar.gz.sha256
