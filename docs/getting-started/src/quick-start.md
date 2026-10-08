@@ -45,6 +45,35 @@ does almost all of the work.
 > Listening on http://127.0.0.1:7890 (primary)
 > ```
 
+### Or, run it with Docker { #docker }
+
+Instead of downloading the binary, you can run the published image, available
+for `linux/amd64` and `linux/arm64` on
+[Docker Hub](https://hub.docker.com/r/zizqlabs/zizq) and as
+`ghcr.io/zizq-labs/zizq`. However you run Zizq, the rest of this quick start
+guide remains the same.
+
+> Run:
+>
+> ```bash
+> docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.3
+> ```
+
+Queue data is stored in `/var/lib/zizq`, so mount a volume there or it is lost
+with the container. The admin API stays private to the container, so run
+`zizq top` inside it.
+
+> Run:
+>
+> ```bash
+> docker exec -it zizq zizq top
+> ```
+
+The default image contains only the `zizq` binary. Use the `-alpine` tag (e.g.
+`zizqlabs/zizq:0.7.3-alpine`) for a shell, `curl` and `jq` inside the
+container. The server is configured with the same `ZIZQ_*` environment
+variables described in the [Command Line Reference](/docs/cli/).
+
 ---------------------------------
 
 ## ⚙️ Enqueue and process your first job { #enqueue }

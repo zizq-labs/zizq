@@ -54,6 +54,7 @@ do
     sed -i "s/Zizq ${CURRENT}/Zizq ${NEW}/" $doc
     sed -i "s/\\/v${CURRENT}\\//\\/v${NEW}\\//" $doc
     sed -i "s/zizq-${CURRENT}/zizq-${NEW}/" $doc
+    sed -i "s/zizq:${CURRENT}/zizq:${NEW}/" $doc
 done
 
 # Update Change Date in LICENSE to 4 years from today.
