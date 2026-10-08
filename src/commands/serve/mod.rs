@@ -9,12 +9,13 @@
 //! Usage: zizq serve [OPTIONS]
 //! ```
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use clap::Parser;
+use clap::{Arg, Parser};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -64,8 +65,72 @@ fn parse_byte_size(s: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Environment variables holding port numbers.
+///
+/// Kubernetes injects `<SERVICE>_PORT=tcp://<ip>:<port>` into every pod
+/// for each Service in the namespace, so a Service named `zizq` or
+/// `zizq-admin` overwrites these. Invalid values are ignored with a
+/// warning rather than failing startup.
+const PORT_ENV_VARS: [&str; 2] = ["ZIZQ_PORT", "ZIZQ_ADMIN_PORT"];
+
+/// Whether `value` parses as a port number.
+fn is_valid_port(value: &OsStr) -> bool {
+    value.to_str().is_some_and(|s| s.parse::<u16>().is_ok())
+}
+
+/// Stop clap reading `arg` from its environment variable when the
+/// variable's value is not a port number.
+///
+/// Only the environment is lenient: an invalid `--port` on the command
+/// line is still an error.
+fn ignore_invalid_port_env(arg: Arg) -> Arg {
+    let value = arg.get_env().and_then(std::env::var_os);
+    ignore_port_env_value(arg, value.as_deref())
+}
+
+/// Clears the environment variable from `arg` if `value` is set and is
+/// not a port number.
+fn ignore_port_env_value(arg: Arg, value: Option<&OsStr>) -> Arg {
+    if value.is_some_and(|v| !is_valid_port(v)) {
+        arg.env(None::<&str>)
+    } else {
+        arg
+    }
+}
+
+/// The Kubernetes Service name that injects `var`, e.g. `zizq-admin` for
+/// `ZIZQ_ADMIN_PORT`.
+fn service_name_for_port_env(var: &str) -> String {
+    var.trim_end_matches("_PORT")
+        .to_lowercase()
+        .replace('_', "-")
+}
+
+/// Log a warning for each port environment variable that was ignored by
+/// [`ignore_invalid_port_env`].
+fn warn_invalid_port_env() {
+    for var in PORT_ENV_VARS {
+        let Some(value) = std::env::var_os(var).filter(|v| !is_valid_port(v)) else {
+            continue;
+        };
+
+        tracing::warn!(
+            env = var,
+            value = %value.to_string_lossy(),
+            "ignoring {var}, which is not a port number. On Kubernetes this is \
+             usually injected for a Service named `{}`; set \
+             `enableServiceLinks: false` in the pod spec",
+            service_name_for_port_env(var),
+        );
+    }
+}
+
 /// Arguments for the `serve` subcommand.
 #[derive(Parser)]
+#[command(
+    mut_arg("port", ignore_invalid_port_env),
+    mut_arg("admin_port", ignore_invalid_port_env)
+)]
 pub struct Args {
     /// Log output format (auto-detected if not set: TTY → pretty, non-TTY/file → compact).
     #[arg(long, value_name = "FORMAT", env = "ZIZQ_LOG_FORMAT")]
@@ -287,6 +352,7 @@ pub async fn run(
 
     let _log_guard = init_logging(&args, root)?;
     log_license(&license);
+    warn_invalid_port_env();
 
     validate_tls_args(&args, &license)?;
 
@@ -755,5 +821,63 @@ async fn shutdown_signal() {
     #[cfg(not(any(unix, windows)))]
     {
         ctrl_c.await.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn port_arg() -> Arg {
+        Args::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "port")
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn is_valid_port_accepts_port_numbers() {
+        assert!(is_valid_port(OsStr::new("7890")));
+        assert!(is_valid_port(OsStr::new("0")));
+        assert!(is_valid_port(OsStr::new("65535")));
+    }
+
+    #[test]
+    fn is_valid_port_rejects_kubernetes_service_links() {
+        assert!(!is_valid_port(OsStr::new("tcp://10.43.0.12:7890")));
+        assert!(!is_valid_port(OsStr::new("65536")));
+        assert!(!is_valid_port(OsStr::new("")));
+    }
+
+    #[test]
+    fn invalid_port_env_value_is_ignored() {
+        let arg = ignore_port_env_value(port_arg(), Some(OsStr::new("tcp://10.43.0.12:7890")));
+        assert_eq!(arg.get_env(), None);
+    }
+
+    #[test]
+    fn valid_port_env_value_is_kept() {
+        let arg = ignore_port_env_value(port_arg(), Some(OsStr::new("7891")));
+        assert_eq!(arg.get_env(), Some(OsStr::new("ZIZQ_PORT")));
+    }
+
+    #[test]
+    fn unset_port_env_is_kept() {
+        let arg = ignore_port_env_value(port_arg(), None);
+        assert_eq!(arg.get_env(), Some(OsStr::new("ZIZQ_PORT")));
+    }
+
+    #[test]
+    fn invalid_port_on_command_line_is_an_error() {
+        let result = Args::try_parse_from(["serve", "--port", "tcp://10.43.0.12:7890"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn service_name_for_port_env_matches_kubernetes_naming() {
+        assert_eq!(service_name_for_port_env("ZIZQ_PORT"), "zizq");
+        assert_eq!(service_name_for_port_env("ZIZQ_ADMIN_PORT"), "zizq-admin");
     }
 }
