@@ -49,12 +49,24 @@ cargo update -p zizq --quiet 2>/dev/null || cargo generate-lockfile --quiet 2>/d
 echo "  Updated Cargo.lock"
 
 # Update docs.
-for doc in docs/getting-started/src/quick-start.md docs/cli/src/installation.md README.md LICENSE
+for doc in docs/getting-started/src/quick-start.md docs/cli/src/installation.md README.md docker/README.md LICENSE
 do
+    # General references in text output.
     sed -i "s/Zizq ${CURRENT}/Zizq ${NEW}/" $doc
+
+    # General version formatting.
     sed -i "s/\\/v${CURRENT}\\//\\/v${NEW}\\//" $doc
+
+    # Binaries
     sed -i "s/zizq-${CURRENT}/zizq-${NEW}/" $doc
+
+    # Docker image tags
     sed -i "s/zizq:${CURRENT}/zizq:${NEW}/" $doc
+    sed -i "s/zizq:${CURRENT%.*}/zizq:${NEW%.*}/" $doc
+    sed -i "s/\`${CURRENT}\`/\`${NEW}\`/" $doc
+    sed -i "s/\`${CURRENT}-alpine\`/\`${NEW}-alpine\`/" $doc
+    sed -i "s/\`${CURRENT%.*}\`/\`${NEW%.*}\`/" $doc
+    sed -i "s/\`${CURRENT%.*}-alpine\`/\`${NEW%.*}-alpine\`/" $doc
 done
 
 # Update Change Date in LICENSE to 4 years from today.
