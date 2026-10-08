@@ -198,12 +198,55 @@ jobs:
           name: zizq-release-${{ matrix.platform }}
           path: target/release/zizq-*
 
+  # --- Build container images, without pushing ---
+  #
+  # Before anything is published, so a broken Dockerfile or expired
+  # registry token fails here rather than after the GitHub Release
+  # exists. The `docker` job rebuilds and pushes once it does; anything
+  # that can fail there is transient and fixed by re-running it.
+
+  docker-build:
+    name: Build Docker Images
+    needs: [ci, release-all-platforms]
+    # Holds DOCKERHUB_TOKEN. Restricted to `main` but with no reviewers:
+    # these jobs only run after the approved `release-all-platforms`.
+    environment: release-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # For the Dockerfile only. The build context is the artifacts.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.ci.outputs.sha }}
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cargo pkgid | sed 's/.*[#@]//')" >> "$GITHUB_OUTPUT"
+
+      - name: Download Linux release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: zizq-release-linux-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: ./.github/actions/docker-images
+        with:
+          version: ${{ steps.version.outputs.version }}
+          push: false
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+          github-token: ${{ github.token }}
+
   # --- Publish GitHub Release (runs after all platforms built) ---
 
   publish:
     name: Publish Release
-    needs: [ci, release-all-platforms]
+    needs: [ci, release-all-platforms, docker-build]
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       # The commit CI tested, not main's HEAD. `release.sh` builds
       # from this tree, so it is what actually ships.
@@ -255,3 +298,37 @@ jobs:
             --title "v${version}" \
             --notes-file release-notes.md \
             artifacts/zizq-${version}-*
+
+
+  # --- Push container images (runs after the GitHub Release exists) ---
+  #
+  # The images package the same Linux archives that were just
+  # published, verified against their checksums by the Dockerfile, so
+  # nothing is compiled here.
+
+  docker:
+    name: Publish Docker Images
+    needs: [ci, publish]
+    environment: release-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.ci.outputs.sha }}
+
+      - name: Download Linux release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: zizq-release-linux-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: ./.github/actions/docker-images
+        with:
+          version: ${{ needs.publish.outputs.version }}
+          push: true
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+          github-token: ${{ github.token }}
