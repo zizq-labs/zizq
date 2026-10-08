@@ -41,6 +41,11 @@ Zizq supports a number of powerful features.
 
 ## Getting started
 
+> [!NOTE]
+> On systems with Docker installed,
+> [alternative instructions for running with Docker](#running-with-docker) are
+> provided further down.
+
 Download a [release](https://github.com/zizq-labs/zizq/releases) compatible
 with your system and extract it. You should put the executable somewhere on
 your PATH but you can also just run it from the current directory.
@@ -69,13 +74,37 @@ Listening on 127.0.0.1:7890 (primary)
 When the server starts, it creates a root directory in which it stores all
 queue data. By default this directory is `{PWD}/zizq-root/` but can be
 explicitly specified by providing the `--root-dir` flag, or by specifying the
-`$ZIZQ_ROOT` environment variable. The server listens on `127.0.0.1` port
+`$ZIZQ_ROOT_DIR` environment variable. The server listens on `127.0.0.1` port
 `7890` unless otherwise specified by `--host` and `--port`, or `$ZIZQ_HOST` and
 `$ZIZQ_PORT`.
 
 Run `zizq serve --help` to see a complete list of available options. The
 defaults should be good even for production use, provided the server is not set
 up to listen on a public IP address.
+
+### Running with Docker
+
+Images for `linux/amd64` and `linux/arm64` are published to
+[Docker Hub](https://hub.docker.com/r/zizqlabs/zizq) and
+`ghcr.io/zizq-labs/zizq` for every release starting from `0.7.3`.
+
+```shell
+docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.3
+```
+
+Queue data is stored in `/var/lib/zizq`, so mount a volume there or queue data
+will be lost when the container is destroyed. The primary API listens on port
+`7890`. The admin API stays private to the container, so run `zizq top` inside
+the container itself:
+
+```shell
+docker exec -it zizq zizq top
+```
+
+The default image is distroless and contains only the `zizq` binary. Use the
+`-alpine` tag (e.g. `zizqlabs/zizq:0.7.3-alpine`) for a shell, `curl` and `jq`
+inside the container. Configure the server with the same `ZIZQ_*` environment
+variables as the binary.
 
 ### Communicating with the server
 
