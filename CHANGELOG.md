@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.3
 
 - `ZIZQ_PORT` and `ZIZQ_ADMIN_PORT` are now ignored, with a warning,
   when they do not hold a port number, rather than failing startup.
