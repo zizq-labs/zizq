@@ -26,9 +26,9 @@
 
 use clap::{Parser, Subcommand};
 
-/// Replaces musl's allocator in the Linux release binaries. See the
-/// `mimalloc` dependency in `Cargo.toml`.
-#[cfg(target_env = "musl")]
+/// Replaces the default allocator in the Linux (musl) and macOS builds.
+/// See the `mimalloc` dependency in `Cargo.toml`.
+#[cfg(any(target_env = "musl", target_os = "macos"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

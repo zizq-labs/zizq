@@ -55,10 +55,15 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
-# musl's own allocator is much slower than glibc's or the system allocators
-# on macOS and Windows under multi-threaded, allocation-heavy load. The
-# Linux release binaries are built against musl, so they use mimalloc.
-[target.'cfg(target_env = "musl")'.dependencies]
+# mimalloc replaces the default allocator where it measurably helps:
+#
+# - musl, which the Linux release binaries are built against. Its own
+#   allocator is much slower under multi-threaded, allocation-heavy load.
+# - macOS, where the system allocator holds on to freed memory, so a large
+#   backlog drains with memory still climbing. Throughput is the same.
+#
+# Windows keeps its system allocator.
+[target.'cfg(any(target_env = "musl", target_os = "macos"))'.dependencies]
 mimalloc = "0.1"
 
 [dev-dependencies]
