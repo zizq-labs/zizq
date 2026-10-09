@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The Linux release binaries now use the mimalloc allocator in place of
+  musl's own, which is slow under multi-threaded load. In benchmarks on
+  arm64 this raised enqueue throughput by about 70% and drain
+  throughput by about 45%, using less CPU per job, and memory is
+  returned to the operating system more readily after a backlog
+  drains. Binaries for other platforms are unchanged.
+
 ## 0.7.3
 
 - `ZIZQ_PORT` and `ZIZQ_ADMIN_PORT` are now ignored, with a warning,
