@@ -26,6 +26,12 @@
 
 use clap::{Parser, Subcommand};
 
+/// Replaces musl's allocator in the Linux release binaries. See the
+/// `mimalloc` dependency in `Cargo.toml`.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use zizq::commands::{backup, compact, restore, serve, tls, top};
 use zizq::license::License;
 
