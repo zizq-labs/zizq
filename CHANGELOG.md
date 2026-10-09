@@ -7,7 +7,11 @@
   arm64 this raised enqueue throughput by about 70% and drain
   throughput by about 45%, using less CPU per job, and memory is
   returned to the operating system more readily after a backlog
-  drains. Binaries for other platforms are unchanged.
+  drains.
+- The macOS release binaries also use mimalloc. Throughput is unchanged,
+  but peak memory with a backlog of 5 million jobs fell by about 28%,
+  as the system allocator held on to memory freed while the backlog
+  drained. Windows binaries are unchanged.
 
 ## 0.7.3
 
