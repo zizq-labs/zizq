@@ -12,7 +12,7 @@ All Zizq releases and release notes are available on the
 to choose a release for your operating system and architecture.
 
 ``` shell
-curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.7.3/zizq-0.7.3-linux-x86_64.tar.gz
+curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.7.4/zizq-0.7.4-linux-x86_64.tar.gz
 ```
 
 Once you have downloaded a release it will need to be extracted.
@@ -23,7 +23,7 @@ Release binaries are gzipped and contain the version number. Extract the file
 from the archive and it should be executable.
 
 ```shell
-tar -xvzf zizq-0.7.3-linux-x86_64.tar.gz
+tar -xvzf zizq-0.7.4-linux-x86_64.tar.gz
 ./zizq --help
 ```
 
@@ -31,7 +31,7 @@ You may prefer to move the `zizq` executable to a standard system path, such as
 `/usr/bin/zizq` or `/usr/local/bin/zizq`.
 
 ``` shell
-tar -xvzf zizq-0.7.3-linux-x86_64.tar.gz
+tar -xvzf zizq-0.7.4-linux-x86_64.tar.gz
 sudo chown root: ./zizq && sudo mv ./zizq /usr/bin/zizq
 zizq --help
 ```
@@ -75,7 +75,7 @@ GitHub Container Registry.
 * `ghcr.io/zizq-labs/zizq`
 
 ``` shell
-docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.3
+docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.4
 ```
 
 ### Image Variants and Tags
@@ -84,8 +84,8 @@ There are two variants of each release.
 
 | Tag | Contents |
 |---|---|
-| `0.7.3`, `0.7`, `latest` | The `zizq` binary alone, with no shell or other tools. |
-| `0.7.3-alpine`, `0.7-alpine`, `alpine` | The `zizq` binary on Alpine Linux, with a shell, `curl` and `jq` for calling the API from inside the container. |
+| `0.7.4`, `0.7`, `latest` | The `zizq` binary alone, with no shell or other tools. |
+| `0.7.4-alpine`, `0.7-alpine`, `alpine` | The `zizq` binary on Alpine Linux, with a shell, `curl` and `jq` for calling the API from inside the container. |
 
 The `M.m` and `latest` tags move with each release. Pin the exact version in
 production so that a restarted container always runs the version you tested.
@@ -109,14 +109,14 @@ docker run -d --name zizq \
   -p 7890:7890 \
   -v zizq-data:/var/lib/zizq \
   -e ZIZQ_DEFAULT_RETRY_LIMIT=10 \
-  zizqlabs/zizq:0.7.3
+  zizqlabs/zizq:0.7.4
 ```
 
 The entrypoint is `zizq`, so any other subcommand can be run in place of
 `serve`.
 
 ``` shell
-docker run --rm zizqlabs/zizq:0.7.3 serve --help
+docker run --rm zizqlabs/zizq:0.7.4 serve --help
 ```
 
 ### Persisting Data
@@ -128,7 +128,7 @@ mounted from the host must be writable by uid `1000`.
 ``` shell
 sudo mkdir -p /var/lib/zizq
 sudo chown 1000:1000 /var/lib/zizq
-docker run -d --name zizq -p 7890:7890 -v /var/lib/zizq:/var/lib/zizq zizqlabs/zizq:0.7.3
+docker run -d --name zizq -p 7890:7890 -v /var/lib/zizq:/var/lib/zizq zizqlabs/zizq:0.7.4
 ```
 
 Only one server may use a root directory at a time. Never point two containers
@@ -165,7 +165,7 @@ changes. See [License Key Management](./licenses.md).
 # compose.yaml
 services:
   zizq:
-    image: zizqlabs/zizq:0.7.3
+    image: zizqlabs/zizq:0.7.4
     ports:
       - "7890:7890"
     volumes:
@@ -217,7 +217,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: zizq
-          image: zizqlabs/zizq:0.7.3
+          image: zizqlabs/zizq:0.7.4
           ports:
             - name: api
               containerPort: 7890
