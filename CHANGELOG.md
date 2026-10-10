@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.4
 
 - The Linux release binaries now use the mimalloc allocator in place of
   musl's own, which is slow under multi-threaded load. In benchmarks on

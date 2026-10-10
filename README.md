@@ -51,8 +51,8 @@ with your system and extract it. You should put the executable somewhere on
 your PATH but you can also just run it from the current directory.
 
 ```shell
-curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.7.3/zizq-0.7.3-linux-x86_64.tar.gz
-tar -xvzf zizq-0.7.3-linux-x86_64.tar.gz
+curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.7.4/zizq-0.7.4-linux-x86_64.tar.gz
+tar -xvzf zizq-0.7.4-linux-x86_64.tar.gz
 ```
 
 ### Starting the server
@@ -66,7 +66,7 @@ starts the server. This is the default when no other subcommand is specified.
 
 ```shell
 $ ./zizq serve
-Zizq 0.7.3
+Zizq 0.7.4
 Listening on 127.0.0.1:8901 (admin)
 Listening on 127.0.0.1:7890 (primary)
 ```
@@ -86,10 +86,10 @@ up to listen on a public IP address.
 
 Images for `linux/amd64` and `linux/arm64` are published to
 [Docker Hub](https://hub.docker.com/r/zizqlabs/zizq) and
-`ghcr.io/zizq-labs/zizq` for every release starting from `0.7.3`.
+`ghcr.io/zizq-labs/zizq` for every release starting from `0.7.4`.
 
 ```shell
-docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.3
+docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.4
 ```
 
 Queue data is stored in `/var/lib/zizq`, so mount a volume there or queue data
@@ -102,7 +102,7 @@ docker exec -it zizq zizq top
 ```
 
 The default image is distroless and contains only the `zizq` binary. Use the
-`-alpine` tag (e.g. `zizqlabs/zizq:0.7.3-alpine`) for a shell, `curl` and `jq`
+`-alpine` tag (e.g. `zizqlabs/zizq:0.7.4-alpine`) for a shell, `curl` and `jq`
 inside the container. Configure the server with the same `ZIZQ_*` environment
 variables as the binary.
 

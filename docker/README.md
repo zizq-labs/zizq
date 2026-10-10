@@ -19,7 +19,7 @@ be processed by workers written in another.
 ## Quick Start
 
 ```shell
-docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.3
+docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.4
 ```
 
 Enqueue a job:
@@ -45,8 +45,8 @@ Images are published for `linux/amd64` and `linux/arm64`, in two variants.
 
 | Tags | Contents |
 |---|---|
-| `0.7.3`, `0.7`, `latest` | The `zizq` binary alone, with no shell or other tools. |
-| `0.7.3-alpine`, `0.7-alpine`, `alpine` | The `zizq` binary on Alpine Linux, with a shell, `curl` and `jq` for calling the API from inside the container. |
+| `0.7.4`, `0.7`, `latest` | The `zizq` binary alone, with no shell or other tools. |
+| `0.7.4-alpine`, `0.7-alpine`, `alpine` | The `zizq` binary on Alpine Linux, with a shell, `curl` and `jq` for calling the API from inside the container. |
 
 The `0.7` and `latest` tags move with each release. Pin the exact version in
 production so that a restarted container always runs the version you tested.
@@ -73,14 +73,14 @@ docker run -d --name zizq \
   -p 7890:7890 \
   -v zizq-data:/var/lib/zizq \
   -e ZIZQ_DEFAULT_RETRY_LIMIT=10 \
-  zizqlabs/zizq:0.7.3
+  zizqlabs/zizq:0.7.4
 ```
 
 The entrypoint is `zizq`, so any other subcommand can be run in place of
 `serve`:
 
 ```shell
-docker run --rm zizqlabs/zizq:0.7.3 serve --help
+docker run --rm zizqlabs/zizq:0.7.4 serve --help
 ```
 
 ## Persisting Data
@@ -120,7 +120,7 @@ environment. The server reloads the license key when the file changes.
 # compose.yaml
 services:
   zizq:
-    image: zizqlabs/zizq:0.7.3
+    image: zizqlabs/zizq:0.7.4
     ports:
       - "7890:7890"
     volumes:

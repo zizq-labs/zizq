@@ -17,7 +17,7 @@ does almost all of the work.
 > Download:
 >
 > ```bash
-> curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.7.3/zizq-0.7.3-linux-x86_64.tar.gz
+> curl -sLO https://github.com/zizq-labs/zizq/releases/download/v0.7.4/zizq-0.7.4-linux-x86_64.tar.gz
 > ```
 
 ### 2. Extract it.
@@ -25,7 +25,7 @@ does almost all of the work.
 > Extract:
 >
 > ```bash
-> tar -xvzf zizq-0.7.3-linux-x86_64.tar.gz
+> tar -xvzf zizq-0.7.4-linux-x86_64.tar.gz
 > ```
 
 ### 3. Run it to start the server.
@@ -35,7 +35,7 @@ does almost all of the work.
 > ```bash
 > ./zizq serve
 > 
-> Zizq 0.7.3
+> Zizq 0.7.4
 > 2026-04-05T05:41:26.893318Z  INFO zizq::commands::serve: no license key provided, running in free tier
 > 2026-04-05T05:41:27.081150Z  INFO zizq::commands::serve: store opened root_dir=./zizq-root
 > 2026-04-05T05:41:27.081547Z  INFO zizq::commands::serve: admin API listening addr=127.0.0.1:8901 scheme=http
@@ -56,7 +56,7 @@ guide remains the same.
 > Run:
 >
 > ```bash
-> docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.3
+> docker run -d --name zizq -p 7890:7890 -v zizq-data:/var/lib/zizq zizqlabs/zizq:0.7.4
 > ```
 
 Queue data is stored in `/var/lib/zizq`, so mount a volume there or it is lost
@@ -70,7 +70,7 @@ with the container. The admin API stays private to the container, so run
 > ```
 
 The default image contains only the `zizq` binary. Use the `-alpine` tag (e.g.
-`zizqlabs/zizq:0.7.3-alpine`) for a shell, `curl` and `jq` inside the
+`zizqlabs/zizq:0.7.4-alpine`) for a shell, `curl` and `jq` inside the
 container. The server is configured with the same `ZIZQ_*` environment
 variables described in the [Command Line Reference](/docs/cli/).
 
