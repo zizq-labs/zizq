@@ -195,13 +195,17 @@ async fn main() -> Result<(), Error> {
     )
     .await?;
 
-    let client = Client::builder()
-        .url(&server.url)
-        .format(match args.format {
-            WireFormat::Json => Format::Json,
-            WireFormat::Msgpack => Format::MessagePack,
-        })
-        .build()?;
+    // Producers and workers get separate clients, and so separate
+    // connections, as they would as separate processes in production.
+    let client = || {
+        Client::builder()
+            .url(&server.url)
+            .format(match args.format {
+                WireFormat::Json => Format::Json,
+                WireFormat::Msgpack => Format::MessagePack,
+            })
+            .build()
+    };
 
     let counters = Arc::new(Counters::default());
     let phase = Arc::new(PhaseCell::default());
@@ -217,14 +221,14 @@ async fn main() -> Result<(), Error> {
     );
 
     let enqueue = load::enqueue(
-        client.clone(),
+        client()?,
         args.jobs,
         args.batch_size,
         args.enqueue_concurrency,
         counters.clone(),
     );
     let drain = load::drain(
-        client,
+        client()?,
         args.jobs,
         args.workers,
         args.concurrency,
