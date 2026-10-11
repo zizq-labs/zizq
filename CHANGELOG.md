@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.5
 
 - Jobs queued to run use about 40% less memory. The in-memory indexes of
   ready, scheduled and in-flight jobs now hold job IDs as 16-byte
