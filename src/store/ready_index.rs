@@ -2,6 +2,7 @@
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use dashmap::DashMap;
@@ -36,8 +37,10 @@ pub(super) struct ReadyIndex {
     ///
     /// Key: `(priority, job_id)`, Value: `queue_name`.
     /// The value stores the queue name so that after `remove()` we know which
-    /// per-queue set to clean up.
-    global: SkipMap<(u16, Id), String>,
+    /// per-queue set to clean up. This is the queue's interned name from
+    /// `by_queue`, shared by every job on the queue, so it costs no extra
+    /// allocation.
+    global: SkipMap<(u16, Id), Arc<str>>,
 
     /// Per-queue indexes — for queue-filtered candidate selection.
     ///
@@ -48,7 +51,12 @@ pub(super) struct ReadyIndex {
     /// claimed in the global set. No entries should exist in the global set
     /// that do not exist in the per-queue set (insert order is per-queue first
     /// then global).
-    by_queue: DashMap<String, SkipSet<(u16, Id)>>,
+    ///
+    /// The keys are the interned queue names. A queue is removed once its
+    /// set is empty, which frees its name when no job holds it any more, so
+    /// queues created on the fly don't accumulate for the life of the
+    /// process.
+    by_queue: DashMap<Arc<str>, SkipSet<(u16, Id)>>,
 }
 
 impl ReadyIndex {
@@ -70,8 +78,27 @@ impl ReadyIndex {
             return;
         };
         self.global.remove(&(priority, id));
-        if let Some(set) = self.by_queue.get(queue) {
-            set.remove(&(priority, id));
+        self.remove_from_queue(queue, &(priority, id));
+    }
+
+    /// Remove an entry from its queue's set, and the queue itself once it
+    /// has no jobs left.
+    fn remove_from_queue(&self, queue: &str, entry: &(u16, Id)) {
+        let now_empty = match self.by_queue.get(queue) {
+            Some(set) => {
+                set.remove(entry);
+                set.is_empty()
+            }
+            None => return,
+        };
+
+        // The read guard above is released before this takes the shard's
+        // write lock, which would otherwise deadlock. Emptiness is checked
+        // again under the write lock, because an insert may have refilled
+        // the set in between. Inserts add to a set only while holding a
+        // guard on it, so none can land in a set being removed.
+        if now_empty {
+            self.by_queue.remove_if(queue, |_, set| set.is_empty());
         }
     }
 
@@ -88,11 +115,24 @@ impl ReadyIndex {
             return;
         };
         let entry = (priority, id);
-        self.by_queue
-            .entry(queue.to_string())
-            .or_insert_with(SkipSet::new)
-            .insert(entry);
-        self.global.insert(entry, queue.to_string());
+
+        // An existing queue is found under a read lock, and its interned
+        // name reused. Only a new queue takes the write lock and allocates.
+        let queue = match self.by_queue.get(queue) {
+            Some(set) => {
+                set.insert(entry);
+                set.key().clone()
+            }
+            None => {
+                let set = self
+                    .by_queue
+                    .entry(Arc::from(queue))
+                    .or_insert_with(SkipSet::new);
+                set.insert(entry);
+                set.key().clone()
+            }
+        };
+        self.global.insert(entry, queue);
     }
 
     /// Iterate over the global ready index in priority order.
@@ -118,7 +158,7 @@ impl ReadyIndex {
     pub(super) fn iter_with_queue(&self) -> impl Iterator<Item = (u16, String, String)> + '_ {
         self.global.iter().map(|entry| {
             let (priority, job_id) = entry.key();
-            (*priority, job_id.to_string(), entry.value().clone())
+            (*priority, job_id.to_string(), entry.value().to_string())
         })
     }
 
@@ -138,13 +178,13 @@ impl ReadyIndex {
         if queues.is_empty() {
             let entry = self.global.front()?;
             let (priority, job_id) = entry.key();
-            return Some((*priority, job_id.to_string(), entry.value().clone()));
+            return Some((*priority, job_id.to_string(), entry.value().to_string()));
         }
 
         queues
             .iter()
             .filter_map(|queue| {
-                let set = self.by_queue.get(queue)?;
+                let set = self.by_queue.get(queue.as_str())?;
                 let entry = set.front()?;
                 let (priority, job_id) = entry.value();
                 Some((*priority, *job_id, queue.clone()))
@@ -169,7 +209,7 @@ impl ReadyIndex {
             .filter_map(|entry| {
                 let front = entry.value().front()?;
                 let (priority, job_id) = front.value();
-                Some((*priority, job_id.to_string(), entry.key().clone()))
+                Some((*priority, job_id.to_string(), entry.key().to_string()))
             })
             .collect()
     }
@@ -209,10 +249,10 @@ impl ReadyIndex {
                 let (priority, job_id, queue) = queues
                     .iter()
                     .filter_map(|q| {
-                        let set = self.by_queue.get(q)?;
+                        let set = self.by_queue.get(q.as_str())?;
                         let front = set.front()?;
                         let (priority, job_id) = *front.value();
-                        Some((priority, job_id, q.clone()))
+                        Some((priority, job_id, set.key().clone()))
                     })
                     .min()?; // ?: or return None
 
@@ -230,10 +270,8 @@ impl ReadyIndex {
             if let Some((entry, (priority, job_id), queue)) = candidate {
                 if entry.remove() {
                     // Won the claim — clean up the per-queue set.
-                    if let Some(set) = self.by_queue.get(&queue) {
-                        set.remove(&(priority, job_id));
-                    }
-                    return Some((priority, job_id.to_string(), queue));
+                    self.remove_from_queue(&queue, &(priority, job_id));
+                    return Some((priority, job_id.to_string(), queue.to_string()));
                 }
             } // else loop again
         }
@@ -401,5 +439,93 @@ mod tests {
     fn iter_empty() {
         let idx = ReadyIndex::new();
         assert_eq!(idx.iter().collect::<Vec<_>>(), Vec::<(u16, String)>::new());
+    }
+
+    #[test]
+    fn jobs_on_a_queue_share_one_interned_name() {
+        let idx = ReadyIndex::new();
+        idx.insert("emails", 10, job_id("j1"));
+        idx.insert("emails", 20, job_id("j2"));
+
+        let names: Vec<Arc<str>> = idx.global.iter().map(|e| e.value().clone()).collect();
+        assert!(Arc::ptr_eq(&names[0], &names[1]));
+    }
+
+    #[test]
+    fn a_queue_is_dropped_once_its_last_job_is_removed() {
+        let idx = ReadyIndex::new();
+        idx.insert("emails", 10, job_id("j1"));
+        idx.insert("emails", 20, job_id("j2"));
+
+        idx.remove("emails", 10, &job_id("j1"));
+        assert_eq!(idx.by_queue.len(), 1);
+
+        idx.remove("emails", 20, &job_id("j2"));
+        assert_eq!(idx.by_queue.len(), 0);
+    }
+
+    #[test]
+    fn a_queue_is_dropped_once_its_last_job_is_claimed() {
+        let idx = ReadyIndex::new();
+        idx.insert("emails", 10, job_id("j1"));
+        idx.insert("webhooks", 10, job_id("j2"));
+
+        idx.claim(&HashSet::new()).unwrap();
+        idx.claim(&["webhooks".into()].into()).unwrap();
+        assert_eq!(idx.by_queue.len(), 0);
+    }
+
+    #[test]
+    fn a_dropped_queue_is_recreated_by_its_next_job() {
+        let idx = ReadyIndex::new();
+        idx.insert("emails", 10, job_id("j1"));
+        idx.claim(&HashSet::new()).unwrap();
+
+        idx.insert("emails", 20, job_id("j2"));
+        let queues: HashSet<String> = ["emails".into()].into();
+        assert_eq!(
+            idx.claim(&queues),
+            Some((20, job_id("j2"), "emails".into()))
+        );
+    }
+
+    /// Inserts and claims racing on one queue, which empties and is
+    /// dropped over and over. An insert that landed in a set being
+    /// dropped would lose its job from the queue-filtered view.
+    #[test]
+    fn no_job_is_lost_while_a_queue_is_dropped_and_recreated() {
+        const PRODUCERS: u32 = 4;
+        const PER_PRODUCER: u32 = 2_000;
+
+        let idx = ReadyIndex::new();
+        let queues: HashSet<String> = ["q".into()].into();
+        let claimed = std::sync::atomic::AtomicU32::new(0);
+        let total = PRODUCERS * PER_PRODUCER;
+
+        std::thread::scope(|scope| {
+            for p in 0..PRODUCERS {
+                let idx = &idx;
+                scope.spawn(move || {
+                    for i in 0..PER_PRODUCER {
+                        let id = scru128::Id::from_u128(u128::from(p * PER_PRODUCER + i + 1));
+                        idx.insert("q", 0, id.to_string());
+                    }
+                });
+            }
+            for _ in 0..4 {
+                let (idx, queues, claimed) = (&idx, &queues, &claimed);
+                scope.spawn(move || {
+                    while claimed.load(std::sync::atomic::Ordering::Relaxed) < total {
+                        if idx.claim(queues).is_some() {
+                            claimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(claimed.into_inner(), total);
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.by_queue.len(), 0);
     }
 }
