@@ -2,12 +2,17 @@
 
 ## Unreleased
 
-- Jobs waiting to run use about a third less memory. The in-memory
-  indexes of ready, scheduled and in-flight jobs now hold job IDs as
-  16-byte integers rather than strings, so a waiting job no longer costs
-  a heap allocation for its ID. A backlog of 5 million ready jobs peaked
-  at 932 MiB, down from 1,298 MiB, with throughput unchanged. Job IDs
-  are unchanged in the API and on disk.
+- Jobs queued to run use about 40% less memory. The in-memory indexes of
+  ready, scheduled and in-flight jobs now hold job IDs as 16-byte
+  integers rather than strings, and every ready job on a queue shares
+  one copy of the queue's name, so a queued job no longer incurs a heap
+  allocation for IDs or queue names. Across a backlog of 5 million ready
+  memory jobs peaked at 875 MiB, down from 1,298 MiB, with throughput
+  unchanged. Job IDs are unchanged in the API and on disk.
+- Fixed a slow memory leak with many dynamically named queues. The ready
+  index kept an entry for every queue name it had ever seen, for the
+  life of the process. A queue's entry is now freed once its last ready
+  job is taken.
 
 ## 0.7.4
 
