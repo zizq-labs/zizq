@@ -874,6 +874,7 @@ impl Budgets {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::test_support::job_id;
     use super::super::BudgetStrategy;
     use super::*;
 
@@ -918,11 +919,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
         assert_eq!(budgets.waiting(), 1);
         assert_eq!(budgets.depth("stripe"), 1);
 
-        budgets.unpark(&refs, "q", 0, "a");
+        budgets.unpark(&refs, "q", 0, &job_id("a"));
         assert_eq!(budgets.waiting(), 0);
         assert_eq!(budgets.depth("stripe"), 0);
     }
@@ -934,11 +935,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
         let refs = vec![draws("stripe", 1), draws("tenant", 1)];
 
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
         assert_eq!(budgets.depth("stripe"), 1);
         assert_eq!(budgets.depth("tenant"), 1);
 
-        budgets.unpark(&refs, "q", 0, "a");
+        budgets.unpark(&refs, "q", 0, &job_id("a"));
         assert_eq!(budgets.depth("stripe"), 0);
         assert_eq!(budgets.depth("tenant"), 0);
         assert_eq!(budgets.waiting(), 0);
@@ -951,11 +952,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "q", 0, "a");
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
+        budgets.park(&refs, "q", 0, &job_id("a"));
         assert_eq!(budgets.waiting(), 1);
 
-        budgets.unpark(&refs, "q", 0, "a");
+        budgets.unpark(&refs, "q", 0, &job_id("a"));
         assert_eq!(budgets.waiting(), 0);
     }
 
@@ -963,7 +964,7 @@ mod tests {
     fn unparking_a_job_that_was_never_parked_is_harmless() {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
 
-        budgets.unpark(&[draws("stripe", 1)], "q", 0, "absent");
+        budgets.unpark(&[draws("stripe", 1)], "q", 0, &job_id("absent"));
 
         assert_eq!(budgets.waiting(), 0);
     }
@@ -973,20 +974,20 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "q", 5, "later");
-        budgets.park(&refs, "q", 1, "urgent");
-        budgets.park(&refs, "q", 5, "earlier");
+        budgets.park(&refs, "q", 5, &job_id("later"));
+        budgets.park(&refs, "q", 1, &job_id("urgent"));
+        budgets.park(&refs, "q", 5, &job_id("earlier"));
 
         assert_eq!(
             budgets.head("stripe", &HashSet::new()),
-            Some((1, "urgent".into(), "q".into()))
+            Some((1, job_id("urgent"), "q".into()))
         );
 
-        budgets.unpark(&refs, "q", 1, "urgent");
+        budgets.unpark(&refs, "q", 1, &job_id("urgent"));
         // Same priority falls back to id order, which is time order.
         assert_eq!(
             budgets.head("stripe", &HashSet::new()),
-            Some((5, "earlier".into(), "q".into()))
+            Some((5, job_id("earlier"), "q".into()))
         );
     }
 
@@ -1002,14 +1003,14 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
         let refs = vec![draws("stripe", 1), draws("tenant", 1)];
 
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
 
         assert_eq!(budgets.job_count(), 1);
         // ...while the hint tallies queue memberships, so it sees two.
         assert_eq!(budgets.waiting(), 2);
 
         let listed: Vec<(u16, String)> = budgets.entries().collect();
-        assert_eq!(listed, vec![(0, "a".into())]);
+        assert_eq!(listed, vec![(0, job_id("a"))]);
     }
 
     #[test]
@@ -1017,8 +1018,8 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
         let refs = vec![draws("stripe", 1), draws("tenant", 1)];
 
-        budgets.park(&refs, "q", 0, "a");
-        budgets.unpark(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
+        budgets.unpark(&refs, "q", 0, &job_id("a"));
 
         assert_eq!(budgets.job_count(), 0);
         assert_eq!(budgets.entries().count(), 0);
@@ -1029,11 +1030,11 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "q", 9, "low");
-        budgets.park(&refs, "q", 1, "high");
+        budgets.park(&refs, "q", 9, &job_id("low"));
+        budgets.park(&refs, "q", 1, &job_id("high"));
 
         let listed: Vec<(u16, String)> = budgets.entries().collect();
-        assert_eq!(listed, vec![(1, "high".into()), (9, "low".into())]);
+        assert_eq!(listed, vec![(1, job_id("high")), (9, job_id("low"))]);
     }
 
     /// Dropping one budget must not evict a job that is still waiting
@@ -1041,13 +1042,18 @@ mod tests {
     #[test]
     fn forgetting_a_budget_keeps_jobs_that_draw_on_another() {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
-        budgets.park(&[draws("stripe", 1), draws("tenant", 1)], "q", 0, "shared");
-        budgets.park(&[draws("stripe", 1)], "q", 0, "only-stripe");
+        budgets.park(
+            &[draws("stripe", 1), draws("tenant", 1)],
+            "q",
+            0,
+            &job_id("shared"),
+        );
+        budgets.park(&[draws("stripe", 1)], "q", 0, &job_id("only-stripe"));
 
         budgets.forget("stripe");
 
         let listed: Vec<(u16, String)> = budgets.entries().collect();
-        assert_eq!(listed, vec![(0, "shared".into())]);
+        assert_eq!(listed, vec![(0, job_id("shared"))]);
         assert_eq!(budgets.job_count(), 1);
     }
 
@@ -1063,14 +1069,11 @@ mod tests {
         assert!(budgets.try_acquire_all(&[draws("monthly", 1)], NOW));
 
         // Priority 0 and enqueued first, so it is the best candidate.
-        budgets.park(&[draws("monthly", 1)], "q", 0, "aaa-starved");
-        budgets.park(&[draws("fast", 1)], "q", 9, "zzz-healthy");
+        budgets.park(&[draws("monthly", 1)], "q", 0, &job_id("aaa-starved"));
+        budgets.park(&[draws("fast", 1)], "q", 9, &job_id("zzz-healthy"));
 
         let claimed = budgets.claim_next(&HashSet::new(), NOW);
-        assert_eq!(
-            claimed.map(|(_, id, _, _)| id),
-            Some("zzz-healthy".to_string())
-        );
+        assert_eq!(claimed.map(|(_, id, _, _)| id), Some(job_id("zzz-healthy")));
 
         // The starved job is still waiting, not lost.
         assert_eq!(budgets.job_count(), 1);
@@ -1087,8 +1090,8 @@ mod tests {
         // Five left, but the head wants six.
         assert!(budgets.try_acquire_all(&[draws("stripe", 5)], NOW));
 
-        budgets.park(&[draws("stripe", 6)], "q", 0, "expensive-head");
-        budgets.park(&[draws("stripe", 1)], "q", 9, "cheap-behind");
+        budgets.park(&[draws("stripe", 6)], "q", 0, &job_id("expensive-head"));
+        budgets.park(&[draws("stripe", 1)], "q", 9, &job_id("cheap-behind"));
 
         assert!(budgets.claim_next(&HashSet::new(), NOW).is_none());
     }
@@ -1107,14 +1110,14 @@ mod tests {
         for (key, budget) in &pairs {
             budgets.sync(key, budget, NOW);
         }
-        budgets.park(&[draws("busy", 1)], "q", 0, "a");
+        budgets.park(&[draws("busy", 1)], "q", 0, &job_id("a"));
 
         assert_eq!(budgets.occupied_count(), 1);
         assert_eq!(
             budgets
                 .claim_next(&HashSet::new(), NOW)
                 .map(|(_, id, _, _)| id),
-            Some("a".to_string())
+            Some(job_id("a"))
         );
         // And it drops back out once its work is gone.
         assert_eq!(budgets.occupied_count(), 0);
@@ -1125,12 +1128,12 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "emails", 1, "urgent-email");
-        budgets.park(&refs, "reports", 5, "slow-report");
+        budgets.park(&refs, "emails", 1, &job_id("urgent-email"));
+        budgets.park(&refs, "reports", 5, &job_id("slow-report"));
 
         assert_eq!(
             budgets.head("stripe", &queues(&["reports"])),
-            Some((5, "slow-report".into(), "reports".into()))
+            Some((5, job_id("slow-report"), "reports".into()))
         );
     }
 
@@ -1139,7 +1142,7 @@ mod tests {
     #[test]
     fn a_filtered_head_is_empty_when_no_job_matches() {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
-        budgets.park(&[draws("stripe", 1)], "emails", 0, "a");
+        budgets.park(&[draws("stripe", 1)], "emails", 0, &job_id("a"));
 
         assert_eq!(budgets.head("stripe", &queues(&["reports"])), None);
     }
@@ -1149,13 +1152,13 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "emails", 9, "low");
-        budgets.park(&refs, "reports", 2, "high");
-        budgets.park(&refs, "ignored", 0, "highest");
+        budgets.park(&refs, "emails", 9, &job_id("low"));
+        budgets.park(&refs, "reports", 2, &job_id("high"));
+        budgets.park(&refs, "ignored", 0, &job_id("highest"));
 
         assert_eq!(
             budgets.head("stripe", &queues(&["emails", "reports"])),
-            Some((2, "high".into(), "reports".into()))
+            Some((2, job_id("high"), "reports".into()))
         );
     }
 
@@ -1166,8 +1169,8 @@ mod tests {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
         let refs = vec![draws("stripe", 1)];
 
-        budgets.park(&refs, "emails", 0, "a");
-        budgets.unpark(&refs, "emails", 0, "a");
+        budgets.park(&refs, "emails", 0, &job_id("a"));
+        budgets.unpark(&refs, "emails", 0, &job_id("a"));
 
         assert_eq!(budgets.head("stripe", &queues(&["emails"])), None);
         assert_eq!(budgets.head("stripe", &HashSet::new()), None);
@@ -1296,7 +1299,7 @@ mod tests {
     #[test]
     fn syncing_an_existing_budget_keeps_its_waiting_jobs() {
         let budgets = registry_with(&[("stripe", concurrency(10))]);
-        budgets.park(&[draws("stripe", 1)], "q", 0, "a");
+        budgets.park(&[draws("stripe", 1)], "q", 0, &job_id("a"));
 
         budgets.sync("stripe", &concurrency(20), NOW);
 
@@ -1326,8 +1329,8 @@ mod tests {
     #[test]
     fn forgetting_a_budget_drops_its_waiting_jobs_from_the_count() {
         let budgets = registry_with(&[("stripe", concurrency(5))]);
-        budgets.park(&[draws("stripe", 1)], "q", 0, "a");
-        budgets.park(&[draws("stripe", 1)], "q", 0, "b");
+        budgets.park(&[draws("stripe", 1)], "q", 0, &job_id("a"));
+        budgets.park(&[draws("stripe", 1)], "q", 0, &job_id("b"));
         assert_eq!(budgets.waiting(), 2);
 
         budgets.forget("stripe");
@@ -1339,7 +1342,12 @@ mod tests {
     #[test]
     fn clearing_forgets_everything() {
         let budgets = registry_with(&[("stripe", concurrency(5)), ("tenant", concurrency(5))]);
-        budgets.park(&[draws("stripe", 1), draws("tenant", 1)], "q", 0, "a");
+        budgets.park(
+            &[draws("stripe", 1), draws("tenant", 1)],
+            "q",
+            0,
+            &job_id("a"),
+        );
 
         budgets.clear();
 
@@ -1382,7 +1390,7 @@ mod tests {
         let refs = [draws("stripe", 4)];
 
         budgets.track(&refs);
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
 
         let claimed = budgets.claim_next(&HashSet::new(), NOW);
         assert!(claimed.is_some());
@@ -1456,13 +1464,13 @@ mod tests {
     #[test]
     fn an_affordable_job_is_reported_with_its_queue() {
         let budgets = registry_with(&[("stripe", concurrency(10))]);
-        budgets.park(&[draws("stripe", 1)], "emails", 0, "a");
+        budgets.park(&[draws("stripe", 1)], "emails", 0, &job_id("a"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 
         assert_eq!(
             wakeup.dispatchable,
-            vec![("a".to_string(), "emails".to_string())]
+            vec![(job_id("a"), "emails".to_string())]
         );
         assert_eq!(wakeup.next_refill, None);
     }
@@ -1475,7 +1483,7 @@ mod tests {
         let refs = [draws("stripe", 1)];
 
         assert!(budgets.try_acquire_all(&refs, NOW));
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 
@@ -1492,7 +1500,7 @@ mod tests {
         let refs = [draws("stripe", 1)];
 
         assert!(budgets.try_acquire_all(&refs, NOW));
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 
@@ -1522,7 +1530,7 @@ mod tests {
 
         let refs = [draws("fast", 1), draws("slow", 1)];
         assert!(budgets.try_acquire_all(&refs, NOW));
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 
@@ -1541,7 +1549,7 @@ mod tests {
 
         let refs = [draws("rate", 1), draws("slots", 1)];
         assert!(budgets.try_acquire_all(&refs, NOW));
-        budgets.park(&refs, "q", 0, "a");
+        budgets.park(&refs, "q", 0, &job_id("a"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 
@@ -1567,15 +1575,12 @@ mod tests {
 
         let starved = [draws("starved", 1)];
         assert!(budgets.try_acquire_all(&starved, NOW));
-        budgets.park(&starved, "q", 0, "waits");
-        budgets.park(&[draws("ready", 1)], "q", 9, "goes");
+        budgets.park(&starved, "q", 0, &job_id("waits"));
+        budgets.park(&[draws("ready", 1)], "q", 9, &job_id("goes"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 
-        assert_eq!(
-            wakeup.dispatchable,
-            vec![("goes".to_string(), "q".to_string())]
-        );
+        assert_eq!(wakeup.dispatchable, vec![(job_id("goes"), "q".to_string())]);
         assert_eq!(wakeup.next_refill, Some(NOW + 60_000));
     }
 
@@ -1589,12 +1594,12 @@ mod tests {
         budgets.sync("b", &concurrency(10), NOW);
         budgets.sync("starved", &per_minute(1), NOW);
 
-        budgets.park(&[draws("a", 1)], "q", 0, "one");
-        budgets.park(&[draws("b", 1)], "q", 1, "two");
+        budgets.park(&[draws("a", 1)], "q", 0, &job_id("one"));
+        budgets.park(&[draws("b", 1)], "q", 1, &job_id("two"));
 
         let starved = [draws("starved", 1)];
         assert!(budgets.try_acquire_all(&starved, NOW));
-        budgets.park(&starved, "q", 2, "waits");
+        budgets.park(&starved, "q", 2, &job_id("waits"));
 
         let wakeup = budgets.wakeup(NOW, 1);
 
@@ -1621,9 +1626,9 @@ mod tests {
         assert!(budgets.try_acquire_all(&[draws("b", 10)], NOW));
 
         // Costly, high priority, in a queue no worker takes from.
-        budgets.park(&[draws("b", 9)], "q", 10, "blocker");
+        budgets.park(&[draws("b", 9)], "q", 10, &job_id("blocker"));
         // Cheap, low priority, in the queue being served.
-        budgets.park(&[draws("b", 1)], "test", 1000, "wanted");
+        budgets.park(&[draws("b", 1)], "test", 1000, &job_id("wanted"));
 
         // One token covers `wanted` after 6s; `blocker` needs nine, so
         // 54s. Timing against the blocker would idle the worker for the
@@ -1636,7 +1641,7 @@ mod tests {
         let wakeup = budgets.wakeup(NOW + 6_000, NO_LIMIT);
         assert_eq!(
             wakeup.dispatchable,
-            vec![("wanted".to_string(), "test".to_string())]
+            vec![(job_id("wanted"), "test".to_string())]
         );
     }
 
@@ -1652,8 +1657,8 @@ mod tests {
         // Something already running holds two of the five.
         assert!(budgets.try_acquire_all(&[draws("stripe", 2)], NOW));
 
-        budgets.park(&[draws("stripe", 5)], "q", 0, "dear");
-        budgets.park(&[draws("stripe", 1)], "q", 1, "cheap");
+        budgets.park(&[draws("stripe", 5)], "q", 0, &job_id("dear"));
+        budgets.park(&[draws("stripe", 1)], "q", 1, &job_id("cheap"));
 
         let wakeup = budgets.wakeup(NOW, NO_LIMIT);
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Jobs waiting to run use about a third less memory. The in-memory
+  indexes of ready, scheduled and in-flight jobs now hold job IDs as
+  16-byte integers rather than strings, so a waiting job no longer costs
+  a heap allocation for its ID. A backlog of 5 million ready jobs peaked
+  at 932 MiB, down from 1,298 MiB, with throughput unchanged. Job IDs
+  are unchanged in the API and on disk.
+
 ## 0.7.4
 
 - The Linux release binaries now use the mimalloc allocator in place of

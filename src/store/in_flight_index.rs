@@ -2,13 +2,15 @@
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 use crossbeam_skiplist::SkipSet;
+use scru128::Id;
+
+use super::index_id::index_id;
 
 /// In-memory chronological index of in-flight jobs.
 ///
-/// Keeps a `SkipSet<(u64, String)>` ordered by `(dequeued_at, job_id)`.
+/// Keeps a `SkipSet<(u64, Id)>` ordered by `(dequeued_at, job_id)`.
 /// The tuple's derived `Ord` gives dequeue-time ordering (oldest first),
-/// then FIFO within the same timestamp (scru128 IDs are lexicographically
-/// time-ordered).
+/// then FIFO within the same timestamp (scru128 IDs are time-ordered).
 ///
 /// Lock-free — uses `crossbeam-skiplist` internally. Producers
 /// (`take_next_n_jobs`) call `insert`; consumers (complete batcher,
@@ -22,7 +24,7 @@ use crossbeam_skiplist::SkipSet;
 /// All access goes through the public methods. Direct access to `entries`
 /// is prevented by module-level privacy.
 pub(super) struct InFlightIndex {
-    entries: SkipSet<(u64, String)>,
+    entries: SkipSet<(u64, Id)>,
 }
 
 impl InFlightIndex {
@@ -41,21 +43,26 @@ impl InFlightIndex {
     pub(super) fn iter(&self) -> impl Iterator<Item = (u64, String)> + '_ {
         self.entries.iter().map(|entry| {
             let (dequeued_at, job_id) = entry.value();
-            (*dequeued_at, job_id.clone())
+            (*dequeued_at, job_id.to_string())
         })
     }
 
     pub(super) fn insert(&self, dequeued_at: u64, job_id: String) {
-        self.entries.insert((dequeued_at, job_id));
+        if let Some(id) = index_id(&job_id) {
+            self.entries.insert((dequeued_at, id));
+        }
     }
 
     pub(super) fn remove(&self, dequeued_at: u64, job_id: &str) {
-        self.entries.remove(&(dequeued_at, job_id.to_string()));
+        if let Some(id) = index_id(job_id) {
+            self.entries.remove(&(dequeued_at, id));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::job_id;
     use super::*;
 
     #[test]
@@ -68,43 +75,43 @@ mod tests {
     #[test]
     fn insert_and_len() {
         let idx = InFlightIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.insert(2000, "j2".into());
-        idx.insert(3000, "j3".into());
+        idx.insert(1000, job_id("j1"));
+        idx.insert(2000, job_id("j2"));
+        idx.insert(3000, job_id("j3"));
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn remove() {
         let idx = InFlightIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.insert(2000, "j2".into());
-        idx.remove(1000, "j1");
+        idx.insert(1000, job_id("j1"));
+        idx.insert(2000, job_id("j2"));
+        idx.remove(1000, &job_id("j1"));
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
     fn remove_nonexistent_is_noop() {
         let idx = InFlightIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.remove(9999, "nonexistent");
+        idx.insert(1000, job_id("j1"));
+        idx.remove(9999, &job_id("nonexistent"));
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
     fn iter_returns_dequeue_time_order() {
         let idx = InFlightIndex::new();
-        idx.insert(3000, "j3".into());
-        idx.insert(1000, "j1".into());
-        idx.insert(2000, "j2".into());
+        idx.insert(3000, job_id("j3"));
+        idx.insert(1000, job_id("j1"));
+        idx.insert(2000, job_id("j2"));
 
         let items: Vec<(u64, String)> = idx.iter().collect();
         assert_eq!(
             items,
             vec![
-                (1000, "j1".into()),
-                (2000, "j2".into()),
-                (3000, "j3".into()),
+                (1000, job_id("j1")),
+                (2000, job_id("j2")),
+                (3000, job_id("j3")),
             ]
         );
     }
@@ -112,14 +119,18 @@ mod tests {
     #[test]
     fn iter_breaks_ties_by_job_id() {
         let idx = InFlightIndex::new();
-        idx.insert(1000, "b".into());
-        idx.insert(1000, "a".into());
-        idx.insert(1000, "c".into());
+        idx.insert(1000, job_id("b"));
+        idx.insert(1000, job_id("a"));
+        idx.insert(1000, job_id("c"));
 
         let items: Vec<(u64, String)> = idx.iter().collect();
         assert_eq!(
             items,
-            vec![(1000, "a".into()), (1000, "b".into()), (1000, "c".into()),]
+            vec![
+                (1000, job_id("a")),
+                (1000, job_id("b")),
+                (1000, job_id("c")),
+            ]
         );
     }
 }

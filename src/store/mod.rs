@@ -11,6 +11,7 @@ mod fail;
 mod find;
 mod group_committer;
 mod in_flight_index;
+mod index_id;
 mod keys;
 mod maintenance;
 mod options;

@@ -5,6 +5,9 @@ use std::collections::HashSet;
 
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use dashmap::DashMap;
+use scru128::Id;
+
+use super::index_id::index_id;
 
 /// In-memory priority index for ready jobs (lock-free).
 ///
@@ -16,9 +19,9 @@ use dashmap::DashMap;
 /// data remains in the database; this index is rebuilt on startup via
 /// `Store::rebuild_ready_index` and then kept in sync at runtime.
 ///
-/// Keys are `(priority, job_id)`. `Ord` on `(u16, String)` gives priority ASC,
+/// Keys are `(priority, job_id)`. `Ord` on `(u16, Id)` gives priority ASC,
 /// then job_id ASC — exactly the ordering needed (FIFO within same priority,
-/// since scru128 IDs are lexicographically time-ordered).
+/// since scru128 IDs are time-ordered, as integers and as strings alike).
 ///
 /// All mutations go through the public methods (`insert`, `remove`, `claim`)
 /// which maintain consistency between the global and per-queue structures.
@@ -34,7 +37,7 @@ pub(super) struct ReadyIndex {
     /// Key: `(priority, job_id)`, Value: `queue_name`.
     /// The value stores the queue name so that after `remove()` we know which
     /// per-queue set to clean up.
-    global: SkipMap<(u16, String), String>,
+    global: SkipMap<(u16, Id), String>,
 
     /// Per-queue indexes — for queue-filtered candidate selection.
     ///
@@ -45,7 +48,7 @@ pub(super) struct ReadyIndex {
     /// claimed in the global set. No entries should exist in the global set
     /// that do not exist in the per-queue set (insert order is per-queue first
     /// then global).
-    by_queue: DashMap<String, SkipSet<(u16, String)>>,
+    by_queue: DashMap<String, SkipSet<(u16, Id)>>,
 }
 
 impl ReadyIndex {
@@ -63,9 +66,12 @@ impl ReadyIndex {
 
     /// Remove a job from both the global and per-queue indexes.
     pub(super) fn remove(&self, queue: &str, priority: u16, job_id: &str) {
-        self.global.remove(&(priority, job_id.to_string()));
+        let Some(id) = index_id(job_id) else {
+            return;
+        };
+        self.global.remove(&(priority, id));
         if let Some(set) = self.by_queue.get(queue) {
-            set.remove(&(priority, job_id.to_string()));
+            set.remove(&(priority, id));
         }
     }
 
@@ -78,11 +84,14 @@ impl ReadyIndex {
     /// whose global counterpart isn't inserted yet — `global.get()` returns
     /// `None` and it retries harmlessly.
     pub(super) fn insert(&self, queue: &str, priority: u16, job_id: String) {
-        let entry = (priority, job_id);
+        let Some(id) = index_id(&job_id) else {
+            return;
+        };
+        let entry = (priority, id);
         self.by_queue
             .entry(queue.to_string())
             .or_insert_with(SkipSet::new)
-            .insert(entry.clone());
+            .insert(entry);
         self.global.insert(entry, queue.to_string());
     }
 
@@ -93,13 +102,13 @@ impl ReadyIndex {
     pub(super) fn iter(&self) -> impl Iterator<Item = (u16, String)> + '_ {
         self.global.iter().map(|entry| {
             let (priority, job_id) = entry.key();
-            (*priority, job_id.clone())
+            (*priority, job_id.to_string())
         })
     }
 
     /// Whether an entry is present.
     pub(super) fn contains(&self, priority: u16, job_id: &str) -> bool {
-        self.global.contains_key(&(priority, job_id.to_string()))
+        index_id(job_id).is_some_and(|id| self.global.contains_key(&(priority, id)))
     }
 
     /// Iterate every entry, yielding `(priority, job_id, queue)`.
@@ -109,7 +118,7 @@ impl ReadyIndex {
     pub(super) fn iter_with_queue(&self) -> impl Iterator<Item = (u16, String, String)> + '_ {
         self.global.iter().map(|entry| {
             let (priority, job_id) = entry.key();
-            (*priority, job_id.clone(), entry.value().clone())
+            (*priority, job_id.to_string(), entry.value().clone())
         })
     }
 
@@ -129,7 +138,7 @@ impl ReadyIndex {
         if queues.is_empty() {
             let entry = self.global.front()?;
             let (priority, job_id) = entry.key();
-            return Some((*priority, job_id.clone(), entry.value().clone()));
+            return Some((*priority, job_id.to_string(), entry.value().clone()));
         }
 
         queues
@@ -138,9 +147,10 @@ impl ReadyIndex {
                 let set = self.by_queue.get(queue)?;
                 let entry = set.front()?;
                 let (priority, job_id) = entry.value();
-                Some((*priority, job_id.clone(), queue.clone()))
+                Some((*priority, *job_id, queue.clone()))
             })
             .min()
+            .map(|(priority, job_id, queue)| (priority, job_id.to_string(), queue))
     }
 
     /// The job each queue would offer next, one per queue.
@@ -159,7 +169,7 @@ impl ReadyIndex {
             .filter_map(|entry| {
                 let front = entry.value().front()?;
                 let (priority, job_id) = front.value();
-                Some((*priority, job_id.clone(), entry.key().clone()))
+                Some((*priority, job_id.to_string(), entry.key().clone()))
             })
             .collect()
     }
@@ -189,7 +199,7 @@ impl ReadyIndex {
                 // If we're just taking a job from any queue, it's just
                 // whatever is at the front of the global queue.
                 let entry = self.global.front()?; // ?: or return None
-                let key = entry.key().clone();
+                let key = *entry.key();
                 let queue = entry.value().clone();
                 Some((entry, key, queue))
             } else {
@@ -201,7 +211,7 @@ impl ReadyIndex {
                     .filter_map(|q| {
                         let set = self.by_queue.get(q)?;
                         let front = set.front()?;
-                        let (priority, job_id) = front.value().clone();
+                        let (priority, job_id) = *front.value();
                         Some((priority, job_id, q.clone()))
                     })
                     .min()?; // ?: or return None
@@ -221,9 +231,9 @@ impl ReadyIndex {
                 if entry.remove() {
                     // Won the claim — clean up the per-queue set.
                     if let Some(set) = self.by_queue.get(&queue) {
-                        set.remove(&(priority, job_id.clone()));
+                        set.remove(&(priority, job_id));
                     }
-                    return Some((priority, job_id, queue));
+                    return Some((priority, job_id.to_string(), queue));
                 }
             } // else loop again
         }
@@ -232,6 +242,7 @@ impl ReadyIndex {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::job_id;
     use super::*;
 
     #[test]
@@ -245,44 +256,44 @@ mod tests {
     #[test]
     fn insert_and_len() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
-        idx.insert("emails", 20, "j2".into());
-        idx.insert("webhooks", 10, "j3".into());
+        idx.insert("emails", 10, job_id("j1"));
+        idx.insert("emails", 20, job_id("j2"));
+        idx.insert("webhooks", 10, job_id("j3"));
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn remove_cleans_both_global_and_per_queue() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
-        idx.insert("emails", 20, "j2".into());
+        idx.insert("emails", 10, job_id("j1"));
+        idx.insert("emails", 20, job_id("j2"));
 
-        idx.remove("emails", 10, "j1");
+        idx.remove("emails", 10, &job_id("j1"));
         assert_eq!(idx.len(), 1);
 
         // Filtered claim should only see j2, not a ghost of j1.
         let queues: HashSet<String> = ["emails".into()].into();
         let claimed = idx.claim(&queues);
-        assert_eq!(claimed, Some((20, "j2".into(), "emails".into())));
+        assert_eq!(claimed, Some((20, job_id("j2"), "emails".into())));
     }
 
     #[test]
     fn remove_nonexistent_is_noop() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
-        idx.remove("emails", 99, "nonexistent");
+        idx.insert("emails", 10, job_id("j1"));
+        idx.remove("emails", 99, &job_id("nonexistent"));
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
     fn claim_unfiltered_returns_highest_priority() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 20, "j1".into());
-        idx.insert("webhooks", 5, "j2".into());
-        idx.insert("emails", 10, "j3".into());
+        idx.insert("emails", 20, job_id("j1"));
+        idx.insert("webhooks", 5, job_id("j2"));
+        idx.insert("emails", 10, job_id("j3"));
 
         let claimed = idx.claim(&HashSet::new()).unwrap();
-        assert_eq!(claimed, (5, "j2".into(), "webhooks".into()));
+        assert_eq!(claimed, (5, job_id("j2"), "webhooks".into()));
         assert_eq!(idx.len(), 2);
     }
 
@@ -290,31 +301,31 @@ mod tests {
     fn claim_unfiltered_fifo_within_same_priority() {
         let idx = ReadyIndex::new();
         // IDs are lexicographically ordered: a < b < c.
-        idx.insert("q", 10, "a".into());
-        idx.insert("q", 10, "c".into());
-        idx.insert("q", 10, "b".into());
+        idx.insert("q", 10, job_id("a"));
+        idx.insert("q", 10, job_id("c"));
+        idx.insert("q", 10, job_id("b"));
 
         let (_, id1, _) = idx.claim(&HashSet::new()).unwrap();
         let (_, id2, _) = idx.claim(&HashSet::new()).unwrap();
         let (_, id3, _) = idx.claim(&HashSet::new()).unwrap();
-        assert_eq!(id1, "a");
-        assert_eq!(id2, "b");
-        assert_eq!(id3, "c");
+        assert_eq!(id1, job_id("a"));
+        assert_eq!(id2, job_id("b"));
+        assert_eq!(id3, job_id("c"));
         assert_eq!(idx.claim(&HashSet::new()), None);
     }
 
     #[test]
     fn claim_filtered_returns_only_from_requested_queues() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
-        idx.insert("webhooks", 5, "j2".into());
-        idx.insert("reports", 1, "j3".into());
+        idx.insert("emails", 10, job_id("j1"));
+        idx.insert("webhooks", 5, job_id("j2"));
+        idx.insert("reports", 1, job_id("j3"));
 
         let queues: HashSet<String> = ["emails".into(), "webhooks".into()].into();
         let (priority, id, queue) = idx.claim(&queues).unwrap();
         // webhooks has priority 5, emails has 10 — webhooks wins.
         assert_eq!(priority, 5);
-        assert_eq!(id, "j2");
+        assert_eq!(id, job_id("j2"));
         assert_eq!(queue, "webhooks");
         // reports (priority 1) should NOT have been returned.
         assert_eq!(idx.len(), 2);
@@ -323,7 +334,7 @@ mod tests {
     #[test]
     fn claim_filtered_returns_none_for_empty_queue() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
+        idx.insert("emails", 10, job_id("j1"));
 
         let queues: HashSet<String> = ["webhooks".into()].into();
         assert_eq!(idx.claim(&queues), None);
@@ -334,18 +345,18 @@ mod tests {
     #[test]
     fn claim_filtered_picks_best_across_queues() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 20, "j1".into());
-        idx.insert("webhooks", 10, "j2".into());
+        idx.insert("emails", 20, job_id("j1"));
+        idx.insert("webhooks", 10, job_id("j2"));
 
         let queues: HashSet<String> = ["emails".into(), "webhooks".into()].into();
         let (_, id, _) = idx.claim(&queues).unwrap();
-        assert_eq!(id, "j2"); // lower priority number wins
+        assert_eq!(id, job_id("j2")); // lower priority number wins
     }
 
     #[test]
     fn claim_removes_from_both_global_and_per_queue() {
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
+        idx.insert("emails", 10, job_id("j1"));
 
         let queues: HashSet<String> = ["emails".into()].into();
         idx.claim(&queues).unwrap();
@@ -362,27 +373,27 @@ mod tests {
         // remove only cleaned the global index, leaving orphaned
         // per-queue entries that caused filtered claim to spin.
         let idx = ReadyIndex::new();
-        idx.insert("emails", 10, "j1".into());
-        idx.remove("emails", 10, "j1");
+        idx.insert("emails", 10, job_id("j1"));
+        idx.remove("emails", 10, &job_id("j1"));
 
-        idx.insert("emails", 20, "j2".into());
+        idx.insert("emails", 20, job_id("j2"));
 
         let queues: HashSet<String> = ["emails".into()].into();
         let claimed = idx.claim(&queues);
-        assert_eq!(claimed, Some((20, "j2".into(), "emails".into())));
+        assert_eq!(claimed, Some((20, job_id("j2"), "emails".into())));
     }
 
     #[test]
     fn iter_returns_priority_order() {
         let idx = ReadyIndex::new();
-        idx.insert("q", 30, "j3".into());
-        idx.insert("q", 10, "j1".into());
-        idx.insert("q", 20, "j2".into());
+        idx.insert("q", 30, job_id("j3"));
+        idx.insert("q", 10, job_id("j1"));
+        idx.insert("q", 20, job_id("j2"));
 
         let items: Vec<(u16, String)> = idx.iter().collect();
         assert_eq!(
             items,
-            vec![(10, "j1".into()), (20, "j2".into()), (30, "j3".into()),]
+            vec![(10, job_id("j1")), (20, job_id("j2")), (30, job_id("j3")),]
         );
     }
 

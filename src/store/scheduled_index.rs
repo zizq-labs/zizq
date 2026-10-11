@@ -2,13 +2,15 @@
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 use crossbeam_skiplist::SkipSet;
+use scru128::Id;
+
+use super::index_id::index_id;
 
 /// In-memory chronological index of scheduled jobs.
 ///
-/// Keeps a `SkipSet<(u64, String)>` ordered by `(ready_at, job_id)`.
+/// Keeps a `SkipSet<(u64, Id)>` ordered by `(ready_at, job_id)`.
 /// The tuple's derived `Ord` gives chronological ordering (ready_at ASC),
-/// then FIFO within the same timestamp (scru128 IDs are lexicographically
-/// time-ordered).
+/// then FIFO within the same timestamp (scru128 IDs are time-ordered).
 ///
 /// Lock-free — uses `crossbeam-skiplist` internally. The scheduler is the
 /// sole consumer of `next_due`/`remove`, so there's no concurrent claim
@@ -17,7 +19,7 @@ use crossbeam_skiplist::SkipSet;
 /// All access goes through the public methods. Direct access to `entries`
 /// is prevented by module-level privacy.
 pub(super) struct ScheduledIndex {
-    entries: SkipSet<(u64, String)>,
+    entries: SkipSet<(u64, Id)>,
 }
 
 impl ScheduledIndex {
@@ -36,16 +38,20 @@ impl ScheduledIndex {
     pub(super) fn iter(&self) -> impl Iterator<Item = (u64, String)> + '_ {
         self.entries.iter().map(|entry| {
             let (ready_at, job_id) = entry.value();
-            (*ready_at, job_id.clone())
+            (*ready_at, job_id.to_string())
         })
     }
 
     pub(super) fn insert(&self, ready_at: u64, job_id: String) {
-        self.entries.insert((ready_at, job_id));
+        if let Some(id) = index_id(&job_id) {
+            self.entries.insert((ready_at, id));
+        }
     }
 
     pub(super) fn remove(&self, ready_at: u64, job_id: &str) {
-        self.entries.remove(&(ready_at, job_id.to_string()));
+        if let Some(id) = index_id(job_id) {
+            self.entries.remove(&(ready_at, id));
+        }
     }
 
     /// Collect entries where `ready_at <= now`, up to `limit`.
@@ -68,7 +74,7 @@ impl ScheduledIndex {
                 // Return without a next_ready_at so the caller loops immediately.
                 return (due, None);
             }
-            due.push((*ready_at, job_id.clone()));
+            due.push((*ready_at, job_id.to_string()));
         }
         // Exhausted the index — no more scheduled jobs at all.
         (due, None)
@@ -77,6 +83,7 @@ impl ScheduledIndex {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::job_id;
     use super::*;
 
     #[test]
@@ -92,43 +99,43 @@ mod tests {
     #[test]
     fn insert_and_len() {
         let idx = ScheduledIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.insert(2000, "j2".into());
-        idx.insert(3000, "j3".into());
+        idx.insert(1000, job_id("j1"));
+        idx.insert(2000, job_id("j2"));
+        idx.insert(3000, job_id("j3"));
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn remove() {
         let idx = ScheduledIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.insert(2000, "j2".into());
-        idx.remove(1000, "j1");
+        idx.insert(1000, job_id("j1"));
+        idx.insert(2000, job_id("j2"));
+        idx.remove(1000, &job_id("j1"));
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
     fn remove_nonexistent_is_noop() {
         let idx = ScheduledIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.remove(9999, "nonexistent");
+        idx.insert(1000, job_id("j1"));
+        idx.remove(9999, &job_id("nonexistent"));
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
     fn iter_returns_chronological_order() {
         let idx = ScheduledIndex::new();
-        idx.insert(3000, "j3".into());
-        idx.insert(1000, "j1".into());
-        idx.insert(2000, "j2".into());
+        idx.insert(3000, job_id("j3"));
+        idx.insert(1000, job_id("j1"));
+        idx.insert(2000, job_id("j2"));
 
         let items: Vec<(u64, String)> = idx.iter().collect();
         assert_eq!(
             items,
             vec![
-                (1000, "j1".into()),
-                (2000, "j2".into()),
-                (3000, "j3".into()),
+                (1000, job_id("j1")),
+                (2000, job_id("j2")),
+                (3000, job_id("j3")),
             ]
         );
     }
@@ -136,24 +143,24 @@ mod tests {
     #[test]
     fn next_due_returns_only_due_entries() {
         let idx = ScheduledIndex::new();
-        idx.insert(100, "j1".into());
-        idx.insert(200, "j2".into());
-        idx.insert(500, "j3".into());
-        idx.insert(1000, "j4".into());
+        idx.insert(100, job_id("j1"));
+        idx.insert(200, job_id("j2"));
+        idx.insert(500, job_id("j3"));
+        idx.insert(1000, job_id("j4"));
 
         let (due, next) = idx.next_due(500, 100);
         assert_eq!(due.len(), 3);
-        assert_eq!(due[0], (100, "j1".into()));
-        assert_eq!(due[1], (200, "j2".into()));
-        assert_eq!(due[2], (500, "j3".into()));
+        assert_eq!(due[0], (100, job_id("j1")));
+        assert_eq!(due[1], (200, job_id("j2")));
+        assert_eq!(due[2], (500, job_id("j3")));
         assert_eq!(next, Some(1000)); // j4 is the next future entry
     }
 
     #[test]
     fn next_due_returns_none_when_all_due() {
         let idx = ScheduledIndex::new();
-        idx.insert(100, "j1".into());
-        idx.insert(200, "j2".into());
+        idx.insert(100, job_id("j1"));
+        idx.insert(200, job_id("j2"));
 
         let (due, next) = idx.next_due(999, 100);
         assert_eq!(due.len(), 2);
@@ -163,14 +170,14 @@ mod tests {
     #[test]
     fn next_due_respects_limit() {
         let idx = ScheduledIndex::new();
-        idx.insert(100, "j1".into());
-        idx.insert(200, "j2".into());
-        idx.insert(300, "j3".into());
+        idx.insert(100, job_id("j1"));
+        idx.insert(200, job_id("j2"));
+        idx.insert(300, job_id("j3"));
 
         let (due, next) = idx.next_due(999, 2);
         assert_eq!(due.len(), 2);
-        assert_eq!(due[0], (100, "j1".into()));
-        assert_eq!(due[1], (200, "j2".into()));
+        assert_eq!(due[0], (100, job_id("j1")));
+        assert_eq!(due[1], (200, job_id("j2")));
         // next is None because we hit the batch cap (caller should loop).
         assert_eq!(next, None);
     }
@@ -178,8 +185,8 @@ mod tests {
     #[test]
     fn next_due_returns_none_when_all_future() {
         let idx = ScheduledIndex::new();
-        idx.insert(500, "j1".into());
-        idx.insert(1000, "j2".into());
+        idx.insert(500, job_id("j1"));
+        idx.insert(1000, job_id("j2"));
 
         let (due, next) = idx.next_due(100, 100);
         assert!(due.is_empty());
@@ -189,12 +196,12 @@ mod tests {
     #[test]
     fn remove_then_reinsert_same_timestamp() {
         let idx = ScheduledIndex::new();
-        idx.insert(1000, "j1".into());
-        idx.remove(1000, "j1");
-        idx.insert(1000, "j2".into());
+        idx.insert(1000, job_id("j1"));
+        idx.remove(1000, &job_id("j1"));
+        idx.insert(1000, job_id("j2"));
 
         assert_eq!(idx.len(), 1);
         let (due, _) = idx.next_due(1000, 100);
-        assert_eq!(due, vec![(1000, "j2".into())]);
+        assert_eq!(due, vec![(1000, job_id("j2"))]);
     }
 }

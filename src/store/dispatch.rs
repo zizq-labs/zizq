@@ -332,6 +332,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::budget::{Budget, BudgetStrategy};
+    use super::super::test_support::job_id;
     use super::*;
 
     fn placement<'a>(id: &'a str, budgets: &'a [BudgetRef]) -> Placement<'a> {
@@ -346,11 +347,11 @@ mod tests {
     #[test]
     fn a_job_round_trips() {
         let dispatch = Dispatch::new(Arc::new(Budgets::new()));
-        dispatch.insert(placement("a", &[]));
+        dispatch.insert(placement(&job_id("a"), &[]));
 
         assert_eq!(dispatch.len(), 1);
         let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
-        assert_eq!(claimed.id, "a");
+        assert_eq!(claimed.id, job_id("a"));
         assert!(claimed.budgets.is_empty());
         assert_eq!(dispatch.len(), 0);
     }
@@ -358,9 +359,9 @@ mod tests {
     #[test]
     fn removing_takes_a_job_out() {
         let dispatch = Dispatch::new(Arc::new(Budgets::new()));
-        dispatch.insert(placement("a", &[]));
+        dispatch.insert(placement(&job_id("a"), &[]));
 
-        dispatch.remove(placement("a", &[]));
+        dispatch.remove(placement(&job_id("a"), &[]));
 
         assert_eq!(dispatch.len(), 0);
     }
@@ -384,10 +385,10 @@ mod tests {
         let (dispatch, _budgets) = with_stripe();
         let refs = vec![BudgetRef::new("stripe")];
 
-        dispatch.insert(placement("a", &refs));
+        dispatch.insert(placement(&job_id("a"), &refs));
 
         let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
-        assert_eq!(claimed.id, "a");
+        assert_eq!(claimed.id, job_id("a"));
         // The bindings come back so the caller can refund them if the
         // job turns out not to be dispatchable after all.
         assert_eq!(claimed.budgets.len(), 1);
@@ -404,7 +405,7 @@ mod tests {
         // Spend the whole allocation before the job is considered.
         assert!(budgets.try_acquire_all(&[BudgetRef::new("stripe").cost(10)], NOW));
 
-        dispatch.insert(placement("a", &refs));
+        dispatch.insert(placement(&job_id("a"), &refs));
 
         assert!(dispatch.claim(&HashSet::new(), NOW).is_none());
         assert_eq!(dispatch.len(), 1);
@@ -422,18 +423,18 @@ mod tests {
         dispatch.insert(Placement {
             queue: "q",
             priority: 0,
-            id: "throttled",
+            id: &job_id("throttled"),
             budgets: &[BudgetRef::new("stripe")],
         });
         dispatch.insert(Placement {
             queue: "q",
             priority: 9,
-            id: "plain",
+            id: &job_id("plain"),
             budgets: &[],
         });
 
         let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
-        assert_eq!(claimed.id, "plain");
+        assert_eq!(claimed.id, job_id("plain"));
     }
 
     /// And when it can pay, priority still decides.
@@ -444,18 +445,18 @@ mod tests {
         dispatch.insert(Placement {
             queue: "q",
             priority: 0,
-            id: "throttled",
+            id: &job_id("throttled"),
             budgets: &[BudgetRef::new("stripe")],
         });
         dispatch.insert(Placement {
             queue: "q",
             priority: 9,
-            id: "plain",
+            id: &job_id("plain"),
             budgets: &[],
         });
 
         let claimed = dispatch.claim(&HashSet::new(), NOW).unwrap();
-        assert_eq!(claimed.id, "throttled");
+        assert_eq!(claimed.id, job_id("throttled"));
     }
 
     #[test]
@@ -463,8 +464,8 @@ mod tests {
         let (dispatch, _budgets) = with_stripe();
         let refs = vec![BudgetRef::new("stripe")];
 
-        dispatch.insert(placement("a", &refs));
-        dispatch.remove(placement("a", &refs));
+        dispatch.insert(placement(&job_id("a"), &refs));
+        dispatch.remove(placement(&job_id("a"), &refs));
 
         assert_eq!(dispatch.len(), 0);
         assert_eq!(dispatch.iter().count(), 0);
@@ -479,19 +480,19 @@ mod tests {
         dispatch.insert(Placement {
             queue: "q",
             priority: 5,
-            id: "plain-mid",
+            id: &job_id("plain-mid"),
             budgets: &[],
         });
         dispatch.insert(Placement {
             queue: "q",
             priority: 1,
-            id: "throttled-first",
+            id: &job_id("throttled-first"),
             budgets: &refs,
         });
         dispatch.insert(Placement {
             queue: "q",
             priority: 9,
-            id: "throttled-last",
+            id: &job_id("throttled-last"),
             budgets: &refs,
         });
 
@@ -499,9 +500,9 @@ mod tests {
         assert_eq!(
             listed,
             vec![
-                (1, "throttled-first".into()),
-                (5, "plain-mid".into()),
-                (9, "throttled-last".into()),
+                (1, job_id("throttled-first")),
+                (5, job_id("plain-mid")),
+                (9, job_id("throttled-last")),
             ]
         );
     }
@@ -511,8 +512,8 @@ mod tests {
         let (dispatch, _budgets) = with_stripe();
         let refs = vec![BudgetRef::new("stripe")];
 
-        dispatch.insert(placement("plain", &[]));
-        dispatch.insert(placement("throttled", &refs));
+        dispatch.insert(placement(&job_id("plain"), &[]));
+        dispatch.insert(placement(&job_id("throttled"), &refs));
 
         assert_eq!(dispatch.len(), 2);
     }
@@ -520,7 +521,7 @@ mod tests {
     #[test]
     fn removing_a_job_that_was_never_placed_is_harmless() {
         let dispatch = Dispatch::new(Arc::new(Budgets::new()));
-        dispatch.remove(placement("absent", &[]));
+        dispatch.remove(placement(&job_id("absent"), &[]));
 
         assert_eq!(dispatch.len(), 0);
     }
@@ -531,17 +532,17 @@ mod tests {
         dispatch.insert(Placement {
             queue: "q",
             priority: 5,
-            id: "b",
+            id: &job_id("b"),
             budgets: &[],
         });
         dispatch.insert(Placement {
             queue: "q",
             priority: 1,
-            id: "a",
+            id: &job_id("a"),
             budgets: &[],
         });
 
         let entries: Vec<(u16, String)> = dispatch.iter().collect();
-        assert_eq!(entries, vec![(1, "a".into()), (5, "b".into())]);
+        assert_eq!(entries, vec![(1, job_id("a")), (5, job_id("b"))]);
     }
 }
