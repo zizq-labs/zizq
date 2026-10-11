@@ -115,3 +115,13 @@ pub(super) fn test_failure_opts() -> FailureOptions {
         kill: false,
     }
 }
+
+/// A valid job ID made from a short readable name, for tests of the
+/// in-memory indexes, which only accept real scru128 IDs. The name's
+/// bytes fill the ID from the front, so IDs sort in the same order as
+/// their names: `job_id("a") < job_id("b") < job_id("j1")`.
+pub(super) fn job_id(name: &str) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..name.len()].copy_from_slice(name.as_bytes());
+    scru128::Id::from_bytes(bytes).to_string()
+}
