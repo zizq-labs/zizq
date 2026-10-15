@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed workers sitting idle while jobs were waiting. Each newly ready
+  job woke only one of the waiting workers, so when a burst of enqueues
+  ended while workers were keeping up, most of them could stay asleep,
+  leaving a backlog to the few that happened to still be busy. In
+  benchmarks with 8 workers, only one was still taking jobs once
+  enqueueing stopped, and the backlog drained 5× slower than it should.
+  Idle workers with spare capacity now check for waiting jobs every
+  100ms.
 - Workers keep taking jobs while large batches are being enqueued.
   The server merges concurrent enqueue requests into shared write
   transactions, and those could grow to many thousands of jobs, holding

@@ -2033,6 +2033,10 @@ async fn reconcile_in_flight(state: &AppState, in_flight: &mut HashMap<String, u
     }
 }
 
+/// How often a take stream that is idle with capacity checks the ready
+/// index for jobs whose dispatch events it missed. See `take_jobs`.
+const IDLE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Handle `GET /jobs/take` — take jobs from the queue and deliver to workers.
 async fn take_jobs(
     TakeAccept(fmt): TakeAccept,
@@ -2115,18 +2119,34 @@ async fn take_jobs(
             // phases.
             let mut claim_token: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
+            // A stopgap for lost wake-ups. Each dispatch event carries a
+            // single claim token that only one stream can win, so a
+            // stream that sleeps after a short batch, or while at
+            // capacity, can miss every token for the jobs still waiting.
+            // When enqueueing then stops, no further event wakes it, and
+            // it sits idle while other streams drain the backlog. While
+            // a stream is idle with capacity, this tick hands it a fresh
+            // token so it checks the ready index anyway.
+            let mut idle_recheck = tokio::time::interval(IDLE_RECHECK_INTERVAL);
+            idle_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
-                // We're not yet at our prefetch limit, and nobody else has
-                // taken the claim.
-                let can_take = !claim_token.load(Ordering::Relaxed)
-                    && (prefetch == 0 || in_flight.len() < prefetch)
+                // We're not yet at our prefetch limit.
+                let has_capacity = (prefetch == 0 || in_flight.len() < prefetch)
                     && (state.global_in_flight_limit == 0
                         || (state.store.in_flight_count() as u64) < state.global_in_flight_limit);
+
+                // ...and nobody else has taken the claim.
+                let claimed = claim_token.load(Ordering::Relaxed);
+                let can_take = !claimed && has_capacity;
 
                 tokio::select! {
                     // Detect client disconnect without waiting for the
                     // next heartbeat or reserve() call.
                     _ = tx.closed() => break,
+                    _ = idle_recheck.tick(), if claimed && has_capacity => {
+                        claim_token = Arc::new(AtomicBool::new(false));
+                    }
                     _ = &mut heartbeat_sleep => {
                         // `try_send` instead of `send().await`: when the
                         // channel buffer is full (the previous heartbeat
@@ -6603,6 +6623,74 @@ mod tests {
         let job_c: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
         assert_eq!(job_c["payload"], "c");
+    }
+
+    /// A stream that misses every dispatch event for a waiting job
+    /// still takes it once it has capacity. Each event carries one
+    /// claim token, which only one stream can win, so a stream can
+    /// otherwise sleep with jobs waiting until another job is enqueued.
+    #[tokio::test]
+    async fn take_rechecks_for_jobs_whose_events_it_missed() {
+        let (state, app) = test_state_and_app();
+
+        state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("first")),
+            )
+            .await
+            .unwrap();
+
+        // Stands in for another stream that wins every claim token.
+        let mut events = state.store.subscribe();
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut claimed_tx = Some(claimed_tx);
+            while let Ok(event) = events.recv().await {
+                if let StoreEvent::JobDispatchable { token, .. } = event {
+                    token.store(true, Ordering::SeqCst);
+                    if let Some(tx) = claimed_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        });
+
+        let req = empty_request("GET", "/jobs/take?prefetch=1");
+        let res = app.oneshot(req).await.unwrap();
+        let mut body = res.into_body();
+
+        let bytes = next_body_bytes(&mut body).await;
+        let first: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(first["payload"], "first");
+
+        // At capacity, the stream can't claim this job's token, and the
+        // stand-in claims it first.
+        state
+            .store
+            .enqueue(
+                crate::time::now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!("second")),
+            )
+            .await
+            .unwrap();
+        claimed_rx.await.unwrap();
+
+        // Capacity frees up, with no event left to wake the stream.
+        state
+            .store
+            .mark_completed(crate::time::now_millis(), first["id"].as_str().unwrap())
+            .await
+            .unwrap();
+
+        let bytes = tokio::time::timeout(Duration::from_secs(2), next_body_bytes(&mut body))
+            .await
+            .expect("stream never took the waiting job");
+        let second: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim()).unwrap();
+        assert_eq!(second["payload"], "second");
     }
 
     #[tokio::test]
