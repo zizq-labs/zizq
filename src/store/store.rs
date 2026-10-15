@@ -391,6 +391,7 @@ impl Store {
             scheduled_index.clone(),
             event_tx.clone(),
             config.enqueue_batch_size,
+            config.enqueue_batch_max_jobs,
         ));
 
         // Start the complete auto-batcher — same shape as the enqueue

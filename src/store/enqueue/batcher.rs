@@ -95,6 +95,12 @@ impl EnqueueBatcher {
     /// flight) and the max ops drained into a single `tx.commit()`.
     /// Counts ops (i.e. requests), not jobs — a bulk request counts as
     /// one op regardless of how many jobs it carries.
+    ///
+    /// `max_jobs` bounds the jobs in one transaction, so a batch can't
+    /// grow large enough to hold the write lock for long and stall the
+    /// takes and acks queued behind it. It only stops ops being *merged*:
+    /// one op is never split, so a request larger than `max_jobs` still
+    /// commits whole, in a transaction of its own. 0 means no limit.
     pub(in crate::store) fn start(
         ks: Arc<Keyspaces>,
         dispatch: Arc<Dispatch>,
@@ -102,6 +108,7 @@ impl EnqueueBatcher {
         scheduled_index: Arc<ScheduledIndex>,
         event_tx: broadcast::Sender<StoreEvent>,
         batch_size: usize,
+        max_jobs: usize,
     ) -> Self {
         // Defend against pathological config — a zero-cap channel would
         // deadlock on send; size 1 effectively disables batching.
@@ -112,22 +119,16 @@ impl EnqueueBatcher {
         std::thread::Builder::new()
             .name("enqueue-batcher".into())
             .spawn(move || {
+                // An op taken off the channel that didn't fit in the
+                // previous batch. It starts the next one.
+                let mut carried = None;
+
                 // Block on the first op (sleeps the thread when idle).
-                // When the sender drops, recv() returns Err and we exit.
-                while let Ok(first) = rx.recv() {
-                    let mut batch = Vec::with_capacity(batch_size);
-                    batch.push(first);
-
-                    // Opportunistically drain whatever else is already
-                    // queued, up to the batch limit. Non-blocking — if
-                    // nothing more is waiting, process what we have.
-                    while batch.len() < batch_size {
-                        match rx.try_recv() {
-                            Ok(op) => batch.push(op),
-                            Err(_) => break,
-                        }
-                    }
-
+                // When the sender drops, recv() returns Err and we exit,
+                // after processing any carried op.
+                while let Some(first) = carried.take().or_else(|| rx.recv().ok()) {
+                    let (batch, next) = gather(first, &rx, batch_size, max_jobs);
+                    carried = next;
                     process_batch(&ks, &dispatch, &budgets, &scheduled_index, &event_tx, batch);
                 }
             })
@@ -155,6 +156,49 @@ impl EnqueueBatcher {
             reply: reply_tx,
         });
         reply_rx
+    }
+}
+
+/// Gather a batch starting with `first`, opportunistically draining
+/// whatever else is already queued. Non-blocking — if nothing more is
+/// waiting, the batch is what we have.
+///
+/// Stops at `batch_size` ops, or when the next op would take the batch
+/// past `max_jobs` jobs (0 for no limit). That op can't go back on the
+/// channel, so it is returned to start the next batch. The first op is
+/// always taken whatever its size, so an op is never split.
+fn gather<T: JobCount>(
+    first: T,
+    rx: &std::sync::mpsc::Receiver<T>,
+    batch_size: usize,
+    max_jobs: usize,
+) -> (Vec<T>, Option<T>) {
+    let mut jobs = first.job_count();
+    let mut batch = Vec::with_capacity(batch_size);
+    batch.push(first);
+
+    while batch.len() < batch_size {
+        let Ok(op) = rx.try_recv() else {
+            break;
+        };
+        if max_jobs > 0 && jobs + op.job_count() > max_jobs {
+            return (batch, Some(op));
+        }
+        jobs += op.job_count();
+        batch.push(op);
+    }
+
+    (batch, None)
+}
+
+/// How many jobs an op adds to a batch.
+trait JobCount {
+    fn job_count(&self) -> usize;
+}
+
+impl JobCount for EnqueueOp {
+    fn job_count(&self) -> usize {
+        self.prepared.len()
     }
 }
 
@@ -306,4 +350,79 @@ fn created_jobs(outcomes: &[OpOutcome]) -> impl Iterator<Item = &Job> {
             EnqueueResult::Created(job) => Some(job),
             EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{Receiver, sync_channel};
+
+    use super::*;
+
+    /// A stand-in op whose value is its job count.
+    impl JobCount for usize {
+        fn job_count(&self) -> usize {
+            *self
+        }
+    }
+
+    fn queued(ops: &[usize]) -> Receiver<usize> {
+        let (tx, rx) = sync_channel(ops.len().max(1));
+        for op in ops {
+            tx.send(*op).unwrap();
+        }
+        rx
+    }
+
+    #[test]
+    fn merges_queued_ops_up_to_the_job_limit() {
+        let rx = queued(&[100, 50, 100]);
+        let (batch, carried) = gather(50, &rx, 1000, 200);
+        assert_eq!(batch, vec![50, 100, 50]);
+        assert_eq!(carried, Some(100));
+    }
+
+    #[test]
+    fn an_op_over_the_limit_is_taken_whole_and_alone() {
+        let rx = queued(&[10]);
+        let (batch, carried) = gather(1000, &rx, 1000, 200);
+        assert_eq!(batch, vec![1000]);
+        assert_eq!(carried, Some(10));
+    }
+
+    #[test]
+    fn a_carried_op_over_the_limit_starts_the_next_batch_alone() {
+        let rx = queued(&[1000, 10]);
+        let (batch, carried) = gather(10, &rx, 1000, 200);
+        assert_eq!(batch, vec![10]);
+        assert_eq!(carried, Some(1000));
+
+        let (batch, carried) = gather(carried.unwrap(), &rx, 1000, 200);
+        assert_eq!(batch, vec![1000]);
+        assert_eq!(carried, Some(10));
+    }
+
+    #[test]
+    fn zero_means_no_job_limit() {
+        let rx = queued(&[1000, 1000]);
+        let (batch, carried) = gather(1000, &rx, 1000, 0);
+        assert_eq!(batch, vec![1000, 1000, 1000]);
+        assert_eq!(carried, None);
+    }
+
+    #[test]
+    fn the_op_limit_still_applies() {
+        let rx = queued(&[1, 1, 1]);
+        let (batch, carried) = gather(1, &rx, 2, 200);
+        assert_eq!(batch, vec![1, 1]);
+        assert_eq!(carried, None);
+        assert_eq!(rx.try_recv(), Ok(1));
+    }
+
+    #[test]
+    fn an_empty_channel_gives_a_batch_of_one() {
+        let rx = queued(&[]);
+        let (batch, carried) = gather(5, &rx, 1000, 200);
+        assert_eq!(batch, vec![5]);
+        assert_eq!(carried, None);
+    }
 }

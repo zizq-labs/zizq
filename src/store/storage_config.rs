@@ -71,6 +71,13 @@ pub struct StorageConfig {
     /// explicit `enqueue_bulk` calls, which run their own tx.
     pub enqueue_batch_size: usize,
 
+    /// Maximum number of jobs in one auto-batched enqueue transaction.
+    /// Stops requests being merged into a transaction large enough to
+    /// hold the write lock for long, which stalls the takes and acks
+    /// waiting on it. A single request larger than this still commits
+    /// whole, on its own. 0 means no limit.
+    pub enqueue_batch_max_jobs: usize,
+
     /// Maximum number of completion (ack) requests coalesced into one
     /// write transaction. Op-count bounded — a bulk-ack of N jobs
     /// still counts as one op. Same shape as `enqueue_batch_size`.
@@ -143,6 +150,10 @@ pub const DEFAULT_MAX_BUDGETS: usize = 8192;
 /// into one auto-batched commit. Also the bounded channel capacity.
 pub const DEFAULT_ENQUEUE_BATCH_SIZE: usize = 1000;
 
+/// Default maximum number of jobs in one auto-batched enqueue
+/// transaction.
+pub const DEFAULT_ENQUEUE_BATCH_MAX_JOBS: usize = 200;
+
 /// Default maximum number of concurrent completion (ack) requests
 /// coalesced into one auto-batched commit. Also the bounded channel
 /// capacity.
@@ -167,6 +178,7 @@ impl Default for StorageConfig {
             default_commit_mode: CommitMode::default(),
             enqueue_commit_mode: None,
             enqueue_batch_size: DEFAULT_ENQUEUE_BATCH_SIZE,
+            enqueue_batch_max_jobs: DEFAULT_ENQUEUE_BATCH_MAX_JOBS,
             complete_batch_size: DEFAULT_COMPLETE_BATCH_SIZE,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
             max_budgets: DEFAULT_MAX_BUDGETS,
@@ -189,6 +201,7 @@ impl StorageConfig {
     /// | `ZIZQ_DEFAULT_COMMIT_MODE` | `default_commit_mode` |
     /// | `ZIZQ_ENQUEUE_COMMIT_MODE` | `enqueue_commit_mode` |
     /// | `ZIZQ_ENQUEUE_BATCH_SIZE` | `enqueue_batch_size` |
+    /// | `ZIZQ_ENQUEUE_BATCH_MAX_JOBS` | `enqueue_batch_max_jobs` |
     /// | `ZIZQ_COMPLETE_BATCH_SIZE` | `complete_batch_size` |
     /// | `ZIZQ_AUTO_COMPACT_THRESHOLD` | `auto_compact_threshold` |
     /// | `ZIZQ_MAX_BUDGETS`        | `max_budgets`      |
@@ -229,6 +242,8 @@ impl StorageConfig {
             },
             enqueue_batch_size: env_parse("ZIZQ_ENQUEUE_BATCH_SIZE")?
                 .unwrap_or(defaults.enqueue_batch_size),
+            enqueue_batch_max_jobs: env_parse("ZIZQ_ENQUEUE_BATCH_MAX_JOBS")?
+                .unwrap_or(defaults.enqueue_batch_max_jobs),
             complete_batch_size: env_parse("ZIZQ_COMPLETE_BATCH_SIZE")?
                 .unwrap_or(defaults.complete_batch_size),
             auto_compact_threshold: env_parse("ZIZQ_AUTO_COMPACT_THRESHOLD")?

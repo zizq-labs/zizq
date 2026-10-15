@@ -441,6 +441,31 @@ durability.
 zizq serve --default-commit-mode buffered --enqueue-commit-mode fsync
 ```
 
+## Enqueue Batching
+
+The server merges enqueue requests that arrive at the same time into a
+shared write transaction, which makes many small concurrent enqueues much
+cheaper than committing each on its own. Two settings bound how much it
+merges:
+
+* `--enqueue-batch-size`, `ZIZQ_ENQUEUE_BATCH_SIZE`: the most requests
+  merged into one transaction (default `1000`)
+* `--enqueue-batch-max-jobs`, `ZIZQ_ENQUEUE_BATCH_MAX_JOBS`: the most
+  jobs merged into one transaction (default `200`, `0` for no limit)
+
+Workers taking jobs need the same write lock, so a very large enqueue
+transaction makes them wait while it commits. The job limit keeps merged
+transactions small enough that workers keep draining while jobs are
+being enqueued. It never splits a request: a single bulk enqueue larger
+than the limit still commits whole, on its own, so it is still all or
+nothing.
+
+That also means one very large bulk enqueue still pauses dispatch while
+it commits, much like one large `UPDATE` in a relational database. If
+you enqueue in bulk while workers are busy, batches of a few hundred
+jobs keep enqueueing and dequeueing moving together, rather than one
+waiting on the other.
+
 ## Cache Settings
 
 For most use cases the Zizq defaults will "just work". The underlying LSM

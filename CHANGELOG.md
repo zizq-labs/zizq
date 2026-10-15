@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Workers keep taking jobs while large batches are being enqueued.
+  The server merges concurrent enqueue requests into shared write
+  transactions, and those could grow to many thousands of jobs, holding
+  the write lock long enough to stall every worker waiting to take one.
+  A new `--enqueue-batch-max-jobs` option (`ZIZQ_ENQUEUE_BATCH_MAX_JOBS`,
+  default 200) stops requests being merged past that many jobs. A single
+  request larger than the limit still commits whole, so enqueues stay
+  all-or-nothing. In benchmarks with workers draining while 1,000-job
+  batches were enqueued, the drain rate rose by 47%; with 200-job
+  batches it rose 2.5×, keeping pace with enqueueing. Enqueue throughput
+  was unchanged. `0` restores the previous behaviour.
+
 ## 0.7.5
 
 - Jobs queued to run use about 40% less memory. The in-memory indexes of
