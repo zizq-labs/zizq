@@ -3,7 +3,7 @@
 
 //! Job failure handling: retry vs kill, backoff, error record persistence.
 
-use fjall::Slice;
+use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::delete::{apply_job_deletion, prepare_job_deletion};
@@ -159,7 +159,9 @@ impl Store {
 
                     // ---- inside tx ----
                     let mut tx = ks.write_tx();
-                    let prev = tx.take(&ks.data, &job_key)?;
+                    // A read, not `take`, since `apply_job_deletion`
+                    // removes the record itself.
+                    let prev = tx.get(&ks.data, &job_key)?;
                     if prev.as_deref() != Some(&*pre_bytes) {
                         drop(tx);
                         continue;

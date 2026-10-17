@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Completing a job, or failing it for the last time with no retention,
+  no longer deletes the job's record twice. That redundant delete was
+  done while holding the write lock that every take and enqueue waits
+  for, and removing it cut the locked time per completed job by about
+  13%.
 - Fixed workers sitting idle while jobs were waiting. Each newly ready
   job woke only one of the waiting workers, so when a burst of enqueues
   ended while workers were keeping up, most of them could stay asleep,

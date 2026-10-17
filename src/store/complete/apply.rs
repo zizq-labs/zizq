@@ -6,6 +6,8 @@
 //! verification per item. Zero-retention completions delete the job;
 //! non-zero retention updates the status/purge keys.
 
+use fjall::Readable;
+
 use super::super::delete::apply_job_deletion;
 use super::super::keys::{make_job_key, make_unique_key};
 use super::super::store::Keyspaces;
@@ -31,8 +33,9 @@ pub(super) fn apply_complete_batch(
         let job_key = make_job_key(&p.id);
 
         if let Some(ref del) = p.deletion {
-            // Zero-retention: delete via CAS.
-            let prev = tx.take(&ks.data, &job_key)?;
+            // Zero-retention: delete via CAS. A read, not `take`, since
+            // `apply_job_deletion` removes the record itself.
+            let prev = tx.get(&ks.data, &job_key)?;
             if prev.as_deref() != Some(&*p.pre_bytes) {
                 return Ok(false);
             }
