@@ -3,7 +3,7 @@
 
 //! Post-commit phase of enqueue: update the in-memory ready/scheduled
 //! index and broadcast the corresponding `JobDispatchable` / `JobScheduled`
-//! event. Called by the auto-batcher after a successful commit, and by
+//! event. Called by the writer after a successful commit, and by
 //! `cron::promote_cron_entry` for the cron-driven enqueue path.
 
 use std::sync::Arc;

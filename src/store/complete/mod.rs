@@ -4,17 +4,18 @@
 //! Job completion operations on `Store`.
 //!
 //! Both the singular `mark_completed` and bulk `mark_completed_bulk` entry
-//! points funnel into the server-side `CompleteBatcher`, which coalesces
-//! concurrent acks across many connections into a single fjall transaction.
+//! points submit to the store's writer, which gathers concurrent acks across
+//! many connections, with other writes, into a single fjall transaction.
 //! The disk work splits across the pre-read → apply pair in sibling
-//! submodules; the methods here are thin async wrappers that hand off
-//! through `spawn_blocking`.
+//! submodules, with `write` holding completion's part of a writer pass;
+//! the methods here are thin async wrappers that hand off through
+//! `spawn_blocking`.
 
 mod apply;
-mod batcher;
 mod pre_read;
+mod write;
 
-pub(super) use batcher::CompleteBatcher;
+pub(in crate::store) use write::{CompleteGroup, CompleteOp};
 
 use tokio::task;
 
@@ -29,9 +30,9 @@ impl Store {
     /// reaper will hard-delete it after the retention period. Returns `true`
     /// if the job was found in the in-flight state, `false` if it was not.
     ///
-    /// Subscribers are notified on success. Routes through the same
-    /// auto-batcher as `mark_completed_bulk` — a singular ack is a
-    /// Vec-of-1 trip through the channel.
+    /// Subscribers are notified on success. Routes through the writer, as
+    /// `mark_completed_bulk` does — a singular ack is a Vec-of-1 trip
+    /// through the channel.
     pub async fn mark_completed(&self, now: u64, id: &str) -> Result<bool, StoreError> {
         let result = self.mark_completed_bulk(now, &[id.to_string()]).await?;
         Ok(!result.completed.is_empty())
@@ -54,18 +55,18 @@ impl Store {
             });
         }
 
-        // Route through the auto-batcher. Per-op dedup happens inside
-        // the batcher; dispatch updates, in_flight_count decrement,
-        // and JobCompleted event broadcasts are all performed once per
-        // unique completed job in the batcher thread.
-        let batcher = self.complete_batcher.clone();
+        // Route through the writer. Per-op dedup happens within the writer;
+        // dispatch updates, in_flight_count decrement, and JobCompleted event
+        // broadcasts are all performed once per unique completed job on
+        // the writer thread.
+        let writer = self.writer.clone();
         let ids: Vec<String> = ids.to_vec();
 
-        let reply_rx = task::spawn_blocking(move || batcher.submit(ids, now)).await?;
+        let reply_rx = task::spawn_blocking(move || writer.submit_complete(ids, now)).await?;
 
         reply_rx
             .await
-            .map_err(|_| StoreError::Internal("complete auto-batcher channel closed".into()))?
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))?
     }
 }
 #[cfg(test)]

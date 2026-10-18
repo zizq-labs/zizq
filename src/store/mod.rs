@@ -28,6 +28,7 @@ mod storage_config;
 mod store;
 mod take;
 mod types;
+mod writer;
 
 #[cfg(test)]
 mod test_support;

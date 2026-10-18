@@ -64,11 +64,9 @@ pub struct StorageConfig {
     /// enqueue inherits `default_commit_mode`.
     pub enqueue_commit_mode: Option<CommitMode>,
 
-    /// Maximum number of single-job enqueues coalesced into one write
-    /// transaction by the server-side auto-batcher. Also the bounded
-    /// channel capacity for in-flight enqueue requests, so it caps both
-    /// per-batch size and total in-flight load. Does NOT apply to
-    /// explicit `enqueue_bulk` calls, which run their own tx.
+    /// Maximum number of enqueue requests (single or bulk, each counting
+    /// as one) gathered into one writer pass. Part of the writer's
+    /// channel capacity, so it also bounds in-flight enqueue load.
     pub enqueue_batch_size: usize,
 
     /// Maximum number of jobs in one auto-batched enqueue transaction.

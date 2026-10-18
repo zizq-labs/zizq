@@ -28,15 +28,14 @@ use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use tokio::sync::broadcast;
 
 use super::budget::Budgets;
-use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
 use super::dispatch::Dispatch;
-use super::enqueue::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::in_flight_index::InFlightIndex;
 use super::scheduled_index::ScheduledIndex;
 use super::storage_config::StorageConfig;
 use super::types::{BackoffConfig, CommitMode, StoreError};
+use super::writer::{Writer, WriterConfig, WriterContext};
 
 /// Events broadcast by the store when job state changes.
 ///
@@ -215,16 +214,11 @@ pub struct Store {
     /// when new work is available and to prune their in-flight tracking.
     pub(super) event_tx: broadcast::Sender<StoreEvent>,
 
-    /// Server-side auto-batcher for concurrent single-job enqueues.
-    /// Owned in an `Arc` so spawn_blocking tasks can cheaply clone the
-    /// handle without holding a `&Store` borrow across the .await.
-    /// Shut down by dropping (the inner `SyncSender` closes, the worker
-    /// drains queued ops and exits).
-    pub(super) enqueue_batcher: Arc<EnqueueBatcher>,
-
-    /// Server-side auto-batcher for concurrent completions (acks).
-    /// Mirrors `enqueue_batcher` in structure and lifecycle.
-    pub(super) complete_batcher: Arc<CompleteBatcher>,
+    /// The thread applying enqueues, takes and completions, gathered
+    /// into shared transactions. Owned in an `Arc` so spawn_blocking
+    /// tasks can cheaply clone the handle. Shut down by dropping: the
+    /// channel closes, and the thread finishes what is queued and exits.
+    pub(super) writer: Arc<Writer>,
 }
 
 /// Groups the fjall database handle and all disk keyspaces into a single
@@ -379,30 +373,26 @@ impl Store {
         let scheduled_index = Arc::new(ScheduledIndex::new());
         let in_flight_index = Arc::new(InFlightIndex::new());
 
-        // Start the enqueue auto-batcher — a dedicated OS thread that
-        // coalesces concurrent enqueue requests (singular + bulk) into
-        // one tx.commit(). Shuts down when this Store (and any
-        // spawn_blocking clones of the Arc) drops — the inner
-        // SyncSender closes, the worker drains remaining ops and exits.
-        let enqueue_batcher = Arc::new(EnqueueBatcher::start(
-            ks.clone(),
-            dispatch.clone(),
-            budgets.clone(),
-            scheduled_index.clone(),
-            event_tx.clone(),
-            config.enqueue_batch_size,
-            config.enqueue_batch_max_jobs,
-        ));
-
-        // Start the complete auto-batcher — same shape as the enqueue
-        // batcher, coalesces concurrent completion (ack) requests.
-        let complete_batcher = Arc::new(CompleteBatcher::start(
-            ks.clone(),
-            dispatch.clone(),
-            in_flight_index.clone(),
-            event_tx.clone(),
-            config.default_completed_retention_ms,
-            config.complete_batch_size,
+        // Start the writer — a dedicated OS thread that gathers
+        // concurrent enqueues, takes and completions into shared
+        // transactions. Shuts down when this Store (and any
+        // spawn_blocking clones of the Arc) drops — the channel closes,
+        // the thread finishes what is queued and exits.
+        let writer = Arc::new(Writer::start(
+            WriterContext {
+                ks: ks.clone(),
+                dispatch: dispatch.clone(),
+                budgets: budgets.clone(),
+                scheduled_index: scheduled_index.clone(),
+                in_flight_index: in_flight_index.clone(),
+                event_tx: event_tx.clone(),
+            },
+            WriterConfig {
+                enqueue_batch_size: config.enqueue_batch_size,
+                enqueue_batch_max_jobs: config.enqueue_batch_max_jobs,
+                complete_batch_size: config.complete_batch_size,
+                default_completed_retention_ms: config.default_completed_retention_ms,
+            },
         ));
 
         Ok(Self {
@@ -418,8 +408,7 @@ impl Store {
             default_backoff: config.default_backoff,
             index_ready: Arc::new(AtomicBool::new(true)),
             event_tx,
-            enqueue_batcher,
-            complete_batcher,
+            writer,
         })
     }
 
