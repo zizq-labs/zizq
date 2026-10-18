@@ -16,16 +16,20 @@
   Idle workers with spare capacity now check for waiting jobs every
   100ms.
 - Workers keep taking jobs while large batches are being enqueued.
-  The server merges concurrent enqueue requests into shared write
-  transactions, and those could grow to many thousands of jobs, holding
-  the write lock long enough to stall every worker waiting to take one.
-  A new `--enqueue-batch-max-jobs` option (`ZIZQ_ENQUEUE_BATCH_MAX_JOBS`,
-  default 200) stops requests being merged past that many jobs. A single
-  request larger than the limit still commits whole, so enqueues stay
-  all-or-nothing. In benchmarks with workers draining while 1,000-job
-  batches were enqueued, the drain rate rose by 47%; with 200-job
-  batches it rose 2.5×, keeping pace with enqueueing. Enqueue throughput
-  was unchanged. `0` restores the previous behaviour.
+  Enqueues, takes and acknowledgements that arrive together are now
+  written by a single writer in one shared transaction, rather than each
+  competing for the write lock. Enqueued batches used to merge into
+  transactions of many thousands of jobs, holding the lock long enough
+  to stall every worker waiting to take one. Now workers' takes and
+  acknowledgements go first, and enqueues fill the room left under a new
+  `--write-batch-max-jobs` option (`ZIZQ_WRITE_BATCH_MAX_JOBS`, default
+  200). When draining alone fills a transaction, enqueues wait for the
+  next one, but never two in a row, so producers always progress. A
+  single enqueue request is never split, so enqueues stay all-or-nothing.
+  In benchmarks with 8 workers draining while jobs were enqueued, the
+  drain rate rose by about 65% with 1,000-job batches, and 2.5× with
+  200-job batches, keeping pace with enqueueing. Throughput with no
+  overlap was unchanged. `0` removes the limit.
 
 ## 0.7.5
 

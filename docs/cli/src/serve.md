@@ -441,30 +441,34 @@ durability.
 zizq serve --default-commit-mode buffered --enqueue-commit-mode fsync
 ```
 
-## Enqueue Batching
+## Write Batching
 
-The server merges enqueue requests that arrive at the same time into a
-shared write transaction, which makes many small concurrent enqueues much
-cheaper than committing each on its own. Two settings bound how much it
-merges:
+The server applies writes that arrive at the same time — enqueues,
+workers taking jobs, and acknowledgements — together in one shared write
+transaction. Many small concurrent writes are much cheaper committed together
+rather than committing each on its own. The following settings can be used to
+tune how much is processed in one transaction:
 
-* `--enqueue-batch-size`, `ZIZQ_ENQUEUE_BATCH_SIZE`: the most requests
-  merged into one transaction (default `1000`)
-* `--enqueue-batch-max-jobs`, `ZIZQ_ENQUEUE_BATCH_MAX_JOBS`: the most
-  jobs merged into one transaction (default `200`, `0` for no limit)
+* `--write-batch-max-jobs`, `ZIZQ_WRITE_BATCH_MAX_JOBS`: the most jobs
+  written in one transaction (default `200`, `0` for no limit)
+* `--enqueue-batch-size`, `ZIZQ_ENQUEUE_BATCH_SIZE`: the most enqueue
+  requests in one transaction (default `1000`)
+* `--complete-batch-size`, `ZIZQ_COMPLETE_BATCH_SIZE`: the most
+  acknowledgement requests in one transaction (default `1000`)
 
-Workers taking jobs need the same write lock, so a very large enqueue
-transaction makes them wait while it commits. The job limit keeps merged
-transactions small enough that workers keep draining while jobs are
-being enqueued. It never splits a request: a single bulk enqueue larger
-than the limit still commits whole, on its own, so it is still all or
-nothing.
+Dequeues and acknowledgements are handled first, and enqueues fill whatever
+room they leave under the job limit. This keeps a burst of enqueues from
+starving the workers that are draining the queue. When dequeues and
+acknowledgements alone fill a transaction, enqueues wait for the next one, but
+never for two in a row, so producers always make progress. A request is never
+split: a bulk enqueue larger than the limit still commits whole, so it is still
+all or nothing.
 
-That also means one very large bulk enqueue still pauses dispatch while
+This also means one very large bulk enqueue may briefly stall dequeueing while
 it commits, much like one large `UPDATE` in a relational database. If
-you enqueue in bulk while workers are busy, batches of a few hundred
-jobs keep enqueueing and dequeueing moving together, rather than one
-waiting on the other.
+you enqueue in bulk while workers are busy, batches of no more than a few
+hundred jobs (or whatever your total concurrency is) keep enqueueing and
+dequeueing moving together, rather than one waiting on the other.
 
 ## Cache Settings
 

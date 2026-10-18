@@ -68,7 +68,7 @@ pub(in crate::store) enum WriteOp {
 /// Settings for [`Writer::start`].
 pub(in crate::store) struct WriterConfig {
     pub enqueue_batch_size: usize,
-    pub enqueue_batch_max_jobs: usize,
+    pub write_batch_max_jobs: usize,
     pub complete_batch_size: usize,
     pub default_completed_retention_ms: u64,
 }
@@ -93,7 +93,7 @@ impl Writer {
     pub(in crate::store) fn start(cx: WriterContext, config: WriterConfig) -> Self {
         let limits = Limits {
             enqueue_ops: config.enqueue_batch_size.max(1),
-            enqueue_jobs: config.enqueue_batch_max_jobs,
+            max_jobs: config.write_batch_max_jobs,
             complete_ops: config.complete_batch_size.max(1),
             take_ops: TAKE_BATCH_SIZE,
         };
@@ -104,7 +104,8 @@ impl Writer {
             .name("writer".into())
             .spawn(move || {
                 let mut carry = VecDeque::new();
-                while let Some(batch) = gather(&mut carry, &rx, &limits) {
+                let mut skipped_enqueues = false;
+                while let Some(batch) = gather(&mut carry, &mut skipped_enqueues, &rx, &limits) {
                     run_pass(&cx, retention_ms, batch, &mut carry);
                 }
             })
@@ -352,11 +353,16 @@ impl Pending for WriteOp {
 struct Limits {
     /// Most enqueue requests (`--enqueue-batch-size`).
     enqueue_ops: usize,
-    /// Most enqueued jobs (`--enqueue-batch-max-jobs`), 0 for no limit.
-    /// Keeps merged enqueues from making takes and acks wait long while
-    /// they commit. The first enqueue in a pass is always taken whole,
-    /// so a request is never split.
-    enqueue_jobs: usize,
+    /// Most jobs in a pass (`--write-batch-max-jobs`), 0 for no limit.
+    /// Takes and completions are admitted first and count towards it;
+    /// enqueues fill whatever room is left. Keeps a burst of enqueues
+    /// from crowding out the draining of the queue.
+    ///
+    /// When draining alone fills a pass, enqueues are left out of it,
+    /// but never from two passes in a row, so workers get passes free of
+    /// a large enqueue and producers still progress. Otherwise at least
+    /// one enqueue request is admitted, whole: a request is never split.
+    max_jobs: usize,
     /// Most completion requests (`--complete-batch-size`).
     complete_ops: usize,
     /// Most takes.
@@ -374,9 +380,9 @@ impl Limits {
 #[derive(Default)]
 struct Counts {
     enqueue_ops: usize,
-    enqueue_jobs: usize,
     complete_ops: usize,
     take_ops: usize,
+    jobs: usize,
 }
 
 impl Counts {
@@ -384,9 +390,9 @@ impl Counts {
         match op.kind() {
             Kind::Enqueue => {
                 self.enqueue_ops < limits.enqueue_ops
-                    && (limits.enqueue_jobs == 0
+                    && (limits.max_jobs == 0
                         || self.enqueue_ops == 0
-                        || self.enqueue_jobs + op.jobs() <= limits.enqueue_jobs)
+                        || self.jobs + op.jobs() <= limits.max_jobs)
             }
             Kind::Complete => self.complete_ops < limits.complete_ops,
             Kind::Take => self.take_ops < limits.take_ops,
@@ -395,22 +401,27 @@ impl Counts {
 
     fn add(&mut self, op: &impl Pending) {
         match op.kind() {
-            Kind::Enqueue => {
-                self.enqueue_ops += 1;
-                self.enqueue_jobs += op.jobs();
-            }
+            Kind::Enqueue => self.enqueue_ops += 1,
             Kind::Complete => self.complete_ops += 1,
             Kind::Take => self.take_ops += 1,
         }
+        self.jobs += op.jobs();
     }
 }
 
-/// Gather the next pass: carried ops first, then whatever is already
-/// waiting on the channel, blocking only for the first op. Ops over a
-/// limit are kept, in order, as the new carry. Returns `None` once the
-/// channel is closed and nothing is carried.
+/// Gather the next pass from the carried ops, then whatever is already
+/// waiting on the channel, blocking only for the first op.
+///
+/// Takes and completions are admitted first, within their limits, then
+/// enqueues into the room they leave, or none at all if draining fills
+/// the pass and the previous pass didn't already leave them out (see
+/// [`Limits::max_jobs`]). `skipped_enqueues` carries that between passes.
+/// The pass keeps the ops' arrival order, and ops not admitted are kept,
+/// in order, as the new carry. Returns `None` once the channel is closed
+/// and nothing is carried.
 fn gather<T: Pending>(
     carry: &mut VecDeque<T>,
+    skipped_enqueues: &mut bool,
     rx: &Receiver<T>,
     limits: &Limits,
 ) -> Option<Vec<T>> {
@@ -419,36 +430,46 @@ fn gather<T: Pending>(
         None => rx.recv().ok()?,
     };
 
-    let mut counts = Counts::default();
-    counts.add(&first);
-    let mut batch = vec![first];
-    let mut overflow = VecDeque::new();
+    let mut candidates = vec![first];
+    candidates.extend(carry.drain(..));
     let mut received = 0;
-
-    loop {
-        let op = if let Some(op) = carry.pop_front() {
-            op
-        } else if received < limits.total_ops() {
-            match rx.try_recv() {
-                Ok(op) => {
-                    received += 1;
-                    op
-                }
-                Err(_) => break,
+    while received < limits.total_ops() {
+        match rx.try_recv() {
+            Ok(op) => {
+                received += 1;
+                candidates.push(op);
             }
-        } else {
-            break;
-        };
-
-        if counts.fits(&op, limits) {
-            counts.add(&op);
-            batch.push(op);
-        } else {
-            overflow.push_back(op);
+            Err(_) => break,
         }
     }
 
-    *carry = overflow;
+    let mut counts = Counts::default();
+    let mut admitted = vec![false; candidates.len()];
+    for draining in [true, false] {
+        if !draining {
+            let full = limits.max_jobs > 0 && counts.jobs >= limits.max_jobs;
+            let waiting = candidates.iter().any(|op| op.kind() == Kind::Enqueue);
+            *skipped_enqueues = full && waiting && !*skipped_enqueues;
+            if *skipped_enqueues {
+                break;
+            }
+        }
+        for (i, op) in candidates.iter().enumerate() {
+            if (op.kind() != Kind::Enqueue) == draining && counts.fits(op, limits) {
+                counts.add(op);
+                admitted[i] = true;
+            }
+        }
+    }
+
+    let mut batch = Vec::with_capacity(candidates.len());
+    for (op, admitted) in candidates.into_iter().zip(admitted) {
+        if admitted {
+            batch.push(op);
+        } else {
+            carry.push_back(op);
+        }
+    }
     Some(batch)
 }
 
@@ -472,10 +493,10 @@ mod tests {
 
     use Kind::{Complete as C, Enqueue as E, Take as T};
 
-    fn limits(enqueue_jobs: usize) -> Limits {
+    fn limits(max_jobs: usize) -> Limits {
         Limits {
             enqueue_ops: 1000,
-            enqueue_jobs,
+            max_jobs,
             complete_ops: 2,
             take_ops: 1000,
         }
@@ -493,7 +514,7 @@ mod tests {
     fn gathers_every_kind_into_one_pass() {
         let rx = queued(vec![Op(T, 10), Op(C, 5), Op(E, 50)]);
         let mut carry = VecDeque::new();
-        let batch = gather(&mut carry, &rx, &limits(200)).unwrap();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(T, 10), Op(C, 5), Op(E, 50)]);
         assert!(carry.is_empty());
     }
@@ -502,16 +523,74 @@ mod tests {
     fn enqueues_past_the_job_limit_are_carried() {
         let rx = queued(vec![Op(E, 150), Op(T, 10), Op(E, 100)]);
         let mut carry = VecDeque::new();
-        let batch = gather(&mut carry, &rx, &limits(200)).unwrap();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(E, 150), Op(T, 10)]);
         assert_eq!(carry, VecDeque::from([Op(E, 100)]));
+    }
+
+    /// Draining comes first: takes and completions fill the pass before
+    /// enqueues, and below the limit one enqueue request is always
+    /// admitted.
+    #[test]
+    fn takes_and_completions_are_admitted_before_enqueues() {
+        let rx = queued(vec![Op(E, 100), Op(E, 50), Op(T, 150), Op(C, 40)]);
+        let mut carry = VecDeque::new();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(E, 100), Op(T, 150), Op(C, 40)]);
+        assert_eq!(carry, VecDeque::from([Op(E, 50)]));
+    }
+
+    /// When draining alone fills a pass, enqueues sit that pass out, but
+    /// never two in a row.
+    #[test]
+    fn enqueues_skip_a_pass_draining_fills_but_never_two() {
+        let mut skipped = false;
+        let mut carry = VecDeque::new();
+
+        let rx = queued(vec![Op(E, 100), Op(T, 150), Op(C, 60)]);
+        let batch = gather(&mut carry, &mut skipped, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(T, 150), Op(C, 60)]);
+        assert_eq!(carry, VecDeque::from([Op(E, 100)]));
+        assert!(skipped);
+
+        let rx = queued(vec![Op(T, 150), Op(C, 60)]);
+        let batch = gather(&mut carry, &mut skipped, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(E, 100), Op(T, 150), Op(C, 60)]);
+        assert!(carry.is_empty());
+        assert!(!skipped);
+    }
+
+    /// A pass that drains without any enqueue waiting doesn't use up the
+    /// skip: the next waiting enqueue can still sit one pass out.
+    #[test]
+    fn a_pass_without_enqueues_waiting_is_not_a_skip() {
+        let mut skipped = false;
+        let mut carry = VecDeque::new();
+
+        let rx = queued(vec![Op(T, 250)]);
+        gather(&mut carry, &mut skipped, &rx, &limits(200)).unwrap();
+        assert!(!skipped);
+
+        let rx = queued(vec![Op(T, 250), Op(E, 10)]);
+        let batch = gather(&mut carry, &mut skipped, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(T, 250)]);
+        assert!(skipped);
+    }
+
+    #[test]
+    fn enqueues_fill_the_room_takes_leave() {
+        let rx = queued(vec![Op(E, 50), Op(E, 50), Op(E, 50), Op(T, 100)]);
+        let mut carry = VecDeque::new();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(E, 50), Op(E, 50), Op(T, 100)]);
+        assert_eq!(carry, VecDeque::from([Op(E, 50)]));
     }
 
     #[test]
     fn the_first_enqueue_is_taken_whole_however_large() {
         let rx = queued(vec![Op(E, 10)]);
         let mut carry = VecDeque::from([Op(E, 1000)]);
-        let batch = gather(&mut carry, &rx, &limits(200)).unwrap();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(E, 1000)]);
         assert_eq!(carry, VecDeque::from([Op(E, 10)]));
     }
@@ -520,7 +599,7 @@ mod tests {
     fn zero_means_no_enqueue_job_limit() {
         let rx = queued(vec![Op(E, 1000), Op(E, 1000)]);
         let mut carry = VecDeque::new();
-        let batch = gather(&mut carry, &rx, &limits(0)).unwrap();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(0)).unwrap();
         assert_eq!(batch.len(), 2);
     }
 
@@ -528,7 +607,7 @@ mod tests {
     fn request_limits_apply_per_kind() {
         let rx = queued(vec![Op(C, 1), Op(C, 1), Op(C, 1), Op(T, 1)]);
         let mut carry = VecDeque::new();
-        let batch = gather(&mut carry, &rx, &limits(200)).unwrap();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(C, 1), Op(C, 1), Op(T, 1)]);
         assert_eq!(carry, VecDeque::from([Op(C, 1)]));
     }
@@ -537,7 +616,7 @@ mod tests {
     fn carried_ops_come_before_newer_ones() {
         let rx = queued(vec![Op(T, 1)]);
         let mut carry = VecDeque::from([Op(C, 1), Op(E, 5)]);
-        let batch = gather(&mut carry, &rx, &limits(200)).unwrap();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(C, 1), Op(E, 5), Op(T, 1)]);
     }
 
@@ -546,8 +625,11 @@ mod tests {
         let (tx, rx) = sync_channel::<Op>(1);
         drop(tx);
         let mut carry = VecDeque::from([Op(T, 1)]);
-        assert_eq!(gather(&mut carry, &rx, &limits(200)), Some(vec![Op(T, 1)]));
-        assert_eq!(gather(&mut carry, &rx, &limits(200)), None);
+        assert_eq!(
+            gather(&mut carry, &mut false, &rx, &limits(200)),
+            Some(vec![Op(T, 1)])
+        );
+        assert_eq!(gather(&mut carry, &mut false, &rx, &limits(200)), None);
     }
 
     #[test]
@@ -864,7 +946,7 @@ mod tests {
                 WriterConfig {
                     enqueue_batch_size: 1000,
                     // One job per pass, so most enqueues are carried.
-                    enqueue_batch_max_jobs: 1,
+                    write_batch_max_jobs: 1,
                     complete_batch_size: 1000,
                     default_completed_retention_ms: 0,
                 },

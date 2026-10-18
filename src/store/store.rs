@@ -389,7 +389,7 @@ impl Store {
             },
             WriterConfig {
                 enqueue_batch_size: config.enqueue_batch_size,
-                enqueue_batch_max_jobs: config.enqueue_batch_max_jobs,
+                write_batch_max_jobs: config.write_batch_max_jobs,
                 complete_batch_size: config.complete_batch_size,
                 default_completed_retention_ms: config.default_completed_retention_ms,
             },

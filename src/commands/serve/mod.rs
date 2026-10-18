@@ -267,13 +267,13 @@ pub struct Args {
     #[arg(long, default_value_t = store::DEFAULT_ENQUEUE_BATCH_SIZE, value_name = "NUMBER", env = "ZIZQ_ENQUEUE_BATCH_SIZE")]
     enqueue_batch_size: usize,
 
-    /// Maximum number of jobs in one auto-batched enqueue commit.
-    /// Keeps merged enqueue requests from holding the write lock long
-    /// enough to stall workers taking jobs at the same time. A single
-    /// request with more jobs than this still commits whole. 0 means no
-    /// limit.
-    #[arg(long, default_value_t = store::DEFAULT_ENQUEUE_BATCH_MAX_JOBS, value_name = "NUMBER", env = "ZIZQ_ENQUEUE_BATCH_MAX_JOBS")]
-    enqueue_batch_max_jobs: usize,
+    /// Maximum number of jobs written in one transaction. Each Worker's
+    /// takes and acks are admitted first, and enqueues fill the room
+    /// they leave, so a burst of enqueues can't stall workers taking
+    /// jobs at the same time. A single enqueue request with more jobs
+    /// than this still commits whole. 0 means no limit.
+    #[arg(long, default_value_t = store::DEFAULT_WRITE_BATCH_MAX_JOBS, value_name = "NUMBER", env = "ZIZQ_WRITE_BATCH_MAX_JOBS")]
+    write_batch_max_jobs: usize,
 
     /// Maximum number of budgets that may exist on the server.
     /// Creating a budget beyond this is rejected. Budgets are listed
@@ -678,7 +678,7 @@ async fn init_store(
     storage_config.default_commit_mode = args.default_commit_mode;
     storage_config.enqueue_commit_mode = args.enqueue_commit_mode;
     storage_config.enqueue_batch_size = args.enqueue_batch_size;
-    storage_config.enqueue_batch_max_jobs = args.enqueue_batch_max_jobs;
+    storage_config.write_batch_max_jobs = args.write_batch_max_jobs;
     storage_config.max_budgets = args.max_budgets;
     storage_config.complete_batch_size = args.complete_batch_size;
     let store = Store::open(root.join(DATABASE_DIR), storage_config)?;
