@@ -15,7 +15,7 @@ mod apply;
 mod pre_read;
 mod write;
 
-pub(in crate::store) use write::{CompleteGroup, CompleteOp};
+pub(in crate::store) use write::{CompleteGroup, CompleteOp, CompleteOutcome};
 
 use tokio::task;
 
@@ -55,18 +55,31 @@ impl Store {
             });
         }
 
-        // Route through the writer. Per-op dedup happens within the writer;
-        // dispatch updates, in_flight_count decrement, and JobCompleted event
-        // broadcasts are all performed once per unique completed job on
-        // the writer thread.
-        let writer = self.writer.clone();
-        let ids: Vec<String> = ids.to_vec();
+        // Prepared here, on a blocking thread, so the writer thread only
+        // checks and writes. A job that changed between this pre-read and
+        // the writer's check comes back as a conflict: pre-read again.
+        loop {
+            let ks = self.ks.clone();
+            let writer = self.writer.clone();
+            let retention_ms = self.config.default_completed_retention_ms;
+            let ids = ids.to_vec();
 
-        let reply_rx = task::spawn_blocking(move || writer.submit_complete(ids, now)).await?;
+            let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let op = CompleteOp::prepare(&ids, now, &ks, retention_ms, reply)?;
+                writer.submit_complete(op);
+                Ok(rx)
+            })
+            .await??;
 
-        reply_rx
-            .await
-            .map_err(|_| StoreError::Internal("writer channel closed".into()))?
+            let outcome = reply_rx
+                .await
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??;
+            match outcome {
+                CompleteOutcome::Done(result) => return Ok(result),
+                CompleteOutcome::Conflict => continue,
+            }
+        }
     }
 }
 #[cfg(test)]

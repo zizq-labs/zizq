@@ -28,8 +28,9 @@
   single enqueue request is never split, so enqueues stay all-or-nothing.
   In benchmarks with 8 workers draining while jobs were enqueued, the
   drain rate rose by about 65% with 1,000-job batches, and 2.5× with
-  200-job batches, keeping pace with enqueueing. Throughput with no
-  overlap was unchanged. `0` removes the limit.
+  200-job batches, keeping pace with enqueueing. The writer also starts
+  on the next transaction while the last is still being made durable,
+  so enqueueing alone got up to 26% faster. `0` removes the limit.
 
 ## 0.7.5
 

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Job ompletions within a writer pass.
+//! Job completions within a writer pass.
 //!
 //! Worker processes typically take a prefetch batch of jobs, process
 //! them concurrently, and ack the completed ones. Each client SDK's
@@ -10,18 +10,16 @@
 //! workers waiting at once share one transaction, with the writer's
 //! other work.
 //!
-//! Both singular `mark_completed` and bulk `mark_completed_bulk` calls
-//! submit a `CompleteOp` of job IDs. A pass's completions go through
-//! these phases:
+//! A completion arrives at the writer already prepared: its caller
+//! removed duplicate IDs and pre-read every job, so the writer thread
+//! only checks and writes. In the pass:
 //!
-//! - **prepare**, before the write lock: dedup per op and across ops,
-//!   then pre-read every job.
-//! - **check**, under the lock: every pre-read record is unchanged.
-//!   If any has changed (most often a concurrent `patch_job`), nothing
-//!   is written for this pass's completions and the ops are carried to
-//!   the next pass, where they are pre-read afresh.
-//! - **apply**, in the pass's transaction.
-//! - **finish**, after the commit: dispatch and in-flight index updates,
+//! - **apply**: each op's pre-read records are checked through the
+//!   transaction. An op with a record that changed since (most often a
+//!   concurrent `patch_job`) writes nothing and is answered `Conflict`,
+//!   for its caller to pre-read again and retry; the other ops still
+//!   commit. A job acked by more than one op is written once.
+//! - **finish**, once durable: dispatch and in-flight index updates,
 //!   `JobCompleted` events, and each op's own `BulkCompleteResult`.
 
 use std::collections::HashSet;
@@ -38,118 +36,106 @@ use super::super::types::StoreError;
 use super::apply::apply_complete_batch;
 use super::pre_read::{PreparedComplete, pre_read_completes};
 
-pub(in crate::store) type CompleteReply =
-    tokio::sync::oneshot::Sender<Result<BulkCompleteResult, StoreError>>;
+/// What became of a completion op.
+pub(in crate::store) enum CompleteOutcome {
+    Done(BulkCompleteResult),
 
-/// A completion request: IDs to ack, the caller's `now`, and a reply
-/// slot for the per-op `BulkCompleteResult`.
-pub(in crate::store) struct CompleteOp {
-    pub ids: Vec<String>,
-    pub now: u64,
-    pub reply: CompleteReply,
+    /// A job changed since it was pre-read. Nothing was written for this
+    /// op: pre-read again and resubmit.
+    Conflict,
 }
 
-/// The completions in one pass, pre-read.
-pub(in crate::store) struct CompleteGroup {
-    /// Each op's IDs (deduped within the op), `now` and reply.
-    ops: Vec<(Vec<String>, u64, CompleteReply)>,
+pub(in crate::store) type CompleteReply =
+    tokio::sync::oneshot::Sender<Result<CompleteOutcome, StoreError>>;
+
+/// A completion request, prepared by its caller.
+pub(in crate::store) struct CompleteOp {
+    /// The op's IDs, deduplicated, in request order.
+    pub ids: Vec<String>,
     prepared: Vec<PreparedComplete>,
-    not_found: HashSet<String>,
+    not_found: Vec<String>,
+    reply: CompleteReply,
+}
+
+impl CompleteOp {
+    /// Remove duplicate IDs and pre-read every job, ready to submit. Done
+    /// on the caller's thread, so the writer thread doesn't.
+    pub(in crate::store) fn prepare(
+        ids: &[String],
+        now: u64,
+        ks: &Keyspaces,
+        default_completed_retention_ms: u64,
+        reply: CompleteReply,
+    ) -> Result<Self, StoreError> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let ids: Vec<String> = ids.iter().filter(|id| seen.insert(*id)).cloned().collect();
+        let (prepared, not_found) =
+            pre_read_completes(&ids, now, ks, default_completed_retention_ms)?;
+        Ok(Self {
+            ids,
+            prepared,
+            not_found,
+            reply,
+        })
+    }
+}
+
+/// The completions in one pass.
+pub(in crate::store) struct CompleteGroup {
+    ops: Vec<CompleteOp>,
+    conflicted: Vec<bool>,
+    /// IDs written this pass, by whichever op wrote them first.
+    written: HashSet<String>,
 }
 
 impl CompleteGroup {
-    /// Dedup and pre-read a pass's completions, before the write lock.
-    /// On a read error the ops are answered with it and `None` returned.
-    pub(in crate::store) fn prepare(
-        ops: Vec<CompleteOp>,
-        ks: &Keyspaces,
-        default_completed_retention_ms: u64,
-    ) -> Option<Self> {
-        // Per-op dedup, mirroring single-op behaviour, plus a global
-        // dedup for the pre-read. `now` is the smallest seen: the most
-        // conservative purge_at.
-        let mut grouped = Vec::with_capacity(ops.len());
-        let mut flat_ids: Vec<String> = Vec::new();
-        let mut global_seen: HashSet<String> = HashSet::new();
-        let mut now = u64::MAX;
-
-        for op in ops {
-            now = now.min(op.now);
-            let mut op_seen: HashSet<String> = HashSet::with_capacity(op.ids.len());
-            let mut op_ids = Vec::with_capacity(op.ids.len());
-            for id in op.ids {
-                if !op_seen.insert(id.clone()) {
-                    continue;
-                }
-                if global_seen.insert(id.clone()) {
-                    flat_ids.push(id.clone());
-                }
-                op_ids.push(id);
-            }
-            grouped.push((op_ids, op.now, op.reply));
-        }
-
-        match pre_read_completes(&flat_ids, now, ks, default_completed_retention_ms) {
-            Ok((prepared, not_found)) => Some(Self {
-                ops: grouped,
-                prepared,
-                not_found: not_found.into_iter().collect(),
-            }),
-            Err(e) => {
-                tracing::error!(error = %e, "writer: completion pre-read failed");
-                let msg = e.to_string();
-                for (_, _, reply) in grouped {
-                    let _ = reply.send(Err(StoreError::Internal(msg.clone())));
-                }
-                None
-            }
+    pub(in crate::store) fn new(ops: Vec<CompleteOp>) -> Self {
+        Self {
+            conflicted: vec![false; ops.len()],
+            ops,
+            written: HashSet::new(),
         }
     }
 
-    /// Whether there is anything to write: every ID may have been
-    /// already completed, or never in flight.
-    pub(in crate::store) fn has_writes(&self) -> bool {
-        !self.prepared.is_empty()
-    }
-
-    /// Whether every pre-read record is unchanged. Reads through the
-    /// pass's transaction, so writes earlier in the pass are seen.
-    pub(in crate::store) fn check(
-        &self,
-        tx: &fjall::SingleWriterWriteTx<'_>,
-        ks: &Keyspaces,
-    ) -> Result<bool, StoreError> {
-        for p in &self.prepared {
-            let current = tx.get(&ks.data, make_job_key(&p.id))?;
-            if current.as_deref() != Some(&*p.pre_bytes) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Write every completion into the pass's transaction. Call only
-    /// after `check`, so no CAS conflict can leave partial writes.
+    /// Check and write each op into the pass's transaction. Reads go
+    /// through the transaction, so writes earlier in the pass are seen.
     pub(in crate::store) fn apply(
-        &self,
+        &mut self,
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
     ) -> Result<(), StoreError> {
-        if apply_complete_batch(tx, ks, &self.prepared)? {
-            Ok(())
-        } else {
-            Err(StoreError::Internal(
-                "completion changed after its check in the same pass".into(),
-            ))
+        for (op, conflicted) in self.ops.iter().zip(self.conflicted.iter_mut()) {
+            // A job an earlier op wrote this pass is done, not changed.
+            for p in op.prepared.iter().filter(|p| !self.written.contains(&p.id)) {
+                let current = tx.get(&ks.data, make_job_key(&p.id))?;
+                if current.as_deref() != Some(&*p.pre_bytes) {
+                    *conflicted = true;
+                    break;
+                }
+            }
+            if *conflicted {
+                continue;
+            }
+
+            for p in &op.prepared {
+                if self.written.insert(p.id.clone())
+                    && !apply_complete_batch(tx, ks, std::slice::from_ref(p))?
+                {
+                    return Err(StoreError::Internal(
+                        "completion changed after its check in the same pass".into(),
+                    ));
+                }
+            }
         }
+        Ok(())
     }
 
     /// How many jobs this pass writes for completions.
     pub(in crate::store) fn writes(&self) -> usize {
-        self.prepared.len()
+        self.written.len()
     }
 
-    /// After the commit: update the in-memory indexes, announce each
+    /// Once durable: update the in-memory indexes, announce each
     /// completion, and answer each op.
     pub(in crate::store) fn finish(
         self,
@@ -157,59 +143,62 @@ impl CompleteGroup {
         in_flight_index: &InFlightIndex,
         event_tx: &broadcast::Sender<StoreEvent>,
     ) {
-        // `prepared` is already deduped (the pre-read is of unique IDs).
-        let mut completed: HashSet<String> = HashSet::with_capacity(self.prepared.len());
-        for p in &self.prepared {
-            dispatch.remove(Placement {
-                queue: &p.queue,
-                priority: p.priority,
-                id: &p.id,
-                budgets: &p.budgets,
-            });
-            // Two separate things, and a completing job needs both: the
-            // slot it occupied while running goes back, and it stops being
-            // counted as outstanding work at all.
-            dispatch.release_concurrency(&p.budgets);
-            dispatch.untrack(&p.budgets);
-            in_flight_index.remove(p.dequeued_at, &p.id);
-            completed.insert(p.id.clone());
-        }
-
-        for id in &completed {
-            let _ = event_tx.send(StoreEvent::JobCompleted { id: id.clone() });
-        }
-
-        for (op_ids, _, reply) in self.ops {
-            let mut result = BulkCompleteResult {
-                completed: Vec::new(),
-                not_found: Vec::new(),
-            };
-            for id in op_ids {
-                if completed.contains(&id) {
-                    result.completed.push(id);
-                } else if self.not_found.contains(&id) {
-                    result.not_found.push(id);
+        let mut done: HashSet<&str> = HashSet::with_capacity(self.written.len());
+        let unconflicted = self
+            .ops
+            .iter()
+            .zip(&self.conflicted)
+            .filter(|(_, conflicted)| !**conflicted);
+        for (op, _) in unconflicted {
+            for p in &op.prepared {
+                if !self.written.contains(&p.id) || !done.insert(&p.id) {
+                    continue;
                 }
-                // Otherwise the ID appears in neither set, which the
-                // pre-read's partition rules out. Surfacing a third
-                // status would break the API contract, so it is dropped.
+                dispatch.remove(Placement {
+                    queue: &p.queue,
+                    priority: p.priority,
+                    id: &p.id,
+                    budgets: &p.budgets,
+                });
+                // Two separate things, and a completing job needs both:
+                // the slot it occupied while running goes back, and it
+                // stops being counted as outstanding work at all.
+                dispatch.release_concurrency(&p.budgets);
+                dispatch.untrack(&p.budgets);
+                in_flight_index.remove(p.dequeued_at, &p.id);
+                let _ = event_tx.send(StoreEvent::JobCompleted { id: p.id.clone() });
             }
-            let _ = reply.send(Ok(result));
+        }
+
+        for (op, conflicted) in self.ops.into_iter().zip(self.conflicted) {
+            let outcome = if conflicted {
+                CompleteOutcome::Conflict
+            } else {
+                CompleteOutcome::Done(BulkCompleteResult {
+                    completed: op
+                        .ids
+                        .into_iter()
+                        .filter(|id| self.written.contains(id))
+                        .collect(),
+                    not_found: op.not_found,
+                })
+            };
+            let _ = op.reply.send(Ok(outcome));
         }
     }
 
     pub(in crate::store) fn fail(self, msg: &str) {
-        for (_, _, reply) in self.ops {
-            let _ = reply.send(Err(StoreError::Internal(msg.to_string())));
+        for op in self.ops {
+            let _ = op.reply.send(Err(StoreError::Internal(msg.to_string())));
         }
     }
 
-    /// The ops again, to carry to the next pass after a conflict.
+    /// The ops again, to carry to the next pass when the transaction they
+    /// were applied to is dropped for another group's failure. Their
+    /// pre-reads may be stale by then, which the next pass's check turns
+    /// into a `Conflict` and a retry.
     pub(in crate::store) fn into_ops(self) -> Vec<CompleteOp> {
         self.ops
-            .into_iter()
-            .map(|(ids, now, reply)| CompleteOp { ids, now, reply })
-            .collect()
     }
 }
 
@@ -220,72 +209,69 @@ mod tests {
     use crate::store::test_support::{enqueue_and_take, test_store};
     use crate::time::now_millis;
 
-    fn op(
-        ids: &[&str],
-    ) -> (
-        CompleteOp,
-        tokio::sync::oneshot::Receiver<Result<BulkCompleteResult, StoreError>>,
-    ) {
+    type Reply = tokio::sync::oneshot::Receiver<Result<CompleteOutcome, StoreError>>;
+
+    fn op(store: &Store, ids: &[&str]) -> (CompleteOp, Reply) {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        let op = CompleteOp {
-            ids: ids.iter().map(|id| id.to_string()).collect(),
-            now: now_millis(),
-            reply,
-        };
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let op = CompleteOp::prepare(&ids, now_millis(), &store.ks, 0, reply).unwrap();
         (op, rx)
     }
 
-    fn prepare(store: &Store, ops: Vec<CompleteOp>) -> CompleteGroup {
-        CompleteGroup::prepare(ops, &store.ks, 0).unwrap()
+    fn done(outcome: Result<CompleteOutcome, StoreError>) -> BulkCompleteResult {
+        match outcome.unwrap() {
+            CompleteOutcome::Done(result) => result,
+            CompleteOutcome::Conflict => panic!("expected the op to be done, not to conflict"),
+        }
     }
 
-    fn check(store: &Store, group: &CompleteGroup) -> bool {
-        let tx = store.ks.write_tx();
-        group.check(&tx, &store.ks).unwrap()
-    }
-
-    /// Commit `group` as the writer would. Commits block on the group
-    /// committer, so on a blocking thread.
-    async fn commit(store: &Store, group: CompleteGroup) {
+    /// Apply, commit and finish `group` as the writer would. Commits
+    /// block on the group committer, so on a blocking thread.
+    async fn commit(store: &Store, mut group: CompleteGroup) -> usize {
         let ks = store.ks.clone();
         let dispatch = store.dispatch.clone();
         let in_flight_index = store.in_flight_index.clone();
         let event_tx = store.event_tx.clone();
         tokio::task::spawn_blocking(move || {
             let mut tx = ks.write_tx();
-            assert!(group.check(&tx, &ks).unwrap());
             group.apply(&mut tx, &ks).unwrap();
+            let writes = group.writes();
             ks.commit(tx, ks.default_commit_mode).unwrap();
             group.finish(&dispatch, &in_flight_index, &event_tx);
+            writes
         })
         .await
-        .unwrap();
+        .unwrap()
     }
 
+    #[test]
+    fn prepare_removes_duplicates_and_splits_out_unknown_ids() {
+        let store = test_store();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let a = rt.block_on(enqueue_and_take(&store)).id;
+
+        let (op, _rx) = op(&store, &[&a, "unknown", &a]);
+        assert_eq!(op.ids, vec![a.clone(), "unknown".to_string()]);
+        assert_eq!(op.prepared.len(), 1);
+        assert_eq!(op.not_found, vec!["unknown".to_string()]);
+    }
+
+    /// An op with a job changed since its pre-read writes none of its
+    /// jobs and is told to retry, while the other op in the pass commits.
     #[tokio::test]
-    async fn check_passes_while_every_record_is_unchanged() {
+    async fn a_conflicting_op_writes_nothing_and_others_commit() {
         let store = test_store();
         let a = enqueue_and_take(&store).await.id;
         let b = enqueue_and_take(&store).await.id;
+        let c = enqueue_and_take(&store).await.id;
 
-        let (op, _rx) = op(&[&a, &b]);
-        assert!(check(&store, &prepare(&store, vec![op])));
-    }
+        let (first, first_rx) = op(&store, &[&a]);
+        let (second, second_rx) = op(&store, &[&b, &c]);
+        let b_before = store.ks.data.get(make_job_key(&b)).unwrap();
 
-    /// The guarantee that lets completions share a transaction: a job
-    /// changed between its pre-read and the write fails the check, so
-    /// the group writes nothing and is retried.
-    #[tokio::test]
-    async fn check_fails_once_a_record_changed_after_its_pre_read() {
-        let store = test_store();
-        let a = enqueue_and_take(&store).await.id;
-        let b = enqueue_and_take(&store).await.id;
-
-        let (op, _rx) = op(&[&a, &b]);
-        let group = prepare(&store, vec![op]);
-
+        // `c` changes after the second op pre-read it.
         let ks = store.ks.clone();
-        let key = make_job_key(&b);
+        let key = make_job_key(&c);
         tokio::task::spawn_blocking(move || {
             let mut tx = ks.write_tx();
             tx.insert(&ks.data, key, b"changed");
@@ -294,35 +280,21 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!check(&store, &group));
-    }
+        let writes = commit(&store, CompleteGroup::new(vec![first, second])).await;
+        assert_eq!(writes, 1);
 
-    /// Ops carried to the next pass after a conflict keep their IDs and
-    /// replies, and complete when prepared again.
-    #[tokio::test]
-    async fn carried_ops_complete_when_prepared_again() {
-        let store = test_store();
-        let a = enqueue_and_take(&store).await.id;
-
-        let (first, first_rx) = op(&[&a, &a]);
-        let (second, second_rx) = op(&["unknown"]);
-        let carried = prepare(&store, vec![first, second]).into_ops();
-
-        assert_eq!(carried.len(), 2);
-        assert_eq!(carried[0].ids, vec![a.clone()]);
-        assert_eq!(carried[1].ids, vec!["unknown".to_string()]);
-
-        commit(&store, prepare(&store, carried)).await;
-
-        let first = first_rx.await.unwrap().unwrap();
-        assert_eq!(first.completed, vec![a.clone()]);
-        let second = second_rx.await.unwrap().unwrap();
-        assert_eq!(second.not_found, vec!["unknown".to_string()]);
+        assert_eq!(done(first_rx.await.unwrap()).completed, vec![a.clone()]);
+        assert!(matches!(
+            second_rx.await.unwrap().unwrap(),
+            CompleteOutcome::Conflict
+        ));
         assert!(store.ks.data.get(make_job_key(&a)).unwrap().is_none());
+        assert_eq!(store.ks.data.get(make_job_key(&b)).unwrap(), b_before);
     }
 
     /// Two workers acking the same job in one pass complete it once, and
-    /// both are told it completed.
+    /// both are told it completed: the second op's check doesn't mistake
+    /// the first op's delete for a change.
     #[tokio::test]
     async fn a_job_acked_by_two_ops_completes_once() {
         let store = test_store();
@@ -330,18 +302,13 @@ mod tests {
         let b = enqueue_and_take(&store).await.id;
         let mut events = store.subscribe();
 
-        let (first, first_rx) = op(&[&a, &b]);
-        let (second, second_rx) = op(&[&a]);
-        let group = prepare(&store, vec![first, second]);
-        assert_eq!(group.writes(), 2);
+        let (first, first_rx) = op(&store, &[&a, &b]);
+        let (second, second_rx) = op(&store, &[&a]);
+        let writes = commit(&store, CompleteGroup::new(vec![first, second])).await;
+        assert_eq!(writes, 2);
 
-        commit(&store, group).await;
-
-        assert_eq!(
-            first_rx.await.unwrap().unwrap().completed,
-            vec![a.clone(), b]
-        );
-        assert_eq!(second_rx.await.unwrap().unwrap().completed, vec![a.clone()]);
+        assert_eq!(done(first_rx.await.unwrap()).completed, vec![a.clone(), b]);
+        assert_eq!(done(second_rx.await.unwrap()).completed, vec![a.clone()]);
         assert_eq!(store.in_flight_count(), 0);
 
         let mut completed_a = 0;

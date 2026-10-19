@@ -16,20 +16,26 @@
 //!    waiting, within per-kind limits (see [`Limits`]). Ops that don't
 //!    fit are carried to the next pass, ahead of anything newer. No
 //!    time-based window: a lone op is never delayed waiting for more.
-//! 2. Pre-reads completions, before the write lock.
-//! 3. Applies enqueues, then takes, then completions, in one
-//!    transaction. Takes and completions check every record they expect
-//!    before writing any, so a conflict never leaves partial writes in a
-//!    transaction other ops share. Checks read through the transaction,
-//!    so they see writes made earlier in the pass.
-//! 4. Commits once, then finishes each kind (in-memory indexes, events)
-//!    and answers each op.
+//! 2. Applies enqueues, then takes, then completions, in one
+//!    transaction. Takes and completions arrive pre-read by their
+//!    callers, and check every record they expect before writing any,
+//!    so a conflict never leaves partial writes in a transaction other
+//!    ops share. Checks read through the transaction, so they see writes
+//!    made earlier in the pass.
+//! 3. Commits once, and hands the pass to the finisher thread without
+//!    waiting for the commit to be durable, then starts the next pass.
+//!
+//! The finisher takes passes in commit order. Once a pass is durable it
+//! finishes each kind (in-memory indexes, events) and answers each op,
+//! so jobs only become takeable, and callers only hear back, once their
+//! writes are durable. Waiting for durability on the writer thread would
+//! leave the write lock idle for the whole wait.
 //!
 //! A failure applying one kind (a corrupt record, say) drops the
 //! transaction, fails that kind's ops, and carries the rest to the next
-//! pass. A completion conflict carries the completions to the next pass,
-//! where they are pre-read again. A failed commit fails every op in the
-//! pass.
+//! pass. A take or completion that conflicts is answered as such, for
+//! its caller to pre-read again and resubmit. A failed commit, or one
+//! that never becomes durable, fails every op in the pass.
 //!
 //! Callers submit from `spawn_blocking`: the channel is bounded, so a
 //! submit blocks when the writer is behind.
@@ -47,9 +53,9 @@ use super::complete::{CompleteGroup, CompleteOp};
 use super::dispatch::Dispatch;
 use super::enqueue::{EnqueueGroup, EnqueueOp, PreparedEnqueue};
 use super::in_flight_index::InFlightIndex;
-use super::results::{BulkCompleteResult, EnqueueResult};
+use super::results::EnqueueResult;
 use super::scheduled_index::ScheduledIndex;
-use super::store::{Keyspaces, StoreEvent};
+use super::store::{Durable, Keyspaces, StoreEvent};
 use super::types::{CommitMode, StoreError};
 use take::{TakeGroup, TakeOp, TakeOutcome, TakeWrite};
 
@@ -70,7 +76,6 @@ pub(in crate::store) struct WriterConfig {
     pub enqueue_batch_size: usize,
     pub write_batch_max_jobs: usize,
     pub complete_batch_size: usize,
-    pub default_completed_retention_ms: u64,
 }
 
 /// What the writer thread needs to apply and finish writes.
@@ -97,19 +102,34 @@ impl Writer {
             complete_ops: config.complete_batch_size.max(1),
             take_ops: TAKE_BATCH_SIZE,
         };
-        let retention_ms = config.default_completed_retention_ms;
         let (tx, rx) = std::sync::mpsc::sync_channel::<WriteOp>(limits.total_ops());
+        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel::<Pass>(FINISH_QUEUE);
+        let cx = Arc::new(cx);
 
         std::thread::Builder::new()
             .name("writer".into())
-            .spawn(move || {
-                let mut carry = VecDeque::new();
-                let mut skipped_enqueues = false;
-                while let Some(batch) = gather(&mut carry, &mut skipped_enqueues, &rx, &limits) {
-                    run_pass(&cx, retention_ms, batch, &mut carry);
+            .spawn({
+                let cx = cx.clone();
+                move || {
+                    let mut carry = VecDeque::new();
+                    let mut skipped_enqueues = false;
+                    while let Some(batch) = gather(&mut carry, &mut skipped_enqueues, &rx, &limits)
+                    {
+                        if let Some(pass) = run_pass(&cx, batch, &mut carry) {
+                            // Blocks while too many passes await durability.
+                            let _ = finish_tx.send(pass);
+                        }
+                    }
                 }
             })
             .expect("failed to spawn writer thread");
+
+        // Ends once the writer thread drops its sender and every pass sent
+        // is finished, so nothing is left unanswered at shutdown.
+        std::thread::Builder::new()
+            .name("writer-finish".into())
+            .spawn(move || finish_passes(&cx, finish_rx))
+            .expect("failed to spawn writer-finish thread");
 
         Self { tx }
     }
@@ -127,14 +147,8 @@ impl Writer {
     }
 
     /// Submit a completion of one or more jobs.
-    pub(in crate::store) fn submit_complete(
-        &self,
-        ids: Vec<String>,
-        now: u64,
-    ) -> oneshot::Receiver<Result<BulkCompleteResult, StoreError>> {
-        let (reply, rx) = oneshot::channel();
-        self.send(WriteOp::Complete(CompleteOp { ids, now, reply }));
-        rx
+    pub(in crate::store) fn submit_complete(&self, op: CompleteOp) {
+        self.send(WriteOp::Complete(op));
     }
 
     /// Submit a take's prepared writes.
@@ -155,13 +169,18 @@ impl Writer {
     }
 }
 
-/// Apply one pass's ops in one transaction and answer each.
+/// Most committed passes waiting to become durable. Bounds how far the
+/// writer can run ahead of durability.
+const FINISH_QUEUE: usize = 16;
+
+/// Apply one pass's ops in one transaction and commit it, without
+/// waiting for it to be durable. Returns the pass for the finisher, or
+/// `None` if it already answered every op (a group failed to apply).
 fn run_pass(
     cx: &WriterContext,
-    retention_ms: u64,
     batch: Vec<WriteOp>,
     carry: &mut VecDeque<WriteOp>,
-) {
+) -> Option<Pass> {
     let ks = &cx.ks;
 
     let (mut enqueues, mut completes, mut takes) = (Vec::new(), Vec::new(), Vec::new());
@@ -173,111 +192,136 @@ fn run_pass(
         }
     }
 
-    let mut enqueue = (!enqueues.is_empty()).then(|| EnqueueGroup::new(enqueues));
-    let mut take = (!takes.is_empty()).then(|| TakeGroup::new(takes));
-
-    // Pre-read before the write lock. Completions with nothing to write
-    // (already completed, or never in flight) are answered at once.
-    let mut complete = if completes.is_empty() {
-        None
-    } else {
-        CompleteGroup::prepare(completes, ks, retention_ms)
+    let mut pass = Pass {
+        enqueue: (!enqueues.is_empty()).then(|| EnqueueGroup::new(enqueues)),
+        take: (!takes.is_empty()).then(|| TakeGroup::new(takes)),
+        complete: (!completes.is_empty()).then(|| CompleteGroup::new(completes)),
+        durable: None,
     };
-    if let Some(group) = complete.take_if(|g| !g.has_writes()) {
-        group.finish(&cx.dispatch, &cx.in_flight_index, &cx.event_tx);
-    }
-
-    if enqueue.is_none() && take.is_none() && complete.is_none() {
-        return;
-    }
 
     let mut tx = ks.write_tx();
 
-    if let Some(group) = enqueue.as_mut()
+    if let Some(group) = pass.enqueue.as_mut()
         && let Err(e) = group.apply(&mut tx, ks)
     {
         drop(tx);
         tracing::error!(error = %e, "writer: applying enqueues failed");
-        enqueue.take().unwrap().fail(&e.to_string());
-        requeue(carry, None, complete, take);
-        return;
+        pass.enqueue.take().unwrap().fail(&e.to_string());
+        requeue(carry, None, pass.complete, pass.take);
+        return None;
     }
 
-    if let Some(group) = take.as_mut()
+    if let Some(group) = pass.take.as_mut()
         && let Err(e) = group.apply(&mut tx, ks)
     {
         drop(tx);
         tracing::error!(error = %e, "writer: applying takes failed");
-        take.take().unwrap().fail(&e.to_string());
-        requeue(carry, enqueue, complete, None);
-        return;
+        pass.take.take().unwrap().fail(&e.to_string());
+        requeue(carry, pass.enqueue, pass.complete, None);
+        return None;
     }
 
-    if let Some(group) = complete.as_ref() {
-        let applied = match group.check(&tx, ks) {
-            Ok(true) => group.apply(&mut tx, ks).map(|()| true),
-            other => other,
-        };
-        match applied {
-            Ok(true) => {}
-            Ok(false) => {
-                // A job changed since its pre-read. Nothing was written
-                // for completions: retry them next pass, pre-read afresh.
-                requeue(carry, None, complete.take(), None);
-            }
-            Err(e) => {
-                drop(tx);
-                tracing::error!(error = %e, "writer: applying completions failed");
-                complete.take().unwrap().fail(&e.to_string());
-                requeue(carry, enqueue, None, take);
-                return;
-            }
-        }
+    if let Some(group) = pass.complete.as_mut()
+        && let Err(e) = group.apply(&mut tx, ks)
+    {
+        drop(tx);
+        tracing::error!(error = %e, "writer: applying completions failed");
+        pass.complete.take().unwrap().fail(&e.to_string());
+        requeue(carry, pass.enqueue, None, pass.take);
+        return None;
     }
 
-    let enqueue_writes = enqueue.as_ref().map_or(0, EnqueueGroup::writes);
+    let enqueue_writes = pass.enqueue.as_ref().map_or(0, EnqueueGroup::writes);
     let writes = enqueue_writes
-        + take.as_ref().map_or(0, TakeGroup::writes)
-        + complete.as_ref().map_or(0, CompleteGroup::writes);
+        + pass.take.as_ref().map_or(0, TakeGroup::writes)
+        + pass.complete.as_ref().map_or(0, CompleteGroup::writes);
 
-    if writes > 0 {
-        if let Some(group) = &enqueue {
-            group.stage(&cx.budgets);
+    if writes == 0 {
+        // Still finished by the finisher, so its answers don't overtake
+        // those of earlier passes still waiting to be durable.
+        drop(tx);
+        return Some(pass);
+    }
+
+    if let Some(group) = &pass.enqueue {
+        group.stage(&cx.budgets);
+    }
+
+    let mode = if enqueue_writes > 0 {
+        stricter(ks.enqueue_commit_mode, ks.default_commit_mode)
+    } else {
+        ks.default_commit_mode
+    };
+
+    match ks.commit_deferred(tx, mode) {
+        Ok(durable) => {
+            pass.durable = Some(durable);
+            Some(pass)
         }
-
-        let mode = if enqueue_writes > 0 {
-            stricter(ks.enqueue_commit_mode, ks.default_commit_mode)
-        } else {
-            ks.default_commit_mode
-        };
-
-        if let Err(e) = ks.commit(tx, mode) {
+        Err(e) => {
             tracing::error!(error = %e, writes, "writer: commit failed");
-            let msg = e.to_string();
-            if let Some(group) = enqueue {
-                group.unstage(&cx.budgets);
-                group.fail(&msg);
-            }
-            if let Some(group) = take {
-                group.fail(&msg);
-            }
-            if let Some(group) = complete {
-                group.fail(&msg);
-            }
+            pass.fail(cx, &e.to_string());
+            None
+        }
+    }
+}
+
+/// The finisher thread: finish each pass in the order the writer
+/// committed them, until the writer is gone.
+fn finish_passes(cx: &WriterContext, passes: Receiver<Pass>) {
+    while let Ok(pass) = passes.recv() {
+        pass.finish(cx);
+    }
+}
+
+/// A committed pass, on its way to being durable.
+struct Pass {
+    enqueue: Option<EnqueueGroup>,
+    take: Option<TakeGroup>,
+    complete: Option<CompleteGroup>,
+    /// `None` if the pass wrote nothing.
+    durable: Option<Durable>,
+}
+
+impl Pass {
+    /// Once durable, update the in-memory indexes, announce, and answer.
+    /// Passes are finished in commit order, on the finisher thread, so
+    /// jobs only become takeable, and callers are only answered, once
+    /// their writes are durable.
+    fn finish(mut self, cx: &WriterContext) {
+        if let Some(durable) = self.durable.take()
+            && let Err(e) = durable.wait()
+        {
+            tracing::error!(error = %e, "writer: persisting a pass failed");
+            self.fail(cx, &e.to_string());
             return;
         }
-    } else {
-        drop(tx);
+
+        if let Some(group) = self.enqueue {
+            group.finish(&cx.dispatch, &cx.scheduled_index, &cx.event_tx);
+        }
+        if let Some(group) = self.take {
+            group.finish();
+        }
+        if let Some(group) = self.complete {
+            group.finish(&cx.dispatch, &cx.in_flight_index, &cx.event_tx);
+        }
     }
 
-    if let Some(group) = enqueue {
-        group.finish(&cx.dispatch, &cx.scheduled_index, &cx.event_tx);
-    }
-    if let Some(group) = take {
-        group.finish();
-    }
-    if let Some(group) = complete {
-        group.finish(&cx.dispatch, &cx.in_flight_index, &cx.event_tx);
+    /// Fail every op, after a commit that didn't happen or didn't become
+    /// durable. Nothing may go on referencing the pass's new jobs, so the
+    /// budgets staged for them are undone.
+    fn fail(self, cx: &WriterContext, msg: &str) {
+        if let Some(group) = self.enqueue {
+            group.unstage(&cx.budgets);
+            group.fail(msg);
+        }
+        if let Some(group) = self.take {
+            group.fail(msg);
+        }
+        if let Some(group) = self.complete {
+            group.fail(msg);
+        }
     }
 }
 
@@ -646,8 +690,11 @@ mod tests {
         use fjall::Slice;
 
         use super::super::*;
+        use std::time::Duration;
+
         use crate::store::keys::{make_job_key, make_status_key, make_unique_key};
         use crate::store::options::EnqueueOptions;
+        use crate::store::store::Durable;
         use crate::store::store::Store;
         use crate::store::test_support::test_store;
         use crate::store::types::JobStatus;
@@ -664,17 +711,43 @@ mod tests {
             }
         }
 
-        /// Run one pass on a blocking thread, as the writer does: commits
-        /// block on the group committer.
+        /// Run and finish one pass on a blocking thread, as the writer and
+        /// its finisher do: waiting for durability blocks.
         async fn pass(store: &Store, batch: Vec<WriteOp>) -> VecDeque<WriteOp> {
             let cx = context(store);
             tokio::task::spawn_blocking(move || {
                 let mut carry = VecDeque::new();
-                run_pass(&cx, 0, batch, &mut carry);
+                if let Some(pass) = run_pass(&cx, batch, &mut carry) {
+                    pass.finish(&cx);
+                }
                 carry
             })
             .await
             .unwrap()
+        }
+
+        fn complete_op(
+            store: &Store,
+            id: &str,
+        ) -> (
+            CompleteOp,
+            oneshot::Receiver<Result<crate::store::complete::CompleteOutcome, StoreError>>,
+        ) {
+            let (reply, rx) = oneshot::channel();
+            let op =
+                CompleteOp::prepare(&[id.to_string()], now_millis(), &store.ks, 0, reply).unwrap();
+            (op, rx)
+        }
+
+        fn completed(
+            outcome: Result<crate::store::complete::CompleteOutcome, StoreError>,
+        ) -> Vec<String> {
+            match outcome.unwrap() {
+                crate::store::complete::CompleteOutcome::Done(result) => result.completed,
+                crate::store::complete::CompleteOutcome::Conflict => {
+                    panic!("expected the completion to be done, not to conflict")
+                }
+            }
         }
 
         async fn enqueue(store: &Store) -> String {
@@ -725,7 +798,7 @@ mod tests {
             .unwrap();
             let (enqueue_reply, enqueue_rx) = oneshot::channel();
             let (take_reply, take_rx) = oneshot::channel();
-            let (complete_reply, complete_rx) = oneshot::channel();
+            let (complete, complete_rx) = complete_op(&store, &in_flight);
 
             let carry = pass(
                 &store,
@@ -738,11 +811,7 @@ mod tests {
                         writes: vec![take_write(&store, &ready)],
                         reply: take_reply,
                     }),
-                    WriteOp::Complete(CompleteOp {
-                        ids: vec![in_flight.clone()],
-                        now: now_millis(),
-                        reply: complete_reply,
-                    }),
+                    WriteOp::Complete(complete),
                 ],
             )
             .await;
@@ -754,7 +823,7 @@ mod tests {
             ));
             assert_eq!(take_rx.await.unwrap().unwrap(), TakeOutcome::Committed);
             assert_eq!(
-                complete_rx.await.unwrap().unwrap().completed,
+                completed(complete_rx.await.unwrap()),
                 vec![in_flight.clone()]
             );
             assert_eq!(&*record(&store, &ready), b"in flight");
@@ -882,7 +951,7 @@ mod tests {
 
             let (enqueue_reply, enqueue_rx) = oneshot::channel();
             let (take_reply, mut take_rx) = oneshot::channel();
-            let (complete_reply, mut complete_rx) = oneshot::channel();
+            let (complete, mut complete_rx) = complete_op(&store, &in_flight);
 
             let carry = pass(
                 &store,
@@ -895,11 +964,7 @@ mod tests {
                         writes: vec![take_write(&store, &ready)],
                         reply: take_reply,
                     }),
-                    WriteOp::Complete(CompleteOp {
-                        ids: vec![in_flight.clone()],
-                        now: now_millis(),
-                        reply: complete_reply,
-                    }),
+                    WriteOp::Complete(complete),
                 ],
             )
             .await;
@@ -929,10 +994,7 @@ mod tests {
 
             assert!(carry.is_empty());
             assert_eq!(take_rx.await.unwrap().unwrap(), TakeOutcome::Committed);
-            assert_eq!(
-                complete_rx.await.unwrap().unwrap().completed,
-                vec![in_flight]
-            );
+            assert_eq!(completed(complete_rx.await.unwrap()), vec![in_flight]);
         }
 
         /// Dropping the last handle lets the thread finish everything
@@ -948,7 +1010,6 @@ mod tests {
                     // One job per pass, so most enqueues are carried.
                     write_batch_max_jobs: 1,
                     complete_batch_size: 1000,
-                    default_completed_retention_ms: 0,
                 },
             );
 
@@ -968,6 +1029,48 @@ mod tests {
                 let results = reply.await.expect("op dropped without a reply").unwrap();
                 assert!(matches!(results.as_slice(), [EnqueueResult::Created(_)]));
             }
+        }
+
+        /// A pass with only completions, finished once `durable` is.
+        fn completions(op: CompleteOp, durable: Option<Durable>) -> Pass {
+            Pass {
+                enqueue: None,
+                take: None,
+                complete: Some(CompleteGroup::new(vec![op])),
+                durable,
+            }
+        }
+
+        /// Passes are answered in commit order. A later pass, even one
+        /// that wrote nothing and has nothing to wait for, isn't answered
+        /// until every earlier pass is durable.
+        #[tokio::test]
+        async fn passes_are_answered_in_commit_order() {
+            let store = test_store();
+            let (first, mut first_rx) = complete_op(&store, "first");
+            let (second, mut second_rx) = complete_op(&store, "second");
+            let (persisted, durable) = Durable::pending();
+
+            let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(FINISH_QUEUE);
+            let cx = context(&store);
+            let finisher = std::thread::spawn(move || finish_passes(&cx, finish_rx));
+
+            finish_tx.send(completions(first, Some(durable))).unwrap();
+            finish_tx.send(completions(second, None)).unwrap();
+
+            let waited = tokio::time::timeout(Duration::from_millis(100), &mut second_rx).await;
+            assert!(
+                waited.is_err(),
+                "answered before the pass before it was durable"
+            );
+            assert!(first_rx.try_recv().is_err());
+
+            persisted.send(Ok(())).unwrap();
+            assert_eq!(completed(first_rx.await.unwrap()), Vec::<String>::new());
+            assert_eq!(completed(second_rx.await.unwrap()), Vec::<String>::new());
+
+            drop(finish_tx);
+            finisher.join().unwrap();
         }
     }
 }

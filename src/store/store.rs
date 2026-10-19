@@ -278,9 +278,41 @@ impl Keyspaces {
         tx: fjall::SingleWriterWriteTx<'_>,
         mode: CommitMode,
     ) -> Result<(), StoreError> {
+        self.commit_deferred(tx, mode)?.wait()
+    }
+
+    /// Commit a transaction and request that it be made durable, without
+    /// waiting for it to be. The returned handle waits.
+    ///
+    /// Lets the writer start its next pass while the last is persisted,
+    /// rather than idling through the wait with the lock unused.
+    pub(super) fn commit_deferred(
+        &self,
+        tx: fjall::SingleWriterWriteTx<'_>,
+        mode: CommitMode,
+    ) -> Result<Durable, StoreError> {
         tx.commit()?;
-        let rx = self.group_committer.persist(mode);
-        match rx.blocking_recv() {
+        Ok(Durable(self.group_committer.persist(mode)))
+    }
+}
+
+/// A committed transaction on its way to being durable.
+pub(super) struct Durable(tokio::sync::oneshot::Receiver<super::group_committer::SyncResult>);
+
+impl Durable {
+    /// A commit that becomes durable when the test says so.
+    #[cfg(test)]
+    pub(super) fn pending() -> (
+        tokio::sync::oneshot::Sender<super::group_committer::SyncResult>,
+        Self,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (tx, Self(rx))
+    }
+
+    /// Block until the commit is durable, or persisting it failed.
+    pub(super) fn wait(self) -> Result<(), StoreError> {
+        match self.0.blocking_recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -391,7 +423,6 @@ impl Store {
                 enqueue_batch_size: config.enqueue_batch_size,
                 write_batch_max_jobs: config.write_batch_max_jobs,
                 complete_batch_size: config.complete_batch_size,
-                default_completed_retention_ms: config.default_completed_retention_ms,
             },
         ));
 
