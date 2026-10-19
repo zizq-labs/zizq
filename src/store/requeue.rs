@@ -6,13 +6,14 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use fjall::Slice;
+use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::dispatch::Placement;
 use super::keys::{make_job_key, make_status_key};
-use super::store::{Store, StoreEvent};
+use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError};
+use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Requeue a job currently in the in-flight state back to ready.
@@ -22,87 +23,126 @@ impl Store {
     ///
     /// Subscribers are notified.
     pub async fn requeue(&self, id: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let id = id.to_string();
-        let event_id = id.clone();
+        // Prepared here, on a blocking thread, so the writer only checks
+        // and writes. A job changed between this pre-read and the
+        // writer's check comes back as a conflict: pre-read again.
+        loop {
+            let ks = self.ks.clone();
+            let writer = self.writer.clone();
+            let id = id.to_string();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Retry loop: pre-read and pre-compute updates outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
-            loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None),
-                };
-
-                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if job.status != JobStatus::InFlight as u8 {
+            let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = RequeueOp::prepare(&ks, &id, reply)? else {
                     return Ok(None);
-                }
+                };
+                writer.submit_job(op.into());
+                Ok(Some(rx))
+            })
+            .await??;
 
-                let old_status_key = make_status_key(JobStatus::InFlight, &id);
-                let new_status_key = make_status_key(JobStatus::Ready, &id);
-
-                let queue = job.queue.clone();
-                let dequeued_at = job.dequeued_at.unwrap_or(0);
-                job.status = JobStatus::Ready.into();
-
-                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                // ---- inside tx (writes only, plus one compare) ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                // Released, not refunded. The job did dispatch and did
-                // run for some unknown amount of time before the worker
-                // went away, so a rate limit keeps the token it spent —
-                // otherwise a flapping worker could re-dispatch the same
-                // job indefinitely at no cost to the limit it exists to
-                // enforce. Only the concurrency slot comes back.
-                //
-                // Before the re-insert, not after. Queueing the job
-                // first leaves a window where it is visible while still
-                // holding its own slot, so a claim can look at it, fail
-                // to acquire, and then the release lands with nothing to
-                // provoke another attempt.
-                dispatch.release_concurrency(&job.budgets);
-
-                // Insert into the in-memory ready index after commit succeeds.
-                dispatch.insert(Placement::of(&job));
-
-                return Ok(Some((queue, dequeued_at)));
+            let Some(reply_rx) = reply_rx else {
+                return Ok(false);
+            };
+            let outcome = reply_rx
+                .await
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??;
+            match outcome {
+                JobOutcome::Done(()) => return Ok(true),
+                JobOutcome::Conflict => continue,
             }
-        })
-        .await??;
+        }
+    }
+}
 
-        if let Some((queue, dequeued_at)) = result {
-            self.in_flight_index.remove(dequeued_at, &event_id);
-            let _ = self.event_tx.send(StoreEvent::JobDispatchable {
-                id: event_id,
-                queue,
-                token: Arc::new(AtomicBool::new(false)),
-            });
-            return Ok(true);
+/// A requeue of one in-flight job, prepared by its caller.
+pub(in crate::store) struct RequeueOp {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    /// The job as it will be once ready again.
+    job: Job,
+    updated: Slice,
+    reply: JobReply<()>,
+}
+
+impl RequeueOp {
+    /// Pre-read the job and work out its ready record. `None` if the job
+    /// is gone or isn't in flight.
+    fn prepare(ks: &Keyspaces, id: &str, reply: JobReply<()>) -> Result<Option<Self>, StoreError> {
+        let job_key = make_job_key(id);
+        let Some(pre_bytes) = ks.data.get(&job_key)? else {
+            return Ok(None);
+        };
+
+        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+        if job.status != JobStatus::InFlight as u8 {
+            return Ok(None);
         }
 
-        Ok(false)
+        job.status = JobStatus::Ready.into();
+        let updated = rmp_serde::to_vec_named(&job)?.into();
+
+        Ok(Some(Self {
+            job_key,
+            pre_bytes,
+            job,
+            updated,
+            reply,
+        }))
+    }
+}
+
+impl JobWrite for RequeueOp {
+    fn apply(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<bool, StoreError> {
+        if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(false);
+        }
+
+        let id = &self.job.id;
+        tx.insert(&ks.data, &self.job_key, self.updated.clone());
+        tx.remove(&ks.index, make_status_key(JobStatus::InFlight, id));
+        tx.insert(&ks.index, make_status_key(JobStatus::Ready, id), b"");
+        Ok(true)
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let job = self.job;
+
+        // Released, not refunded. The job did dispatch and did run for
+        // some unknown amount of time before the worker went away, so a
+        // rate limit keeps the token it spent — otherwise a flapping
+        // worker could re-dispatch the same job indefinitely at no cost
+        // to the limit it exists to enforce. Only the concurrency slot
+        // comes back.
+        //
+        // Before the re-insert, not after. Queueing the job first leaves
+        // a window where it is visible while still holding its own slot,
+        // so a claim can look at it, fail to acquire, and then the
+        // release lands with nothing to provoke another attempt.
+        cx.dispatch.release_concurrency(&job.budgets);
+        cx.dispatch.insert(Placement::of(&job));
+
+        cx.in_flight_index
+            .remove(job.dequeued_at.unwrap_or(0), &job.id);
+        let _ = cx.event_tx.send(StoreEvent::JobDispatchable {
+            id: job.id.clone(),
+            queue: job.queue.clone(),
+            token: Arc::new(AtomicBool::new(false)),
+        });
+
+        let _ = self.reply.send(Ok(JobOutcome::Done(())));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
     }
 }
 
@@ -111,11 +151,112 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::budget::{BudgetBinding, BudgetStrategy};
+    use super::super::keys::make_job_key;
     use super::super::options::EnqueueOptions;
     use super::super::store::StoreEvent;
+    use super::super::test_support::enqueue_and_take;
     use super::super::test_support::{test_failure_opts, test_store};
-    use super::super::types::JobStatus;
+    use super::super::types::{JobStatus, StoreError};
+    use super::super::writer::{JobOp, JobOutcome, JobWrite, WriterContext};
     use crate::time::now_millis;
+
+    /// Prepare a requeue of `id`, as its caller would.
+    fn requeue_op(
+        store: &super::Store,
+        id: &str,
+    ) -> (
+        super::RequeueOp,
+        tokio::sync::oneshot::Receiver<Result<JobOutcome<()>, StoreError>>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = super::RequeueOp::prepare(&store.ks, id, reply)
+            .unwrap()
+            .unwrap();
+        (op, rx)
+    }
+
+    /// Apply, commit and finish `ops` as one writer pass would. Commits
+    /// block on the group committer, so on a blocking thread.
+    async fn one_pass(store: &super::Store, ops: Vec<JobOp>) {
+        let ks = store.ks.clone();
+        let cx = WriterContext {
+            ks: store.ks.clone(),
+            dispatch: store.dispatch.clone(),
+            budgets: store.budgets.clone(),
+            scheduled_index: store.scheduled_index.clone(),
+            in_flight_index: store.in_flight_index.clone(),
+            event_tx: store.event_tx.clone(),
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            let written: Vec<bool> = ops
+                .iter()
+                .map(|op| op.apply(&mut tx, &ks).unwrap())
+                .collect();
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+            for (op, written) in ops.into_iter().zip(written) {
+                if written {
+                    op.finish(&cx);
+                } else {
+                    op.conflict();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A requeue of a job changed since its pre-read writes nothing and
+    /// is told to retry, while another in the same pass commits.
+    #[tokio::test]
+    async fn a_requeue_of_a_changed_job_conflicts_and_others_commit() {
+        let store = test_store();
+        let a = enqueue_and_take(&store).await.id;
+        let b = enqueue_and_take(&store).await.id;
+
+        let (first, first_rx) = requeue_op(&store, &a);
+        let (second, second_rx) = requeue_op(&store, &b);
+
+        // `b` changes after its requeue pre-read it.
+        let ks = store.ks.clone();
+        let key = make_job_key(&b);
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            tx.insert(&ks.data, key, b"changed");
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+        })
+        .await
+        .unwrap();
+
+        one_pass(&store, vec![first.into(), second.into()]).await;
+
+        assert_eq!(first_rx.await.unwrap().unwrap(), JobOutcome::Done(()));
+        assert_eq!(second_rx.await.unwrap().unwrap(), JobOutcome::Conflict);
+        assert_eq!(store.dispatch.len(), 1);
+        assert_eq!(
+            store.ks.data.get(make_job_key(&b)).unwrap().as_deref(),
+            Some(b"changed".as_slice())
+        );
+    }
+
+    /// Two writes of one job in the same pass: the second sees the
+    /// first's write and conflicts, rather than writing over it.
+    #[tokio::test]
+    async fn a_second_write_of_a_job_in_one_pass_conflicts() {
+        let store = test_store();
+        let id = enqueue_and_take(&store).await.id;
+
+        let (first, first_rx) = requeue_op(&store, &id);
+        let (second, second_rx) = requeue_op(&store, &id);
+        one_pass(&store, vec![first.into(), second.into()]).await;
+
+        assert_eq!(first_rx.await.unwrap().unwrap(), JobOutcome::Done(()));
+        assert_eq!(second_rx.await.unwrap().unwrap(), JobOutcome::Conflict);
+
+        // Retried, it finds the job no longer in flight.
+        assert!(!store.requeue(&id).await.unwrap());
+        assert_eq!(store.dispatch.len(), 1);
+    }
 
     /// A worker that vanished was, from the budget's point of view, a
     /// completion whose outcome never arrived: the job has stopped

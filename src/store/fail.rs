@@ -6,12 +6,13 @@
 use fjall::{Readable, Slice};
 use tokio::task;
 
-use super::delete::{apply_job_deletion, prepare_job_deletion};
+use super::delete::{JobDeletion, apply_job_deletion, prepare_job_deletion};
 use super::dispatch::Placement;
 use super::keys::{make_error_key, make_job_key, make_purge_key, make_status_key, make_unique_key};
 use super::options::FailureOptions;
-use super::store::{Store, StoreEvent};
+use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{BackoffConfig, ErrorRecord, Job, JobStatus, StoreError, UniqueWhile};
+use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Record a job failure and either schedule a retry or kill the job
@@ -30,229 +31,290 @@ impl Store {
         id: &str,
         opts: FailureOptions,
     ) -> Result<Option<Job>, StoreError> {
-        let ks = self.ks.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let dispatch = self.dispatch.clone();
-        let default_dead_retention_ms = self.default_dead_retention_ms;
-        let default_retry_limit = self.default_retry_limit;
-        let default_backoff = self.default_backoff.clone();
+        let defaults = FailDefaults {
+            dead_retention_ms: self.default_dead_retention_ms,
+            retry_limit: self.default_retry_limit,
+            backoff: self.default_backoff.clone(),
+        };
+        let opts = std::sync::Arc::new(opts);
 
-        let id = id.to_string();
-        let id_for_event = id.clone();
+        // Prepared here, on a blocking thread, so the writer only checks
+        // and writes. A job changed between this pre-read and the
+        // writer's check comes back as a conflict: pre-read again.
+        loop {
+            let ks = self.ks.clone();
+            let writer = self.writer.clone();
+            let id = id.to_string();
+            let opts = opts.clone();
+            let defaults = defaults.clone();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Extract fields from opts before the retry loop so they can
-            // be cloned on each iteration.
-            let kill = opts.kill;
-            let retry_at = opts.retry_at;
-            let error_message = opts.message;
-            let error_type_opt = opts.error_type;
-            let error_backtrace = opts.backtrace;
-
-            // Retry loop: pre-read and pre-compute updates outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
-            let job = loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None),
-                };
-
-                let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if job.status != JobStatus::InFlight as u8 {
+            let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = FailOp::prepare(&ks, &id, now, &opts, &defaults, reply)? else {
                     return Ok(None);
-                }
-
-                job.attempts += 1;
-                job.failed_at = Some(now);
-
-                let error_key = make_error_key(&id, job.attempts);
-
-                let error_record = ErrorRecord {
-                    message: error_message.clone(),
-                    error_type: error_type_opt.clone(),
-                    backtrace: error_backtrace.clone(),
-                    dequeued_at: job.dequeued_at.unwrap_or(0),
-                    failed_at: now,
-                    attempt: job.attempts,
                 };
+                writer.submit_job(op.into());
+                Ok(Some(rx))
+            })
+            .await??;
 
-                let error_bytes = rmp_serde::to_vec_named(&error_record)?;
+            let Some(reply_rx) = reply_rx else {
+                return Ok(None);
+            };
+            let outcome = reply_rx
+                .await
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??;
+            match outcome {
+                JobOutcome::Done(job) => return Ok(Some(job)),
+                JobOutcome::Conflict => continue,
+            }
+        }
+    }
+}
 
-                let retry_limit = job.retry_limit.unwrap_or(default_retry_limit);
+/// The store-wide defaults a failure falls back on.
+#[derive(Clone)]
+struct FailDefaults {
+    dead_retention_ms: u64,
+    retry_limit: u32,
+    backoff: BackoffConfig,
+}
 
-                if kill {
-                    job.status = JobStatus::Dead.into();
-                } else if let Some(ra) = retry_at {
-                    job.status = JobStatus::Scheduled.into();
-                    job.ready_at = ra;
-                } else if job.attempts > retry_limit {
-                    job.status = JobStatus::Dead.into();
-                } else {
-                    let backoff = job.backoff.as_ref().unwrap_or(&default_backoff);
-                    let delay_ms = compute_backoff(job.attempts, backoff);
-                    job.status = JobStatus::Scheduled.into();
-                    job.ready_at = now + delay_ms;
-                };
+/// A failure of one in-flight job, prepared by its caller.
+pub(in crate::store) struct FailOp {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    /// The job as it will be once failed.
+    job: Job,
+    write: FailWrite,
+    reply: JobReply<Job>,
+}
 
-                let old_status_key = make_status_key(JobStatus::InFlight, &id);
+/// What failing the job writes.
+enum FailWrite {
+    /// Back to Scheduled, to retry once its backoff is over.
+    Retry {
+        updated: Slice,
+        error_key: Vec<u8>,
+        error_bytes: Vec<u8>,
+    },
 
-                if job.status == JobStatus::Scheduled as u8 {
-                    let new_status_key = make_status_key(JobStatus::Scheduled, &id);
-                    let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
+    /// Dead, kept until the reaper purges it.
+    Bury {
+        updated: Slice,
+        error_key: Vec<u8>,
+        error_bytes: Vec<u8>,
+        purge_key: Vec<u8>,
+    },
 
-                    // ---- inside tx (writes only, plus one compare) ----
-                    let mut tx = ks.write_tx();
+    /// Dead with no retention: deleted outright.
+    Delete(JobDeletion),
+}
 
-                    let prev =
-                        tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
+impl FailOp {
+    /// Pre-read the job and work out what failing it writes. `None` if
+    /// the job is gone or isn't in flight.
+    fn prepare(
+        ks: &Keyspaces,
+        id: &str,
+        now: u64,
+        opts: &FailureOptions,
+        defaults: &FailDefaults,
+        reply: JobReply<Job>,
+    ) -> Result<Option<Self>, StoreError> {
+        let job_key = make_job_key(id);
+        let Some(pre_bytes) = ks.data.get(&job_key)? else {
+            return Ok(None);
+        };
 
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue;
-                    }
+        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+        if job.status != JobStatus::InFlight as u8 {
+            return Ok(None);
+        }
 
-                    tx.insert(&ks.data, &error_key, &error_bytes);
-                    tx.remove(&ks.index, &old_status_key);
-                    tx.insert(&ks.index, &new_status_key, b"");
+        job.attempts += 1;
+        job.failed_at = Some(now);
 
-                    // If unique_while == Queued, restore the unique index now
-                    // that the job is re-entering the queue. Only insert if no
-                    // other job has claimed the key while this one was in-flight.
-                    if let Some(ref uc) = job.unique {
-                        if uc.unique_while() == UniqueWhile::Queued {
-                            let id_bytes: Slice = id.as_bytes().into();
-                            tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                                Some(existing) => Some(existing.clone()),
-                                None => Some(id_bytes.clone()),
-                            })?;
-                        }
-                    }
+        let error_key = make_error_key(id, job.attempts);
+        let error_bytes = rmp_serde::to_vec_named(&ErrorRecord {
+            message: opts.message.clone(),
+            error_type: opts.error_type.clone(),
+            backtrace: opts.backtrace.clone(),
+            dequeued_at: job.dequeued_at.unwrap_or(0),
+            failed_at: now,
+            attempt: job.attempts,
+        })?;
 
-                    ks.commit(tx, ks.default_commit_mode)?;
+        let retry_limit = job.retry_limit.unwrap_or(defaults.retry_limit);
 
-                    // The attempt is over even though the job is not:
-                    // it waits out its backoff holding no capacity, and
-                    // acquires again when the retry is dispatched. It
-                    // stays *tracked* throughout, being unfinished work
-                    // the budget still owes room to.
-                    dispatch.release_concurrency(&job.budgets);
-                    scheduled_index.insert(job.ready_at, id.clone());
+        if opts.kill {
+            job.status = JobStatus::Dead.into();
+        } else if let Some(retry_at) = opts.retry_at {
+            job.status = JobStatus::Scheduled.into();
+            job.ready_at = retry_at;
+        } else if job.attempts > retry_limit {
+            job.status = JobStatus::Dead.into();
+        } else {
+            let backoff = job.backoff.as_ref().unwrap_or(&defaults.backoff);
+            job.status = JobStatus::Scheduled.into();
+            job.ready_at = now + compute_backoff(job.attempts, backoff);
+        }
 
-                    break job;
-                }
+        let write = if job.status == JobStatus::Scheduled as u8 {
+            FailWrite::Retry {
+                updated: rmp_serde::to_vec_named(&job)?.into(),
+                error_key,
+                error_bytes,
+            }
+        } else {
+            let retention_ms = job
+                .retention
+                .as_ref()
+                .and_then(|r| r.dead_ms)
+                .unwrap_or(defaults.dead_retention_ms);
 
-                // Dead: check retention to decide sync delete vs deferred.
-                let retention_ms = job
-                    .retention
-                    .as_ref()
-                    .and_then(|r| r.dead_ms)
-                    .unwrap_or(default_dead_retention_ms);
-
-                if retention_ms == 0 {
-                    // Zero retention: prepare deletion keys outside tx.
-                    let del = prepare_job_deletion(&job, JobStatus::InFlight, &ks);
-
-                    // ---- inside tx ----
-                    let mut tx = ks.write_tx();
-                    // A read, not `take`, since `apply_job_deletion`
-                    // removes the record itself.
-                    let prev = tx.get(&ks.data, &job_key)?;
-                    if prev.as_deref() != Some(&*pre_bytes) {
-                        drop(tx);
-                        continue;
-                    }
-                    apply_job_deletion(&mut tx, &del, &ks);
-                    job.status = JobStatus::Dead.into();
-                    ks.commit(tx, ks.default_commit_mode)?;
-
-                    dispatch.remove(Placement::of(&job));
-                    dispatch.release_concurrency(&job.budgets);
-                    dispatch.untrack(&job.budgets);
-
-                    break job;
-                }
-
-                // Non-zero retention: defer deletion to the reaper.
+            if retention_ms == 0 {
+                FailWrite::Delete(prepare_job_deletion(&job, JobStatus::InFlight, ks))
+            } else {
                 let purge_at = now + retention_ms;
-                let new_status_key = make_status_key(JobStatus::Dead, &id);
-                let purge_key = make_purge_key(purge_at, &id);
-
                 job.purge_at = Some(purge_at);
-                let updated_slice: Slice = rmp_serde::to_vec_named(&job)?.into();
-
-                // ---- inside tx ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
+                FailWrite::Bury {
+                    updated: rmp_serde::to_vec_named(&job)?.into(),
+                    error_key,
+                    error_bytes,
+                    purge_key: make_purge_key(purge_at, id),
                 }
+            }
+        };
 
-                tx.insert(&ks.data, &error_key, &error_bytes);
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-                tx.insert(&ks.index, &purge_key, b"");
+        Ok(Some(Self {
+            job_key,
+            pre_bytes,
+            job,
+            write,
+            reply,
+        }))
+    }
+}
+
+impl JobWrite for FailOp {
+    fn apply(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<bool, StoreError> {
+        if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(false);
+        }
+
+        let id = &self.job.id;
+        let in_flight_key = make_status_key(JobStatus::InFlight, id);
+
+        match &self.write {
+            FailWrite::Retry {
+                updated,
+                error_key,
+                error_bytes,
+            } => {
+                tx.insert(&ks.data, &self.job_key, updated.clone());
+                tx.insert(&ks.data, error_key, error_bytes);
+                tx.remove(&ks.index, &in_flight_key);
+                tx.insert(&ks.index, make_status_key(JobStatus::Scheduled, id), b"");
+
+                // If unique_while == Queued, restore the unique index now
+                // that the job is re-entering the queue. Only insert if no
+                // other job has claimed the key while this one was in-flight.
+                if let Some(ref uc) = self.job.unique
+                    && uc.unique_while() == UniqueWhile::Queued
+                {
+                    let id_bytes: Slice = id.as_bytes().into();
+                    tx.fetch_update(&ks.index, make_unique_key(&uc.key), |v| match v {
+                        Some(existing) => Some(existing.clone()),
+                        None => Some(id_bytes.clone()),
+                    })?;
+                }
+            }
+
+            FailWrite::Bury {
+                updated,
+                error_key,
+                error_bytes,
+                purge_key,
+            } => {
+                tx.insert(&ks.data, &self.job_key, updated.clone());
+                tx.insert(&ks.data, error_key, error_bytes);
+                tx.remove(&ks.index, &in_flight_key);
+                tx.insert(&ks.index, make_status_key(JobStatus::Dead, id), b"");
+                tx.insert(&ks.index, purge_key, b"");
 
                 // Remove unique index for Queued or Active scope on death,
                 // but only if it still belongs to this job.
-                if let Some(ref uc) = job.unique {
+                if let Some(ref uc) = self.job.unique {
                     let scope = uc.unique_while();
                     if scope == UniqueWhile::Queued || scope == UniqueWhile::Active {
                         let job_id = id.as_bytes();
-                        tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
+                        tx.fetch_update(&ks.index, make_unique_key(&uc.key), |v| match v {
                             Some(v) if v.as_ref() == job_id => None,
                             other => other.cloned(),
                         })?;
                     }
                 }
-
-                ks.commit(tx, ks.default_commit_mode)?;
-
-                dispatch.remove(Placement::of(&job));
-                dispatch.release_concurrency(&job.budgets);
-                dispatch.untrack(&job.budgets);
-
-                break job;
-            };
-
-            Ok(Some(job))
-        })
-        .await??;
-
-        // Emit events outside spawn_blocking due to &self.event_tx.
-        if let Some(ref job) = result {
-            self.in_flight_index
-                .remove(job.dequeued_at.unwrap_or(0), &id_for_event);
-
-            // Always emit JobFailed first so workers prune their
-            // in-flight set before any downstream events arrive.
-            //
-            // The attempts count must match what the worker stored when
-            // it took the job — that's the pre-increment value, since
-            // record_failure bumps attempts by 1 inside the closure.
-            let _ = self.event_tx.send(StoreEvent::JobFailed {
-                id: id_for_event,
-                attempts: job.attempts - 1,
-            });
-
-            if job.status == JobStatus::Scheduled as u8 {
-                // Rescheduled for retry — tell the scheduler to wake up
-                // at the new ready_at.
-                let _ = self.event_tx.send(StoreEvent::JobScheduled {
-                    id: job.id.clone(),
-                    ready_at: job.ready_at,
-                });
             }
+
+            FailWrite::Delete(del) => apply_job_deletion(tx, del, ks),
         }
 
-        Ok(result)
+        Ok(true)
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let job = self.job;
+
+        if job.status == JobStatus::Scheduled as u8 {
+            // The attempt is over even though the job is not: it waits
+            // out its backoff holding no capacity, and acquires again
+            // when the retry is dispatched. It stays *tracked*
+            // throughout, being unfinished work the budget still owes
+            // room to.
+            cx.dispatch.release_concurrency(&job.budgets);
+            cx.scheduled_index.insert(job.ready_at, job.id.clone());
+        } else {
+            cx.dispatch.remove(Placement::of(&job));
+            cx.dispatch.release_concurrency(&job.budgets);
+            cx.dispatch.untrack(&job.budgets);
+        }
+
+        cx.in_flight_index
+            .remove(job.dequeued_at.unwrap_or(0), &job.id);
+
+        // Always emit JobFailed first so workers prune their in-flight
+        // set before any downstream events arrive.
+        //
+        // The attempts count must match what the worker stored when it
+        // took the job: the value before this failure incremented it.
+        let _ = cx.event_tx.send(StoreEvent::JobFailed {
+            id: job.id.clone(),
+            attempts: job.attempts - 1,
+        });
+
+        if job.status == JobStatus::Scheduled as u8 {
+            // Rescheduled for retry: tell the scheduler to wake up at the
+            // new ready_at.
+            let _ = cx.event_tx.send(StoreEvent::JobScheduled {
+                id: job.id.clone(),
+                ready_at: job.ready_at,
+            });
+        }
+
+        let _ = self.reply.send(Ok(JobOutcome::Done(job)));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
     }
 }
 

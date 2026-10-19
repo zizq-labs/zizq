@@ -40,6 +40,7 @@
 //! Callers submit from `spawn_blocking`: the channel is bounded, so a
 //! submit blocks when the writer is behind.
 
+pub(in crate::store) mod job;
 pub(in crate::store) mod take;
 
 use std::collections::VecDeque;
@@ -57,6 +58,8 @@ use super::results::EnqueueResult;
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Durable, Keyspaces, StoreEvent};
 use super::types::{CommitMode, StoreError};
+use job::JobGroup;
+pub(in crate::store) use job::{JobOp, JobOutcome, JobReply, JobWrite};
 use take::{TakeGroup, TakeOp, TakeOutcome, TakeWrite};
 
 /// Most takes in one pass. Each take carries at most a worker's
@@ -64,11 +67,17 @@ use take::{TakeGroup, TakeOp, TakeOutcome, TakeWrite};
 /// are open.
 const TAKE_BATCH_SIZE: usize = 1000;
 
+/// Most single-job writes (fails, requeues, ...) in one pass.
+const JOB_BATCH_SIZE: usize = 1000;
+
 /// A write waiting for the writer.
 pub(in crate::store) enum WriteOp {
     Enqueue(EnqueueOp),
     Complete(CompleteOp),
     Take(TakeOp),
+    /// Boxed: a single-job write holds a whole job record, and inline it
+    /// would make every op in the channel that size.
+    Job(Box<JobOp>),
 }
 
 /// Settings for [`Writer::start`].
@@ -101,6 +110,7 @@ impl Writer {
             max_jobs: config.write_batch_max_jobs,
             complete_ops: config.complete_batch_size.max(1),
             take_ops: TAKE_BATCH_SIZE,
+            job_ops: JOB_BATCH_SIZE,
         };
         let (tx, rx) = std::sync::mpsc::sync_channel::<WriteOp>(limits.total_ops());
         let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel::<Pass>(FINISH_QUEUE);
@@ -161,6 +171,11 @@ impl Writer {
         rx
     }
 
+    /// Submit a single-job write. Its reply goes back through the op.
+    pub(in crate::store) fn submit_job(&self, op: JobOp) {
+        self.send(WriteOp::Job(Box::new(op)));
+    }
+
     /// Blocks while the channel is full. A send error means the thread is
     /// gone: the dropped reply closes the caller's receiver, which it
     /// reports as an internal error.
@@ -183,12 +198,14 @@ fn run_pass(
 ) -> Option<Pass> {
     let ks = &cx.ks;
 
-    let (mut enqueues, mut completes, mut takes) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut enqueues, mut completes, mut takes, mut jobs) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for op in batch {
         match op {
             WriteOp::Enqueue(op) => enqueues.push(op),
             WriteOp::Complete(op) => completes.push(op),
             WriteOp::Take(op) => takes.push(op),
+            WriteOp::Job(op) => jobs.push(*op),
         }
     }
 
@@ -196,6 +213,7 @@ fn run_pass(
         enqueue: (!enqueues.is_empty()).then(|| EnqueueGroup::new(enqueues)),
         take: (!takes.is_empty()).then(|| TakeGroup::new(takes)),
         complete: (!completes.is_empty()).then(|| CompleteGroup::new(completes)),
+        job: (!jobs.is_empty()).then(|| JobGroup::new(jobs)),
         durable: None,
     };
 
@@ -207,7 +225,7 @@ fn run_pass(
         drop(tx);
         tracing::error!(error = %e, "writer: applying enqueues failed");
         pass.enqueue.take().unwrap().fail(&e.to_string());
-        requeue(carry, None, pass.complete, pass.take);
+        requeue(carry, None, pass.complete, pass.take, pass.job);
         return None;
     }
 
@@ -217,7 +235,7 @@ fn run_pass(
         drop(tx);
         tracing::error!(error = %e, "writer: applying takes failed");
         pass.take.take().unwrap().fail(&e.to_string());
-        requeue(carry, pass.enqueue, pass.complete, None);
+        requeue(carry, pass.enqueue, pass.complete, None, pass.job);
         return None;
     }
 
@@ -227,14 +245,25 @@ fn run_pass(
         drop(tx);
         tracing::error!(error = %e, "writer: applying completions failed");
         pass.complete.take().unwrap().fail(&e.to_string());
-        requeue(carry, pass.enqueue, None, pass.take);
+        requeue(carry, pass.enqueue, None, pass.take, pass.job);
+        return None;
+    }
+
+    if let Some(group) = pass.job.as_mut()
+        && let Err(e) = group.apply(&mut tx, ks)
+    {
+        // The group failed only the op that hit the error.
+        drop(tx);
+        tracing::error!(error = %e, "writer: applying a job write failed");
+        requeue(carry, pass.enqueue, pass.complete, pass.take, pass.job);
         return None;
     }
 
     let enqueue_writes = pass.enqueue.as_ref().map_or(0, EnqueueGroup::writes);
     let writes = enqueue_writes
         + pass.take.as_ref().map_or(0, TakeGroup::writes)
-        + pass.complete.as_ref().map_or(0, CompleteGroup::writes);
+        + pass.complete.as_ref().map_or(0, CompleteGroup::writes)
+        + pass.job.as_ref().map_or(0, JobGroup::writes);
 
     if writes == 0 {
         // Still finished by the finisher, so its answers don't overtake
@@ -279,6 +308,7 @@ struct Pass {
     enqueue: Option<EnqueueGroup>,
     take: Option<TakeGroup>,
     complete: Option<CompleteGroup>,
+    job: Option<JobGroup>,
     /// `None` if the pass wrote nothing.
     durable: Option<Durable>,
 }
@@ -306,6 +336,9 @@ impl Pass {
         if let Some(group) = self.complete {
             group.finish(&cx.dispatch, &cx.in_flight_index, &cx.event_tx);
         }
+        if let Some(group) = self.job {
+            group.finish(cx);
+        }
     }
 
     /// Fail every op, after a commit that didn't happen or didn't become
@@ -322,6 +355,9 @@ impl Pass {
         if let Some(group) = self.complete {
             group.fail(msg);
         }
+        if let Some(group) = self.job {
+            group.fail(msg);
+        }
     }
 }
 
@@ -332,6 +368,7 @@ fn requeue(
     enqueue: Option<EnqueueGroup>,
     complete: Option<CompleteGroup>,
     take: Option<TakeGroup>,
+    job: Option<JobGroup>,
 ) {
     let ops: Vec<WriteOp> = enqueue
         .into_iter()
@@ -347,6 +384,11 @@ fn requeue(
                 .into_iter()
                 .flat_map(CompleteGroup::into_ops)
                 .map(WriteOp::Complete),
+        )
+        .chain(
+            job.into_iter()
+                .flat_map(JobGroup::into_ops)
+                .map(|op| WriteOp::Job(Box::new(op))),
         )
         .collect();
     for op in ops.into_iter().rev() {
@@ -367,6 +409,7 @@ enum Kind {
     Enqueue,
     Complete,
     Take,
+    Job,
 }
 
 /// What gathering needs to know about an op.
@@ -381,6 +424,7 @@ impl Pending for WriteOp {
             WriteOp::Enqueue(_) => Kind::Enqueue,
             WriteOp::Complete(_) => Kind::Complete,
             WriteOp::Take(_) => Kind::Take,
+            WriteOp::Job(_) => Kind::Job,
         }
     }
 
@@ -389,6 +433,7 @@ impl Pending for WriteOp {
             WriteOp::Enqueue(op) => op.prepared.len(),
             WriteOp::Complete(op) => op.ids.len(),
             WriteOp::Take(op) => op.writes.len(),
+            WriteOp::Job(_) => 1,
         }
     }
 }
@@ -411,13 +456,16 @@ struct Limits {
     complete_ops: usize,
     /// Most takes.
     take_ops: usize,
+    /// Most single-job writes. Admitted with takes and completions:
+    /// nacks and requeues are draining too.
+    job_ops: usize,
 }
 
 impl Limits {
     /// Also the channel capacity, so backpressure starts where one pass
     /// could no longer absorb everything waiting.
     fn total_ops(&self) -> usize {
-        self.enqueue_ops + self.complete_ops + self.take_ops
+        self.enqueue_ops + self.complete_ops + self.take_ops + self.job_ops
     }
 }
 
@@ -426,6 +474,7 @@ struct Counts {
     enqueue_ops: usize,
     complete_ops: usize,
     take_ops: usize,
+    job_ops: usize,
     jobs: usize,
 }
 
@@ -440,6 +489,7 @@ impl Counts {
             }
             Kind::Complete => self.complete_ops < limits.complete_ops,
             Kind::Take => self.take_ops < limits.take_ops,
+            Kind::Job => self.job_ops < limits.job_ops,
         }
     }
 
@@ -448,6 +498,7 @@ impl Counts {
             Kind::Enqueue => self.enqueue_ops += 1,
             Kind::Complete => self.complete_ops += 1,
             Kind::Take => self.take_ops += 1,
+            Kind::Job => self.job_ops += 1,
         }
         self.jobs += op.jobs();
     }
@@ -535,7 +586,7 @@ mod tests {
         }
     }
 
-    use Kind::{Complete as C, Enqueue as E, Take as T};
+    use Kind::{Complete as C, Enqueue as E, Job as J, Take as T};
 
     fn limits(max_jobs: usize) -> Limits {
         Limits {
@@ -543,6 +594,7 @@ mod tests {
             max_jobs,
             complete_ops: 2,
             take_ops: 1000,
+            job_ops: 2,
         }
     }
 
@@ -582,6 +634,20 @@ mod tests {
         let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(E, 100), Op(T, 150), Op(C, 40)]);
         assert_eq!(carry, VecDeque::from([Op(E, 50)]));
+    }
+
+    /// Fails and requeues are draining work, admitted with takes and
+    /// completions ahead of enqueues, each counting as one job, within
+    /// their own request limit.
+    #[test]
+    fn single_job_writes_are_admitted_with_draining() {
+        // The two single-job writes admitted bring draining to exactly the
+        // limit, so the enqueue sits this pass out.
+        let rx = queued(vec![Op(E, 100), Op(J, 1), Op(T, 198), Op(J, 1), Op(J, 1)]);
+        let mut carry = VecDeque::new();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(J, 1), Op(T, 198), Op(J, 1)]);
+        assert_eq!(carry, VecDeque::from([Op(E, 100), Op(J, 1)]));
     }
 
     /// When draining alone fills a pass, enqueues sit that pass out, but
@@ -1037,6 +1103,7 @@ mod tests {
                 enqueue: None,
                 take: None,
                 complete: Some(CompleteGroup::new(vec![op])),
+                job: None,
                 durable,
             }
         }
