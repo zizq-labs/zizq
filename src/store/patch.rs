@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use fjall::Slice;
+use fjall::{Readable, Slice};
 use tokio::sync::broadcast;
 use tokio::task;
 
@@ -23,6 +23,7 @@ use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payloa
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
+use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl PatchJobOptions {
     /// Apply all patches to a mutable job, including status transitions
@@ -225,102 +226,38 @@ impl Store {
         id: &str,
         patch: PatchJobOptions,
     ) -> Result<Option<Job>, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
-        let id = id.to_string();
+        let patch = Arc::new(patch);
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let job_key = make_job_key(&id);
+        // Prepared here, on a blocking thread, so the writer only checks
+        // and writes. A job changed between this pre-read and the
+        // writer's check comes back as a conflict: pre-read again.
+        loop {
+            let ks = self.ks.clone();
+            let writer = self.writer.clone();
+            let id = id.to_string();
+            let patch = patch.clone();
 
-            let mut tx = ks.write_tx();
-
-            // Read, patch, and write in a single fetch_update call.
-            // Errors are captured in patch_err since the closure can only
-            // return Option<Slice>.
-            let mut patched_job: Option<Job> = None;
-            let mut diff: Option<PatchDiff> = None;
-            let mut patch_err: Option<StoreError> = None;
-
-            let prev = tx.fetch_update(&ks.data, &job_key, |existing| {
-                let bytes = existing?;
-
-                let mut job: Job = match rmp_serde::from_slice(bytes) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        patch_err = Some(e.into());
-                        return Some(bytes.clone());
-                    }
+            let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = PatchOp::prepare(&ks, &id, now, &patch, reply)? else {
+                    return Ok(None);
                 };
+                writer.submit_job(op.into());
+                Ok(Some(rx))
+            })
+            .await??;
 
-                let status = match JobStatus::try_from(job.status) {
-                    Ok(s) => s,
-                    Err(v) => {
-                        patch_err = Some(StoreError::Corruption(format!(
-                            "job {} has unrecognized status byte: {v}",
-                            job.id
-                        )));
-                        return Some(bytes.clone());
-                    }
-                };
-
-                // Reject patches on terminal jobs.
-                if status.is_terminal() {
-                    patch_err = Some(StoreError::InvalidOperation(format!(
-                        "cannot patch job {} in {} status",
-                        job.id,
-                        match status {
-                            JobStatus::Completed => "completed",
-                            JobStatus::Dead => "dead",
-                            _ => unreachable!(),
-                        }
-                    )));
-                    return Some(bytes.clone());
-                }
-
-                diff = Some(patch.apply(&mut job, now));
-
-                match rmp_serde::to_vec_named(&job) {
-                    Ok(updated) => {
-                        patched_job = Some(job);
-                        Some(updated.into())
-                    }
-                    Err(e) => {
-                        patch_err = Some(e.into());
-                        Some(bytes.clone())
-                    }
-                }
-            })?;
-
-            // Propagate any error from inside the closure.
-            if let Some(e) = patch_err {
-                return Err(e);
-            }
-
-            // If prev was None, the job doesn't exist.
-            if prev.is_none() {
+            let Some(reply_rx) = reply_rx else {
                 return Ok(None);
-            }
-
-            let job = match patched_job {
-                Some(j) => j,
-                None => return Ok(None),
             };
-            let diff = diff.unwrap();
-
-            diff.update_keyspaces(&mut tx, &ks);
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            diff.update_indexes(&dispatch, &scheduled_index);
-            diff.emit_events(&event_tx);
-
-            Ok(Some(job))
-        })
-        .await??;
-
-        Ok(result)
+            let outcome = reply_rx
+                .await
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??;
+            match outcome {
+                JobOutcome::Done(job) => return Ok(Some(job)),
+                JobOutcome::Conflict => continue,
+            }
+        }
     }
 
     /// Patch all jobs matching the given filters in a single transaction.
@@ -423,18 +360,148 @@ impl Store {
     }
 }
 
+/// A patch of one job, prepared by its caller.
+pub(in crate::store) struct PatchOp {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    /// The job as it will be once patched.
+    job: Job,
+    updated: Slice,
+    diff: PatchDiff,
+    reply: JobReply<Job>,
+}
+
+impl PatchOp {
+    /// Pre-read the job and patch it. `None` if the job doesn't exist; an
+    /// error if it can't be patched, as a terminal job can't.
+    fn prepare(
+        ks: &Keyspaces,
+        id: &str,
+        now: u64,
+        patch: &PatchJobOptions,
+        reply: JobReply<Job>,
+    ) -> Result<Option<Self>, StoreError> {
+        let job_key = make_job_key(id);
+        let Some(pre_bytes) = ks.data.get(&job_key)? else {
+            return Ok(None);
+        };
+
+        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+        let status = JobStatus::try_from(job.status).map_err(|v| {
+            StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+        })?;
+
+        if status.is_terminal() {
+            return Err(StoreError::InvalidOperation(format!(
+                "cannot patch job {} in {} status",
+                job.id,
+                match status {
+                    JobStatus::Completed => "completed",
+                    JobStatus::Dead => "dead",
+                    _ => unreachable!(),
+                }
+            )));
+        }
+
+        let diff = patch.apply(&mut job, now);
+        let updated = rmp_serde::to_vec_named(&job)?.into();
+
+        Ok(Some(Self {
+            job_key,
+            pre_bytes,
+            job,
+            updated,
+            diff,
+            reply,
+        }))
+    }
+}
+
+impl JobWrite for PatchOp {
+    fn apply(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<bool, StoreError> {
+        if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(false);
+        }
+
+        tx.insert(&ks.data, &self.job_key, self.updated.clone());
+        self.diff.update_keyspaces(tx, ks);
+        Ok(true)
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        self.diff.update_indexes(&cx.dispatch, &cx.scheduled_index);
+        self.diff.emit_events(&cx.event_tx);
+        let _ = self.reply.send(Ok(JobOutcome::Done(self.job)));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
+    use super::super::keys::make_job_key;
     use super::super::options::{
         BulkPatchOptions, EnqueueOptions, JobFilter, ListJobsOptions, PatchJobOptions,
         RetentionConfigPatch,
     };
     use super::super::store::StoreEvent;
-    use super::super::test_support::{test_store, test_store_with_retention};
-    use super::super::types::{BackoffConfig, JobStatus, RetentionConfig, StoreError};
+    use super::super::test_support::{run_job_ops, test_store, test_store_with_retention};
+    use super::super::types::{BackoffConfig, Job, JobStatus, RetentionConfig, StoreError};
+    use super::super::writer::JobOutcome;
     use crate::time::now_millis;
+
+    /// A patch prepared while a job is ready, of a job then taken, is
+    /// told to retry rather than writing the job back over its in-flight
+    /// state. Retried, it patches the job as it now is.
+    #[tokio::test]
+    async fn a_patch_of_a_job_taken_since_its_pre_read_conflicts() {
+        let store = test_store();
+        let now = now_millis();
+        let id = store
+            .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(null)))
+            .await
+            .unwrap()
+            .into_job()
+            .id;
+
+        let patch = PatchJobOptions {
+            priority: Some(100),
+            ..Default::default()
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = super::PatchOp::prepare(&store.ks, &id, now, &patch, reply)
+            .unwrap()
+            .unwrap();
+
+        store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        run_job_ops(&store, vec![op.into()]).await;
+
+        assert!(matches!(rx.await.unwrap().unwrap(), JobOutcome::Conflict));
+        let bytes = store.ks.data.get(make_job_key(&id)).unwrap().unwrap();
+        let stored: Job = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(stored.status, JobStatus::InFlight as u8);
+        assert_ne!(stored.priority, 100);
+
+        let patched = store.patch_job(now, &id, patch).await.unwrap().unwrap();
+        assert_eq!(patched.status, JobStatus::InFlight as u8);
+        assert_eq!(patched.priority, 100);
+    }
 
     // --- patch_job ---
 

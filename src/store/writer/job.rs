@@ -14,7 +14,9 @@
 //! and resubmit. Checks read through the pass's transaction, so they see
 //! writes made earlier in the same pass.
 
+use super::super::delete::PurgeOp;
 use super::super::fail::FailOp;
+use super::super::patch::PatchOp;
 use super::super::requeue::RequeueOp;
 use super::super::store::Keyspaces;
 use super::super::types::StoreError;
@@ -104,6 +106,8 @@ macro_rules! job_ops {
 job_ops! {
     Fail(FailOp),
     Requeue(RequeueOp),
+    Patch(PatchOp),
+    Purge(PurgeOp),
 }
 
 /// The single-job writes in one pass.

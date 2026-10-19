@@ -154,10 +154,10 @@ mod tests {
     use super::super::keys::make_job_key;
     use super::super::options::EnqueueOptions;
     use super::super::store::StoreEvent;
-    use super::super::test_support::enqueue_and_take;
+    use super::super::test_support::{enqueue_and_take, run_job_ops};
     use super::super::test_support::{test_failure_opts, test_store};
     use super::super::types::{JobStatus, StoreError};
-    use super::super::writer::{JobOp, JobOutcome, JobWrite, WriterContext};
+    use super::super::writer::JobOutcome;
     use crate::time::now_millis;
 
     /// Prepare a requeue of `id`, as its caller would.
@@ -173,37 +173,6 @@ mod tests {
             .unwrap()
             .unwrap();
         (op, rx)
-    }
-
-    /// Apply, commit and finish `ops` as one writer pass would. Commits
-    /// block on the group committer, so on a blocking thread.
-    async fn one_pass(store: &super::Store, ops: Vec<JobOp>) {
-        let ks = store.ks.clone();
-        let cx = WriterContext {
-            ks: store.ks.clone(),
-            dispatch: store.dispatch.clone(),
-            budgets: store.budgets.clone(),
-            scheduled_index: store.scheduled_index.clone(),
-            in_flight_index: store.in_flight_index.clone(),
-            event_tx: store.event_tx.clone(),
-        };
-        tokio::task::spawn_blocking(move || {
-            let mut tx = ks.write_tx();
-            let written: Vec<bool> = ops
-                .iter()
-                .map(|op| op.apply(&mut tx, &ks).unwrap())
-                .collect();
-            ks.commit(tx, ks.default_commit_mode).unwrap();
-            for (op, written) in ops.into_iter().zip(written) {
-                if written {
-                    op.finish(&cx);
-                } else {
-                    op.conflict();
-                }
-            }
-        })
-        .await
-        .unwrap();
     }
 
     /// A requeue of a job changed since its pre-read writes nothing and
@@ -228,7 +197,7 @@ mod tests {
         .await
         .unwrap();
 
-        one_pass(&store, vec![first.into(), second.into()]).await;
+        run_job_ops(&store, vec![first.into(), second.into()]).await;
 
         assert_eq!(first_rx.await.unwrap().unwrap(), JobOutcome::Done(()));
         assert_eq!(second_rx.await.unwrap().unwrap(), JobOutcome::Conflict);
@@ -248,7 +217,7 @@ mod tests {
 
         let (first, first_rx) = requeue_op(&store, &id);
         let (second, second_rx) = requeue_op(&store, &id);
-        one_pass(&store, vec![first.into(), second.into()]).await;
+        run_job_ops(&store, vec![first.into(), second.into()]).await;
 
         assert_eq!(first_rx.await.unwrap().unwrap(), JobOutcome::Done(()));
         assert_eq!(second_rx.await.unwrap().unwrap(), JobOutcome::Conflict);
