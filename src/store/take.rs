@@ -116,9 +116,21 @@ impl Store {
                 // 2. Pre-read phase — read each claimed job from the data keyspace.
                 //    Filter out any that are deleted or no longer Ready.
                 let mut valid: Vec<PreRead> = Vec::with_capacity(claimed.len());
+                let mut seen: HashSet<&str> = HashSet::with_capacity(claimed.len());
 
                 for candidate in &claimed {
                     let job_id = &candidate.id;
+
+                    // The ready index can briefly hold a job twice, under
+                    // two priorities: a take that conflicted with a patch
+                    // puts the job back where it was while the patch
+                    // re-files it. Both copies would pass the writer's
+                    // check, so a second claim of the job is given back.
+                    if !seen.insert(job_id) {
+                        dispatch.refund(&candidate.budgets);
+                        continue;
+                    }
+
                     let job_key = make_job_key(job_id);
                     let pre_bytes = match ks.data.get(&job_key)? {
                         Some(bytes) => bytes,
@@ -758,6 +770,37 @@ mod tests {
     }
 
     // --- take_next_n_jobs tests ---
+
+    /// The ready index can briefly hold one job under two placements: a
+    /// take that conflicts with a priority patch puts the job back where
+    /// it was, while the patch re-files it at its new priority. A take
+    /// that claims both must still take the job once.
+    #[tokio::test]
+    async fn a_job_claimed_twice_in_one_take_is_taken_once() {
+        let store = test_store();
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        store.dispatch.insert(super::super::dispatch::Placement {
+            queue: &job.queue,
+            priority: job.priority.wrapping_add(1),
+            id: &job.id,
+            budgets: &job.budgets,
+        });
+
+        let taken = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 5)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = taken.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec![job.id.as_str()]);
+    }
 
     #[tokio::test]
     async fn take_next_n_jobs_returns_up_to_n() {
