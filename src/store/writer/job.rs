@@ -1,28 +1,32 @@
 // Copyright (c) 2026 Chris Corbyn <chris@zizq.io>
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
-//! Single-job writes within a writer pass.
+//! Writes applied one request at a time, within a writer pass.
 //!
 //! Enqueues, takes and completions are batched across requests, each
-//! kind in its own way. Everything else changes one job per request, in
-//! the same shape: the caller pre-reads the job and works out its new
-//! state, and the writer checks the job is unchanged before writing it.
-//! Those ops share one kind of write, [`JobOp`], which lists them all.
+//! kind in its own way. Everything else is applied request by request,
+//! and shares one kind of write, [`JobOp`], which lists them all.
 //!
-//! An op whose job changed since its pre-read writes nothing and is
-//! answered [`JobOutcome::Conflict`], for its caller to pre-read again
-//! and resubmit. Checks read through the pass's transaction, so they see
-//! writes made earlier in the same pass.
+//! Most change one job, in the same shape: the caller pre-reads the job
+//! and works out its new state, and the writer checks the job is
+//! unchanged before writing it. An op whose job changed since its
+//! pre-read writes nothing and is answered [`JobOutcome::Conflict`], for
+//! its caller to pre-read again and resubmit. Checks read through the
+//! pass's transaction, so they see writes made earlier in the same pass.
+//!
+//! Bulk patches and deletes change every job a filter matches, all or
+//! nothing. They are *exclusive*: each runs in a pass of its own, so the
+//! scan for matching jobs sees exactly the state its writes go into.
 
-use super::super::delete::PurgeOp;
+use super::super::delete::{BulkDeleteOp, PurgeOp};
 use super::super::fail::FailOp;
-use super::super::patch::PatchOp;
+use super::super::patch::{BulkPatchOp, PatchOp};
 use super::super::requeue::RequeueOp;
 use super::super::store::Keyspaces;
 use super::super::types::StoreError;
 use super::WriterContext;
 
-/// What became of a single-job write.
+/// What became of a write.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::store) enum JobOutcome<T> {
     Done(T),
@@ -35,17 +39,35 @@ pub(in crate::store) enum JobOutcome<T> {
 pub(in crate::store) type JobReply<T> =
     tokio::sync::oneshot::Sender<Result<JobOutcome<T>, StoreError>>;
 
-/// A write of one job, prepared by its caller.
+/// What applying a write did to the pass's transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::store) enum Applied {
+    Wrote,
+
+    /// Nothing to write, as when a filter matches no jobs. Still finished.
+    Nothing,
+
+    /// The job changed since it was pre-read. Nothing was written.
+    Conflict,
+}
+
+/// A write applied on its own, prepared by its caller.
 pub(in crate::store) trait JobWrite {
     /// Check the job is still as pre-read, then write it into the pass's
-    /// transaction. `Ok(false)` if it changed: nothing was written.
+    /// transaction.
     fn apply(
-        &self,
+        &mut self,
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<Applied, StoreError>;
 
-    /// Once durable: update the in-memory indexes, announce, and answer.
+    /// Whether the op needs a pass of its own.
+    fn exclusive(&self) -> bool {
+        false
+    }
+
+    /// Once durable (or at once, if nothing was written): update the
+    /// in-memory indexes, announce, and answer.
     fn finish(self, cx: &WriterContext);
 
     /// Answer that the job changed, and nothing was written.
@@ -54,11 +76,11 @@ pub(in crate::store) trait JobWrite {
     fn fail(self, msg: &str);
 }
 
-/// Declare [`JobOp`], with one variant per single-job write, and forward
+/// Declare [`JobOp`], with one variant per kind of write, and forward
 /// [`JobWrite`] to each.
 macro_rules! job_ops {
     ($($variant:ident($op:ty)),* $(,)?) => {
-        /// Every single-job write the writer applies.
+        /// Every write the writer applies one request at a time.
         pub(in crate::store) enum JobOp {
             $($variant($op)),*
         }
@@ -73,12 +95,18 @@ macro_rules! job_ops {
 
         impl JobWrite for JobOp {
             fn apply(
-                &self,
+                &mut self,
                 tx: &mut fjall::SingleWriterWriteTx<'_>,
                 ks: &Keyspaces,
-            ) -> Result<bool, StoreError> {
+            ) -> Result<Applied, StoreError> {
                 match self {
                     $(JobOp::$variant(op) => op.apply(tx, ks)),*
+                }
+            }
+
+            fn exclusive(&self) -> bool {
+                match self {
+                    $(JobOp::$variant(op) => op.exclusive()),*
                 }
             }
 
@@ -108,20 +136,22 @@ job_ops! {
     Requeue(RequeueOp),
     Patch(PatchOp),
     Purge(PurgeOp),
+    BulkPatch(BulkPatchOp),
+    BulkDelete(BulkDeleteOp),
 }
 
-/// The single-job writes in one pass.
+/// The one-at-a-time writes in one pass.
 pub(super) struct JobGroup {
     ops: Vec<JobOp>,
-    /// Per op, once applied: whether it wrote, or conflicted.
-    written: Vec<bool>,
+    /// Per op, once applied.
+    applied: Vec<Applied>,
 }
 
 impl JobGroup {
     pub(super) fn new(ops: Vec<JobOp>) -> Self {
         Self {
             ops,
-            written: Vec::new(),
+            applied: Vec::new(),
         }
     }
 
@@ -133,12 +163,12 @@ impl JobGroup {
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
     ) -> Result<(), StoreError> {
-        self.written.clear();
+        self.applied.clear();
         for i in 0..self.ops.len() {
             match self.ops[i].apply(tx, ks) {
-                Ok(written) => self.written.push(written),
+                Ok(applied) => self.applied.push(applied),
                 Err(e) => {
-                    self.written.clear();
+                    self.applied.clear();
                     self.ops.remove(i).fail(&e.to_string());
                     return Err(e);
                 }
@@ -147,17 +177,19 @@ impl JobGroup {
         Ok(())
     }
 
-    /// How many jobs this pass writes for single-job ops.
+    /// How many ops in this pass wrote anything.
     pub(super) fn writes(&self) -> usize {
-        self.written.iter().filter(|w| **w).count()
+        self.applied
+            .iter()
+            .filter(|a| **a == Applied::Wrote)
+            .count()
     }
 
     pub(super) fn finish(self, cx: &WriterContext) {
-        for (op, written) in self.ops.into_iter().zip(self.written) {
-            if written {
-                op.finish(cx);
-            } else {
-                op.conflict();
+        for (op, applied) in self.ops.into_iter().zip(self.applied) {
+            match applied {
+                Applied::Wrote | Applied::Nothing => op.finish(cx),
+                Applied::Conflict => op.conflict(),
             }
         }
     }

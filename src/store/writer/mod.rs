@@ -59,7 +59,7 @@ use super::scheduled_index::ScheduledIndex;
 use super::store::{Durable, Keyspaces, StoreEvent};
 use super::types::{CommitMode, StoreError};
 use job::JobGroup;
-pub(in crate::store) use job::{JobOp, JobOutcome, JobReply, JobWrite};
+pub(in crate::store) use job::{Applied, JobOp, JobOutcome, JobReply, JobWrite};
 use take::{TakeGroup, TakeOp, TakeOutcome, TakeWrite};
 
 /// Most takes in one pass. Each take carries at most a worker's
@@ -410,6 +410,8 @@ enum Kind {
     Complete,
     Take,
     Job,
+    /// Runs in a pass of its own.
+    Exclusive,
 }
 
 /// What gathering needs to know about an op.
@@ -424,6 +426,7 @@ impl Pending for WriteOp {
             WriteOp::Enqueue(_) => Kind::Enqueue,
             WriteOp::Complete(_) => Kind::Complete,
             WriteOp::Take(_) => Kind::Take,
+            WriteOp::Job(op) if op.exclusive() => Kind::Exclusive,
             WriteOp::Job(_) => Kind::Job,
         }
     }
@@ -490,6 +493,8 @@ impl Counts {
             Kind::Complete => self.complete_ops < limits.complete_ops,
             Kind::Take => self.take_ops < limits.take_ops,
             Kind::Job => self.job_ops < limits.job_ops,
+            // Only ever first in line, and then alone: see `gather`.
+            Kind::Exclusive => false,
         }
     }
 
@@ -499,6 +504,7 @@ impl Counts {
             Kind::Complete => self.complete_ops += 1,
             Kind::Take => self.take_ops += 1,
             Kind::Job => self.job_ops += 1,
+            Kind::Exclusive => {}
         }
         self.jobs += op.jobs();
     }
@@ -514,6 +520,11 @@ impl Counts {
 /// The pass keeps the ops' arrival order, and ops not admitted are kept,
 /// in order, as the new carry. Returns `None` once the channel is closed
 /// and nothing is carried.
+///
+/// An exclusive op is only admitted once it is first in line, and then
+/// alone. Everything that arrived before it has gone by then, and nothing
+/// that arrives after it can overtake it for long: the ops ahead of it in
+/// the carry only ever leave it.
 fn gather<T: Pending>(
     carry: &mut VecDeque<T>,
     skipped_enqueues: &mut bool,
@@ -536,6 +547,13 @@ fn gather<T: Pending>(
             }
             Err(_) => break,
         }
+    }
+
+    if candidates[0].kind() == Kind::Exclusive {
+        let mut candidates = candidates.into_iter();
+        let first = candidates.next();
+        carry.extend(candidates);
+        return first.map(|op| vec![op]);
     }
 
     let mut counts = Counts::default();
@@ -586,7 +604,7 @@ mod tests {
         }
     }
 
-    use Kind::{Complete as C, Enqueue as E, Job as J, Take as T};
+    use Kind::{Complete as C, Enqueue as E, Exclusive as X, Job as J, Take as T};
 
     fn limits(max_jobs: usize) -> Limits {
         Limits {
@@ -648,6 +666,40 @@ mod tests {
         let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
         assert_eq!(batch, vec![Op(J, 1), Op(T, 198), Op(J, 1)]);
         assert_eq!(carry, VecDeque::from([Op(E, 100), Op(J, 1)]));
+    }
+
+    /// An exclusive op sits out the pass it was gathered in, which goes
+    /// ahead with everything else, then runs alone at the front of the
+    /// next, ahead of whatever arrived since.
+    #[test]
+    fn an_exclusive_op_runs_alone_once_first_in_line() {
+        let rx = queued(vec![Op(T, 10), Op(X, 0), Op(J, 1), Op(E, 5)]);
+        let mut carry = VecDeque::new();
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(T, 10), Op(J, 1), Op(E, 5)]);
+        assert_eq!(carry, VecDeque::from([Op(X, 0)]));
+
+        let rx = queued(vec![Op(T, 10)]);
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(X, 0)]);
+        assert_eq!(carry, VecDeque::from([Op(T, 10)]));
+    }
+
+    /// Ops ahead of an exclusive op that don't fit a pass stay ahead of
+    /// it, so it runs only once they have gone.
+    #[test]
+    fn an_exclusive_op_waits_behind_ops_carried_before_it() {
+        let mut carry = VecDeque::from([Op(C, 1), Op(C, 1), Op(C, 1), Op(X, 0)]);
+        let rx = queued(Vec::new());
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(C, 1), Op(C, 1)]);
+        assert_eq!(carry, VecDeque::from([Op(C, 1), Op(X, 0)]));
+
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(C, 1)]);
+        let batch = gather(&mut carry, &mut false, &rx, &limits(200)).unwrap();
+        assert_eq!(batch, vec![Op(X, 0)]);
+        assert!(carry.is_empty());
     }
 
     /// When draining alone fills a pass, enqueues sit that pass out, but

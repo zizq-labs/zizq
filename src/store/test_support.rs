@@ -17,7 +17,7 @@ use super::options::{EnqueueOptions, FailureOptions};
 use super::storage_config::StorageConfig;
 use super::store::Store;
 use super::types::{BackoffConfig, Job};
-use super::writer::{JobOp, JobWrite, WriterContext};
+use super::writer::{Applied, JobOp, JobWrite, WriterContext};
 use crate::time::now_millis;
 
 /// The temporary directory a test store lives in, removed when the store
@@ -143,16 +143,16 @@ pub(super) async fn run_job_ops(store: &Store, ops: Vec<JobOp>) {
     };
     tokio::task::spawn_blocking(move || {
         let mut tx = ks.write_tx();
-        let written: Vec<bool> = ops
-            .iter()
+        let mut ops = ops;
+        let applied: Vec<Applied> = ops
+            .iter_mut()
             .map(|op| op.apply(&mut tx, &ks).unwrap())
             .collect();
         ks.commit(tx, ks.default_commit_mode).unwrap();
-        for (op, written) in ops.into_iter().zip(written) {
-            if written {
-                op.finish(&cx);
-            } else {
-                op.conflict();
+        for (op, applied) in ops.into_iter().zip(applied) {
+            match applied {
+                Applied::Wrote | Applied::Nothing => op.finish(&cx),
+                Applied::Conflict => op.conflict(),
             }
         }
     })

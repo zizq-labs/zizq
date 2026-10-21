@@ -12,7 +12,7 @@ use super::keys::{make_error_key, make_job_key, make_purge_key, make_status_key,
 use super::options::FailureOptions;
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{BackoffConfig, ErrorRecord, Job, JobStatus, StoreError, UniqueWhile};
-use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Record a job failure and either schedule a retry or kill the job
@@ -199,12 +199,12 @@ impl FailOp {
 
 impl JobWrite for FailOp {
     fn apply(
-        &self,
+        &mut self,
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Applied, StoreError> {
         if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
-            return Ok(false);
+            return Ok(Applied::Conflict);
         }
 
         let id = &self.job.id;
@@ -264,7 +264,7 @@ impl JobWrite for FailOp {
             FailWrite::Delete(del) => apply_job_deletion(tx, del, ks),
         }
 
-        Ok(true)
+        Ok(Applied::Wrote)
     }
 
     fn finish(self, cx: &WriterContext) {

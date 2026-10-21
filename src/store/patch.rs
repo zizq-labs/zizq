@@ -23,7 +23,7 @@ use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payloa
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
-use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl PatchJobOptions {
     /// Apply all patches to a mutable job, including status transitions
@@ -268,95 +268,37 @@ impl Store {
     ///
     /// Returns the count of actually patched jobs.
     pub async fn patch_jobs(&self, opts: BulkPatchOptions) -> Result<usize, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = BulkPatchOp {
+            opts,
+            now: crate::time::now_millis(),
+            diffs: Vec::new(),
+            reply,
+        };
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || writer.submit_job(op.into())).await?;
 
-        let diffs = task::spawn_blocking(move || -> Result<_, StoreError> {
-            let mut tx = ks.write_tx();
-            let snapshot = ks.db.read_tx();
-
-            let needs_payload = filter_needs_payload(&opts.filter);
-            let now = crate::time::now_millis();
-
-            let jobs =
-                match build_id_stream(&snapshot, &ks, &opts.filter, &None, ScanDirection::Asc) {
-                    Some((id_stream, source, _)) => apply_filters(
-                        JobStream::by_id(
-                            id_stream,
-                            &snapshot,
-                            &ks.data,
-                            None,
-                            needs_payload,
-                            source,
-                        ),
-                        &opts.filter,
-                    ),
-                    None => apply_filters(
-                        JobStream::full_scan(
-                            &snapshot,
-                            &ks,
-                            &None,
-                            ScanDirection::Asc,
-                            None,
-                            needs_payload,
-                        ),
-                        &opts.filter,
-                    ),
-                };
-
-            let mut diffs: Vec<PatchDiff> = Vec::new();
-
-            for result in jobs {
-                let mut job = result?;
-                let status = match JobStatus::try_from(job.status) {
-                    Ok(s) => s,
-                    Err(_) => continue, // Skip corrupt jobs.
-                };
-
-                // Skip terminal jobs.
-                if status.is_terminal() {
-                    continue;
-                }
-
-                let diff = opts.patch.apply(&mut job, now);
-                diff.update_keyspaces(&mut tx, &ks);
-
-                let updated: Slice = rmp_serde::to_vec_named(&job)?.into();
-                let job_key = make_job_key(&job.id);
-                tx.fetch_update(&ks.data, &job_key, |_| Some(updated.clone()))?;
-
-                diffs.push(diff);
+        let patched = match rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(patched) => patched,
+            JobOutcome::Conflict => {
+                return Err(StoreError::Internal(
+                    "bulk patch reported a conflict".into(),
+                ));
             }
-
-            if diffs.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            for diff in &diffs {
-                diff.update_indexes(&dispatch, &scheduled_index);
-            }
-
-            Ok(diffs)
-        })
-        .await??;
-
-        for diff in &diffs {
-            diff.emit_events(&event_tx);
-        }
+        };
 
         // See the equivalent block in `delete_jobs` — bulk patches that
         // change indexed fields write tombstones to the index keyspace,
         // and we want to reclaim those once the batch is large enough.
         let threshold = self.config.auto_compact_threshold;
-        if threshold > 0 && diffs.len() as u64 >= threshold {
+        if threshold > 0 && patched as u64 >= threshold {
             self.compact_all().await?;
         }
 
-        Ok(diffs.len())
+        Ok(patched)
     }
 }
 
@@ -419,17 +361,17 @@ impl PatchOp {
 
 impl JobWrite for PatchOp {
     fn apply(
-        &self,
+        &mut self,
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Applied, StoreError> {
         if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
-            return Ok(false);
+            return Ok(Applied::Conflict);
         }
 
         tx.insert(&ks.data, &self.job_key, self.updated.clone());
         self.diff.update_keyspaces(tx, ks);
-        Ok(true)
+        Ok(Applied::Wrote)
     }
 
     fn finish(self, cx: &WriterContext) {
@@ -447,11 +389,104 @@ impl JobWrite for PatchOp {
     }
 }
 
+/// A patch of every job a filter matches, all or nothing.
+///
+/// Exclusive: it runs in a pass of its own, so the scan sees exactly the
+/// state its writes go into, with nothing earlier in the transaction
+/// hidden from it.
+pub(in crate::store) struct BulkPatchOp {
+    opts: BulkPatchOptions,
+    now: u64,
+    /// Filled in by `apply`, for `finish`.
+    diffs: Vec<PatchDiff>,
+    reply: JobReply<usize>,
+}
+
+impl JobWrite for BulkPatchOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        self.diffs.clear();
+        let snapshot = ks.db.read_tx();
+        let filter = &self.opts.filter;
+        let needs_payload = filter_needs_payload(filter);
+
+        let jobs = match build_id_stream(&snapshot, ks, filter, &None, ScanDirection::Asc) {
+            Some((id_stream, source, _)) => apply_filters(
+                JobStream::by_id(id_stream, &snapshot, &ks.data, None, needs_payload, source),
+                filter,
+            ),
+            None => apply_filters(
+                JobStream::full_scan(
+                    &snapshot,
+                    ks,
+                    &None,
+                    ScanDirection::Asc,
+                    None,
+                    needs_payload,
+                ),
+                filter,
+            ),
+        };
+
+        for result in jobs {
+            let mut job = result?;
+            let status = match JobStatus::try_from(job.status) {
+                Ok(s) => s,
+                Err(_) => continue, // Skip corrupt jobs.
+            };
+
+            // Skip terminal jobs.
+            if status.is_terminal() {
+                continue;
+            }
+
+            let diff = self.opts.patch.apply(&mut job, self.now);
+            diff.update_keyspaces(tx, ks);
+
+            let updated: Slice = rmp_serde::to_vec_named(&job)?.into();
+            tx.insert(&ks.data, make_job_key(&job.id), updated);
+
+            self.diffs.push(diff);
+        }
+
+        Ok(if self.diffs.is_empty() {
+            Applied::Nothing
+        } else {
+            Applied::Wrote
+        })
+    }
+
+    fn exclusive(&self) -> bool {
+        true
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        for diff in &self.diffs {
+            diff.update_indexes(&cx.dispatch, &cx.scheduled_index);
+        }
+        for diff in &self.diffs {
+            diff.emit_events(&cx.event_tx);
+        }
+        let _ = self.reply.send(Ok(JobOutcome::Done(self.diffs.len())));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::super::keys::make_job_key;
+    use super::super::keys::{make_job_key, make_status_key};
     use super::super::options::{
         BulkPatchOptions, EnqueueOptions, JobFilter, ListJobsOptions, PatchJobOptions,
         RetentionConfigPatch,
@@ -461,6 +496,101 @@ mod tests {
     use super::super::types::{BackoffConfig, Job, JobStatus, RetentionConfig, StoreError};
     use super::super::writer::JobOutcome;
     use crate::time::now_millis;
+
+    /// Bulk patches racing workers taking the same jobs never write a job
+    /// back as it was before it was taken. Afterwards every job's record
+    /// and status index agree, and it is in flight, having been taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bulk_patches_racing_takes_leave_every_job_consistent() {
+        let store = test_store();
+        let now = now_millis();
+        let mut ids = Vec::new();
+        for i in 0..300 {
+            let job = store
+                .enqueue(now, EnqueueOptions::new("t", "q", serde_json::json!(i)))
+                .await
+                .unwrap()
+                .into_job();
+            ids.push(job.id);
+        }
+
+        // Taking until every job is taken, not until a take comes back
+        // empty: a priority patch briefly lifts a job out of the ready
+        // index to re-place it, so an empty take doesn't mean done.
+        let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let takers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let taken = taken.clone();
+                let total = ids.len();
+                tokio::spawn(async move {
+                    let queues: HashSet<String> = HashSet::new();
+                    while taken.lock().unwrap().len() < total {
+                        let jobs = store
+                            .take_next_n_jobs(now_millis(), &queues, 5)
+                            .await
+                            .unwrap();
+                        if jobs.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                        taken.lock().unwrap().extend(jobs.into_iter().map(|j| j.id));
+                    }
+                })
+            })
+            .collect();
+
+        for priority in 0..20 {
+            let opts = BulkPatchOptions {
+                filter: JobFilter {
+                    queues: ["q".into()].into(),
+                    ..Default::default()
+                },
+                patch: PatchJobOptions {
+                    priority: Some(priority),
+                    ..Default::default()
+                },
+            };
+            store.patch_jobs(opts).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for taker in takers {
+                taker.await.unwrap();
+            }
+        })
+        .await
+        .expect("every job should be taken");
+
+        // A job a patch wrote back as ready after it was taken would be
+        // taken twice, or still be waiting to be.
+        let mut taken = taken.lock().unwrap().clone();
+        taken.sort();
+        let before = taken.len();
+        taken.dedup();
+        assert_eq!(taken.len(), before, "a job was taken twice");
+        assert!(
+            store
+                .take_next_n_jobs(now_millis(), &HashSet::new(), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for id in &ids {
+            let bytes = store.ks.data.get(make_job_key(id)).unwrap().unwrap();
+            let job: Job = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(job.status, JobStatus::InFlight as u8, "job {id}");
+            for status in [JobStatus::Ready, JobStatus::Scheduled, JobStatus::InFlight] {
+                let indexed = store
+                    .ks
+                    .index
+                    .get(make_status_key(status, id))
+                    .unwrap()
+                    .is_some();
+                assert_eq!(indexed, status == JobStatus::InFlight, "job {id}");
+            }
+        }
+        assert_eq!(store.in_flight_count(), ids.len());
+    }
 
     /// A patch prepared while a job is ready, of a job then taken, is
     /// told to retry rather than writing the job back over its in-flight

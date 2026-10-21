@@ -23,7 +23,7 @@ use super::options::BulkDeleteOptions;
 use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
-use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Hard-delete a job and all associated data.
@@ -80,146 +80,41 @@ impl Store {
 
     /// Bulk-delete jobs matching the given filters.
     ///
-    /// Acquires the write lock, scans matching jobs under a consistent
-    /// snapshot, deletes each one, and commits in a single transaction.
-    /// Returns the count of deleted jobs.
+    /// Scans matching jobs and deletes each one in a single transaction,
+    /// in a writer pass of its own. Returns the count of deleted jobs.
     ///
     /// Emits `StoreEvent::JobDeleted` for each deleted job.
     pub async fn delete_jobs(&self, opts: BulkDeleteOptions) -> Result<usize, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let in_flight_index = self.in_flight_index.clone();
-        let event_tx = self.event_tx.clone();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = BulkDeleteOp {
+            opts,
+            deleted: Vec::new(),
+            reply,
+        };
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || writer.submit_job(op.into())).await?;
 
-        let deleted_ids = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Acquire the write lock first, then open a snapshot.
-            // The snapshot sees the latest committed state, and since we
-            // hold the writer lock, nothing can commit while we scan + delete.
-            let mut tx = ks.write_tx();
-            let snapshot = ks.db.read_tx();
-
-            let needs_payload = filter_needs_payload(&opts.filter);
-
-            // Build the job stream: filtered by indexes, or full scan.
-            // Then apply range and payload filters as post-hydration checks.
-            let jobs =
-                match build_id_stream(&snapshot, &ks, &opts.filter, &None, ScanDirection::Asc) {
-                    Some((id_stream, source, _)) => apply_filters(
-                        JobStream::by_id(
-                            id_stream,
-                            &snapshot,
-                            &ks.data,
-                            None, // no expiry filtering for deletion
-                            needs_payload,
-                            source,
-                        ),
-                        &opts.filter,
-                    ),
-                    None => apply_filters(
-                        JobStream::full_scan(
-                            &snapshot,
-                            &ks,
-                            &None,
-                            ScanDirection::Asc,
-                            None,
-                            needs_payload,
-                        ),
-                        &opts.filter,
-                    ),
-                };
-
-            // Track deleted jobs for post-commit cleanup.
-            struct Deleted {
-                id: String,
-                queue: String,
-                status: JobStatus,
-                priority: u16,
-                ready_at: u64,
-                dequeued_at: u64,
-                /// Carried from the pre-read so the post-commit index
-                /// cleanup can describe the job's placement without
-                /// reading it again.
-                budgets: Vec<BudgetRef>,
+        let deleted = match rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(deleted) => deleted,
+            JobOutcome::Conflict => {
+                return Err(StoreError::Internal(
+                    "bulk delete reported a conflict".into(),
+                ));
             }
-
-            let mut deleted: Vec<Deleted> = Vec::new();
-
-            for result in jobs {
-                let job = result?;
-                let status = JobStatus::try_from(job.status).map_err(|v| {
-                    StoreError::Corruption(format!(
-                        "job {} has unrecognized status byte: {v}",
-                        job.id
-                    ))
-                })?;
-
-                let del = prepare_job_deletion(&job, status, &ks);
-                apply_job_deletion(&mut tx, &del, &ks);
-
-                deleted.push(Deleted {
-                    id: job.id,
-                    queue: job.queue,
-                    status,
-                    priority: job.priority,
-                    ready_at: job.ready_at,
-                    dequeued_at: job.dequeued_at.unwrap_or(0),
-                    budgets: job.budgets,
-                });
-            }
-
-            if deleted.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // Post-commit: clean up in-memory indexes.
-            for d in &deleted {
-                match d.status {
-                    JobStatus::Ready => {
-                        dispatch.remove(Placement {
-                            queue: &d.queue,
-                            priority: d.priority,
-                            id: &d.id,
-                            budgets: &d.budgets,
-                        });
-                    }
-                    JobStatus::Scheduled => {
-                        scheduled_index.remove(d.ready_at, &d.id);
-                    }
-                    JobStatus::InFlight => {
-                        in_flight_index.remove(d.dequeued_at, &d.id);
-                        // See `purge_job`: only in-flight holds capacity.
-                        dispatch.release_concurrency(&d.budgets);
-                    }
-                    _ => {}
-                }
-
-                // See `purge_job`: terminal jobs are already uncounted.
-                if !d.status.is_terminal() {
-                    dispatch.untrack(&d.budgets);
-                }
-            }
-
-            let deleted_ids: Vec<String> = deleted.into_iter().map(|d| d.id).collect();
-            Ok(deleted_ids)
-        })
-        .await??;
-
-        for id in &deleted_ids {
-            let _ = event_tx.send(StoreEvent::JobDeleted { id: id.clone() });
-        }
+        };
 
         // Force a full compaction when we've written enough tombstones that
         // leveled compaction would otherwise leave them sitting in upper
         // levels on a quiet database.
         let threshold = self.config.auto_compact_threshold;
-        if threshold > 0 && deleted_ids.len() as u64 >= threshold {
+        if threshold > 0 && deleted as u64 >= threshold {
             self.compact_all().await?;
         }
 
-        Ok(deleted_ids.len())
+        Ok(deleted)
     }
 
     /// Hard-delete a batch of jobs in a single transaction (no events).
@@ -406,16 +301,16 @@ impl PurgeOp {
 
 impl JobWrite for PurgeOp {
     fn apply(
-        &self,
+        &mut self,
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Applied, StoreError> {
         if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
-            return Ok(false);
+            return Ok(Applied::Conflict);
         }
 
         apply_job_deletion(tx, &self.del, ks);
-        Ok(true)
+        Ok(Applied::Wrote)
     }
 
     fn finish(self, cx: &WriterContext) {
@@ -451,6 +346,144 @@ impl JobWrite for PurgeOp {
         }
 
         let _ = self.reply.send(Ok(JobOutcome::Done(())));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
+/// A delete of every job a filter matches, all or nothing.
+///
+/// Exclusive: it runs in a pass of its own, so the scan sees exactly the
+/// state its writes go into, with nothing earlier in the transaction
+/// hidden from it.
+pub(in crate::store) struct BulkDeleteOp {
+    opts: BulkDeleteOptions,
+    /// Filled in by `apply`, for `finish`.
+    deleted: Vec<Deleted>,
+    reply: JobReply<usize>,
+}
+
+/// What `finish` needs of a deleted job, read during the scan so it never
+/// reads the job again.
+struct Deleted {
+    id: String,
+    queue: String,
+    status: JobStatus,
+    priority: u16,
+    ready_at: u64,
+    dequeued_at: u64,
+    budgets: Vec<BudgetRef>,
+}
+
+impl JobWrite for BulkDeleteOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        self.deleted.clear();
+        let snapshot = ks.db.read_tx();
+        let filter = &self.opts.filter;
+        let needs_payload = filter_needs_payload(filter);
+
+        // Build the job stream: filtered by indexes, or full scan. Then
+        // apply range and payload filters as post-hydration checks.
+        let jobs = match build_id_stream(&snapshot, ks, filter, &None, ScanDirection::Asc) {
+            Some((id_stream, source, _)) => apply_filters(
+                JobStream::by_id(
+                    id_stream,
+                    &snapshot,
+                    &ks.data,
+                    None, // no expiry filtering for deletion
+                    needs_payload,
+                    source,
+                ),
+                filter,
+            ),
+            None => apply_filters(
+                JobStream::full_scan(
+                    &snapshot,
+                    ks,
+                    &None,
+                    ScanDirection::Asc,
+                    None,
+                    needs_payload,
+                ),
+                filter,
+            ),
+        };
+
+        for result in jobs {
+            let job = result?;
+            let status = JobStatus::try_from(job.status).map_err(|v| {
+                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+            })?;
+
+            let del = prepare_job_deletion(&job, status, ks);
+            apply_job_deletion(tx, &del, ks);
+
+            self.deleted.push(Deleted {
+                id: job.id,
+                queue: job.queue,
+                status,
+                priority: job.priority,
+                ready_at: job.ready_at,
+                dequeued_at: job.dequeued_at.unwrap_or(0),
+                budgets: job.budgets,
+            });
+        }
+
+        Ok(if self.deleted.is_empty() {
+            Applied::Nothing
+        } else {
+            Applied::Wrote
+        })
+    }
+
+    fn exclusive(&self) -> bool {
+        true
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        for d in &self.deleted {
+            match d.status {
+                JobStatus::Ready => {
+                    cx.dispatch.remove(Placement {
+                        queue: &d.queue,
+                        priority: d.priority,
+                        id: &d.id,
+                        budgets: &d.budgets,
+                    });
+                }
+                JobStatus::Scheduled => {
+                    cx.scheduled_index.remove(d.ready_at, &d.id);
+                }
+                JobStatus::InFlight => {
+                    cx.in_flight_index.remove(d.dequeued_at, &d.id);
+                    // See `PurgeOp`: only in-flight holds capacity.
+                    cx.dispatch.release_concurrency(&d.budgets);
+                }
+                _ => {}
+            }
+
+            // See `PurgeOp`: terminal jobs are already uncounted.
+            if !d.status.is_terminal() {
+                cx.dispatch.untrack(&d.budgets);
+            }
+        }
+
+        for d in &self.deleted {
+            let _ = cx
+                .event_tx
+                .send(StoreEvent::JobDeleted { id: d.id.clone() });
+        }
+        let _ = self.reply.send(Ok(JobOutcome::Done(self.deleted.len())));
     }
 
     fn conflict(self) {

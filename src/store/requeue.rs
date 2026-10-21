@@ -13,7 +13,7 @@ use super::dispatch::Placement;
 use super::keys::{make_job_key, make_status_key};
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError};
-use super::writer::{JobOutcome, JobReply, JobWrite, WriterContext};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Requeue a job currently in the in-flight state back to ready.
@@ -94,19 +94,19 @@ impl RequeueOp {
 
 impl JobWrite for RequeueOp {
     fn apply(
-        &self,
+        &mut self,
         tx: &mut fjall::SingleWriterWriteTx<'_>,
         ks: &Keyspaces,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Applied, StoreError> {
         if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
-            return Ok(false);
+            return Ok(Applied::Conflict);
         }
 
         let id = &self.job.id;
         tx.insert(&ks.data, &self.job_key, self.updated.clone());
         tx.remove(&ks.index, make_status_key(JobStatus::InFlight, id));
         tx.insert(&ks.index, make_status_key(JobStatus::Ready, id), b"");
-        Ok(true)
+        Ok(Applied::Wrote)
     }
 
     fn finish(self, cx: &WriterContext) {
