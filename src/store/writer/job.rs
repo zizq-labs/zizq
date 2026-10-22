@@ -18,10 +18,11 @@
 //! nothing. They are *exclusive*: each runs in a pass of its own, so the
 //! scan for matching jobs sees exactly the state its writes go into.
 
-use super::super::delete::{BulkDeleteOp, PurgeOp};
+use super::super::delete::{BulkDeleteOp, PurgeOp, ReapOp};
 use super::super::fail::FailOp;
 use super::super::patch::{BulkPatchOp, PatchOp};
 use super::super::requeue::RequeueOp;
+use super::super::scheduled::PromoteOp;
 use super::super::store::Keyspaces;
 use super::super::types::StoreError;
 use super::WriterContext;
@@ -64,6 +65,12 @@ pub(in crate::store) trait JobWrite {
     /// Whether the op needs a pass of its own.
     fn exclusive(&self) -> bool {
         false
+    }
+
+    /// How many jobs the op may write, counted against the pass's job
+    /// limit. An exclusive op runs alone, so its count doesn't matter.
+    fn jobs(&self) -> usize {
+        1
     }
 
     /// Once durable (or at once, if nothing was written): update the
@@ -110,6 +117,12 @@ macro_rules! job_ops {
                 }
             }
 
+            fn jobs(&self) -> usize {
+                match self {
+                    $(JobOp::$variant(op) => op.jobs()),*
+                }
+            }
+
             fn finish(self, cx: &WriterContext) {
                 match self {
                     $(JobOp::$variant(op) => op.finish(cx)),*
@@ -138,6 +151,8 @@ job_ops! {
     Purge(PurgeOp),
     BulkPatch(BulkPatchOp),
     BulkDelete(BulkDeleteOp),
+    Promote(PromoteOp),
+    Reap(ReapOp),
 }
 
 /// The one-at-a-time writes in one pass.

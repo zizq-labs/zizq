@@ -119,74 +119,35 @@ impl Store {
 
     /// Hard-delete a batch of jobs in a single transaction (no events).
     ///
-    /// Opens one write transaction, deletes all found jobs, and commits once.
-    /// Returns the count of actually deleted jobs. Missing jobs are silently
-    /// skipped.
+    /// Used by the reaper. Returns the count of actually deleted jobs.
+    /// Missing jobs are silently skipped, as are jobs that changed after
+    /// they were read: a job still expired is reaped on the next scan.
     pub async fn purge_batch(&self, ids: &[String]) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
+        let writer = self.writer.clone();
         let ids = ids.to_vec();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // ---- outside tx: prepare all deletions ----
-            let mut deletions: Vec<(JobDeletion, String, u16, Vec<BudgetRef>)> = Vec::new();
-
-            for id in &ids {
-                let job_key = make_job_key(id);
-                let job_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => continue, // Already purged.
-                };
-
-                let job: Job = rmp_serde::from_slice(&job_bytes)?;
-                let status = JobStatus::try_from(job.status).map_err(|v| {
-                    StoreError::Corruption(format!(
-                        "job {} has unrecognized status byte: {v}",
-                        job.id
-                    ))
-                })?;
-
-                let priority = job.priority;
-                let queue = job.queue.clone();
-                deletions.push((
-                    prepare_job_deletion(&job, status, &ks),
-                    queue,
-                    priority,
-                    job.budgets,
-                ));
+        let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let op = ReapOp::prepare(&ks, &ids, reply)?;
+            if op.reaps.is_empty() {
+                return Ok(None);
             }
-
-            // ---- inside tx (writes only) ----
-            let count = deletions.len();
-            let mut tx = ks.write_tx();
-            for (del, _, _, _) in &deletions {
-                apply_job_deletion(&mut tx, del, &ks);
-            }
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // Defensive: remove from dispatch in case of inconsistency.
-            //
-            // Deliberately no `untrack` to match it. The reaper only
-            // reaches jobs past their retention, which means they went
-            // terminal — and stopped counting against their budgets —
-            // some time ago. Untracking defensively here would
-            // double-decrement every reaped job, and unlike a stray
-            // dispatch entry, an under-count is not self-correcting: it
-            // reads as capacity the budget does not have.
-            for (del, queue, priority, budgets) in deletions {
-                dispatch.remove(Placement {
-                    queue: &queue,
-                    priority,
-                    id: &del.id,
-                    budgets: &budgets,
-                });
-            }
-
-            Ok(count)
+            writer.submit_job(op.into());
+            Ok(Some(rx))
         })
         .await??;
 
-        Ok(result)
+        let Some(reply_rx) = reply_rx else {
+            return Ok(0);
+        };
+        match reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(count) => Ok(count),
+            JobOutcome::Conflict => Err(StoreError::Internal("reaping reported a conflict".into())),
+        }
     }
 }
 
@@ -495,6 +456,119 @@ impl JobWrite for BulkDeleteOp {
     }
 }
 
+/// The reaper's hard delete of a batch of expired jobs, prepared by its
+/// caller. Each job is checked on its own: one that changed since it was
+/// read is left for a later scan, and the rest are still reaped.
+pub(in crate::store) struct ReapOp {
+    reaps: Vec<Reap>,
+    /// Per job, once applied: whether it was deleted.
+    deleted: Vec<bool>,
+    reply: JobReply<usize>,
+}
+
+struct Reap {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    del: JobDeletion,
+    queue: String,
+    priority: u16,
+    budgets: Vec<BudgetRef>,
+}
+
+impl ReapOp {
+    /// Pre-read every job still there and gather its keys.
+    fn prepare(ks: &Keyspaces, ids: &[String], reply: JobReply<usize>) -> Result<Self, StoreError> {
+        let mut reaps = Vec::with_capacity(ids.len());
+        for id in ids {
+            let job_key = make_job_key(id);
+            let Some(pre_bytes) = ks.data.get(&job_key)? else {
+                continue; // Already purged.
+            };
+
+            let job: Job = rmp_serde::from_slice(&pre_bytes)?;
+            let status = JobStatus::try_from(job.status).map_err(|v| {
+                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+            })?;
+
+            reaps.push(Reap {
+                job_key,
+                pre_bytes,
+                del: prepare_job_deletion(&job, status, ks),
+                queue: job.queue,
+                priority: job.priority,
+                budgets: job.budgets,
+            });
+        }
+        Ok(Self {
+            reaps,
+            deleted: Vec::new(),
+            reply,
+        })
+    }
+}
+
+impl JobWrite for ReapOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        self.deleted.clear();
+        for reap in &self.reaps {
+            let unchanged = tx.get(&ks.data, &reap.job_key)?.as_deref() == Some(&*reap.pre_bytes);
+            if unchanged {
+                apply_job_deletion(tx, &reap.del, ks);
+            }
+            self.deleted.push(unchanged);
+        }
+
+        Ok(if self.deleted.contains(&true) {
+            Applied::Wrote
+        } else {
+            Applied::Nothing
+        })
+    }
+
+    fn jobs(&self) -> usize {
+        self.reaps.len()
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let mut count = 0;
+        for (reap, deleted) in self.reaps.iter().zip(&self.deleted) {
+            if !deleted {
+                continue;
+            }
+            count += 1;
+
+            // Defensive: remove from dispatch in case of inconsistency.
+            //
+            // Deliberately no `untrack` to match it. The reaper only
+            // reaches jobs past their retention, which means they went
+            // terminal — and stopped counting against their budgets —
+            // some time ago. Untracking defensively here would
+            // double-decrement every reaped job, and unlike a stray
+            // dispatch entry, an under-count is not self-correcting: it
+            // reads as capacity the budget does not have.
+            cx.dispatch.remove(Placement {
+                queue: &reap.queue,
+                priority: reap.priority,
+                id: &reap.del.id,
+                budgets: &reap.budgets,
+            });
+        }
+        let _ = self.reply.send(Ok(JobOutcome::Done(count)));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -503,7 +577,7 @@ mod tests {
     use crate::filter::PayloadFilter;
 
     use super::super::budget::{BudgetBinding, BudgetStrategy};
-    use super::super::keys::make_status_key;
+    use super::super::keys::{make_job_key, make_status_key};
     use super::super::options::{BulkDeleteOptions, EnqueueOptions, ListJobsOptions};
     use super::super::storage_config::StorageConfig;
     use super::super::store::{Store, StoreEvent};
@@ -513,6 +587,43 @@ mod tests {
     use super::super::types::JobStatus;
     use super::super::writer::JobOutcome;
     use crate::time::now_millis;
+
+    /// The reaper skips a job that changed since it read it, leaving it
+    /// for a later scan, and still reaps the rest of the batch.
+    #[tokio::test]
+    async fn the_reaper_skips_a_job_changed_since_it_was_read() {
+        let store = test_store();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let job = store
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("t", "q", serde_json::json!(i)),
+                )
+                .await
+                .unwrap()
+                .into_job();
+            ids.push(job.id);
+        }
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = super::ReapOp::prepare(&store.ks, &ids, reply).unwrap();
+
+        let ks = store.ks.clone();
+        let key = make_job_key(&ids[1]);
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            tx.insert(&ks.data, key, b"changed");
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+        })
+        .await
+        .unwrap();
+
+        run_job_ops(&store, vec![op.into()]).await;
+        assert_eq!(rx.await.unwrap().unwrap(), JobOutcome::Done(1));
+        assert!(store.ks.data.get(make_job_key(&ids[0])).unwrap().is_none());
+        assert!(store.ks.data.get(make_job_key(&ids[1])).unwrap().is_some());
+    }
 
     /// A delete prepared while a job is ready, of a job then taken, is
     /// told to retry. Written regardless, it would remove the ready

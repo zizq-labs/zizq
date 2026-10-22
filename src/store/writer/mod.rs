@@ -436,7 +436,7 @@ impl Pending for WriteOp {
             WriteOp::Enqueue(op) => op.prepared.len(),
             WriteOp::Complete(op) => op.ids.len(),
             WriteOp::Take(op) => op.writes.len(),
-            WriteOp::Job(_) => 1,
+            WriteOp::Job(op) => op.jobs(),
         }
     }
 }

@@ -12,13 +12,14 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use fjall::Slice;
+use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::dispatch::Placement;
 use super::keys::{IndexKind, make_job_key, make_purge_key, make_status_key};
-use super::store::{Store, StoreEvent};
+use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Fetch a batch of due scheduled jobs.
@@ -73,91 +74,51 @@ impl Store {
     ///
     /// Subscribers are notified with `StoreEvent::JobDispatchable`.
     pub async fn promote_scheduled(&self, job: &Job) -> Result<(), StoreError> {
+        // Remove from the in-memory scheduled index *before* the write to
+        // prevent data races (same as take_next_job).
+        self.scheduled_index.remove(job.ready_at, &job.id);
+
         let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
+        let writer = self.writer.clone();
         let scheduled_index = self.scheduled_index.clone();
+        let (id, ready_at) = (job.id.clone(), job.ready_at);
 
-        let id = job.id.clone();
-        let event_id = job.id.clone();
-        let event_queue = job.queue.clone();
-        let ready_at = job.ready_at;
-
-        task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Remove from the in-memory scheduled index *before* commit to
-            // prevent data races (same as take_next_job).
-            scheduled_index.remove(ready_at, &id);
-
-            // Retry loop: pre-read and pre-compute updates outside the tx,
-            // then compare-and-write inside. Retries only if a concurrent job
-            // metadata update modified the job between the pre-read and lock
-            // acquisition.
-            let job_key = make_job_key(&id);
+        // Prepared on a blocking thread, so the writer only checks and
+        // writes, and the reply is waited for there too: like a take, the
+        // scheduler holds one blocking thread while its promotion is
+        // written. A job changed between this pre-read and the writer's
+        // check comes back as a conflict: pre-read again.
+        task::spawn_blocking(move || -> Result<(), StoreError> {
             loop {
-                // ---- outside tx ----
-                let pre_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(()), // Already gone.
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = PromoteOp::prepare(&ks, &id, reply)? else {
+                    return Ok(()); // Gone, or no longer scheduled.
                 };
+                writer.submit_job(op.into());
 
-                let current: Job = rmp_serde::from_slice(&pre_bytes)?;
-
-                if current.status != JobStatus::Scheduled as u8 {
-                    return Ok(()); // No longer scheduled.
-                }
-
-                let old_status_key = make_status_key(JobStatus::Scheduled, &id);
-                let new_status_key = make_status_key(JobStatus::Ready, &id);
-
-                let mut updated = current;
-                updated.status = JobStatus::Ready.into();
-
-                let updated_slice: Slice = rmp_serde::to_vec_named(&updated)?.into();
-
-                // ---- inside tx (writes only, plus one compare) ----
-                let mut tx = ks.write_tx();
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                tx.remove(&ks.index, &old_status_key);
-                tx.insert(&ks.index, &new_status_key, b"");
-
-                let _sync = match ks.commit(tx, ks.default_commit_mode) {
-                    Ok(sync) => sync,
+                let outcome = rx
+                    .blocking_recv()
+                    .map_err(|_| StoreError::Internal("writer channel closed".into()))
+                    .and_then(|outcome| outcome);
+                match outcome {
+                    Ok(JobOutcome::Done(())) => return Ok(()),
+                    Ok(JobOutcome::Conflict) => continue,
                     Err(e) => {
-                        // Commit failed — re-insert into the scheduled index
-                        // if the job is still Scheduled.
-                        let _tx = ks.write_tx();
-                        if let Ok(Some(bytes)) = ks.data.get(&job_key) {
-                            if let Ok(current) = rmp_serde::from_slice::<Job>(&bytes) {
-                                if current.status == JobStatus::Scheduled as u8 {
-                                    scheduled_index.insert(ready_at, id);
-                                }
-                            }
+                        // Not promoted: put it back in the scheduled index
+                        // if it is still scheduled, for the scheduler to
+                        // retry.
+                        if let Ok(Some(bytes)) = ks.data.get(make_job_key(&id))
+                            && let Ok(current) = rmp_serde::from_slice::<Job>(&bytes)
+                            && current.status == JobStatus::Scheduled as u8
+                        {
+                            scheduled_index.insert(ready_at, id);
                         }
                         return Err(e);
                     }
-                };
-
-                // Insert into the in-memory ready index after commit succeeds.
-                dispatch.insert(Placement::of(&updated));
-
-                return Ok(());
+                }
             }
         })
-        .await??;
-
-        let _ = self.event_tx.send(StoreEvent::JobDispatchable {
-            id: event_id,
-            queue: event_queue,
-            token: Arc::new(AtomicBool::new(false)),
-        });
-
-        Ok(())
+        .await?
     }
 
     /// Fetch a batch of jobs whose purge_at has passed.
@@ -201,16 +162,131 @@ impl Store {
     }
 }
 
+/// A promotion of one scheduled job to ready, prepared by its caller.
+pub(in crate::store) struct PromoteOp {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    /// The job as it will be once ready.
+    job: Job,
+    updated: Slice,
+    reply: JobReply<()>,
+}
+
+impl PromoteOp {
+    /// Pre-read the job and work out its ready record. `None` if the job
+    /// is gone or isn't scheduled.
+    fn prepare(ks: &Keyspaces, id: &str, reply: JobReply<()>) -> Result<Option<Self>, StoreError> {
+        let job_key = make_job_key(id);
+        let Some(pre_bytes) = ks.data.get(&job_key)? else {
+            return Ok(None);
+        };
+
+        let mut job: Job = rmp_serde::from_slice(&pre_bytes)?;
+        if job.status != JobStatus::Scheduled as u8 {
+            return Ok(None);
+        }
+
+        job.status = JobStatus::Ready.into();
+        let updated = rmp_serde::to_vec_named(&job)?.into();
+
+        Ok(Some(Self {
+            job_key,
+            pre_bytes,
+            job,
+            updated,
+            reply,
+        }))
+    }
+}
+
+impl JobWrite for PromoteOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(Applied::Conflict);
+        }
+
+        let id = &self.job.id;
+        tx.insert(&ks.data, &self.job_key, self.updated.clone());
+        tx.remove(&ks.index, make_status_key(JobStatus::Scheduled, id));
+        tx.insert(&ks.index, make_status_key(JobStatus::Ready, id), b"");
+        Ok(Applied::Wrote)
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let job = self.job;
+        cx.dispatch.insert(Placement::of(&job));
+        let _ = cx.event_tx.send(StoreEvent::JobDispatchable {
+            id: job.id.clone(),
+            queue: job.queue.clone(),
+            token: Arc::new(AtomicBool::new(false)),
+        });
+        let _ = self.reply.send(Ok(JobOutcome::Done(())));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::time::SystemTime;
 
-    use super::super::options::EnqueueOptions;
+    use super::super::options::{EnqueueOptions, PatchJobOptions};
     use super::super::store::StoreEvent;
-    use super::super::test_support::test_store;
+    use super::super::test_support::{run_job_ops, test_store};
     use super::super::types::JobStatus;
+    use super::super::writer::JobOutcome;
     use crate::time::now_millis;
+
+    /// A promotion prepared before a patch to the job is told to retry
+    /// rather than writing over the patch. Retried, it promotes the job
+    /// as patched.
+    #[tokio::test]
+    async fn a_promotion_of_a_job_patched_since_its_pre_read_conflicts() {
+        let store = test_store();
+        let now = now_millis();
+        let job = store
+            .enqueue(
+                now,
+                EnqueueOptions::new("test", "q", serde_json::json!("a")).ready_at(now + 60_000),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = super::PromoteOp::prepare(&store.ks, &job.id, reply)
+            .unwrap()
+            .unwrap();
+
+        let patch = PatchJobOptions {
+            priority: Some(7),
+            ..Default::default()
+        };
+        store.patch_job(now, &job.id, patch).await.unwrap();
+        run_job_ops(&store, vec![op.into()]).await;
+        assert_eq!(rx.await.unwrap().unwrap(), JobOutcome::Conflict);
+
+        let (batch, _) = store.next_scheduled(now + 60_000, 10).await.unwrap();
+        store.promote_scheduled(&batch[0]).await.unwrap();
+        let taken = store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.id, job.id);
+        assert_eq!(taken.priority, 7);
+    }
 
     #[tokio::test]
     async fn promote_scheduled_moves_due_job_to_ready() {
