@@ -18,6 +18,7 @@
 //! nothing. They are *exclusive*: each runs in a pass of its own, so the
 //! scan for matching jobs sees exactly the state its writes go into.
 
+use super::super::budget::{BudgetOp, JobBudgetOp, JobsBudgetOp};
 use super::super::delete::{BulkDeleteOp, PurgeOp, ReapOp};
 use super::super::fail::FailOp;
 use super::super::patch::{BulkPatchOp, PatchOp};
@@ -80,6 +81,11 @@ pub(in crate::store) trait JobWrite {
     /// Answer that the job changed, and nothing was written.
     fn conflict(self);
 
+    /// The pass's writes were thrown away after this op applied: undo
+    /// whatever `apply` changed outside the transaction. The op may be
+    /// applied again in a later pass.
+    fn discard(&mut self) {}
+
     fn fail(self, msg: &str);
 }
 
@@ -129,6 +135,12 @@ macro_rules! job_ops {
                 }
             }
 
+            fn discard(&mut self) {
+                match self {
+                    $(JobOp::$variant(op) => op.discard()),*
+                }
+            }
+
             fn conflict(self) {
                 match self {
                     $(JobOp::$variant(op) => op.conflict()),*
@@ -153,6 +165,9 @@ job_ops! {
     BulkDelete(BulkDeleteOp),
     Promote(PromoteOp),
     Reap(ReapOp),
+    Budget(BudgetOp),
+    JobBudget(JobBudgetOp),
+    JobsBudget(JobsBudgetOp),
 }
 
 /// The one-at-a-time writes in one pass.
@@ -183,7 +198,9 @@ impl JobGroup {
             match self.ops[i].apply(tx, ks) {
                 Ok(applied) => self.applied.push(applied),
                 Err(e) => {
-                    self.applied.clear();
+                    // The transaction goes, so the ops before this one
+                    // are carried, and must not leave anything behind.
+                    self.discard();
                     self.ops.remove(i).fail(&e.to_string());
                     return Err(e);
                 }
@@ -209,9 +226,21 @@ impl JobGroup {
         }
     }
 
-    pub(super) fn fail(self, msg: &str) {
+    /// Fail every op, after a commit that didn't happen or didn't become
+    /// durable.
+    pub(super) fn fail(mut self, msg: &str) {
+        self.discard();
         for op in self.ops {
             op.fail(msg);
+        }
+    }
+
+    /// Undo what the ops that wrote did outside the transaction.
+    fn discard(&mut self) {
+        for (op, applied) in self.ops.iter_mut().zip(self.applied.drain(..)) {
+            if applied == Applied::Wrote {
+                op.discard();
+            }
         }
     }
 

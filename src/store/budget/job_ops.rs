@@ -32,21 +32,24 @@
 //! The same restriction falls out for terminal jobs, which hold nothing
 //! and will never run again.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use fjall::Slice;
+use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::super::dispatch::Placement;
 use super::super::keys::make_job_key;
 use super::super::options::JobFilter;
 use super::super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
-use super::super::store::{Store, StoreEvent};
+use super::super::store::{Keyspaces, Store, StoreEvent};
 use super::super::types::{Job, JobStatus, ScanDirection, StoreError};
-use super::BudgetPlan;
+use super::super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 use super::mutation::{BudgetMutation, BudgetMutationError, BudgetMutationOutcome};
 use super::ops::{plan_budgets, stage_budgets, unstage_budgets, write_created_budgets};
+use super::registry::Budgets;
+use super::{Budget, BudgetBinding, BudgetPlan, BudgetRef};
 
 /// What applying a mutation to one job did.
 ///
@@ -149,124 +152,46 @@ impl Store {
         mutation: BudgetMutation,
         now: u64,
     ) -> Result<JobBudgetChange, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let live = self.budgets.clone();
-        let id = id.to_string();
+        validate(&mutation)?;
+        let mutation = Arc::new(mutation);
 
-        let change = task::spawn_blocking(move || -> Result<JobBudgetChange, StoreError> {
-            let job_key = make_job_key(&id);
+        // Prepared here, on a blocking thread, so the writer only checks
+        // and writes. A job changed between this pre-read and the
+        // writer's check comes back as a conflict: pre-read again.
+        let change = loop {
+            let ks = self.ks.clone();
+            let writer = self.writer.clone();
+            let live = self.budgets.clone();
+            let id = id.to_string();
+            let mutation = mutation.clone();
 
-            // Retry loop: pre-read and decide outside the tx, then
-            // compare-and-write inside. Retries only when the job
-            // changed under us between the two.
-            loop {
-                // ---- outside tx ----
-                let Some(pre_bytes) = ks.data.get(&job_key)? else {
-                    return Ok(JobBudgetChange::JobNotFound);
-                };
+            let prepared = task::spawn_blocking(move || -> Result<_, StoreError> {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                Ok(
+                    match JobBudgetOp::prepare(&ks, &id, &mutation, live, now, reply)? {
+                        ControlFlow::Continue(op) => {
+                            writer.submit_job(op.into());
+                            Err(rx)
+                        }
+                        ControlFlow::Break(change) => Ok(change),
+                    },
+                )
+            })
+            .await??;
 
-                let job: Job = rmp_serde::from_slice(&pre_bytes)?;
-                let status = JobStatus::try_from(job.status).map_err(|v| {
-                    StoreError::Corruption(format!("job {id} has unrecognized status byte: {v}"))
-                })?;
-
-                if !matches!(status, JobStatus::Ready | JobStatus::Scheduled) {
-                    return Ok(JobBudgetChange::NotQueued(status));
-                }
-
-                let next = match mutation.apply(&job.budgets) {
-                    Ok(BudgetMutationOutcome::Changed(next)) => next,
-                    // Nothing to write, nothing to move, nothing to
-                    // re-account. Returned as the job already is.
-                    Ok(BudgetMutationOutcome::Unchanged) => {
-                        return Ok(JobBudgetChange::Unchanged(job));
-                    }
-                    Err(BudgetMutationError::AlreadyBound(key)) => {
-                        return Ok(JobBudgetChange::AlreadyBound(key));
-                    }
-                    Err(BudgetMutationError::NotBound(key)) => {
-                        return Ok(JobBudgetChange::NotBound(key));
-                    }
-                    // Malformed rather than inapplicable: these are
-                    // wrong for every job the request could be aimed at,
-                    // not just this one, so they fail the call rather
-                    // than reporting a per-job outcome a bulk route
-                    // would skip over.
-                    Err(BudgetMutationError::DuplicateKey(key)) => {
-                        return Err(StoreError::InvalidOperation(format!(
-                            "budget '{key}' named more than once"
-                        )));
-                    }
-                    Err(BudgetMutationError::ZeroCost(key)) => {
-                        return Err(StoreError::InvalidOperation(format!(
-                            "budget '{key}' cost must be at least 1"
-                        )));
-                    }
-                };
-
-                let previous = job.budgets.clone();
-                let mut updated = job.clone();
-                updated.budgets = next;
-                let updated_slice: Slice = rmp_serde::to_vec_named(&updated)?.into();
-
-                // ---- inside tx ----
-                let mut tx = ks.write_tx();
-
-                // Same pre-pass an enqueue runs: every budget whose
-                // cost this mutation sets must exist or be creatable,
-                // and that cost must fit what the bucket can hold.
-                // Resolved under the write lock so the answer cannot
-                // change between the check and the write it guards.
-                let costed = mutation.costed();
-                let created = match plan_budgets(&tx, &ks, costed.iter(), now)? {
-                    BudgetPlan::Proceed(created) => created,
-                    BudgetPlan::Reject(e) => return Err(e),
-                };
-                write_created_budgets(&mut tx, &ks, &created)?;
-
-                let prev = tx.fetch_update(&ks.data, &job_key, |_| Some(updated_slice.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue;
-                }
-
-                // Staged before the commit, while the write lock still
-                // excludes every other writer — see `stage_budgets`. The
-                // *new* bindings are counted up here; the old ones are
-                // counted down after, so the accounting reads high for a
-                // moment rather than low.
-                stage_budgets(&live, &created, std::iter::once(&updated), now);
-
-                if let Err(e) = ks.commit(tx, ks.default_commit_mode) {
-                    unstage_budgets(&live, &created, std::iter::once(&updated));
-                    return Err(e);
-                }
-
-                live.untrack(&previous);
-
-                // A scheduled job is not placed for dispatch at all, so
-                // there is nothing to move; it is re-placed from its new
-                // bindings when it is promoted.
-                if status == JobStatus::Ready {
-                    dispatch.remove(Placement {
-                        queue: &updated.queue,
-                        priority: updated.priority,
-                        id: &updated.id,
-                        budgets: &previous,
-                    });
-                    dispatch.insert(Placement::of(&updated));
-                }
-
-                return Ok(JobBudgetChange::Changed(updated));
+            let reply_rx = match prepared {
+                Ok(change) => break change,
+                Err(reply_rx) => reply_rx,
+            };
+            match reply_rx
+                .await
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+            {
+                JobOutcome::Done(change) => break change,
+                JobOutcome::Conflict => continue,
             }
-        })
-        .await??;
+        };
 
-        // Announced outside the closure, which holds the keyspace and
-        // the registry but not the event channel.
-        //
         // Worth announcing whichever way the bindings moved. Unbinding a
         // budget can make a job dispatchable that was throttled a moment
         // ago, and rebinding it moves it between groups — in both cases
@@ -308,172 +233,416 @@ impl Store {
         mutation: BudgetMutation,
         now: u64,
     ) -> Result<BulkBudgetChange, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let live = self.budgets.clone();
+        validate(&mutation)?;
 
-        let (result, rewritten) = task::spawn_blocking(
-            move || -> Result<(BulkBudgetChange, Vec<Rewritten>), StoreError> {
-                // Write lock first, then the snapshot: nothing can commit
-                // while the scan runs, so the set cannot shift underneath
-                // the decisions made about it.
-                let mut tx = ks.write_tx();
-                let snapshot = ks.db.read_tx();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = JobsBudgetOp {
+            filter,
+            mutation,
+            now,
+            live: self.budgets.clone(),
+            created: Vec::new(),
+            rewritten: Vec::new(),
+            staged: false,
+            result: None,
+            reply,
+        };
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || writer.submit_job(op.into())).await?;
 
-                // Resolved once. Every job takes the same mutation, so
-                // the budgets it names and the costs it sets are the same
-                // whichever job is being looked at.
-                let costed = mutation.costed();
-                let created = match plan_budgets(&tx, &ks, costed.iter(), now)? {
-                    BudgetPlan::Proceed(created) => created,
-                    BudgetPlan::Reject(e) => return Err(e),
-                };
-                write_created_budgets(&mut tx, &ks, &created)?;
+        match rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(change) => Ok(change),
+            JobOutcome::Conflict => Err(StoreError::Internal(
+                "bulk budget change reported a conflict".into(),
+            )),
+        }
+    }
+}
 
-                let needs_payload = filter_needs_payload(&filter);
-                let jobs = match build_id_stream(&snapshot, &ks, &filter, &None, ScanDirection::Asc)
-                {
-                    Some((id_stream, source, _)) => apply_filters(
-                        JobStream::by_id(
-                            id_stream,
-                            &snapshot,
-                            &ks.data,
-                            None,
-                            needs_payload,
-                            source,
-                        ),
-                        &filter,
-                    ),
-                    None => apply_filters(
-                        JobStream::full_scan(
-                            &snapshot,
-                            &ks,
-                            &None,
-                            ScanDirection::Asc,
-                            None,
-                            needs_payload,
-                        ),
-                        &filter,
-                    ),
-                };
+/// Reject a mutation that is malformed whatever job it meets.
+fn validate(mutation: &BudgetMutation) -> Result<(), StoreError> {
+    match mutation.validate() {
+        Ok(()) => Ok(()),
+        Err(BudgetMutationError::DuplicateKey(key)) => Err(StoreError::InvalidOperation(format!(
+            "budget '{key}' named more than once"
+        ))),
+        Err(BudgetMutationError::ZeroCost(key)) => Err(StoreError::InvalidOperation(format!(
+            "budget '{key}' cost must be at least 1"
+        ))),
+        Err(e) => Err(StoreError::Internal(format!(
+            "unexpected budget mutation error: {e:?}"
+        ))),
+    }
+}
 
-                let mut rewritten: Vec<Rewritten> = Vec::new();
-                let mut blocked: Vec<String> = Vec::new();
+/// A change to one queued job's budget bindings, prepared by its caller.
+pub(in crate::store) struct JobBudgetOp {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    previous: Vec<BudgetRef>,
+    /// The job as it will be once re-bound.
+    updated: Job,
+    updated_slice: Slice,
+    status: JobStatus,
+    /// Every binding whose cost the mutation sets, checked in the pass.
+    costed: Vec<BudgetBinding>,
+    now: u64,
+    live: Arc<Budgets>,
+    /// Filled in by `apply`.
+    created: Vec<(String, Budget)>,
+    staged: bool,
+    rejected: Option<StoreError>,
+    reply: JobReply<JobBudgetChange>,
+}
 
-                for job in jobs {
-                    let job = job?;
-                    let status = JobStatus::try_from(job.status).map_err(|v| {
-                        StoreError::Corruption(format!(
-                            "job {} has unrecognized status byte: {v}",
-                            job.id
-                        ))
-                    })?;
+impl JobBudgetOp {
+    /// Pre-read the job and work out its new bindings, ready for the
+    /// writer, or break with the answer when there is nothing to write.
+    fn prepare(
+        ks: &Keyspaces,
+        id: &str,
+        mutation: &BudgetMutation,
+        live: Arc<Budgets>,
+        now: u64,
+        reply: JobReply<JobBudgetChange>,
+    ) -> Result<ControlFlow<JobBudgetChange, Self>, StoreError> {
+        let job_key = make_job_key(id);
+        let Some(pre_bytes) = ks.data.get(&job_key)? else {
+            return Ok(ControlFlow::Break(JobBudgetChange::JobNotFound));
+        };
 
-                    // Applied before the state is consulted, so that
-                    // "would have changed but could not" can be told
-                    // apart from "there was nothing to do". Only the
-                    // first is worth reporting.
-                    let next = match mutation.apply(&job.budgets) {
-                        Ok(BudgetMutationOutcome::Changed(next)) => next,
-                        // Nothing to do. Not a shortfall, and not
-                        // reported: these are what the bulk verbs
-                        // promise to pass over.
-                        Ok(BudgetMutationOutcome::Unchanged) => continue,
-                        Err(BudgetMutationError::AlreadyBound(_))
-                        | Err(BudgetMutationError::NotBound(_)) => continue,
-                        // Wrong for every job, not just this one.
-                        Err(BudgetMutationError::DuplicateKey(key)) => {
-                            return Err(StoreError::InvalidOperation(format!(
-                                "budget '{key}' named more than once"
-                            )));
-                        }
-                        Err(BudgetMutationError::ZeroCost(key)) => {
-                            return Err(StoreError::InvalidOperation(format!(
-                                "budget '{key}' cost must be at least 1"
-                            )));
-                        }
-                    };
+        let job: Job = rmp_serde::from_slice(&pre_bytes)?;
+        let status = JobStatus::try_from(job.status).map_err(|v| {
+            StoreError::Corruption(format!("job {id} has unrecognized status byte: {v}"))
+        })?;
 
-                    match status {
-                        JobStatus::Ready | JobStatus::Scheduled => {}
-                        // Live work whose bindings cannot move while it
-                        // holds tokens against them. The caller can try
-                        // again once it has left the in-flight state.
-                        JobStatus::InFlight => {
-                            blocked.push(job.id);
-                            continue;
-                        }
-                        // Finished, so its bindings are record-keeping: it
-                        // will never dispatch and is already untracked.
-                        // Nothing to do and nothing to report.
-                        JobStatus::Completed | JobStatus::Dead => continue,
-                    }
-
-                    let previous = job.budgets.clone();
-                    let mut updated = job;
-                    updated.budgets = next;
-
-                    tx.insert(
-                        &ks.data,
-                        make_job_key(&updated.id),
-                        rmp_serde::to_vec_named(&updated)?,
-                    );
-
-                    rewritten.push(Rewritten {
-                        previous,
-                        updated,
-                        status,
-                    });
-                }
-
-                let result = BulkBudgetChange {
-                    changed: rewritten.len(),
-                    blocked,
-                };
-
-                // Nothing written and nothing created: no commit to make.
-                if rewritten.is_empty() && created.is_empty() {
-                    drop(tx);
-                    return Ok((result, Vec::new()));
-                }
-
-                stage_budgets(&live, &created, rewritten.iter().map(|r| &r.updated), now);
-
-                if let Err(e) = ks.commit(tx, ks.default_commit_mode) {
-                    unstage_budgets(&live, &created, rewritten.iter().map(|r| &r.updated));
-                    return Err(e);
-                }
-
-                for entry in &rewritten {
-                    live.untrack(&entry.previous);
-
-                    if entry.status == JobStatus::Ready {
-                        dispatch.remove(Placement {
-                            queue: &entry.updated.queue,
-                            priority: entry.updated.priority,
-                            id: &entry.updated.id,
-                            budgets: &entry.previous,
-                        });
-                        dispatch.insert(Placement::of(&entry.updated));
-                    }
-                }
-
-                Ok((result, rewritten))
-            },
-        )
-        .await??;
-
-        for entry in rewritten {
-            if entry.status == JobStatus::Ready {
-                let _ = self.event_tx.send(StoreEvent::JobDispatchable {
-                    id: entry.updated.id,
-                    queue: entry.updated.queue,
-                    token: Arc::new(AtomicBool::new(false)),
-                });
-            }
+        if !matches!(status, JobStatus::Ready | JobStatus::Scheduled) {
+            return Ok(ControlFlow::Break(JobBudgetChange::NotQueued(status)));
         }
 
-        Ok(result)
+        let next = match mutation.apply(&job.budgets) {
+            Ok(BudgetMutationOutcome::Changed(next)) => next,
+            // Nothing to write, nothing to move, nothing to re-account.
+            // Returned as the job already is.
+            Ok(BudgetMutationOutcome::Unchanged) => {
+                return Ok(ControlFlow::Break(JobBudgetChange::Unchanged(job)));
+            }
+            Err(BudgetMutationError::AlreadyBound(key)) => {
+                return Ok(ControlFlow::Break(JobBudgetChange::AlreadyBound(key)));
+            }
+            Err(BudgetMutationError::NotBound(key)) => {
+                return Ok(ControlFlow::Break(JobBudgetChange::NotBound(key)));
+            }
+            // Ruled out by `validate` before any job is read.
+            Err(e) => {
+                return Err(StoreError::Internal(format!(
+                    "unexpected budget mutation error: {e:?}"
+                )));
+            }
+        };
+
+        let previous = job.budgets.clone();
+        let mut updated = job;
+        updated.budgets = next;
+        let updated_slice = rmp_serde::to_vec_named(&updated)?.into();
+
+        Ok(ControlFlow::Continue(Self {
+            job_key,
+            pre_bytes,
+            previous,
+            updated,
+            updated_slice,
+            status,
+            costed: mutation.costed(),
+            now,
+            live,
+            created: Vec::new(),
+            staged: false,
+            rejected: None,
+            reply,
+        }))
+    }
+}
+
+impl JobWrite for JobBudgetOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        // Checked before any budget is created for it, so a conflict
+        // leaves nothing in the transaction.
+        if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(Applied::Conflict);
+        }
+
+        // Same pre-pass an enqueue runs: every budget whose cost this
+        // mutation sets must exist or be creatable, and that cost must
+        // fit what the bucket can hold. Read through the transaction, so
+        // the answer cannot change between the check and the write it
+        // guards.
+        self.created = match plan_budgets(&*tx, ks, self.costed.iter(), self.now)? {
+            BudgetPlan::Proceed(created) => created,
+            BudgetPlan::Reject(e) => {
+                self.rejected = Some(e);
+                return Ok(Applied::Nothing);
+            }
+        };
+        write_created_budgets(tx, ks, &self.created)?;
+        tx.insert(&ks.data, &self.job_key, self.updated_slice.clone());
+
+        // Staged before the commit, while no other write can come between
+        // — see `stage_budgets`. The *new* bindings are counted up here;
+        // the old ones are counted down once durable, so the accounting
+        // reads high for a moment rather than low.
+        stage_budgets(
+            &self.live,
+            &self.created,
+            std::iter::once(&self.updated),
+            self.now,
+        );
+        self.staged = true;
+        Ok(Applied::Wrote)
+    }
+
+    fn discard(&mut self) {
+        if std::mem::take(&mut self.staged) {
+            unstage_budgets(&self.live, &self.created, std::iter::once(&self.updated));
+        }
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        if let Some(e) = self.rejected {
+            let _ = self.reply.send(Err(e));
+            return;
+        }
+
+        self.live.untrack(&self.previous);
+
+        // A scheduled job is not placed for dispatch at all, so there is
+        // nothing to move; it is re-placed from its new bindings when it
+        // is promoted.
+        if self.status == JobStatus::Ready {
+            cx.dispatch.remove(Placement {
+                queue: &self.updated.queue,
+                priority: self.updated.priority,
+                id: &self.updated.id,
+                budgets: &self.previous,
+            });
+            cx.dispatch.insert(Placement::of(&self.updated));
+        }
+
+        let _ = self
+            .reply
+            .send(Ok(JobOutcome::Done(JobBudgetChange::Changed(self.updated))));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
+/// A change to the budget bindings of every job a filter matches, all or
+/// nothing.
+///
+/// Exclusive: it runs in a pass of its own, so the scan sees exactly the
+/// state its writes go into.
+pub(in crate::store) struct JobsBudgetOp {
+    filter: JobFilter,
+    mutation: BudgetMutation,
+    now: u64,
+    live: Arc<Budgets>,
+    /// Filled in by `apply`.
+    created: Vec<(String, Budget)>,
+    rewritten: Vec<Rewritten>,
+    staged: bool,
+    result: Option<Result<BulkBudgetChange, StoreError>>,
+    reply: JobReply<BulkBudgetChange>,
+}
+
+impl JobsBudgetOp {
+    fn scan(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Vec<String>, StoreError> {
+        let snapshot = ks.db.read_tx();
+        let filter = &self.filter;
+        let needs_payload = filter_needs_payload(filter);
+        let jobs = match build_id_stream(&snapshot, ks, filter, &None, ScanDirection::Asc) {
+            Some((id_stream, source, _)) => apply_filters(
+                JobStream::by_id(id_stream, &snapshot, &ks.data, None, needs_payload, source),
+                filter,
+            ),
+            None => apply_filters(
+                JobStream::full_scan(
+                    &snapshot,
+                    ks,
+                    &None,
+                    ScanDirection::Asc,
+                    None,
+                    needs_payload,
+                ),
+                filter,
+            ),
+        };
+
+        let mut blocked = Vec::new();
+        for job in jobs {
+            let job = job?;
+            let status = JobStatus::try_from(job.status).map_err(|v| {
+                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+            })?;
+
+            // Applied before the state is consulted, so that "would have
+            // changed but could not" can be told apart from "there was
+            // nothing to do". Only the first is worth reporting.
+            let next = match self.mutation.apply(&job.budgets) {
+                Ok(BudgetMutationOutcome::Changed(next)) => next,
+                // Nothing to do. Not a shortfall, and not reported: these
+                // are what the bulk verbs promise to pass over.
+                Ok(BudgetMutationOutcome::Unchanged)
+                | Err(BudgetMutationError::AlreadyBound(_))
+                | Err(BudgetMutationError::NotBound(_)) => continue,
+                // Ruled out by `validate` before the op was submitted.
+                Err(e) => {
+                    return Err(StoreError::Internal(format!(
+                        "unexpected budget mutation error: {e:?}"
+                    )));
+                }
+            };
+
+            match status {
+                JobStatus::Ready | JobStatus::Scheduled => {}
+                // Live work whose bindings cannot move while it holds
+                // tokens against them. The caller can try again once it
+                // has left the in-flight state.
+                JobStatus::InFlight => {
+                    blocked.push(job.id);
+                    continue;
+                }
+                // Finished, so its bindings are record-keeping: it will
+                // never dispatch and is already untracked. Nothing to do
+                // and nothing to report.
+                JobStatus::Completed | JobStatus::Dead => continue,
+            }
+
+            let previous = job.budgets.clone();
+            let mut updated = job;
+            updated.budgets = next;
+            tx.insert(
+                &ks.data,
+                make_job_key(&updated.id),
+                rmp_serde::to_vec_named(&updated)?,
+            );
+            self.rewritten.push(Rewritten {
+                previous,
+                updated,
+                status,
+            });
+        }
+        Ok(blocked)
+    }
+}
+
+impl JobWrite for JobsBudgetOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        self.rewritten.clear();
+
+        // Resolved once, before anything is written. Every job takes the
+        // same mutation, so the budgets it names and the costs it sets
+        // are the same whichever job is being looked at.
+        let costed = self.mutation.costed();
+        self.created = match plan_budgets(&*tx, ks, costed.iter(), self.now)? {
+            BudgetPlan::Proceed(created) => created,
+            BudgetPlan::Reject(e) => {
+                self.result = Some(Err(e));
+                return Ok(Applied::Nothing);
+            }
+        };
+        write_created_budgets(tx, ks, &self.created)?;
+
+        let blocked = self.scan(tx, ks)?;
+        self.result = Some(Ok(BulkBudgetChange {
+            changed: self.rewritten.len(),
+            blocked,
+        }));
+
+        // Nothing written and nothing created: nothing to commit.
+        if self.rewritten.is_empty() && self.created.is_empty() {
+            return Ok(Applied::Nothing);
+        }
+
+        stage_budgets(
+            &self.live,
+            &self.created,
+            self.rewritten.iter().map(|r| &r.updated),
+            self.now,
+        );
+        self.staged = true;
+        Ok(Applied::Wrote)
+    }
+
+    fn exclusive(&self) -> bool {
+        true
+    }
+
+    fn discard(&mut self) {
+        if std::mem::take(&mut self.staged) {
+            unstage_budgets(
+                &self.live,
+                &self.created,
+                self.rewritten.iter().map(|r| &r.updated),
+            );
+        }
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let result = self.result.unwrap_or_else(|| {
+            Err(StoreError::Internal(
+                "bulk budget change never applied".into(),
+            ))
+        });
+        if result.is_ok() {
+            for entry in &self.rewritten {
+                self.live.untrack(&entry.previous);
+
+                if entry.status == JobStatus::Ready {
+                    cx.dispatch.remove(Placement {
+                        queue: &entry.updated.queue,
+                        priority: entry.updated.priority,
+                        id: &entry.updated.id,
+                        budgets: &entry.previous,
+                    });
+                    cx.dispatch.insert(Placement::of(&entry.updated));
+                    let _ = cx.event_tx.send(StoreEvent::JobDispatchable {
+                        id: entry.updated.id.clone(),
+                        queue: entry.updated.queue.clone(),
+                        token: Arc::new(AtomicBool::new(false)),
+                    });
+                }
+            }
+        }
+        let _ = self.reply.send(result.map(JobOutcome::Done));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
     }
 }
 
@@ -481,8 +650,8 @@ impl Store {
 mod tests {
     use std::collections::HashSet;
 
-    use super::super::super::options::EnqueueOptions;
-    use super::super::super::test_support::{test_store, test_store_with_retention};
+    use super::super::super::options::{EnqueueOptions, PatchJobOptions};
+    use super::super::super::test_support::{run_job_ops, test_store, test_store_with_retention};
     use super::super::{BudgetBinding, BudgetStrategy};
     use super::*;
     use crate::time::now_millis;
@@ -671,6 +840,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dispatched.id, stuck.id);
+    }
+
+    /// Prepare `mutation` of `id` for the writer, as the caller would.
+    fn prepared(
+        store: &Store,
+        id: &str,
+        mutation: &BudgetMutation,
+    ) -> (
+        JobBudgetOp,
+        tokio::sync::oneshot::Receiver<Result<JobOutcome<JobBudgetChange>, StoreError>>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        match JobBudgetOp::prepare(&store.ks, id, mutation, store.budgets.clone(), NOW, reply)
+            .unwrap()
+        {
+            ControlFlow::Continue(op) => (op, rx),
+            ControlFlow::Break(change) => panic!("expected a write, got {change:?}"),
+        }
+    }
+
+    /// A change prepared before its job changed is told to retry, and
+    /// creates nothing: the job is checked before any budget the change
+    /// would create is written.
+    #[tokio::test]
+    async fn a_conflicting_change_creates_no_budget() {
+        let store = test_store();
+        let job = enqueue_bound(&store, &[]).await;
+        let mutation = BudgetMutation::Add(BudgetBinding::new("fresh").cost(2).create_with(
+            super::super::BudgetPolicy {
+                allocation: 50,
+                strategy: BudgetStrategy::WhileInFlight,
+            },
+        ));
+        let (op, rx) = prepared(&store, &job.id, &mutation);
+
+        let patch = PatchJobOptions {
+            priority: Some(9),
+            ..Default::default()
+        };
+        store.patch_job(now_millis(), &job.id, patch).await.unwrap();
+        run_job_ops(&store, vec![op.into()]).await;
+
+        assert!(matches!(rx.await.unwrap().unwrap(), JobOutcome::Conflict));
+        assert!(store.get_budget("fresh").await.unwrap().is_none());
+        assert_eq!(store.budgets.tracked("fresh"), 0);
+    }
+
+    /// Discarded after it applied, as when another op fails the pass,
+    /// a change leaves no accounting behind, so applied again in a later
+    /// pass the job is counted once.
+    #[tokio::test]
+    async fn a_discarded_change_leaves_no_accounting() {
+        let store = store_with_budgets(&["stripe"]).await;
+        let job = enqueue_bound(&store, &[]).await;
+        let mutation = BudgetMutation::Add(BudgetBinding::new("stripe").cost(1));
+        let (mut op, rx) = prepared(&store, &job.id, &mutation);
+
+        let ks = store.ks.clone();
+        let live = store.budgets.clone();
+        let op = tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            assert_eq!(op.apply(&mut tx, &ks).unwrap(), Applied::Wrote);
+            assert_eq!(live.tracked("stripe"), 1);
+            op.discard();
+            drop(tx);
+            assert_eq!(live.tracked("stripe"), 0);
+            op
+        })
+        .await
+        .unwrap();
+
+        run_job_ops(&store, vec![op.into()]).await;
+        assert!(matches!(
+            rx.await.unwrap().unwrap(),
+            JobOutcome::Done(JobBudgetChange::Changed(_))
+        ));
+        assert_eq!(store.budgets.tracked("stripe"), 1);
     }
 
     /// Binding to a budget that does not exist yet is one call, as it is

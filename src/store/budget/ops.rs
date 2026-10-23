@@ -34,6 +34,7 @@ use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
 use super::super::store::{Keyspaces, Store, StoreEvent};
 use super::super::types::{Job, StoreError};
+use super::super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 use super::registry::Budgets;
 use super::{Budget, BudgetBinding, BudgetStrategy};
 
@@ -49,38 +50,17 @@ impl Store {
         strategy: BudgetStrategy,
         now: u64,
     ) -> Result<Budget, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let key = key.to_string();
-
-        task::spawn_blocking(move || -> Result<Budget, StoreError> {
-            // Validate before taking the write lock.
-            let budget = Budget::new(allocation, strategy, now)?;
-            let budget_key = make_budget_key(&key);
-
-            let mut tx = ks.write_tx();
-
-            // Checked under the single-writer lock, so no concurrent
-            // creator can slip between the read and the insert.
-            if ks.data.get(&budget_key)?.is_some() {
-                return Err(StoreError::Conflict(format!(
-                    "budget '{key}' already exists"
-                )));
-            }
-
-            check_budget_capacity(&tx, &ks, &key, NOTHING_PLANNED)?;
-
-            tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // Only after the record is durable: a group built from a
-            // policy that failed to commit would throttle against
-            // something that does not exist.
-            live.sync(&key, &budget, now);
-
-            Ok(budget)
-        })
-        .await?
+        // Validated before it reaches the writer.
+        Budget::new(allocation, strategy, now)?;
+        let change = BudgetChange::Create {
+            key: key.to_string(),
+            allocation,
+            strategy,
+        };
+        match self.write_budget(change, now).await? {
+            BudgetWritten::Saved(_, budget) => Ok(budget),
+            _ => Err(StoreError::Internal("budget create wrote nothing".into())),
+        }
     }
 
     /// Create a budget, or replace an existing one's policy.
@@ -94,35 +74,16 @@ impl Store {
         strategy: BudgetStrategy,
         now: u64,
     ) -> Result<Budget, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let key = key.to_string();
-
-        let budget = task::spawn_blocking(move || -> Result<Budget, StoreError> {
-            let mut budget = Budget::new(allocation, strategy, now)?;
-            let budget_key = make_budget_key(&key);
-
-            let mut tx = ks.write_tx();
-
-            match ks.data.get(&budget_key)? {
-                Some(bytes) => {
-                    let existing: Budget = rmp_serde::from_slice(&bytes)?;
-                    budget.created_at = existing.created_at;
-                    check_costs_fit(&tx, &ks, &live, &key, budget.capacity())?;
-                }
-                // Replacing a budget cannot push the server over its
-                // cap; only creating one can.
-                None => check_budget_capacity(&tx, &ks, &key, NOTHING_PLANNED)?,
-            }
-
-            tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            live.sync(&key, &budget, now);
-
-            Ok(budget)
-        })
-        .await??;
+        Budget::new(allocation, strategy, now)?;
+        let change = BudgetChange::Put {
+            key: key.to_string(),
+            allocation,
+            strategy,
+        };
+        let budget = match self.write_budget(change, now).await? {
+            BudgetWritten::Saved(_, budget) => budget,
+            _ => return Err(StoreError::Internal("budget put wrote nothing".into())),
+        };
 
         // A wider allocation can make parked jobs affordable, and
         // nothing else would say so: a concurrency budget has no clock
@@ -147,46 +108,14 @@ impl Store {
         opts: PatchBudgetOptions,
         now: u64,
     ) -> Result<Option<Budget>, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let key = key.to_string();
-
-        let budget = task::spawn_blocking(move || -> Result<Option<Budget>, StoreError> {
-            let budget_key = make_budget_key(&key);
-
-            let mut tx = ks.write_tx();
-
-            let existing: Budget = match ks.data.get(&budget_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => return Ok(None),
-            };
-
-            // Re-validated through `Budget::new`, since a patch can
-            // reach a combination neither the stored policy nor the
-            // patch alone would have been rejected for.
-            // Merged rather than replaced: the strategy is a nested
-            // object, and merge patch recurses into those. Applied here
-            // rather than in the API layer because it needs the stored
-            // policy, and reading that outside this transaction would
-            // leave a window for a concurrent write between the read and
-            // the merge.
-            let mut budget = Budget::new(
-                opts.allocation.unwrap_or(existing.allocation),
-                opts.strategy.apply(existing.strategy)?,
-                now,
-            )?;
-            budget.created_at = existing.created_at;
-
-            check_costs_fit(&tx, &ks, &live, &key, budget.capacity())?;
-
-            tx.insert(&ks.data, &budget_key, &rmp_serde::to_vec_named(&budget)?);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            live.sync(&key, &budget, now);
-
-            Ok(Some(budget))
-        })
-        .await??;
+        let change = BudgetChange::Patch {
+            key: key.to_string(),
+            opts,
+        };
+        let budget = match self.write_budget(change, now).await? {
+            BudgetWritten::Saved(_, budget) => Some(budget),
+            _ => None,
+        };
 
         // See `put_budget`: a grown allocation has to be announced.
         self.wake_budgeted_jobs(now, BUDGET_WAKE_LIMIT);
@@ -315,29 +244,14 @@ impl Store {
     /// Reported separately rather than as one count, because the two
     /// have different ways out.
     pub async fn delete_budget(&self, key: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let key = key.to_string();
-
-        task::spawn_blocking(move || -> Result<bool, StoreError> {
-            let budget_key = make_budget_key(&key);
-
-            let mut tx = ks.write_tx();
-
-            if ks.data.get(&budget_key)?.is_none() {
-                return Ok(false);
-            }
-
-            check_unreferenced(&tx, &ks, &live, &key)?;
-
-            tx.remove(&ks.data, &budget_key);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            live.forget(&key);
-
-            Ok(true)
-        })
-        .await?
+        let change = BudgetChange::Delete {
+            key: key.to_string(),
+        };
+        let now = crate::time::now_millis();
+        Ok(matches!(
+            self.write_budget(change, now).await?,
+            BudgetWritten::Deleted(keys) if !keys.is_empty()
+        ))
     }
 
     /// Delete every budget, for `POST /reset`.
@@ -358,43 +272,262 @@ impl Store {
     /// second deletion path that could strand work if the order ever
     /// changed.
     pub async fn delete_budgets(&self) -> Result<usize, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
+        let now = crate::time::now_millis();
+        match self.write_budget(BudgetChange::DeleteAll, now).await? {
+            BudgetWritten::Deleted(keys) => Ok(keys.len()),
+            _ => Ok(0),
+        }
+    }
 
-        task::spawn_blocking(move || -> Result<usize, StoreError> {
-            let mut tx = ks.write_tx();
+    /// Have the writer apply a change to the budget records, and mirror
+    /// it into the live registry once durable.
+    async fn write_budget(
+        &self,
+        change: BudgetChange,
+        now: u64,
+    ) -> Result<BudgetWritten, StoreError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = BudgetOp {
+            change,
+            now,
+            live: self.budgets.clone(),
+            written: None,
+            reply,
+        };
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || writer.submit_job(op.into())).await?;
 
-            let start = vec![RecordKind::Budget as u8, 0];
-            let end = vec![RecordKind::Budget as u8, 1];
+        match rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(written) => Ok(written),
+            JobOutcome::Conflict => Err(StoreError::Internal(
+                "budget write reported a conflict".into(),
+            )),
+        }
+    }
+}
 
-            let keys: Vec<String> = tx
-                .range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
-                .map(|guard| {
-                    let (key, _) = guard.into_inner()?;
-                    // Skip the `B\0` prefix to recover the budget key.
-                    String::from_utf8(key[2..].to_vec()).map_err(|e| {
-                        StoreError::Corruption(format!("budget key is not valid UTF-8: {e}"))
+/// A change to the budget records.
+pub(in crate::store) enum BudgetChange {
+    /// Create, refusing a key that is taken.
+    Create {
+        key: String,
+        allocation: u32,
+        strategy: BudgetStrategy,
+    },
+
+    /// Create, or replace an existing policy whole.
+    Put {
+        key: String,
+        allocation: u32,
+        strategy: BudgetStrategy,
+    },
+
+    /// Merge fields into an existing policy.
+    Patch {
+        key: String,
+        opts: PatchBudgetOptions,
+    },
+
+    Delete {
+        key: String,
+    },
+
+    /// Every budget, for `POST /reset`.
+    DeleteAll,
+}
+
+/// What a budget change wrote.
+pub(in crate::store) enum BudgetWritten {
+    /// The budget's policy as stored.
+    Saved(String, Budget),
+
+    /// The budgets removed.
+    Deleted(Vec<String>),
+
+    /// Nothing: a patch or delete of a budget that doesn't exist.
+    Nothing,
+}
+
+/// A change to the budget records, applied in a writer pass.
+///
+/// Unlike job writes, nothing is pre-read: every check reads through the
+/// pass's transaction, so it sees what the pass already wrote, and the
+/// answer can't change between the check and the write it guards. A
+/// refusal (`Conflict`, or a check failing) writes nothing and is this
+/// op's answer alone; the rest of the pass still commits.
+pub(in crate::store) struct BudgetOp {
+    change: BudgetChange,
+    now: u64,
+    live: Arc<Budgets>,
+    /// Filled in by `apply`.
+    written: Option<Result<BudgetWritten, StoreError>>,
+    reply: JobReply<BudgetWritten>,
+}
+
+impl BudgetOp {
+    fn write(
+        &self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<BudgetWritten, StoreError> {
+        let live = &*self.live;
+        let now = self.now;
+
+        match &self.change {
+            BudgetChange::Create {
+                key,
+                allocation,
+                strategy,
+            } => {
+                let budget = Budget::new(*allocation, *strategy, now)?;
+                let budget_key = make_budget_key(key);
+                if tx.get(&ks.data, &budget_key)?.is_some() {
+                    return Err(StoreError::Conflict(format!(
+                        "budget '{key}' already exists"
+                    )));
+                }
+                check_budget_capacity(&*tx, ks, key, NOTHING_PLANNED)?;
+                tx.insert(&ks.data, &budget_key, rmp_serde::to_vec_named(&budget)?);
+                Ok(BudgetWritten::Saved(key.clone(), budget))
+            }
+
+            BudgetChange::Put {
+                key,
+                allocation,
+                strategy,
+            } => {
+                let mut budget = Budget::new(*allocation, *strategy, now)?;
+                let budget_key = make_budget_key(key);
+                match tx.get(&ks.data, &budget_key)? {
+                    Some(bytes) => {
+                        let existing: Budget = rmp_serde::from_slice(&bytes)?;
+                        budget.created_at = existing.created_at;
+                        check_costs_fit(&*tx, ks, live, key, budget.capacity())?;
+                    }
+                    // Replacing a budget cannot push the server over its
+                    // cap; only creating one can.
+                    None => check_budget_capacity(&*tx, ks, key, NOTHING_PLANNED)?,
+                }
+                tx.insert(&ks.data, &budget_key, rmp_serde::to_vec_named(&budget)?);
+                Ok(BudgetWritten::Saved(key.clone(), budget))
+            }
+
+            BudgetChange::Patch { key, opts } => {
+                let budget_key = make_budget_key(key);
+                let existing: Budget = match tx.get(&ks.data, &budget_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => return Ok(BudgetWritten::Nothing),
+                };
+
+                // Re-validated through `Budget::new`, since a patch can
+                // reach a combination neither the stored policy nor the
+                // patch alone would have been rejected for. Merged rather
+                // than replaced: the strategy is a nested object, and
+                // merge patch recurses into those. Applied here rather
+                // than in the API layer because it needs the stored
+                // policy, read in the same transaction as the write.
+                let mut budget = Budget::new(
+                    opts.allocation.unwrap_or(existing.allocation),
+                    opts.strategy.apply(existing.strategy)?,
+                    now,
+                )?;
+                budget.created_at = existing.created_at;
+
+                check_costs_fit(&*tx, ks, live, key, budget.capacity())?;
+                tx.insert(&ks.data, &budget_key, rmp_serde::to_vec_named(&budget)?);
+                Ok(BudgetWritten::Saved(key.clone(), budget))
+            }
+
+            BudgetChange::Delete { key } => {
+                let budget_key = make_budget_key(key);
+                if tx.get(&ks.data, &budget_key)?.is_none() {
+                    return Ok(BudgetWritten::Nothing);
+                }
+                check_unreferenced(&*tx, ks, live, key)?;
+                tx.remove(&ks.data, &budget_key);
+                Ok(BudgetWritten::Deleted(vec![key.clone()]))
+            }
+
+            BudgetChange::DeleteAll => {
+                let start = vec![RecordKind::Budget as u8, 0];
+                let end = vec![RecordKind::Budget as u8, 1];
+
+                let keys: Vec<String> = tx
+                    .range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
+                    .map(|guard| {
+                        let (key, _) = guard.into_inner()?;
+                        // Skip the `B\0` prefix to recover the budget key.
+                        String::from_utf8(key[2..].to_vec()).map_err(|e| {
+                            StoreError::Corruption(format!("budget key is not valid UTF-8: {e}"))
+                        })
                     })
-                })
-                .collect::<Result<_, _>>()?;
+                    .collect::<Result<_, _>>()?;
 
-            // Checked for all before removing any, so a refusal leaves
-            // the keyspace untouched rather than half-wiped.
-            for key in &keys {
-                check_unreferenced(&tx, &ks, &live, key)?;
+                // Checked for all before removing any, so a refusal
+                // leaves the keyspace untouched rather than half-wiped.
+                for key in &keys {
+                    check_unreferenced(&*tx, ks, live, key)?;
+                }
+                for key in &keys {
+                    tx.remove(&ks.data, make_budget_key(key));
+                }
+                Ok(BudgetWritten::Deleted(keys))
             }
+        }
+    }
+}
 
-            for key in &keys {
-                tx.remove(&ks.data, make_budget_key(key));
+impl JobWrite for BudgetOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        // Every check and read comes before the write it guards, so an
+        // error leaves nothing in the transaction, and is this op's
+        // answer alone.
+        let written = self.write(tx, ks);
+        let applied = match &written {
+            Ok(BudgetWritten::Saved(..)) => Applied::Wrote,
+            Ok(BudgetWritten::Deleted(keys)) if !keys.is_empty() => Applied::Wrote,
+            _ => Applied::Nothing,
+        };
+        self.written = Some(written);
+        Ok(applied)
+    }
+
+    fn finish(self, _cx: &WriterContext) {
+        // Only now the records are durable: a group built from a policy
+        // that failed to commit would throttle against something that
+        // does not exist.
+        let written = self
+            .written
+            .unwrap_or_else(|| Err(StoreError::Internal("budget write never applied".into())));
+        match &written {
+            Ok(BudgetWritten::Saved(key, budget)) => self.live.sync(key, budget, self.now),
+            Ok(BudgetWritten::Deleted(keys)) => {
+                if matches!(self.change, BudgetChange::DeleteAll) {
+                    self.live.clear();
+                } else {
+                    for key in keys {
+                        self.live.forget(key);
+                    }
+                }
             }
+            _ => {}
+        }
+        let _ = self.reply.send(written.map(JobOutcome::Done));
+    }
 
-            ks.commit(tx, ks.default_commit_mode)?;
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
 
-            live.clear();
-
-            Ok(keys.len())
-        })
-        .await?
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
     }
 }
 
@@ -791,12 +924,64 @@ mod tests {
     use super::super::super::options::{
         BudgetStrategyKind, BudgetStrategyPatch, PatchBudgetOptions,
     };
-    use super::super::super::test_support::{test_store, test_store_with_max_budgets};
+    use super::super::super::test_support::{run_job_ops, test_store, test_store_with_max_budgets};
+    use super::super::super::writer::JobOutcome;
     use super::super::BudgetStrategy;
+    use super::{BudgetChange, BudgetOp, BudgetWritten};
     use crate::store::Store;
     use crate::store::StoreError;
 
     const NOW: u64 = 1_700_000_000_000;
+
+    /// A create of `key`, as `create_budget` submits it.
+    fn create_op(
+        store: &Store,
+        key: &str,
+    ) -> (
+        BudgetOp,
+        tokio::sync::oneshot::Receiver<Result<JobOutcome<BudgetWritten>, StoreError>>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = BudgetOp {
+            change: BudgetChange::Create {
+                key: key.to_string(),
+                allocation: 5,
+                strategy: BudgetStrategy::WhileInFlight,
+            },
+            now: NOW,
+            live: store.budgets.clone(),
+            written: None,
+            reply,
+        };
+        (op, rx)
+    }
+
+    /// Two creates of one key in the same pass: the second sees the
+    /// first through the transaction and is refused with `Conflict`,
+    /// as its own answer, while the rest of the pass still commits.
+    #[tokio::test]
+    async fn a_second_create_of_a_key_in_one_pass_conflicts_alone() {
+        let store = test_store();
+        let (first, first_rx) = create_op(&store, "a");
+        let (second, second_rx) = create_op(&store, "a");
+        let (other, other_rx) = create_op(&store, "b");
+
+        run_job_ops(&store, vec![first.into(), second.into(), other.into()]).await;
+
+        assert!(matches!(
+            first_rx.await.unwrap(),
+            Ok(JobOutcome::Done(BudgetWritten::Saved(..)))
+        ));
+        assert!(matches!(
+            second_rx.await.unwrap(),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(matches!(
+            other_rx.await.unwrap(),
+            Ok(JobOutcome::Done(BudgetWritten::Saved(..)))
+        ));
+        assert_eq!(store.list_budgets().await.unwrap().len(), 2);
+    }
 
     /// A patch that replaces the strategy wholesale, for the tests that
     /// predate merge semantics and care about the end state rather than

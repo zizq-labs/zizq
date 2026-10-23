@@ -28,11 +28,12 @@ mod ops;
 mod registry;
 
 pub use job_ops::JobBudgetChange;
+pub(in crate::store) use job_ops::{JobBudgetOp, JobsBudgetOp};
 pub use mutation::BudgetMutation;
 pub(in crate::store) use registry::Budgets;
 
 pub(in crate::store) use ops::{
-    BudgetPlan, plan_budgets, stage_budgets, sync_created_budgets, unstage_budgets,
+    BudgetOp, BudgetPlan, plan_budgets, stage_budgets, sync_created_budgets, unstage_budgets,
     write_created_budgets,
 };
 
