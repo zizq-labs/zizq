@@ -19,6 +19,7 @@
 //! scan for matching jobs sees exactly the state its writes go into.
 
 use super::super::budget::{BudgetOp, JobBudgetOp, JobsBudgetOp};
+use super::super::cron::CronOp;
 use super::super::delete::{BulkDeleteOp, PurgeOp, ReapOp};
 use super::super::fail::FailOp;
 use super::super::patch::{BulkPatchOp, PatchOp};
@@ -168,6 +169,7 @@ job_ops! {
     Budget(BudgetOp),
     JobBudget(JobBudgetOp),
     JobsBudget(JobsBudgetOp),
+    Cron(CronOp),
 }
 
 /// The one-at-a-time writes in one pass.

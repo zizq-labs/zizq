@@ -714,6 +714,7 @@ pub struct PatchBudgetOptions {
 ///
 /// The caller provides the entry definition; the Store computes
 /// `next_enqueue_at` from the expression and `now`.
+#[derive(Clone)]
 pub struct CronEntryOptions {
     /// Entry name (unique within the group).
     pub name: String,
