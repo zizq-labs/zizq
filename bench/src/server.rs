@@ -29,7 +29,11 @@ pub struct Server {
 /// The hash tells apart builds of the same version, such as the musl
 /// release binary and a local glibc build.
 pub async fn identify(path: &Path) -> Result<(String, String), Error> {
-    let output = Command::new(path).arg("--version").output().await?;
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| format!("cannot run {}: {e}", path.display()))?;
     let version = String::from_utf8(output.stdout)?
         .trim()
         .trim_start_matches("zizq ")
@@ -40,21 +44,37 @@ pub async fn identify(path: &Path) -> Result<(String, String), Error> {
     Ok((version, sha256))
 }
 
+/// Where the server accepts connections.
+#[derive(Clone, Copy)]
+pub enum Listen {
+    /// Loopback only, for a client on the same machine.
+    Local,
+    /// Every interface, for a client on another machine.
+    Network,
+}
+
 /// Start the server on a free port with a fresh root directory, and wait
 /// until it accepts connections.
+///
+/// It listens as `listen` says, with its output going to `log`.
 pub async fn start(
     path: &Path,
     root_dir: &Path,
+    listen: Listen,
     log: File,
     extra_args: &[String],
 ) -> Result<Server, Error> {
-    let addr = free_addr().await?;
+    let bind = match listen {
+        Listen::Local => "127.0.0.1",
+        Listen::Network => "0.0.0.0",
+    };
+    let addr = free_addr(bind).await?;
 
     let mut child = Command::new(path)
         .arg("serve")
         .arg("--root-dir")
         .arg(root_dir)
-        .args(["--host", "127.0.0.1", "--port", &addr.port().to_string()])
+        .args(["--host", bind, "--port", &addr.port().to_string()])
         .arg("--no-admin")
         .args(extra_args)
         .stdout(log.try_clone()?)
@@ -65,7 +85,8 @@ pub async fn start(
     let pid = child.id().ok_or("server exited immediately")?;
     let started = Instant::now();
 
-    while TcpStream::connect(addr).await.is_err() {
+    let probe = SocketAddr::from(([127, 0, 0, 1], addr.port()));
+    while TcpStream::connect(probe).await.is_err() {
         if let Some(status) = child.try_wait()? {
             return Err(format!("server exited during startup: {status}").into());
         }
@@ -78,7 +99,7 @@ pub async fn start(
     Ok(Server {
         child,
         pid,
-        url: format!("http://{addr}"),
+        url: format!("http://{probe}"),
     })
 }
 
@@ -102,7 +123,7 @@ impl Server {
 }
 
 /// Find a port that is free right now by binding to port 0.
-async fn free_addr() -> Result<SocketAddr, Error> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+async fn free_addr(bind: &str) -> Result<SocketAddr, Error> {
+    let listener = TcpListener::bind((bind, 0)).await?;
     Ok(listener.local_addr()?)
 }

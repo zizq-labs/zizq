@@ -2,11 +2,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
@@ -16,7 +16,7 @@ use crate::load::Counters;
 
 /// What the benchmark is doing, recorded with each sample so charts can
 /// shade the phases.
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum Phase {
@@ -68,6 +68,53 @@ pub struct Sample {
     completed: u64,
 }
 
+/// The server's resource use at one moment.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Metrics {
+    /// Resident memory, in bytes.
+    pub rss: u64,
+    /// Peak resident memory, in bytes. Linux only.
+    pub rss_peak: Option<u64>,
+    /// CPU time used since the server started, in milliseconds.
+    pub cpu_ms: u64,
+    /// Total size of the files in the server's root directory, in bytes.
+    pub disk: u64,
+}
+
+/// Where the server's metrics come from.
+pub enum Source {
+    /// A process on this machine, measured directly.
+    Local { pid: u32, root_dir: PathBuf },
+    /// A server on another machine, as last reported by its agent.
+    Remote(Arc<Mutex<Metrics>>),
+}
+
+/// Where the client's CPU use comes from.
+pub enum ClientCpu {
+    /// This process, which is running the load.
+    Local,
+    /// A load agent on another machine: its CPU time in milliseconds, as
+    /// last reported.
+    Remote(Arc<AtomicU64>),
+}
+
+/// Measure the server process `pid` on this machine. `system` must have
+/// just refreshed the process's memory and CPU.
+pub fn measure(system: &System, pid: u32, root_dir: &Path) -> Metrics {
+    let (rss, cpu_ms) = usage(system, Pid::from_u32(pid));
+    Metrics {
+        rss,
+        rss_peak: peak_rss(pid),
+        cpu_ms,
+        disk: dir_size(root_dir),
+    }
+}
+
+/// What `measure` needs refreshed for a process.
+pub fn refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing().with_memory().with_cpu()
+}
+
 /// Handle to a running sampler.
 pub struct Sampler {
     stop: oneshot::Sender<()>,
@@ -87,8 +134,8 @@ impl Sampler {
 pub fn start(
     out: Arc<Mutex<impl Write + Send + 'static>>,
     interval: Duration,
-    server_pid: u32,
-    root_dir: PathBuf,
+    server: Source,
+    client: ClientCpu,
     counters: Arc<Counters>,
     phase: Arc<PhaseCell>,
     started: Instant,
@@ -96,22 +143,24 @@ pub fn start(
     let (stop, mut stopped) = oneshot::channel();
 
     let task = tokio::spawn(async move {
-        let server = Pid::from_u32(server_pid);
         let bench = sysinfo::get_current_pid()?;
-        let refresh = ProcessRefreshKind::nothing().with_memory().with_cpu();
+        let mut pids = vec![bench];
+        if let Source::Local { pid, .. } = &server {
+            pids.push(Pid::from_u32(*pid));
+        }
         let mut system = System::new();
+        let read = |system: &System| match &server {
+            Source::Local { pid, root_dir } => measure(system, *pid, root_dir),
+            Source::Remote(latest) => *latest.lock().unwrap(),
+        };
+        let client_cpu_ms = |system: &System| match &client {
+            ClientCpu::Local => usage(system, bench).1,
+            ClientCpu::Remote(cpu_ms) => cpu_ms.load(Ordering::Relaxed),
+        };
 
         // Baseline, so the first sample's CPU covers only its own interval.
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[server, bench]),
-            true,
-            refresh,
-        );
-        let mut last = (
-            Instant::now(),
-            usage(&system, server).1,
-            usage(&system, bench).1,
-        );
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, refresh_kind());
+        let mut last = (Instant::now(), read(&system).cpu_ms, client_cpu_ms(&system));
         let mut max_rss = 0;
 
         let mut ticker = tokio::time::interval(interval);
@@ -124,29 +173,29 @@ pub fn start(
             };
 
             system.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&[server, bench]),
+                ProcessesToUpdate::Some(&pids),
                 true,
-                refresh,
+                refresh_kind(),
             );
             let now = Instant::now();
-            let (rss, server_cpu_ms) = usage(&system, server);
-            let (_, bench_cpu_ms) = usage(&system, bench);
+            let server = read(&system);
+            let bench_cpu_ms = client_cpu_ms(&system);
             let elapsed_ms = now.duration_since(last.0).as_secs_f64() * 1000.0;
-            max_rss = max_rss.max(rss);
+            max_rss = max_rss.max(server.rss);
 
             let sample = Sample {
                 kind: "sample",
                 t: now.duration_since(started).as_secs_f64(),
                 phase: phase.get(),
-                rss,
-                rss_peak: peak_rss(server_pid),
-                server_cpu: percent(server_cpu_ms.saturating_sub(last.1), elapsed_ms),
+                rss: server.rss,
+                rss_peak: server.rss_peak,
+                server_cpu: percent(server.cpu_ms.saturating_sub(last.1), elapsed_ms),
                 bench_cpu: percent(bench_cpu_ms.saturating_sub(last.2), elapsed_ms),
-                disk: dir_size(&root_dir),
+                disk: server.disk,
                 enqueued: counters.enqueued.load(Ordering::Relaxed),
                 completed: counters.completed.load(Ordering::Relaxed),
             };
-            last = (now, server_cpu_ms, bench_cpu_ms);
+            last = (now, server.cpu_ms, bench_cpu_ms);
 
             let mut out = out.lock().unwrap();
             serde_json::to_writer(&mut *out, &sample)?;
