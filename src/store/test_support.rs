@@ -17,6 +17,7 @@ use super::options::{EnqueueOptions, FailureOptions};
 use super::storage_config::StorageConfig;
 use super::store::Store;
 use super::types::{BackoffConfig, Job};
+use super::writer::{Applied, JobOp, JobWrite, WriterContext};
 use crate::time::now_millis;
 
 /// The temporary directory a test store lives in, removed when the store
@@ -124,4 +125,37 @@ pub(super) fn job_id(name: &str) -> String {
     let mut bytes = [0u8; 16];
     bytes[..name.len()].copy_from_slice(name.as_bytes());
     scru128::Id::from_bytes(bytes).to_string()
+}
+
+/// Apply, commit and finish single-job writes as one writer pass would:
+/// each op is answered `Done`, or `Conflict` if its job changed since it
+/// was prepared. Commits block on the group committer, so on a blocking
+/// thread.
+pub(super) async fn run_job_ops(store: &Store, ops: Vec<JobOp>) {
+    let ks = store.ks.clone();
+    let cx = WriterContext {
+        ks: store.ks.clone(),
+        dispatch: store.dispatch.clone(),
+        budgets: store.budgets.clone(),
+        scheduled_index: store.scheduled_index.clone(),
+        in_flight_index: store.in_flight_index.clone(),
+        event_tx: store.event_tx.clone(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut tx = ks.write_tx();
+        let mut ops = ops;
+        let applied: Vec<Applied> = ops
+            .iter_mut()
+            .map(|op| op.apply(&mut tx, &ks).unwrap())
+            .collect();
+        ks.commit(tx, ks.default_commit_mode).unwrap();
+        for (op, applied) in ops.into_iter().zip(applied) {
+            match applied {
+                Applied::Wrote | Applied::Nothing => op.finish(&cx),
+                Applied::Conflict => op.conflict(),
+            }
+        }
+    })
+    .await
+    .unwrap();
 }

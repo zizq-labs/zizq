@@ -47,6 +47,61 @@ and the machine, one line per sample, and a summary.
   `TMPDIR` to put it on a different disk, or on `/dev/shm` to take storage out
   of the comparison entirely, e.g. when comparing allocators.
 
+### Running the server on another machine
+
+With `--remote`, the server runs on another machine and the benchmark loads
+it over the network, e.g. the server on an M4 Mac and the client on a Pi:
+
+```shell
+cargo run --release -- --remote me@m4.local \
+    --remote-bench ~/bin/zizq-bench --server ~/bin/zizq --jobs 500000
+```
+
+`zizq-bench` must be installed on the server's machine too, and SSH must work
+without a password prompt (keys or an agent). The benchmark runs
+`zizq-bench --agent` there over SSH. The agent starts the server listening on
+all interfaces with a fresh root directory, and reports its memory, CPU and
+disk use back over the same connection, so results files are the same as for
+a local run. The server's log is copied back alongside them.
+
+| Option | Default | |
+|---|---|---|
+| `--remote` | | SSH destination for the server's machine, e.g. `user@host` |
+| `--server` | | The `zizq` binary, as a path on the server's machine |
+| `--remote-bench` | `zizq-bench` | How to run `zizq-bench` there. Not quoted, so it can carry a prefix, e.g. `env TMPDIR=/dev/shm ~/bin/zizq-bench` |
+| `--remote-addr` | the SSH host | Address the client reaches the server at, e.g. a private network address |
+
+The server listens on a random port, which must be reachable from the
+client's machine. The header records both machines, and the summary and plot
+scripts only compare runs that used the same pair.
+
+### Running the client on another machine
+
+`--remote-client` is the other way round: the server runs on this machine and
+the load (the producers and workers) runs on another, e.g. the server on an
+M4 Mac and the load from a Pi. Only this machine makes an SSH connection, so
+the server's machine needn't accept SSH at all:
+
+```shell
+cargo run --release -- --server ./zizq --remote-client pi@raspberrypi.local \
+    --remote-bench ~/bin/zizq-bench --jobs 500000
+```
+
+The server is started and sampled here, listening on all interfaces, and
+`zizq-bench --load-agent` runs the load on the other machine, reporting its
+progress and its own CPU use back. Results and the server's log are written
+here as usual, with the agent's own errors in a `.client.log` alongside.
+
+| Option | Default | |
+|---|---|---|
+| `--remote-client` | | SSH destination for the client's machine, e.g. `user@host` |
+| `--remote-bench` | `zizq-bench` | How to run `zizq-bench` there |
+| `--server-addr` | this machine's hostname | Address the client reaches this server at, e.g. `fer-chippie.local` |
+
+The other machine must be able to reach the server's port here. The agent
+checks it can before starting the load, and fails rather than waiting if it
+can't.
+
 ## Running the Scenario Matrix
 
 `matrix.sh` runs every combination of mode, job count and completed-job

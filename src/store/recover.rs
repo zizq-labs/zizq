@@ -17,22 +17,43 @@ use tokio::task;
 
 use super::dispatch::Placement;
 use super::keys::{IndexKind, make_job_key, make_status_key, make_unique_key};
-use super::store::{Store, StoreEvent};
+use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueWhile};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 use crate::time::now_millis;
 
 impl Store {
     /// Recover state after startup.
     ///
-    /// Move orphaned in-flight jobs back to Ready.
+    /// Move orphaned in-flight jobs back to Ready in the LSM indexes, in
+    /// one writer pass of its own.
     ///
-    /// Must complete before accepting API requests to avoid races
-    /// with concurrent job completions. The job scan and status
-    /// transitions run synchronously; only the durable commit is
-    /// awaited.
+    /// Must complete before accepting API requests to avoid races with
+    /// concurrent job completions. Does not touch the in-memory ready
+    /// index — that's handled by `rebuild_dispatch`, which runs
+    /// immediately after.
     pub async fn recover_in_flight(&self) -> Result<usize, StoreError> {
-        let store = self.clone();
-        task::spawn_blocking(move || store.recover_in_flight_jobs()).await?
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || -> Result<usize, StoreError> {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            writer.submit_job(
+                RecoverOp {
+                    decided: None,
+                    reply,
+                }
+                .into(),
+            );
+            match rx
+                .blocking_recv()
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+            {
+                JobOutcome::Done(count) => Ok(count),
+                JobOutcome::Conflict => Err(StoreError::Internal(
+                    "in-flight recovery reported a conflict".into(),
+                )),
+            }
+        })
+        .await?
     }
 
     /// Rebuild all in-memory indexes asynchronously.
@@ -73,7 +94,7 @@ impl Store {
     /// re-insert it.
     ///
     /// Allocations come back full, and for concurrency budgets that is
-    /// simply accurate: `recover_in_flight_jobs` has already returned
+    /// simply accurate: `recover_in_flight` has already returned
     /// every in-flight job to Ready, so nothing holds a slot. Time-based
     /// budgets also come back full, which does mean a restart forgives
     /// whatever the previous process had spent — an acceptable trade-off.
@@ -88,75 +109,6 @@ impl Store {
         }
 
         Ok(budgets.len())
-    }
-
-    /// Move orphaned in-flight jobs back to Ready in the LSM indexes.
-    ///
-    /// Runs synchronously so it completes before any API requests are
-    /// accepted. Does not touch the in-memory ready index — that's
-    /// handled by `rebuild_dispatch`, which runs immediately after.
-    fn recover_in_flight_jobs(&self) -> Result<usize, StoreError> {
-        let ks = &self.ks;
-
-        // Scan the status index for all InFlight jobs.
-        // InFlight = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
-        let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8, 0];
-        let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8 + 1, 0];
-        let range = (Bound::Included(start), Bound::Excluded(end));
-
-        // Collect IDs via a read snapshot first — the write tx type
-        // does not support range scans.
-        let snapshot = ks.db.read_tx();
-        let in_flight_ids: Vec<String> = snapshot
-            .range::<Vec<u8>, _>(&ks.index, range)
-            .map(|entry| {
-                let (key, _) = entry.into_inner()?;
-                // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
-                String::from_utf8(key[4..].to_vec())
-                    .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
-        drop(snapshot);
-
-        if in_flight_ids.is_empty() {
-            return Ok(0);
-        }
-
-        let count = in_flight_ids.len();
-        let mut tx = ks.write_tx();
-
-        for id in &in_flight_ids {
-            let job_key = make_job_key(id);
-            let job_bytes = ks.data.get(&job_key)?.ok_or_else(|| {
-                StoreError::Corruption(format!("in-flight job missing from data keyspace: {id:?}"))
-            })?;
-            let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
-
-            let old_status_key = make_status_key(JobStatus::InFlight, id);
-            let new_status_key = make_status_key(JobStatus::Ready, id);
-            job.status = JobStatus::Ready.into();
-            let updated_bytes = rmp_serde::to_vec_named(&job)?;
-
-            tx.insert(&ks.data, &job_key, &updated_bytes);
-            tx.remove(&ks.index, &old_status_key);
-            tx.insert(&ks.index, &new_status_key, b"");
-
-            // If unique_while == Queued, restore the unique index when
-            // a job recovers from InFlight back to Ready. Only insert if no
-            // other job has claimed the key while this one was in-flight.
-            if let Some(ref uc) = job.unique {
-                if uc.unique_while() == UniqueWhile::Queued {
-                    let id_bytes: Slice = id.as_bytes().into();
-                    tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                        Some(existing) => Some(existing.clone()),
-                        None => Some(id_bytes.clone()),
-                    })?;
-                }
-            }
-        }
-
-        ks.commit(tx, ks.default_commit_mode)?;
-        Ok(count)
     }
 
     /// Populate the in-memory ready index from the `jobs_by_status` index.
@@ -264,16 +216,176 @@ impl Store {
     }
 }
 
+/// The return of every orphaned in-flight job to Ready, at startup.
+///
+/// Exclusive, since it scans the in-flight status index: alone in its
+/// pass, the scan sees exactly the state its writes go into. Decides
+/// before it writes, so a corrupt record is this op's answer, with its
+/// own error, and nothing is half written.
+pub(in crate::store) struct RecoverOp {
+    /// Filled in by `apply`.
+    decided: Option<Result<usize, StoreError>>,
+    reply: JobReply<usize>,
+}
+
+/// One job's return to Ready, decided before anything is written.
+struct Recovery {
+    id: String,
+    job_key: Vec<u8>,
+    updated: Vec<u8>,
+    /// Restored if the job is unique while queued, and no other job has
+    /// claimed the key while this one was in flight.
+    unique_key: Option<Vec<u8>>,
+}
+
+impl RecoverOp {
+    fn decide(
+        tx: &fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Vec<Recovery>, StoreError> {
+        // Scan the status index for all InFlight jobs.
+        // InFlight = 2, so the prefix range is [S, 0, 2, 0]..[S, 0, 3, 0].
+        let start: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8, 0];
+        let end: Vec<u8> = vec![IndexKind::Status as u8, 0, JobStatus::InFlight as u8 + 1, 0];
+        let in_flight_ids: Vec<String> = tx
+            .range::<Vec<u8>, _>(&ks.index, (Bound::Included(start), Bound::Excluded(end)))
+            .map(|entry| {
+                let (key, _) = entry.into_inner()?;
+                // Key layout: S\0{status_u8}\0{job_id} — skip the 4-byte prefix.
+                String::from_utf8(key[4..].to_vec())
+                    .map_err(|e| StoreError::Corruption(format!("job ID is not valid UTF-8: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+
+        in_flight_ids
+            .into_iter()
+            .map(|id| {
+                let job_key = make_job_key(&id);
+                let job_bytes = tx.get(&ks.data, &job_key)?.ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "in-flight job missing from data keyspace: {id:?}"
+                    ))
+                })?;
+                let mut job: Job = rmp_serde::from_slice(&job_bytes)?;
+                job.status = JobStatus::Ready.into();
+
+                let unique_key = job
+                    .unique
+                    .as_ref()
+                    .filter(|uc| uc.unique_while() == UniqueWhile::Queued)
+                    .map(|uc| make_unique_key(&uc.key));
+
+                Ok(Recovery {
+                    updated: rmp_serde::to_vec_named(&job)?,
+                    job_key,
+                    unique_key,
+                    id,
+                })
+            })
+            .collect()
+    }
+}
+
+impl JobWrite for RecoverOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        let recoveries = match Self::decide(tx, ks) {
+            Ok(recoveries) => recoveries,
+            Err(e) => {
+                self.decided = Some(Err(e));
+                return Ok(Applied::Nothing);
+            }
+        };
+
+        for r in &recoveries {
+            tx.insert(&ks.data, &r.job_key, &r.updated);
+            tx.remove(&ks.index, make_status_key(JobStatus::InFlight, &r.id));
+            tx.insert(&ks.index, make_status_key(JobStatus::Ready, &r.id), b"");
+
+            if let Some(unique_key) = &r.unique_key {
+                let id_bytes: Slice = r.id.as_bytes().into();
+                tx.fetch_update(&ks.index, unique_key, |v| match v {
+                    Some(existing) => Some(existing.clone()),
+                    None => Some(id_bytes.clone()),
+                })?;
+            }
+        }
+
+        self.decided = Some(Ok(recoveries.len()));
+        Ok(if recoveries.is_empty() {
+            Applied::Nothing
+        } else {
+            Applied::Wrote
+        })
+    }
+
+    fn exclusive(&self) -> bool {
+        true
+    }
+
+    fn finish(self, _cx: &WriterContext) {
+        let decided = self
+            .decided
+            .unwrap_or_else(|| Err(StoreError::Internal("recovery never applied".into())));
+        let _ = self.reply.send(decided.map(JobOutcome::Done));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::time::SystemTime;
 
     use super::super::budget::{BudgetBinding, BudgetStrategy};
+    use super::super::keys::{make_job_key, make_status_key};
     use super::super::options::EnqueueOptions;
-    use super::super::test_support::test_store;
-    use super::super::types::JobStatus;
+    use super::super::test_support::{enqueue_and_take, test_store};
+    use super::super::types::{JobStatus, StoreError};
     use crate::time::now_millis;
+
+    /// An in-flight index entry with no job record is corruption, and
+    /// recovery reports it as such. Every job is checked before any is
+    /// written, so the valid in-flight job isn't recovered either: a
+    /// failed recovery leaves nothing half done.
+    #[tokio::test]
+    async fn a_corrupt_in_flight_entry_fails_recovery_whole() {
+        let store = test_store();
+        let valid = enqueue_and_take(&store).await.id;
+
+        let ks = store.ks.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            tx.insert(
+                &ks.index,
+                make_status_key(JobStatus::InFlight, "ghost"),
+                b"",
+            );
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let result = store.recover_in_flight().await;
+        assert!(
+            matches!(result, Err(StoreError::Corruption(_))),
+            "{result:?}"
+        );
+
+        let bytes = store.ks.data.get(make_job_key(&valid)).unwrap().unwrap();
+        let job: super::Job = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(job.status, JobStatus::InFlight as u8);
+    }
 
     #[tokio::test]
     async fn recover_moves_in_flight_to_ready() {

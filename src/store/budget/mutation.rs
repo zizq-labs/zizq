@@ -195,6 +195,20 @@ impl BudgetMutation {
         }
     }
 
+    /// Reject a mutation that is wrong whatever job it is applied to: a
+    /// repeated key, or a cost of zero. Checked before any job is
+    /// touched, so a bulk change fails as a whole rather than part way.
+    pub(in crate::store) fn validate(&self) -> Result<(), BudgetMutationError> {
+        match self {
+            Self::ReplaceAll(bindings) => to_refs(bindings).map(|_| ()),
+            Self::Add(binding) | Self::Set(binding) => check_cost(binding),
+            Self::SetCost { key, cost } if *cost == 0 => {
+                Err(BudgetMutationError::ZeroCost(key.clone()))
+            }
+            Self::SetCost { .. } | Self::Remove { .. } | Self::RemoveAll => Ok(()),
+        }
+    }
+
     /// Every binding whose cost this mutation sets.
     ///
     /// What the transaction has to validate: each named budget must

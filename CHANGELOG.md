@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+This release changes how the server writes to its database. Every write
+(enqueues, workers taking and acknowledging jobs, and everything else)
+now goes through a single writer, which applies whatever is waiting in
+one shared transaction. Before, each request competed for the database's
+write lock and held it for as long as its own write took, so one large
+enqueue could stall every worker waiting for a job. Now the writer
+decides the order, and puts workers first, so queues keep draining while
+producers are busy. The main difference you may notice is that
+enqueueing is paced to the rate workers drain while they're busy. The
+details are below.
+
+- Completing a job, or failing it for the last time with no retention,
+  no longer deletes the job's record twice. That redundant delete was
+  done while holding the write lock that every take and enqueue waits
+  for, and removing it cut the locked time per completed job by about
+  13%.
+- Fixed workers sitting idle while jobs were waiting. Each newly ready
+  job woke only one of the waiting workers, so when a burst of enqueues
+  ended while workers were keeping up, most of them could stay asleep,
+  leaving a backlog to the few that happened to still be busy. In
+  benchmarks with 8 workers, only one was still taking jobs once
+  enqueueing stopped, and the backlog drained 5× slower than it should.
+  Idle workers with spare capacity now check for waiting jobs every
+  100ms.
+- Workers keep taking jobs while large batches are being enqueued.
+  Workers' takes and acknowledgements go into each transaction first,
+  and enqueues fill the room left under a new `--write-batch-max-jobs`
+  option (`ZIZQ_WRITE_BATCH_MAX_JOBS`, default 200). When draining alone
+  fills a transaction, enqueues wait for the next one, but never two in
+  a row, so producers always progress. A single enqueue request is never
+  split, so enqueues stay all-or-nothing. `0` removes the limit. The
+  writer also starts on the next transaction while the last is still
+  being made durable.
+
+  In benchmarks against 0.7.5 on an 8-core arm64 machine, with 8
+  workers draining while jobs were enqueued, jobs were drained 53%
+  faster with 1,000-job batches, and 2.8× faster with 200-job batches,
+  and runs finished up to 18% sooner. In exchange, enqueueing is slowed
+  while workers are still waiting on jobs, because producers now wait
+  their turn behind them: by 10% with 1,000-job batches, and by half with
+  200-job batches, where enqueueing and draining now move more or less in
+  lockstop. With no workers running, enqueueing was 26-28% faster. Draining
+  with nothing being simultaneously enqueued was 9% faster with 8 workers,
+  but marginally (5%) slower with only 2 workers.
+
 ## 0.7.5
 
 - Jobs queued to run use about 40% less memory. The in-memory indexes of

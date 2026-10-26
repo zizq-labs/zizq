@@ -24,6 +24,7 @@ use super::keys::{
 };
 use super::store::{Store, StoreEvent};
 use super::types::{Job, JobStatus, StoreError, UniqueWhile};
+use super::writer::take::{TakeOutcome, TakeWrite};
 
 impl Store {
     /// Take the next job from the priority index.
@@ -72,6 +73,7 @@ impl Store {
         let ks = self.ks.clone();
         let dispatch = self.dispatch.clone();
         let event_tx = self.event_tx.clone();
+        let writer = self.writer.clone();
         let queues = queues.clone();
 
         let spawn_start = std::time::Instant::now();
@@ -114,9 +116,21 @@ impl Store {
                 // 2. Pre-read phase — read each claimed job from the data keyspace.
                 //    Filter out any that are deleted or no longer Ready.
                 let mut valid: Vec<PreRead> = Vec::with_capacity(claimed.len());
+                let mut seen: HashSet<&str> = HashSet::with_capacity(claimed.len());
 
                 for candidate in &claimed {
                     let job_id = &candidate.id;
+
+                    // The ready index can briefly hold a job twice, under
+                    // two priorities: a take that conflicted with a patch
+                    // puts the job back where it was while the patch
+                    // re-files it. Both copies would pass the writer's
+                    // check, so a second claim of the job is given back.
+                    if !seen.insert(job_id) {
+                        dispatch.refund(&candidate.budgets);
+                        continue;
+                    }
+
                     let job_key = make_job_key(job_id);
                     let pre_bytes = match ks.data.get(&job_key)? {
                         Some(bytes) => bytes,
@@ -165,86 +179,78 @@ impl Store {
                     return Ok(Vec::new());
                 }
 
-                // 3. Write phase — one transaction for all valid pre-reads.
-                //    If any CAS fails, abort the entire transaction since
-                //    fetch_update already wrote into the tx buffer.
-                let mut tx = ks.write_tx();
-                let mut cas_conflict_detected = false;
-
-                for pre in &valid {
-                    let prev = tx.fetch_update(&ks.data, &pre.job_key, |_| {
-                        Some(pre.updated_slice.clone())
-                    })?;
-
-                    if prev.as_deref() != Some(&*pre.pre_bytes) {
-                        cas_conflict_detected = true;
-                        break;
-                    }
-
-                    tx.remove(&ks.index, &pre.old_status_key);
-                    tx.insert(&ks.index, &pre.new_status_key, b"");
-
-                    // If unique_while == Queued, remove the unique index when
-                    // the job transitions out of the queue (Ready -> InFlight),
-                    // but only if it still belongs to this job.
-                    if let Some(ref uc) = pre.job.unique {
-                        if uc.unique_while() == UniqueWhile::Queued {
-                            let job_id = pre.job_id.as_bytes();
-                            tx.fetch_update(&ks.index, &make_unique_key(&uc.key), |v| match v {
-                                Some(v) if v.as_ref() == job_id => None,
-                                other => other.cloned(),
-                            })?;
+                // 3. Write phase — the writer writes every valid pre-read
+                //    in a transaction shared with other writes, after
+                //    checking none has changed since it was read.
+                let writes: Vec<TakeWrite> = valid
+                    .iter()
+                    .map(|pre| {
+                        let mut release_keys = Vec::new();
+                        // If unique_while == Queued, the unique index is
+                        // released when the job leaves the queue (Ready ->
+                        // InFlight), but only if it still belongs to this job.
+                        if let Some(ref uc) = pre.job.unique
+                            && uc.unique_while() == UniqueWhile::Queued
+                        {
+                            release_keys.push(make_unique_key(&uc.key));
                         }
-                    }
+                        // Batched jobs close their batch on claim: no more
+                        // folds can target this job. Released only if it
+                        // still points at *this* job — a prior seal may
+                        // have already replaced it with a fresh batch.
+                        if let Some(ref bc) = pre.job.batch {
+                            release_keys.push(make_batch_key(&bc.key));
+                        }
+                        TakeWrite {
+                            job_key: pre.job_key.clone(),
+                            pre_bytes: pre.pre_bytes.clone(),
+                            updated: pre.updated_slice.clone(),
+                            old_status_key: pre.old_status_key.clone(),
+                            new_status_key: pre.new_status_key.clone(),
+                            release_keys,
+                            job_id: pre.job_id.clone(),
+                        }
+                    })
+                    .collect();
 
-                    // Batched jobs close their batch on claim: no more
-                    // folds can target this job. Remove the index entry
-                    // only if it still points at *this* job — a prior
-                    // seal may have already replaced it with a fresh
-                    // batch.
-                    if let Some(ref bc) = pre.job.batch {
-                        let job_id = pre.job_id.as_bytes();
-                        tx.fetch_update(&ks.index, &make_batch_key(&bc.key), |v| match v {
-                            Some(v) if v.as_ref() == job_id => None,
-                            other => other.cloned(),
-                        })?;
-                    }
-                }
-
-                if cas_conflict_detected {
-                    // CAS mismatch — abort the whole batch, re-insert
-                    // valid entries into the ready index, and retry.
-                    tracing::trace!(
-                        valid = valid.len(),
-                        "take_next_n_jobs: CAS conflict, retrying"
-                    );
-                    drop(tx);
-                    for pre in &valid {
-                        // Back on the queue and not running, so its
-                        // tokens are not owed by anyone.
-                        dispatch.refund(&pre.job.budgets);
-                        dispatch.insert(Placement::of(&pre.job));
-                    }
-                    continue; // Back to the top of the retry loop
-                }
-
+                let outcome = writer
+                    .submit_take(writes)
+                    .blocking_recv()
+                    .unwrap_or_else(|_| Err(StoreError::Internal("writer stopped".into())));
                 let write_tx_elapsed = blocking_start.elapsed();
 
-                if let Err(e) = ks.commit(tx, ks.default_commit_mode) {
-                    // 4. Rollback — re-insert valid entries into the
-                    //    ready index and notify workers.
-                    let _tx = ks.write_tx();
-                    for pre in &valid {
-                        dispatch.refund(&pre.job.budgets);
-                        dispatch.insert(Placement::of(&pre.job));
-
-                        let _ = event_tx.send(StoreEvent::JobDispatchable {
-                            id: pre.job_id.clone(),
-                            queue: pre.job.queue.clone(),
-                            token: Arc::new(AtomicBool::new(false)),
-                        });
+                match outcome {
+                    Ok(TakeOutcome::Committed) => {}
+                    Ok(TakeOutcome::Conflict) => {
+                        // A job changed since it was pre-read. Nothing was
+                        // written: put the jobs back and retry.
+                        tracing::trace!(
+                            valid = valid.len(),
+                            "take_next_n_jobs: CAS conflict, retrying"
+                        );
+                        for pre in &valid {
+                            // Back on the queue and not running, so its
+                            // tokens are not owed by anyone.
+                            dispatch.refund(&pre.job.budgets);
+                            dispatch.insert(Placement::of(&pre.job));
+                        }
+                        continue; // Back to the top of the retry loop
                     }
-                    return Err(e);
+                    Err(e) => {
+                        // 4. Rollback — re-insert valid entries into the
+                        //    ready index and notify workers.
+                        for pre in &valid {
+                            dispatch.refund(&pre.job.budgets);
+                            dispatch.insert(Placement::of(&pre.job));
+
+                            let _ = event_tx.send(StoreEvent::JobDispatchable {
+                                id: pre.job_id.clone(),
+                                queue: pre.job.queue.clone(),
+                                token: Arc::new(AtomicBool::new(false)),
+                            });
+                        }
+                        return Err(e);
+                    }
                 }
 
                 // 5. Hydrate phase — read payloads for all committed jobs.
@@ -293,10 +299,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    use super::super::keys::make_job_key;
     use super::super::options::{BulkDeleteOptions, EnqueueOptions};
     use super::super::store::StoreEvent;
     use super::super::test_support::test_store;
-    use super::super::types::JobStatus;
+    use super::super::types::{Job, JobStatus};
     use crate::time::now_millis;
 
     #[tokio::test]
@@ -763,6 +770,37 @@ mod tests {
 
     // --- take_next_n_jobs tests ---
 
+    /// The ready index can briefly hold one job under two placements: a
+    /// take that conflicts with a priority patch puts the job back where
+    /// it was, while the patch re-files it at its new priority. A take
+    /// that claims both must still take the job once.
+    #[tokio::test]
+    async fn a_job_claimed_twice_in_one_take_is_taken_once() {
+        let store = test_store();
+        let job = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job();
+
+        store.dispatch.insert(super::super::dispatch::Placement {
+            queue: &job.queue,
+            priority: job.priority.wrapping_add(1),
+            id: &job.id,
+            budgets: &job.budgets,
+        });
+
+        let taken = store
+            .take_next_n_jobs(now_millis(), &HashSet::new(), 5)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = taken.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec![job.id.as_str()]);
+    }
+
     #[tokio::test]
     async fn take_next_n_jobs_returns_up_to_n() {
         let store = test_store();
@@ -1079,5 +1117,72 @@ mod tests {
         let taken = store.take_next_job(now, &queues).await.unwrap();
         assert!(taken.is_some(), "filtered take should return the new job");
         assert_eq!(taken.unwrap().id, enqueued.id);
+    }
+
+    /// A job whose record changes after the take pre-read it is put back
+    /// and taken again, from its new record. The test holds the write
+    /// lock so the writer can't apply the take until the record has
+    /// changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn take_retries_a_job_changed_after_its_pre_read() {
+        let store = Arc::new(test_store());
+        let id = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("test", "q", serde_json::json!({})),
+            )
+            .await
+            .unwrap()
+            .into_job()
+            .id;
+
+        // Hold the write lock until told to change the record.
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (change_tx, change_rx) = std::sync::mpsc::channel::<()>();
+        let ks = store.ks.clone();
+        let job_key = make_job_key(&id);
+        let holder = tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            locked_tx.send(()).unwrap();
+            change_rx.recv().unwrap();
+
+            let mut job: Job =
+                rmp_serde::from_slice(&ks.data.get(&job_key).unwrap().unwrap()).unwrap();
+            job.priority = 7;
+            tx.insert(&ks.data, &job_key, rmp_serde::to_vec_named(&job).unwrap());
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+        });
+        locked_rx.await.unwrap();
+
+        let take = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .take_next_n_jobs(now_millis(), &HashSet::new(), 1)
+                    .await
+            }
+        });
+
+        // Once claimed, the take pre-reads straight away and waits on the
+        // writer, which waits on the lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store.dispatch.len() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "take never claimed the job"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        change_tx.send(()).unwrap();
+        holder.await.unwrap();
+
+        let jobs = take.await.unwrap().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(jobs[0].priority, 7);
+        assert_eq!(store.in_flight_count(), 1);
+        assert_eq!(store.dispatch.len(), 0);
     }
 }

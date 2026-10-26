@@ -28,6 +28,7 @@ mod storage_config;
 mod store;
 mod take;
 mod types;
+mod writer;
 
 #[cfg(test)]
 mod test_support;
@@ -48,7 +49,7 @@ pub use storage_config::{
     DEFAULT_CACHE_SIZE, DEFAULT_COMPLETE_BATCH_SIZE, DEFAULT_COMPLETED_RETENTION_MS,
     DEFAULT_DATA_TABLE_SIZE, DEFAULT_DEAD_RETENTION_MS, DEFAULT_ENQUEUE_BATCH_SIZE,
     DEFAULT_INDEX_TABLE_SIZE, DEFAULT_JOURNAL_SIZE, DEFAULT_L0_THRESHOLD, DEFAULT_MAX_BUDGETS,
-    DEFAULT_RETRY_LIMIT, StorageConfig,
+    DEFAULT_RETRY_LIMIT, DEFAULT_WRITE_BATCH_MAX_JOBS, StorageConfig,
 };
 pub use store::{Store, StoreEvent};
 

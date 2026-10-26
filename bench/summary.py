@@ -108,7 +108,8 @@ def main():
 
     for path in files(args.paths):
         header, summary = load(path)
-        hosts.add(json.dumps(header["host"], sort_keys=True))
+        # The server's machine counts too, when it ran on its own.
+        hosts.add(json.dumps([header["host"], header.get("server_host")], sort_keys=True))
         key = config(header)
         if summary is None:
             failed[key] += 1

@@ -3,21 +3,22 @@
 
 //! Enqueue operations: single and bulk job insertion.
 //!
-//! Both entry points funnel into the server-side `EnqueueBatcher` which
-//! coalesces concurrent enqueues across many connections into a single
-//! fjall transaction. The disk work splits across the prepare → apply →
-//! finalize trio in sibling submodules; the methods here are thin async
+//! Both entry points submit to the store's writer, which gathers
+//! concurrent enqueues across many connections, with other writes, into a
+//! single fjall transaction. The disk work splits across the prepare →
+//! apply → finalize trio in sibling submodules, with `write` holding
+//! enqueue's part of a writer pass; the methods here are thin async
 //! wrappers that hand off through `spawn_blocking`.
 
 mod apply;
-mod batcher;
 mod finalize;
 mod prepare;
+mod write;
 
 pub(in crate::store) use apply::{apply_enqueue, plan_op_budgets};
-pub(super) use batcher::EnqueueBatcher;
 pub(in crate::store) use finalize::finalize_enqueue;
 pub(in crate::store) use prepare::{PreparedEnqueue, prepare_enqueue, validate_batch_config};
+pub(in crate::store) use write::{EnqueueGroup, EnqueueOp};
 
 use tokio::task;
 
@@ -45,24 +46,24 @@ impl Store {
         // batcher path as `enqueue_bulk`. The batcher coalesces this
         // with whatever else is in the channel at mutex-acquire time
         // and commits the whole coalesced batch atomically.
-        let batcher = self.enqueue_batcher.clone();
+        let writer = self.writer.clone();
 
         let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
             let prepared = prepare_enqueue(opts, now)?;
-            Ok(batcher.submit(vec![prepared]))
+            Ok(writer.submit_enqueue(vec![prepared]))
         })
         .await??;
 
         let mut results = reply_rx
             .await
-            .map_err(|_| StoreError::Internal("enqueue auto-batcher channel closed".into()))??;
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??;
 
         // Vec-of-1 contract — the batcher always returns the same number
         // of results as the input length. `unwrap` is safe in
         // principle, but we still guard against batcher-side bugs.
-        results.pop().ok_or_else(|| {
-            StoreError::Internal("enqueue auto-batcher returned empty result".into())
-        })
+        results
+            .pop()
+            .ok_or_else(|| StoreError::Internal("writer returned an empty enqueue result".into()))
     }
 
     /// Enqueue multiple jobs in a single transaction.
@@ -71,9 +72,9 @@ impl Store {
     /// a single commit. In-memory indexes are updated after commit succeeds.
     /// Events are broadcast after the sync completes.
     ///
-    /// Bulk participates in the same auto-batcher as singular enqueue —
-    /// a bulk-of-N counts as one op in the batcher's op-count budget,
-    /// and may share a commit with other concurrent enqueue requests.
+    /// Bulk goes through the same writer as singular enqueue — a bulk-of-N
+    /// counts as one op in the writer's op-count limit, and may share a
+    /// commit with other concurrent writes.
     /// Atomicity is preserved at the commit boundary: if the coalesced
     /// commit fails, every participating op fails together.
     pub async fn enqueue_bulk(
@@ -85,20 +86,20 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let batcher = self.enqueue_batcher.clone();
+        let writer = self.writer.clone();
 
         let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
             let prepared: Vec<PreparedEnqueue> = batch
                 .into_iter()
                 .map(|opts| prepare_enqueue(opts, now))
                 .collect::<Result<_, StoreError>>()?;
-            Ok(batcher.submit(prepared))
+            Ok(writer.submit_enqueue(prepared))
         })
         .await??;
 
         reply_rx
             .await
-            .map_err(|_| StoreError::Internal("enqueue auto-batcher channel closed".into()))?
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))?
     }
 }
 #[cfg(test)]

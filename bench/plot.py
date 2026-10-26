@@ -171,9 +171,19 @@ def plot(runs, bucket, title):
     return fig
 
 
+def machines(header):
+    """The machine a run used, or both when the server ran on its own."""
+    def describe(host):
+        return f"{host['cpu']}, {host['cores']} cores, {host['os']}"
+
+    server = header.get("server_host")
+    if server is None:
+        return describe(header["host"])
+    return f"server {describe(server)}; client {describe(header['host'])}"
+
+
 def title_for(runs):
     h = runs[0]["header"]
-    host = h["host"]
     if len(runs) == 1:
         a = h["args"]
         s = runs[0]["summary"] or {}
@@ -181,13 +191,12 @@ def title_for(runs):
             f"zizq {h['version']} ({h['label']}), {a['mode']}, {a['jobs']:,} jobs: "
             f"drain {s.get('drain_rate', 0):,.0f}/s, "
             f"peak memory {s.get('peak_rss', 0) / MIB:,.0f} MiB\n"
-            f"{host['cpu']}, {host['cores']} cores, {host['os']}"
+            f"{machines(h)}"
         )
-    hosts = {(r["header"]["host"]["cpu"], r["header"]["host"]["cores"]) for r in runs}
+    hosts = {machines(r["header"]) for r in runs}
     if len(hosts) > 1:
-        return "Mixed hosts: " + " vs ".join(
-            f"{cpu}, {cores} cores" for cpu, cores in sorted(hosts))
-    return f"{host['cpu']}, {host['cores']} cores, {host['os']}"
+        return "Mixed hosts: " + " vs ".join(sorted(hosts))
+    return machines(h)
 
 
 def main():
@@ -203,7 +212,9 @@ def main():
 
     runs = [load(path) for path in args.files]
 
-    hosts = {json.dumps(r["header"]["host"], sort_keys=True) for r in runs}
+    # The server's machine counts too, when it ran on its own.
+    hosts = {json.dumps([r["header"]["host"], r["header"].get("server_host")],
+                        sort_keys=True) for r in runs}
     if len(hosts) > 1 and not args.allow_mixed_hosts:
         sys.exit("runs are from different hosts and are not comparable "
                  "(pass --allow-mixed-hosts to plot them anyway)")

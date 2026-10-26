@@ -2,8 +2,9 @@
 // Licensed under the Business Source License 1.1. See LICENSE file for details.
 
 //! Pure-computation phase of enqueue: assemble a `PreparedEnqueue` from
-//! `EnqueueOptions` without touching the database. Used both by the
-//! enqueue auto-batcher and by `cron::promote_cron_entry`.
+//! `EnqueueOptions` without touching the database. Used both by
+//! enqueue (before submitting to the writer) and by
+//! `cron::promote_cron_entry`.
 
 use std::collections::HashSet;
 

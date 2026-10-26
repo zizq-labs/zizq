@@ -10,6 +10,7 @@
 //!   events so workers can release capacity for in-flight jobs deleted
 //!   out from under them.
 
+use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::budget::BudgetRef;
@@ -22,6 +23,7 @@ use super::options::BulkDeleteOptions;
 use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
+use super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 
 impl Store {
     /// Hard-delete a job and all associated data.
@@ -29,65 +31,36 @@ impl Store {
     /// Called by the reaper for each expired job. Returns `true` if the
     /// job was found and deleted, `false` if already purged.
     pub async fn purge_job(&self, id: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let in_flight_index = self.in_flight_index.clone();
-        let id = id.to_string();
+        // Prepared here, on a blocking thread, so the writer only checks
+        // and writes. A job changed between this pre-read and the
+        // writer's check comes back as a conflict: pre-read again, so the
+        // deletion removes the keys of the state the job is really in.
+        loop {
+            let ks = self.ks.clone();
+            let writer = self.writer.clone();
+            let id = id.to_string();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // ---- outside tx ----
-            let job_key = make_job_key(&id);
-            let job_bytes = match ks.data.get(&job_key)? {
-                Some(bytes) => bytes,
-                None => return Ok(false), // Already purged.
+            let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = PurgeOp::prepare(&ks, &id, reply)? else {
+                    return Ok(None);
+                };
+                writer.submit_job(op.into());
+                Ok(Some(rx))
+            })
+            .await??;
+
+            let Some(reply_rx) = reply_rx else {
+                return Ok(false); // Already purged.
             };
-
-            let job: Job = rmp_serde::from_slice(&job_bytes)?;
-            let status = JobStatus::try_from(job.status).map_err(|v| {
-                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
-            })?;
-
-            let del = prepare_job_deletion(&job, status, &ks);
-
-            // ---- inside tx (writes only) ----
-            let mut tx = ks.write_tx();
-            apply_job_deletion(&mut tx, &del, &ks);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // Remove from in-memory indexes based on the job's status.
-            match status {
-                JobStatus::Ready => {
-                    dispatch.remove(Placement::of(&job));
-                }
-                JobStatus::Scheduled => {
-                    scheduled_index.remove(job.ready_at, &id);
-                }
-                JobStatus::InFlight => {
-                    in_flight_index.remove(job.dequeued_at.unwrap_or(0), &id);
-                    // Only an in-flight job is holding capacity. A ready
-                    // or scheduled one was never dispatched, so it has
-                    // no slot to give back and crediting one would
-                    // invent capacity out of nothing.
-                    dispatch.release_concurrency(&job.budgets);
-                }
-                _ => {}
+            let outcome = reply_rx
+                .await
+                .map_err(|_| StoreError::Internal("writer channel closed".into()))??;
+            match outcome {
+                JobOutcome::Done(()) => return Ok(true),
+                JobOutcome::Conflict => continue,
             }
-
-            // Only a job that was still unfinished is still counted. One
-            // deleted after completing or dying stopped counting when it
-            // got there, and untracking it again would take the budget
-            // below the work it actually holds — which reads as capacity
-            // that is not there.
-            if !status.is_terminal() {
-                dispatch.untrack(&job.budgets);
-            }
-
-            Ok(true)
-        })
-        .await??;
-
-        Ok(result)
+        }
     }
 
     /// Delete a job by ID via the API.
@@ -107,218 +80,74 @@ impl Store {
 
     /// Bulk-delete jobs matching the given filters.
     ///
-    /// Acquires the write lock, scans matching jobs under a consistent
-    /// snapshot, deletes each one, and commits in a single transaction.
-    /// Returns the count of deleted jobs.
+    /// Scans matching jobs and deletes each one in a single transaction,
+    /// in a writer pass of its own. Returns the count of deleted jobs.
     ///
     /// Emits `StoreEvent::JobDeleted` for each deleted job.
     pub async fn delete_jobs(&self, opts: BulkDeleteOptions) -> Result<usize, StoreError> {
-        let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let in_flight_index = self.in_flight_index.clone();
-        let event_tx = self.event_tx.clone();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = BulkDeleteOp {
+            opts,
+            deleted: Vec::new(),
+            reply,
+        };
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || writer.submit_job(op.into())).await?;
 
-        let deleted_ids = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // Acquire the write lock first, then open a snapshot.
-            // The snapshot sees the latest committed state, and since we
-            // hold the writer lock, nothing can commit while we scan + delete.
-            let mut tx = ks.write_tx();
-            let snapshot = ks.db.read_tx();
-
-            let needs_payload = filter_needs_payload(&opts.filter);
-
-            // Build the job stream: filtered by indexes, or full scan.
-            // Then apply range and payload filters as post-hydration checks.
-            let jobs =
-                match build_id_stream(&snapshot, &ks, &opts.filter, &None, ScanDirection::Asc) {
-                    Some((id_stream, source, _)) => apply_filters(
-                        JobStream::by_id(
-                            id_stream,
-                            &snapshot,
-                            &ks.data,
-                            None, // no expiry filtering for deletion
-                            needs_payload,
-                            source,
-                        ),
-                        &opts.filter,
-                    ),
-                    None => apply_filters(
-                        JobStream::full_scan(
-                            &snapshot,
-                            &ks,
-                            &None,
-                            ScanDirection::Asc,
-                            None,
-                            needs_payload,
-                        ),
-                        &opts.filter,
-                    ),
-                };
-
-            // Track deleted jobs for post-commit cleanup.
-            struct Deleted {
-                id: String,
-                queue: String,
-                status: JobStatus,
-                priority: u16,
-                ready_at: u64,
-                dequeued_at: u64,
-                /// Carried from the pre-read so the post-commit index
-                /// cleanup can describe the job's placement without
-                /// reading it again.
-                budgets: Vec<BudgetRef>,
+        let deleted = match rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(deleted) => deleted,
+            JobOutcome::Conflict => {
+                return Err(StoreError::Internal(
+                    "bulk delete reported a conflict".into(),
+                ));
             }
-
-            let mut deleted: Vec<Deleted> = Vec::new();
-
-            for result in jobs {
-                let job = result?;
-                let status = JobStatus::try_from(job.status).map_err(|v| {
-                    StoreError::Corruption(format!(
-                        "job {} has unrecognized status byte: {v}",
-                        job.id
-                    ))
-                })?;
-
-                let del = prepare_job_deletion(&job, status, &ks);
-                apply_job_deletion(&mut tx, &del, &ks);
-
-                deleted.push(Deleted {
-                    id: job.id,
-                    queue: job.queue,
-                    status,
-                    priority: job.priority,
-                    ready_at: job.ready_at,
-                    dequeued_at: job.dequeued_at.unwrap_or(0),
-                    budgets: job.budgets,
-                });
-            }
-
-            if deleted.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // Post-commit: clean up in-memory indexes.
-            for d in &deleted {
-                match d.status {
-                    JobStatus::Ready => {
-                        dispatch.remove(Placement {
-                            queue: &d.queue,
-                            priority: d.priority,
-                            id: &d.id,
-                            budgets: &d.budgets,
-                        });
-                    }
-                    JobStatus::Scheduled => {
-                        scheduled_index.remove(d.ready_at, &d.id);
-                    }
-                    JobStatus::InFlight => {
-                        in_flight_index.remove(d.dequeued_at, &d.id);
-                        // See `purge_job`: only in-flight holds capacity.
-                        dispatch.release_concurrency(&d.budgets);
-                    }
-                    _ => {}
-                }
-
-                // See `purge_job`: terminal jobs are already uncounted.
-                if !d.status.is_terminal() {
-                    dispatch.untrack(&d.budgets);
-                }
-            }
-
-            let deleted_ids: Vec<String> = deleted.into_iter().map(|d| d.id).collect();
-            Ok(deleted_ids)
-        })
-        .await??;
-
-        for id in &deleted_ids {
-            let _ = event_tx.send(StoreEvent::JobDeleted { id: id.clone() });
-        }
+        };
 
         // Force a full compaction when we've written enough tombstones that
         // leveled compaction would otherwise leave them sitting in upper
         // levels on a quiet database.
         let threshold = self.config.auto_compact_threshold;
-        if threshold > 0 && deleted_ids.len() as u64 >= threshold {
+        if threshold > 0 && deleted as u64 >= threshold {
             self.compact_all().await?;
         }
 
-        Ok(deleted_ids.len())
+        Ok(deleted)
     }
 
     /// Hard-delete a batch of jobs in a single transaction (no events).
     ///
-    /// Opens one write transaction, deletes all found jobs, and commits once.
-    /// Returns the count of actually deleted jobs. Missing jobs are silently
-    /// skipped.
+    /// Used by the reaper. Returns the count of actually deleted jobs.
+    /// Missing jobs are silently skipped, as are jobs that changed after
+    /// they were read: a job still expired is reaped on the next scan.
     pub async fn purge_batch(&self, ids: &[String]) -> Result<usize, StoreError> {
         let ks = self.ks.clone();
-        let dispatch = self.dispatch.clone();
+        let writer = self.writer.clone();
         let ids = ids.to_vec();
 
-        let result = task::spawn_blocking(move || -> Result<_, StoreError> {
-            // ---- outside tx: prepare all deletions ----
-            let mut deletions: Vec<(JobDeletion, String, u16, Vec<BudgetRef>)> = Vec::new();
-
-            for id in &ids {
-                let job_key = make_job_key(id);
-                let job_bytes = match ks.data.get(&job_key)? {
-                    Some(bytes) => bytes,
-                    None => continue, // Already purged.
-                };
-
-                let job: Job = rmp_serde::from_slice(&job_bytes)?;
-                let status = JobStatus::try_from(job.status).map_err(|v| {
-                    StoreError::Corruption(format!(
-                        "job {} has unrecognized status byte: {v}",
-                        job.id
-                    ))
-                })?;
-
-                let priority = job.priority;
-                let queue = job.queue.clone();
-                deletions.push((
-                    prepare_job_deletion(&job, status, &ks),
-                    queue,
-                    priority,
-                    job.budgets,
-                ));
+        let reply_rx = task::spawn_blocking(move || -> Result<_, StoreError> {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let op = ReapOp::prepare(&ks, &ids, reply)?;
+            if op.reaps.is_empty() {
+                return Ok(None);
             }
-
-            // ---- inside tx (writes only) ----
-            let count = deletions.len();
-            let mut tx = ks.write_tx();
-            for (del, _, _, _) in &deletions {
-                apply_job_deletion(&mut tx, del, &ks);
-            }
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // Defensive: remove from dispatch in case of inconsistency.
-            //
-            // Deliberately no `untrack` to match it. The reaper only
-            // reaches jobs past their retention, which means they went
-            // terminal — and stopped counting against their budgets —
-            // some time ago. Untracking defensively here would
-            // double-decrement every reaped job, and unlike a stray
-            // dispatch entry, an under-count is not self-correcting: it
-            // reads as capacity the budget does not have.
-            for (del, queue, priority, budgets) in deletions {
-                dispatch.remove(Placement {
-                    queue: &queue,
-                    priority,
-                    id: &del.id,
-                    budgets: &budgets,
-                });
-            }
-
-            Ok(count)
+            writer.submit_job(op.into());
+            Ok(Some(rx))
         })
         .await??;
 
-        Ok(result)
+        let Some(reply_rx) = reply_rx else {
+            return Ok(0);
+        };
+        match reply_rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(count) => Ok(count),
+            JobOutcome::Conflict => Err(StoreError::Internal("reaping reported a conflict".into())),
+        }
     }
 }
 
@@ -395,6 +224,351 @@ pub(super) fn apply_job_deletion(
     }
 }
 
+/// A hard delete of one job, prepared by its caller.
+pub(in crate::store) struct PurgeOp {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    job: Job,
+    status: JobStatus,
+    del: JobDeletion,
+    reply: JobReply<()>,
+}
+
+impl PurgeOp {
+    /// Pre-read the job and gather every key it has. `None` if it is
+    /// already gone.
+    fn prepare(ks: &Keyspaces, id: &str, reply: JobReply<()>) -> Result<Option<Self>, StoreError> {
+        let job_key = make_job_key(id);
+        let Some(pre_bytes) = ks.data.get(&job_key)? else {
+            return Ok(None);
+        };
+
+        let job: Job = rmp_serde::from_slice(&pre_bytes)?;
+        let status = JobStatus::try_from(job.status).map_err(|v| {
+            StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+        })?;
+        let del = prepare_job_deletion(&job, status, ks);
+
+        Ok(Some(Self {
+            job_key,
+            pre_bytes,
+            job,
+            status,
+            del,
+            reply,
+        }))
+    }
+}
+
+impl JobWrite for PurgeOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        if tx.get(&ks.data, &self.job_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(Applied::Conflict);
+        }
+
+        apply_job_deletion(tx, &self.del, ks);
+        Ok(Applied::Wrote)
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let job = &self.job;
+
+        // Remove from in-memory indexes based on the job's status.
+        match self.status {
+            JobStatus::Ready => {
+                cx.dispatch.remove(Placement::of(job));
+            }
+            JobStatus::Scheduled => {
+                cx.scheduled_index.remove(job.ready_at, &job.id);
+            }
+            JobStatus::InFlight => {
+                cx.in_flight_index
+                    .remove(job.dequeued_at.unwrap_or(0), &job.id);
+                // Only an in-flight job is holding capacity. A ready or
+                // scheduled one was never dispatched, so it has no slot
+                // to give back and crediting one would invent capacity
+                // out of nothing.
+                cx.dispatch.release_concurrency(&job.budgets);
+            }
+            _ => {}
+        }
+
+        // Only a job that was still unfinished is still counted. One
+        // deleted after completing or dying stopped counting when it got
+        // there, and untracking it again would take the budget below the
+        // work it actually holds — which reads as capacity that is not
+        // there.
+        if !self.status.is_terminal() {
+            cx.dispatch.untrack(&job.budgets);
+        }
+
+        let _ = self.reply.send(Ok(JobOutcome::Done(())));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
+/// A delete of every job a filter matches, all or nothing.
+///
+/// Exclusive: it runs in a pass of its own, so the scan sees exactly the
+/// state its writes go into, with nothing earlier in the transaction
+/// hidden from it.
+pub(in crate::store) struct BulkDeleteOp {
+    opts: BulkDeleteOptions,
+    /// Filled in by `apply`, for `finish`.
+    deleted: Vec<Deleted>,
+    reply: JobReply<usize>,
+}
+
+/// What `finish` needs of a deleted job, read during the scan so it never
+/// reads the job again.
+struct Deleted {
+    id: String,
+    queue: String,
+    status: JobStatus,
+    priority: u16,
+    ready_at: u64,
+    dequeued_at: u64,
+    budgets: Vec<BudgetRef>,
+}
+
+impl JobWrite for BulkDeleteOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        self.deleted.clear();
+        let snapshot = ks.db.read_tx();
+        let filter = &self.opts.filter;
+        let needs_payload = filter_needs_payload(filter);
+
+        // Build the job stream: filtered by indexes, or full scan. Then
+        // apply range and payload filters as post-hydration checks.
+        let jobs = match build_id_stream(&snapshot, ks, filter, &None, ScanDirection::Asc) {
+            Some((id_stream, source, _)) => apply_filters(
+                JobStream::by_id(
+                    id_stream,
+                    &snapshot,
+                    &ks.data,
+                    None, // no expiry filtering for deletion
+                    needs_payload,
+                    source,
+                ),
+                filter,
+            ),
+            None => apply_filters(
+                JobStream::full_scan(
+                    &snapshot,
+                    ks,
+                    &None,
+                    ScanDirection::Asc,
+                    None,
+                    needs_payload,
+                ),
+                filter,
+            ),
+        };
+
+        for result in jobs {
+            let job = result?;
+            let status = JobStatus::try_from(job.status).map_err(|v| {
+                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+            })?;
+
+            let del = prepare_job_deletion(&job, status, ks);
+            apply_job_deletion(tx, &del, ks);
+
+            self.deleted.push(Deleted {
+                id: job.id,
+                queue: job.queue,
+                status,
+                priority: job.priority,
+                ready_at: job.ready_at,
+                dequeued_at: job.dequeued_at.unwrap_or(0),
+                budgets: job.budgets,
+            });
+        }
+
+        Ok(if self.deleted.is_empty() {
+            Applied::Nothing
+        } else {
+            Applied::Wrote
+        })
+    }
+
+    fn exclusive(&self) -> bool {
+        true
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        for d in &self.deleted {
+            match d.status {
+                JobStatus::Ready => {
+                    cx.dispatch.remove(Placement {
+                        queue: &d.queue,
+                        priority: d.priority,
+                        id: &d.id,
+                        budgets: &d.budgets,
+                    });
+                }
+                JobStatus::Scheduled => {
+                    cx.scheduled_index.remove(d.ready_at, &d.id);
+                }
+                JobStatus::InFlight => {
+                    cx.in_flight_index.remove(d.dequeued_at, &d.id);
+                    // See `PurgeOp`: only in-flight holds capacity.
+                    cx.dispatch.release_concurrency(&d.budgets);
+                }
+                _ => {}
+            }
+
+            // See `PurgeOp`: terminal jobs are already uncounted.
+            if !d.status.is_terminal() {
+                cx.dispatch.untrack(&d.budgets);
+            }
+        }
+
+        for d in &self.deleted {
+            let _ = cx
+                .event_tx
+                .send(StoreEvent::JobDeleted { id: d.id.clone() });
+        }
+        let _ = self.reply.send(Ok(JobOutcome::Done(self.deleted.len())));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
+/// The reaper's hard delete of a batch of expired jobs, prepared by its
+/// caller. Each job is checked on its own: one that changed since it was
+/// read is left for a later scan, and the rest are still reaped.
+pub(in crate::store) struct ReapOp {
+    reaps: Vec<Reap>,
+    /// Per job, once applied: whether it was deleted.
+    deleted: Vec<bool>,
+    reply: JobReply<usize>,
+}
+
+struct Reap {
+    job_key: Vec<u8>,
+    pre_bytes: Slice,
+    del: JobDeletion,
+    queue: String,
+    priority: u16,
+    budgets: Vec<BudgetRef>,
+}
+
+impl ReapOp {
+    /// Pre-read every job still there and gather its keys.
+    fn prepare(ks: &Keyspaces, ids: &[String], reply: JobReply<usize>) -> Result<Self, StoreError> {
+        let mut reaps = Vec::with_capacity(ids.len());
+        for id in ids {
+            let job_key = make_job_key(id);
+            let Some(pre_bytes) = ks.data.get(&job_key)? else {
+                continue; // Already purged.
+            };
+
+            let job: Job = rmp_serde::from_slice(&pre_bytes)?;
+            let status = JobStatus::try_from(job.status).map_err(|v| {
+                StoreError::Corruption(format!("job {} has unrecognized status byte: {v}", job.id))
+            })?;
+
+            reaps.push(Reap {
+                job_key,
+                pre_bytes,
+                del: prepare_job_deletion(&job, status, ks),
+                queue: job.queue,
+                priority: job.priority,
+                budgets: job.budgets,
+            });
+        }
+        Ok(Self {
+            reaps,
+            deleted: Vec::new(),
+            reply,
+        })
+    }
+}
+
+impl JobWrite for ReapOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        self.deleted.clear();
+        for reap in &self.reaps {
+            let unchanged = tx.get(&ks.data, &reap.job_key)?.as_deref() == Some(&*reap.pre_bytes);
+            if unchanged {
+                apply_job_deletion(tx, &reap.del, ks);
+            }
+            self.deleted.push(unchanged);
+        }
+
+        Ok(if self.deleted.contains(&true) {
+            Applied::Wrote
+        } else {
+            Applied::Nothing
+        })
+    }
+
+    fn jobs(&self) -> usize {
+        self.reaps.len()
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let mut count = 0;
+        for (reap, deleted) in self.reaps.iter().zip(&self.deleted) {
+            if !deleted {
+                continue;
+            }
+            count += 1;
+
+            // Defensive: remove from dispatch in case of inconsistency.
+            //
+            // Deliberately no `untrack` to match it. The reaper only
+            // reaches jobs past their retention, which means they went
+            // terminal — and stopped counting against their budgets —
+            // some time ago. Untracking defensively here would
+            // double-decrement every reaped job, and unlike a stray
+            // dispatch entry, an under-count is not self-correcting: it
+            // reads as capacity the budget does not have.
+            cx.dispatch.remove(Placement {
+                queue: &reap.queue,
+                priority: reap.priority,
+                id: &reap.del.id,
+                budgets: &reap.budgets,
+            });
+        }
+        let _ = self.reply.send(Ok(JobOutcome::Done(count)));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -403,12 +577,91 @@ mod tests {
     use crate::filter::PayloadFilter;
 
     use super::super::budget::{BudgetBinding, BudgetStrategy};
+    use super::super::keys::{make_job_key, make_status_key};
     use super::super::options::{BulkDeleteOptions, EnqueueOptions, ListJobsOptions};
     use super::super::storage_config::StorageConfig;
     use super::super::store::{Store, StoreEvent};
-    use super::super::test_support::{enqueue_and_take, test_store, test_store_with_retention};
+    use super::super::test_support::{
+        enqueue_and_take, run_job_ops, test_store, test_store_with_retention,
+    };
     use super::super::types::JobStatus;
+    use super::super::writer::JobOutcome;
     use crate::time::now_millis;
+
+    /// The reaper skips a job that changed since it read it, leaving it
+    /// for a later scan, and still reaps the rest of the batch.
+    #[tokio::test]
+    async fn the_reaper_skips_a_job_changed_since_it_was_read() {
+        let store = test_store();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let job = store
+                .enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("t", "q", serde_json::json!(i)),
+                )
+                .await
+                .unwrap()
+                .into_job();
+            ids.push(job.id);
+        }
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = super::ReapOp::prepare(&store.ks, &ids, reply).unwrap();
+
+        let ks = store.ks.clone();
+        let key = make_job_key(&ids[1]);
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            tx.insert(&ks.data, key, b"changed");
+            ks.commit(tx, ks.default_commit_mode).unwrap();
+        })
+        .await
+        .unwrap();
+
+        run_job_ops(&store, vec![op.into()]).await;
+        assert_eq!(rx.await.unwrap().unwrap(), JobOutcome::Done(1));
+        assert!(store.ks.data.get(make_job_key(&ids[0])).unwrap().is_none());
+        assert!(store.ks.data.get(make_job_key(&ids[1])).unwrap().is_some());
+    }
+
+    /// A delete prepared while a job is ready, of a job then taken, is
+    /// told to retry. Written regardless, it would remove the ready
+    /// status key the job no longer has and leave its in-flight one
+    /// behind, listing a job that doesn't exist.
+    #[tokio::test]
+    async fn a_delete_of_a_job_taken_since_its_pre_read_conflicts() {
+        let store = test_store();
+        let id = store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("t", "q", serde_json::json!(null)),
+            )
+            .await
+            .unwrap()
+            .into_job()
+            .id;
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = super::PurgeOp::prepare(&store.ks, &id, reply)
+            .unwrap()
+            .unwrap();
+
+        store
+            .take_next_job(now_millis(), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        run_job_ops(&store, vec![op.into()]).await;
+        assert_eq!(rx.await.unwrap().unwrap(), JobOutcome::Conflict);
+
+        assert!(store.delete_job(&id).await.unwrap());
+        for status in [JobStatus::Ready, JobStatus::InFlight] {
+            let key = make_status_key(status, &id);
+            assert!(store.ks.index.get(key).unwrap().is_none());
+        }
+        assert_eq!(store.in_flight_count(), 0);
+    }
 
     /// Enqueue a job drawing `cost` from a budget created for the test.
     async fn budgeted(store: &Store, cost: u32) -> String {

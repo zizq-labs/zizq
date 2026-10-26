@@ -9,23 +9,26 @@
 
 use std::collections::HashSet;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use fjall::{Readable, Slice};
 use tokio::task;
 
 use super::super::budget::{
-    Budget, BudgetPlan, plan_budgets, stage_budgets, sync_created_budgets, unstage_budgets,
-    write_created_budgets,
+    Budget, BudgetPlan, Budgets, plan_budgets, stage_budgets, sync_created_budgets,
+    unstage_budgets, write_created_budgets,
 };
 use super::super::enqueue::{
-    apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue, validate_batch_config,
+    PreparedEnqueue, apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue,
+    validate_batch_config,
 };
 use super::super::keys::RecordKind;
 use super::super::options::{CronEntryOptions, PatchCronGroupOptions, ReplaceCronGroupOptions};
 use super::super::results::EnqueueResult;
 use super::super::store::{Keyspaces, Store, StoreEvent};
-use super::super::types::StoreError;
-use super::{CronEntry, CronGroup};
+use super::super::types::{Job, StoreError};
+use super::super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
+use super::{CronEntry, CronGroup, CronScheduleIndex};
 
 impl Store {
     /// Replace all entries in a cron group.
@@ -42,185 +45,27 @@ impl Store {
         opts: ReplaceCronGroupOptions,
         now: u64,
     ) -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
-        let group_paused = opts.paused;
-        let group_timezone = opts.timezone;
-        let entries = opts.entries;
-
-        task::spawn_blocking(move || -> Result<(CronGroup, Vec<CronEntry>), StoreError> {
-            let group_key = make_cron_group_key(&group);
-            let prefix = make_cron_group_prefix(&group);
-
-            // Validate the group timezone even when no entry inherits it —
-            // otherwise it would be stored unchecked and only fail later.
-            validate_timezone(group_timezone.as_deref())?;
-
-            // Validate all cron expressions and batch configs before
-            // acquiring the write lock. The group timezone comes from the
-            // request, so no read is needed to resolve each entry's
-            // effective timezone.
-            let mut computed_next: Vec<Option<u64>> = Vec::with_capacity(entries.len());
-            for input in &entries {
-                // Validates the expression; None means no future occurrences.
-                let tz = input.timezone.as_deref().or(group_timezone.as_deref());
-                let next = cron_next_after(&input.expression, now, tz)?;
-                computed_next.push(next);
-
-                if let Some(ref cfg) = input.job.batch {
-                    validate_batch_config(cfg, &input.job.payload)?;
-                }
+        // Validated before it reaches the writer. The group timezone is
+        // checked even when no entry inherits it, or it would be stored
+        // unchecked and only fail later. It comes from the request, so
+        // each entry's effective timezone resolves without a read.
+        validate_timezone(opts.timezone.as_deref())?;
+        for input in &opts.entries {
+            let tz = input.timezone.as_deref().or(opts.timezone.as_deref());
+            cron_next_after(&input.expression, now, tz)?;
+            if let Some(ref cfg) = input.job.batch {
+                validate_batch_config(cfg, &input.job.payload)?;
             }
+        }
 
-            // Acquire the single-writer lock. All reads within this scope
-            // are consistent — no other writer can modify data.
-            let mut tx = ks.write_tx();
-
-            // Load or create group metadata, applying pause state if
-            // requested. The timezone is applied unconditionally — this is a
-            // full replace, so an absent timezone clears any existing one.
-            let mut old_group_timezone: Option<String> = None;
-
-            let existing_group: CronGroup = match ks.data.get(&group_key)? {
-                Some(bytes) => {
-                    let mut g: CronGroup = rmp_serde::from_slice(&bytes)?;
-                    old_group_timezone = g.timezone.clone();
-
-                    let mut dirty = g.timezone != group_timezone;
-                    g.timezone = group_timezone.clone();
-
-                    if let Some(paused) = group_paused {
-                        if paused != g.paused {
-                            match (g.paused, paused) {
-                                (false, true) => g.paused_at = Some(now),
-                                (true, false) => g.resumed_at = Some(now),
-                                _ => {}
-                            }
-                            g.paused = paused;
-                        }
-                        dirty = true;
-                    }
-
-                    if dirty {
-                        tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&g)?);
-                    }
-                    g
-                }
-                None => {
-                    let g = CronGroup {
-                        paused: group_paused.unwrap_or(false),
-                        paused_at: if group_paused == Some(true) {
-                            Some(now)
-                        } else {
-                            None
-                        },
-                        timezone: group_timezone.clone(),
-                        ..CronGroup::default()
-                    };
-                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&g)?);
-                    g
-                }
-            };
-
-            // Load all existing entries for this group.
-            let mut range_end = prefix.clone();
-            *range_end.last_mut().unwrap() = 1; // \0 -> \1
-
-            let data: &fjall::Keyspace = ks.data.as_ref();
-            let existing_entries: std::collections::HashMap<String, CronEntry> = data
-                .range::<Vec<u8>, _>((Bound::Included(prefix.clone()), Bound::Excluded(range_end)))
-                .skip(1) // skip the group metadata key
-                .map(|guard| {
-                    let (_, value) = guard.into_inner()?;
-                    let entry: CronEntry = rmp_serde::from_slice(&value)?;
-                    Ok((entry.name.clone(), entry))
-                })
-                .collect::<Result<_, StoreError>>()?;
-
-            // Collect input names before consuming entries (needed for
-            // deletion check below).
-            let input_names: std::collections::HashSet<String> =
-                entries.iter().map(|e| e.name.clone()).collect();
-
-            // Build the new entries with smart merge logic.
-            let new_entries: Vec<CronEntry> = entries
-                .into_iter()
-                .zip(computed_next)
-                .map(|(input, computed)| {
-                    let existing = existing_entries.get(&input.name);
-                    merge_cron_entry(
-                        input,
-                        existing,
-                        computed,
-                        now,
-                        old_group_timezone.as_deref(),
-                        group_timezone.as_deref(),
-                    )
-                })
-                .collect();
-
-            // Delete removed entries (present in existing but not in input).
-            for (name, _) in &existing_entries {
-                if !input_names.contains(name) {
-                    tx.remove(&ks.data, &make_cron_entry_key(&group, name));
-                }
-            }
-
-            let created_budgets: Vec<(String, Budget)>;
-
-            // Resolve every entry's budgets, creating any the templates
-            // ask for. Done at install rather than at first firing so
-            // that an entry accepted into a schedule is guaranteed to
-            // be fireable: deferring creation would leave a window in
-            // which the server reaches its budget cap and the entry can
-            // never run.
-            match plan_budgets(
-                &tx,
-                &ks,
-                new_entries.iter().flat_map(|e| e.job.budgets.iter()),
-                now,
-            )? {
-                BudgetPlan::Proceed(planned) => {
-                    write_created_budgets(&mut tx, &ks, &planned)?;
-                    created_budgets = planned;
-                }
-                BudgetPlan::Reject(e) => return Err(e),
-            }
-
-            // Write new/updated entries.
-            for entry in &new_entries {
-                let entry_key = make_cron_entry_key(&group, &entry.name);
-                let entry_bytes = rmp_serde::to_vec_named(entry)?;
-                tx.insert(&ks.data, &entry_key, &entry_bytes);
-            }
-
-            ks.commit(tx, ks.default_commit_mode)?;
-            sync_created_budgets(&live, &created_budgets, now);
-
-            // ---- outside tx: update in-memory cron index ----
-
-            // Remove all old entries from the index.
-            for (name, old_entry) in &existing_entries {
-                if let Some(next) = old_entry.next_enqueue_at {
-                    cron_index.remove(next, &group, name);
-                }
-            }
-
-            // Insert all new entries into the index.
-            for entry in &new_entries {
-                if let Some(next) = entry.next_enqueue_at {
-                    cron_index.insert(next, group.clone(), entry.name.clone());
-                }
-            }
-
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-
-            Ok((existing_group, new_entries))
-        })
-        .await?
+        let change = CronChange::ReplaceGroup {
+            group: group.to_string(),
+            opts,
+        };
+        match self.write_cron(change, now).await? {
+            CronWritten::Group(group, entries) => Ok((group, entries)),
+            _ => Err(StoreError::Internal("cron replace wrote no group".into())),
+        }
     }
 
     /// List all cron group names.
@@ -330,85 +175,19 @@ impl Store {
         opts: CronEntryOptions,
         now: u64,
     ) -> Result<CronEntry, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
-
-        task::spawn_blocking(move || -> Result<CronEntry, StoreError> {
-            // Validate the batch config before acquiring the write lock. The
-            // expression cannot be checked yet — resolving the entry's
-            // effective timezone needs the group, which must be read under
-            // the lock so a concurrent group patch cannot slip in between.
-            if let Some(ref cfg) = opts.job.batch {
-                validate_batch_config(cfg, &opts.job.payload)?;
-            }
-
-            let group_key = make_cron_group_key(&group);
-            let entry_key = make_cron_entry_key(&group, &opts.name);
-
-            let mut tx = ks.write_tx();
-
-            // Load or create group metadata.
-            let group_meta: CronGroup = match ks.data.get(&group_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => {
-                    let group_meta = CronGroup::default();
-                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group_meta)?);
-                    group_meta
-                }
-            };
-
-            // Validates the expression; None means no future occurrences.
-            let tz = opts.timezone.as_deref().or(group_meta.timezone.as_deref());
-            let next_enqueue_at = cron_next_after(&opts.expression, now, tz)?;
-
-            // Check for conflict.
-            if ks.data.get(&entry_key)?.is_some() {
-                return Err(StoreError::Conflict(format!(
-                    "cron entry '{}' already exists in group '{}'",
-                    opts.name, group
-                )));
-            }
-
-            let entry = CronEntry {
-                name: opts.name,
-                expression: opts.expression,
-                timezone: opts.timezone,
-                paused: opts.paused.unwrap_or(false),
-                paused_at: None,
-                resumed_at: None,
-                job: opts.job,
-                next_enqueue_at,
-                last_enqueue_at: None,
-            };
-
-            let created_budgets: Vec<(String, Budget)>;
-
-            match plan_budgets(&tx, &ks, entry.job.budgets.iter(), now)? {
-                BudgetPlan::Proceed(planned) => {
-                    write_created_budgets(&mut tx, &ks, &planned)?;
-                    created_budgets = planned;
-                }
-                BudgetPlan::Reject(e) => return Err(e),
-            }
-
-            tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
-
-            ks.commit(tx, ks.default_commit_mode)?;
-            sync_created_budgets(&live, &created_budgets, now);
-
-            // ---- outside tx: update in-memory cron index ----
-            if let Some(next) = entry.next_enqueue_at {
-                cron_index.insert(next, group.clone(), entry.name.clone());
-            }
-
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-
-            Ok(entry)
-        })
-        .await?
+        // The expression can't be checked yet: resolving the entry's
+        // effective timezone needs the group, read in the writer's pass.
+        if let Some(ref cfg) = opts.job.batch {
+            validate_batch_config(cfg, &opts.job.payload)?;
+        }
+        let change = CronChange::AddEntry {
+            group: group.to_string(),
+            opts,
+        };
+        match self.write_cron(change, now).await? {
+            CronWritten::Entry(entry) => Ok(entry),
+            _ => Err(StoreError::Internal("cron add wrote no entry".into())),
+        }
     }
 
     /// Create or replace a single entry in a cron group.
@@ -423,84 +202,17 @@ impl Store {
         opts: CronEntryOptions,
         now: u64,
     ) -> Result<CronEntry, StoreError> {
-        let ks = self.ks.clone();
-        let live = self.budgets.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
-
-        task::spawn_blocking(move || -> Result<CronEntry, StoreError> {
-            if let Some(ref cfg) = opts.job.batch {
-                validate_batch_config(cfg, &opts.job.payload)?;
-            }
-
-            let group_key = make_cron_group_key(&group);
-            let entry_key = make_cron_entry_key(&group, &opts.name);
-
-            let mut tx = ks.write_tx();
-
-            // Load or create group metadata. The group's timezone is needed
-            // to resolve the entry's effective timezone, so it is read under
-            // the write lock rather than before it.
-            let group_meta: CronGroup = match ks.data.get(&group_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => {
-                    let group_meta = CronGroup::default();
-                    tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group_meta)?);
-                    group_meta
-                }
-            };
-
-            let tz = opts.timezone.as_deref().or(group_meta.timezone.as_deref());
-            let next_enqueue_at = cron_next_after(&opts.expression, now, tz)?;
-
-            // Load existing entry for smart merge.
-            let old_entry: Option<CronEntry> = match ks.data.get(&entry_key)? {
-                Some(bytes) => Some(rmp_serde::from_slice(&bytes)?),
-                None => None,
-            };
-
-            // The group timezone is unchanged by this call, so the entry's
-            // old and new effective timezones resolve against the same group.
-            let entry = merge_cron_entry(
-                opts,
-                old_entry.as_ref(),
-                next_enqueue_at,
-                now,
-                group_meta.timezone.as_deref(),
-                group_meta.timezone.as_deref(),
-            );
-
-            let created_budgets: Vec<(String, Budget)>;
-
-            match plan_budgets(&tx, &ks, entry.job.budgets.iter(), now)? {
-                BudgetPlan::Proceed(planned) => {
-                    write_created_budgets(&mut tx, &ks, &planned)?;
-                    created_budgets = planned;
-                }
-                BudgetPlan::Reject(e) => return Err(e),
-            }
-
-            tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
-
-            ks.commit(tx, ks.default_commit_mode)?;
-            sync_created_budgets(&live, &created_budgets, now);
-
-            // ---- outside tx: update in-memory cron index ----
-            if let Some(old) = &old_entry {
-                if let Some(next) = old.next_enqueue_at {
-                    cron_index.remove(next, &group, &entry.name);
-                }
-            }
-            if let Some(next) = entry.next_enqueue_at {
-                cron_index.insert(next, group.clone(), entry.name.clone());
-            }
-
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-
-            Ok(entry)
-        })
-        .await?
+        if let Some(ref cfg) = opts.job.batch {
+            validate_batch_config(cfg, &opts.job.payload)?;
+        }
+        let change = CronChange::PutEntry {
+            group: group.to_string(),
+            opts,
+        };
+        match self.write_cron(change, now).await? {
+            CronWritten::Entry(entry) => Ok(entry),
+            _ => Err(StoreError::Internal("cron put wrote no entry".into())),
+        }
     }
 
     /// Rewrite a stored entry's expression, bypassing validation.
@@ -516,32 +228,14 @@ impl Store {
         entry_name: &str,
         expression: &str,
     ) -> Result<(), StoreError> {
-        let ks = self.ks.clone();
-        let group = group.to_string();
-        let entry_name = entry_name.to_string();
-        let expression = expression.to_string();
-
-        task::spawn_blocking(move || -> Result<(), StoreError> {
-            let entry_key = make_cron_entry_key(&group, &entry_name);
-
-            let mut entry: CronEntry = match ks.data.get(&entry_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => {
-                    return Err(StoreError::InvalidOperation(format!(
-                        "no such cron entry: {group}/{entry_name}"
-                    )));
-                }
-            };
-
-            entry.expression = expression;
-
-            let mut tx = ks.write_tx();
-            tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            Ok(())
-        })
-        .await?
+        let change = CronChange::SetExpressionUnvalidated {
+            group: group.to_string(),
+            name: entry_name.to_string(),
+            expression: expression.to_string(),
+        };
+        self.write_cron(change, crate::time::now_millis())
+            .await
+            .map(|_| ())
     }
 
     /// Update a single cron entry's pause state.
@@ -555,42 +249,15 @@ impl Store {
         paused: bool,
         now: u64,
     ) -> Result<Option<CronEntry>, StoreError> {
-        let ks = self.ks.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
-        let entry_name = entry_name.to_string();
-
-        task::spawn_blocking(move || -> Result<Option<CronEntry>, StoreError> {
-            let group_key = make_cron_group_key(&group);
-            let entry_key = make_cron_entry_key(&group, &entry_name);
-
-            // Check group exists.
-            if ks.data.get(&group_key)?.is_none() {
-                return Ok(None);
-            }
-
-            let mut tx = ks.write_tx();
-
-            let mut entry: CronEntry = match ks.data.get(&entry_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => return Ok(None),
-            };
-
-            if paused != entry.paused {
-                match (entry.paused, paused) {
-                    (false, true) => entry.paused_at = Some(now),
-                    (true, false) => entry.resumed_at = Some(now),
-                    _ => {}
-                }
-                entry.paused = paused;
-                tx.insert(&ks.data, &entry_key, &rmp_serde::to_vec_named(&entry)?);
-                ks.commit(tx, ks.default_commit_mode)?;
-                let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-            }
-
-            Ok(Some(entry))
-        })
-        .await?
+        let change = CronChange::PatchEntry {
+            group: group.to_string(),
+            name: entry_name.to_string(),
+            paused,
+        };
+        match self.write_cron(change, now).await? {
+            CronWritten::MaybeEntry(entry) => Ok(entry),
+            _ => Err(StoreError::Internal("cron patch wrote no entry".into())),
+        }
     }
 
     /// Delete a single entry from a cron group.
@@ -602,41 +269,15 @@ impl Store {
         group: &str,
         entry_name: &str,
     ) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
-        let entry_name = entry_name.to_string();
-
-        task::spawn_blocking(move || -> Result<bool, StoreError> {
-            let group_key = make_cron_group_key(&group);
-            let entry_key = make_cron_entry_key(&group, &entry_name);
-
-            // Check group exists.
-            if ks.data.get(&group_key)?.is_none() {
-                return Ok(false);
-            }
-
-            // Load entry for index cleanup.
-            let entry: CronEntry = match ks.data.get(&entry_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => return Ok(false),
-            };
-
-            let mut tx = ks.write_tx();
-            tx.remove(&ks.data, &entry_key);
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // ---- outside tx: update in-memory cron index ----
-            if let Some(next) = entry.next_enqueue_at {
-                cron_index.remove(next, &group, &entry_name);
-            }
-
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-
-            Ok(true)
-        })
-        .await?
+        let change = CronChange::DeleteEntry {
+            group: group.to_string(),
+            name: entry_name.to_string(),
+        };
+        let now = crate::time::now_millis();
+        Ok(matches!(
+            self.write_cron(change, now).await?,
+            CronWritten::Deleted(n) if n > 0
+        ))
     }
 
     /// Update group-level metadata (pause state and default timezone).
@@ -653,119 +294,19 @@ impl Store {
         opts: PatchCronGroupOptions,
         now: u64,
     ) -> Result<Option<CronGroup>, StoreError> {
-        let ks = self.ks.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
-
-        task::spawn_blocking(move || -> Result<Option<CronGroup>, StoreError> {
-            let group_key = make_cron_group_key(&group);
-            let prefix = make_cron_group_prefix(&group);
-
-            if let Some(ref tz) = opts.timezone {
-                validate_timezone(tz.as_deref())?;
-            }
-
-            let mut tx = ks.write_tx();
-
-            let mut group_meta: CronGroup = match ks.data.get(&group_key)? {
-                Some(bytes) => rmp_serde::from_slice(&bytes)?,
-                None => return Ok(None),
-            };
-
-            let mut dirty = false;
-
-            if let Some(paused) = opts.paused {
-                if paused != group_meta.paused {
-                    match (group_meta.paused, paused) {
-                        (false, true) => group_meta.paused_at = Some(now),
-                        (true, false) => group_meta.resumed_at = Some(now),
-                        _ => {}
-                    }
-                    group_meta.paused = paused;
-                    dirty = true;
-                }
-            }
-
-            let timezone_changed = match opts.timezone {
-                Some(tz) if tz != group_meta.timezone => {
-                    group_meta.timezone = tz;
-                    dirty = true;
-                    true
-                }
-                _ => false,
-            };
-
-            if !dirty {
-                return Ok(Some(group_meta));
-            }
-
-            tx.insert(&ks.data, &group_key, &rmp_serde::to_vec_named(&group_meta)?);
-
-            // Reschedule entries that inherit the group's timezone. Their
-            // expressions are unchanged, but the wall-clock times those
-            // expressions denote have moved.
-            let mut rescheduled: Vec<(Option<u64>, Option<u64>, String)> = Vec::new();
-
-            if timezone_changed {
-                let mut range_end = prefix.clone();
-                *range_end.last_mut().unwrap() = 1; // \0 -> \1
-
-                let data: &fjall::Keyspace = ks.data.as_ref();
-                let entries: Vec<CronEntry> = data
-                    .range::<Vec<u8>, _>((
-                        Bound::Included(prefix.clone()),
-                        Bound::Excluded(range_end),
-                    ))
-                    .skip(1) // skip the group metadata key
-                    .map(|guard| {
-                        let (_, value) = guard.into_inner()?;
-                        let entry: CronEntry = rmp_serde::from_slice(&value)?;
-                        Ok(entry)
-                    })
-                    .collect::<Result<_, StoreError>>()?;
-
-                for mut entry in entries {
-                    // An entry naming its own timezone ignores the group's.
-                    if entry.timezone.is_some() {
-                        continue;
-                    }
-
-                    let next =
-                        cron_next_after(&entry.expression, now, group_meta.timezone.as_deref())?;
-                    if next == entry.next_enqueue_at {
-                        continue;
-                    }
-
-                    let old_next = entry.next_enqueue_at;
-                    entry.next_enqueue_at = next;
-
-                    tx.insert(
-                        &ks.data,
-                        &make_cron_entry_key(&group, &entry.name),
-                        &rmp_serde::to_vec_named(&entry)?,
-                    );
-                    rescheduled.push((old_next, next, entry.name));
-                }
-            }
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // ---- outside tx: update in-memory cron index ----
-            for (old_next, next, name) in rescheduled {
-                if let Some(old) = old_next {
-                    cron_index.remove(old, &group, &name);
-                }
-                if let Some(next) = next {
-                    cron_index.insert(next, group.clone(), name);
-                }
-            }
-
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-
-            Ok(Some(group_meta))
-        })
-        .await?
+        if let Some(ref tz) = opts.timezone {
+            validate_timezone(tz.as_deref())?;
+        }
+        let change = CronChange::PatchGroup {
+            group: group.to_string(),
+            opts,
+        };
+        match self.write_cron(change, now).await? {
+            CronWritten::MaybeGroup(group) => Ok(group),
+            _ => Err(StoreError::Internal(
+                "cron group patch wrote no group".into(),
+            )),
+        }
     }
 
     /// Delete every cron group and entry in a single transaction.
@@ -774,50 +315,11 @@ impl Store {
     /// `CronScheduleChanged` event regardless of how many groups were
     /// removed.
     pub async fn delete_cron_groups(&self) -> Result<usize, StoreError> {
-        let ks = self.ks.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-
-        let count = task::spawn_blocking(move || -> Result<usize, StoreError> {
-            let data: &fjall::Keyspace = ks.data.as_ref();
-            let start: Vec<u8> = vec![RecordKind::Cron as u8];
-            let end: Vec<u8> = vec![RecordKind::Cron as u8 + 1];
-
-            let mut tx = ks.write_tx();
-            let mut groups_seen: HashSet<Vec<u8>> = HashSet::new();
-
-            for guard in data.range::<Vec<u8>, _>((Bound::Included(start), Bound::Excluded(end))) {
-                let (key, _) = guard.into_inner()?;
-                let key_bytes = key.as_ref();
-
-                // Key layout: C{group}\0... — the group-meta key is C{group}
-                // (no trailing \0). We dedupe by the prefix up to and
-                // including the first \0 (or the whole key for the meta).
-                let group_end = key_bytes[1..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map(|p| 1 + p)
-                    .unwrap_or(key_bytes.len());
-                groups_seen.insert(key_bytes[..group_end].to_vec());
-
-                tx.remove(&ks.data, key_bytes);
-            }
-
-            if groups_seen.is_empty() {
-                return Ok(0);
-            }
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            cron_index.clear();
-
-            Ok(groups_seen.len())
-        })
-        .await??;
-
-        if count > 0 {
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-        }
+        let now = crate::time::now_millis();
+        let count = match self.write_cron(CronChange::DeleteAllGroups, now).await? {
+            CronWritten::Deleted(count) => count,
+            _ => 0,
+        };
 
         // Reclaim tombstone space when the wipe was large enough.
         let threshold = self.config.auto_compact_threshold;
@@ -833,60 +335,40 @@ impl Store {
     /// Returns `true` if the group existed and was deleted, `false` if it
     /// did not exist.
     pub async fn delete_cron_group(&self, group: &str) -> Result<bool, StoreError> {
-        let ks = self.ks.clone();
-        let cron_index = self.cron_index.clone();
-        let event_tx = self.event_tx.clone();
-        let group = group.to_string();
+        let change = CronChange::DeleteGroup {
+            group: group.to_string(),
+        };
+        let now = crate::time::now_millis();
+        Ok(matches!(
+            self.write_cron(change, now).await?,
+            CronWritten::Deleted(n) if n > 0
+        ))
+    }
 
-        task::spawn_blocking(move || -> Result<bool, StoreError> {
-            let group_key = make_cron_group_key(&group);
-            let prefix = make_cron_group_prefix(&group);
+    /// Have the writer apply a change to the cron records, and mirror it
+    /// into the schedule index once durable.
+    async fn write_cron(&self, change: CronChange, now: u64) -> Result<CronWritten, StoreError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = CronOp {
+            change,
+            now,
+            live: self.budgets.clone(),
+            cron_index: self.cron_index.clone(),
+            decided: None,
+            reply,
+        };
+        let writer = self.writer.clone();
+        task::spawn_blocking(move || writer.submit_job(op.into())).await?;
 
-            let mut tx = ks.write_tx();
-
-            // Check if the group exists.
-            if ks.data.get(&group_key)?.is_none() {
-                return Ok(false);
-            }
-
-            // Collect all entry keys and their next_enqueue_at for index cleanup.
-            let mut range_end = prefix.clone();
-            *range_end.last_mut().unwrap() = 1;
-
-            let data: &fjall::Keyspace = ks.data.as_ref();
-            let mut entries_to_remove: Vec<(String, Option<u64>)> = Vec::new();
-
-            for guard in data
-                .range::<Vec<u8>, _>((Bound::Included(prefix.clone()), Bound::Excluded(range_end)))
-            {
-                let (key, value) = guard.into_inner()?;
-                // Remove everything — group metadata and all entries.
-                tx.remove(&ks.data, key.as_ref());
-
-                // Track entry next_enqueue_at for index cleanup (skip group key).
-                if key.len() > prefix.len() {
-                    let entry: CronEntry = rmp_serde::from_slice(&value)?;
-                    entries_to_remove.push((entry.name, entry.next_enqueue_at));
-                }
-            }
-
-            // Remove the group metadata key itself.
-            tx.remove(&ks.data, &group_key);
-
-            ks.commit(tx, ks.default_commit_mode)?;
-
-            // ---- outside tx: update in-memory cron index ----
-            for (entry_name, next) in &entries_to_remove {
-                if let Some(next) = next {
-                    cron_index.remove(*next, &group, entry_name);
-                }
-            }
-
-            let _ = event_tx.send(StoreEvent::CronScheduleChanged);
-
-            Ok(true)
-        })
-        .await?
+        match rx
+            .await
+            .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+        {
+            JobOutcome::Done(written) => Ok(written),
+            JobOutcome::Conflict => Err(StoreError::Internal(
+                "cron write reported a conflict".into(),
+            )),
+        }
     }
 
     /// Load a single cron entry from the store.
@@ -922,10 +404,10 @@ impl Store {
 
     /// Atomically advance a due cron entry's schedule and enqueue its job.
     ///
-    /// Pre-reads the entry and group outside the write tx, then uses
-    /// `fetch_update` to CAS the entry inside the tx. Retries if the
-    /// entry was modified concurrently. Returns early without writing
-    /// if the entry is paused, not actually due, or no longer exists.
+    /// Pre-reads the entry and group, then has the writer check the entry
+    /// is unchanged before advancing it. Retries if the entry was modified
+    /// concurrently. Returns early without writing if the entry is paused,
+    /// not actually due, or no longer exists.
     pub async fn promote_cron_entry(
         &self,
         group: &str,
@@ -933,162 +415,41 @@ impl Store {
         now: u64,
     ) -> Result<Option<CronEntry>, StoreError> {
         let ks = self.ks.clone();
+        let writer = self.writer.clone();
         let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
         let group = group.to_string();
         let entry_name = entry_name.to_string();
 
+        // Prepared on a blocking thread, so the writer only checks and
+        // writes, and the reply is waited for there too: the cron
+        // scheduler holds one blocking thread while its promotion is
+        // written. A changed entry comes back as a conflict: pre-read
+        // again.
         task::spawn_blocking(move || -> Result<Option<CronEntry>, StoreError> {
-            let entry_key = make_cron_entry_key(&group, &entry_name);
-            let group_key = make_cron_group_key(&group);
-
             loop {
-                // ---- outside tx: pre-read ----
-                let pre_bytes = match ks.data.get(&entry_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None), // Entry deleted.
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = CronPromoteOp::prepare(
+                    &ks,
+                    &group,
+                    &entry_name,
+                    now,
+                    live.clone(),
+                    cron_index.clone(),
+                    reply,
+                )?
+                else {
+                    return Ok(None);
                 };
-                let mut entry: CronEntry = rmp_serde::from_slice(&pre_bytes)?;
+                writer.submit_job(Box::new(op).into());
 
-                // Not due: either no future occurrence or not yet due.
-                match entry.next_enqueue_at {
-                    None => return Ok(None),
-                    Some(next) if next > now => return Ok(None),
-                    _ => {}
+                match rx
+                    .blocking_recv()
+                    .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+                {
+                    JobOutcome::Done(entry) => return Ok(Some(entry)),
+                    JobOutcome::Conflict => continue,
                 }
-
-                // Check if group or entry is paused, and pick up the group's
-                // timezone for entries that do not name one.
-                let (group_paused, group_timezone) = match ks.data.get(&group_key)? {
-                    Some(bytes) => {
-                        let g: CronGroup = rmp_serde::from_slice(&bytes)?;
-                        (g.paused, g.timezone)
-                    }
-                    None => (false, None),
-                };
-                let is_paused = group_paused || entry.paused;
-
-                // Compute next occurrence (None if no future occurrences).
-                let tz = entry.timezone.as_deref().or(group_timezone.as_deref());
-                let next = cron_next_after(&entry.expression, now, tz)?;
-
-                // Prepare the job enqueue (unless paused). Pure — the
-                // entry is not mutated until the budget pre-pass below
-                // has said whether this tick actually fires.
-                let prepared = if !is_paused {
-                    Some(prepare_enqueue(entry.job.clone(), now)?)
-                } else {
-                    None
-                };
-
-                // ---- inside tx: CAS + enqueue ----
-                let mut tx = ks.write_tx();
-
-                // Cron fires through `apply_enqueue` directly rather
-                // than the batcher, so it runs the budget pre-pass
-                // itself — otherwise a scheduled job would reference
-                // budgets nobody resolved, and a `create_with` on the
-                // template would never create anything.
-                //
-                // Resolution succeeding is an invariant, not a hope: an
-                // entry is validated before it enters a schedule, and a
-                // budget it references cannot be deleted or shrunk out
-                // from under it. A rejection here therefore means one of
-                // those protections has a hole, which is why it is
-                // logged as an error rather than treated as a normal
-                // outcome.
-                let mut budget_creations: Vec<(String, Budget)> = Vec::new();
-                let mut fires = prepared.is_some();
-
-                if let Some(ref p) = prepared {
-                    match plan_op_budgets(&tx, &ks, std::slice::from_ref(p))? {
-                        BudgetPlan::Proceed(creations) => budget_creations = creations,
-                        BudgetPlan::Reject(e) => {
-                            // Skip the tick rather than failing the
-                            // promotion. Returning an error would
-                            // discard the schedule advance with it,
-                            // leaving the entry perpetually due and the
-                            // scheduler spinning on it — a far worse
-                            // way to surface a bug than a gap and a
-                            // log line.
-                            tracing::error!(
-                                group = %group,
-                                entry = %entry_name,
-                                error = %e,
-                                "cron entry references budgets that no longer resolve — \
-                                 this should be impossible, as entries are validated on \
-                                 install and their budgets protected from deletion and \
-                                 shrinking. Skipping this tick."
-                            );
-                            fires = false;
-                        }
-                    }
-                }
-
-                if fires {
-                    entry.last_enqueue_at = Some(now);
-                }
-
-                // Advance the schedule (time moves forward regardless of
-                // pause, or of a tick that could not fire).
-                let old_next = entry.next_enqueue_at;
-                entry.next_enqueue_at = next;
-
-                let updated_entry_bytes: Slice = rmp_serde::to_vec_named(&entry)?.into();
-
-                // CAS the cron entry — retry if it changed since pre-read.
-                let prev =
-                    tx.fetch_update(&ks.data, &entry_key, |_| Some(updated_entry_bytes.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue; // Entry changed — retry.
-                }
-
-                // Enqueue the job if this tick fires.
-                let enqueue_result = match (fires, prepared.as_ref()) {
-                    (true, Some(p)) => {
-                        write_created_budgets(&mut tx, &ks, &budget_creations)?;
-                        Some(apply_enqueue(&mut tx, &ks, p)?)
-                    }
-                    _ => None,
-                };
-
-                // Staged before the commit, while the write lock still
-                // excludes every other writer — see `stage_budgets`.
-                // Cron fires jobs like any other enqueue, so it needs
-                // the same protection against a budget being deleted in
-                // the gap between durability and accounting.
-                let fired = enqueue_result.as_ref().and_then(|r| match r {
-                    EnqueueResult::Created(job) => Some(job),
-                    EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
-                });
-                stage_budgets(&live, &budget_creations, fired, now);
-
-                if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
-                    unstage_budgets(&live, &budget_creations, fired);
-                    return Err(e);
-                }
-
-                // ---- outside tx: update in-memory indexes ----
-
-                // Update cron schedule index.
-                if let Some(old) = old_next {
-                    cron_index.remove(old, &group, &entry_name);
-                }
-                if let Some(next) = next {
-                    cron_index.insert(next, group.clone(), entry_name.clone());
-                }
-
-                // Finalize job enqueue (in-memory indexes + events).
-                if let Some(ref result) = enqueue_result {
-                    finalize_enqueue(result, &dispatch, &scheduled_index, &event_tx);
-                }
-
-                return Ok(Some(entry));
             }
         })
         .await?
@@ -1225,6 +586,836 @@ pub(in crate::store) fn cron_budget_usage(
     }
 
     Ok(usage)
+}
+
+/// A change to the cron records.
+pub(in crate::store) enum CronChange {
+    ReplaceGroup {
+        group: String,
+        opts: ReplaceCronGroupOptions,
+    },
+    AddEntry {
+        group: String,
+        opts: CronEntryOptions,
+    },
+    PutEntry {
+        group: String,
+        opts: CronEntryOptions,
+    },
+    PatchEntry {
+        group: String,
+        name: String,
+        paused: bool,
+    },
+    DeleteEntry {
+        group: String,
+        name: String,
+    },
+    PatchGroup {
+        group: String,
+        opts: PatchCronGroupOptions,
+    },
+    DeleteGroup {
+        group: String,
+    },
+    DeleteAllGroups,
+    #[cfg(test)]
+    SetExpressionUnvalidated {
+        group: String,
+        name: String,
+        expression: String,
+    },
+}
+
+/// What a cron change answers with.
+pub(in crate::store) enum CronWritten {
+    /// A replaced group, with its entries.
+    Group(CronGroup, Vec<CronEntry>),
+    /// An added or put entry.
+    Entry(CronEntry),
+    /// A patched entry, or `None` if the group or entry doesn't exist.
+    MaybeEntry(Option<CronEntry>),
+    /// A patched group, or `None` if it doesn't exist.
+    MaybeGroup(Option<CronGroup>),
+    /// How many entries or groups were deleted.
+    Deleted(usize),
+}
+
+/// Everything a cron change writes, decided before any of it is.
+#[derive(Default)]
+struct CronWrites {
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    removes: Vec<Vec<u8>>,
+    created_budgets: Vec<(String, Budget)>,
+    /// `(next_enqueue_at, group, entry)` to take out of the schedule
+    /// index once durable, then to put in.
+    unschedule: Vec<(u64, String, String)>,
+    schedule: Vec<(u64, String, String)>,
+    clear_index: bool,
+    /// Whether to announce `CronScheduleChanged`.
+    changed: bool,
+}
+
+impl CronWrites {
+    fn writes_anything(&self) -> bool {
+        !self.puts.is_empty() || !self.removes.is_empty() || !self.created_budgets.is_empty()
+    }
+}
+
+/// A change to the cron records, applied in a writer pass.
+///
+/// Decides first, then writes: every read, check and serialization comes
+/// before anything goes into the transaction. A refusal (`Conflict`, an
+/// invalid expression, budgets that don't resolve) is then this op's
+/// answer alone, and the rest of the pass still commits. Reads go through
+/// the transaction, so they see what the pass already wrote.
+pub(in crate::store) struct CronOp {
+    change: CronChange,
+    now: u64,
+    live: Arc<Budgets>,
+    cron_index: Arc<CronScheduleIndex>,
+    /// Filled in by `apply`. Boxed, being much larger than any other
+    /// op's state, which every op in a pass would otherwise be sized to.
+    decided: Option<Box<Result<(CronWrites, CronWritten), StoreError>>>,
+    reply: JobReply<CronWritten>,
+}
+
+impl CronOp {
+    fn decide(
+        &self,
+        tx: &fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<(CronWrites, CronWritten), StoreError> {
+        let now = self.now;
+        let mut w = CronWrites::default();
+
+        match &self.change {
+            CronChange::ReplaceGroup { group, opts } => {
+                let group_key = make_cron_group_key(group);
+                let group_timezone = opts.timezone.clone();
+
+                // Load or create group metadata, applying pause state if
+                // requested. The timezone is applied unconditionally —
+                // this is a full replace, so an absent timezone clears
+                // any existing one.
+                let mut old_group_timezone: Option<String> = None;
+                let existing_group: CronGroup = match tx.get(&ks.data, &group_key)? {
+                    Some(bytes) => {
+                        let mut g: CronGroup = rmp_serde::from_slice(&bytes)?;
+                        old_group_timezone = g.timezone.clone();
+
+                        let mut dirty = g.timezone != group_timezone;
+                        g.timezone = group_timezone.clone();
+
+                        if let Some(paused) = opts.paused {
+                            if paused != g.paused {
+                                match (g.paused, paused) {
+                                    (false, true) => g.paused_at = Some(now),
+                                    (true, false) => g.resumed_at = Some(now),
+                                    _ => {}
+                                }
+                                g.paused = paused;
+                            }
+                            dirty = true;
+                        }
+
+                        if dirty {
+                            w.puts
+                                .push((group_key.clone(), rmp_serde::to_vec_named(&g)?));
+                        }
+                        g
+                    }
+                    None => {
+                        let g = CronGroup {
+                            paused: opts.paused.unwrap_or(false),
+                            paused_at: if opts.paused == Some(true) {
+                                Some(now)
+                            } else {
+                                None
+                            },
+                            timezone: group_timezone.clone(),
+                            ..CronGroup::default()
+                        };
+                        w.puts
+                            .push((group_key.clone(), rmp_serde::to_vec_named(&g)?));
+                        g
+                    }
+                };
+
+                let existing_entries = group_entries(tx, ks, group)?;
+                let input_names: HashSet<&str> =
+                    opts.entries.iter().map(|e| e.name.as_str()).collect();
+
+                // Build the new entries with smart merge logic.
+                let mut new_entries = Vec::with_capacity(opts.entries.len());
+                for input in &opts.entries {
+                    let tz = input.timezone.as_deref().or(group_timezone.as_deref());
+                    let computed = cron_next_after(&input.expression, now, tz)?;
+                    new_entries.push(merge_cron_entry(
+                        input.clone(),
+                        existing_entries.get(&input.name),
+                        computed,
+                        now,
+                        old_group_timezone.as_deref(),
+                        group_timezone.as_deref(),
+                    ));
+                }
+
+                // Resolve every entry's budgets, creating any the
+                // templates ask for. Done at install rather than at first
+                // firing so that an entry accepted into a schedule is
+                // guaranteed to be fireable: deferring creation would
+                // leave a window in which the server reaches its budget
+                // cap and the entry can never run.
+                w.created_budgets = match plan_budgets(
+                    tx,
+                    ks,
+                    new_entries.iter().flat_map(|e| e.job.budgets.iter()),
+                    now,
+                )? {
+                    BudgetPlan::Proceed(planned) => planned,
+                    BudgetPlan::Reject(e) => return Err(e),
+                };
+
+                // Delete removed entries (present in existing but not in
+                // input).
+                for name in existing_entries.keys() {
+                    if !input_names.contains(name.as_str()) {
+                        w.removes.push(make_cron_entry_key(group, name));
+                    }
+                }
+                for entry in &new_entries {
+                    w.puts.push((
+                        make_cron_entry_key(group, &entry.name),
+                        rmp_serde::to_vec_named(entry)?,
+                    ));
+                }
+
+                for (name, old_entry) in &existing_entries {
+                    if let Some(next) = old_entry.next_enqueue_at {
+                        w.unschedule.push((next, group.clone(), name.clone()));
+                    }
+                }
+                for entry in &new_entries {
+                    if let Some(next) = entry.next_enqueue_at {
+                        w.schedule.push((next, group.clone(), entry.name.clone()));
+                    }
+                }
+                w.changed = true;
+
+                Ok((w, CronWritten::Group(existing_group, new_entries)))
+            }
+
+            CronChange::AddEntry { group, opts } => {
+                let group_key = make_cron_group_key(group);
+                let entry_key = make_cron_entry_key(group, &opts.name);
+
+                // Load or create group metadata.
+                let group_meta: CronGroup = match tx.get(&ks.data, &group_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => {
+                        let group_meta = CronGroup::default();
+                        w.puts
+                            .push((group_key, rmp_serde::to_vec_named(&group_meta)?));
+                        group_meta
+                    }
+                };
+
+                // Validates the expression; None means no future
+                // occurrences.
+                let tz = opts.timezone.as_deref().or(group_meta.timezone.as_deref());
+                let next_enqueue_at = cron_next_after(&opts.expression, now, tz)?;
+
+                if tx.get(&ks.data, &entry_key)?.is_some() {
+                    return Err(StoreError::Conflict(format!(
+                        "cron entry '{}' already exists in group '{}'",
+                        opts.name, group
+                    )));
+                }
+
+                let entry = CronEntry {
+                    name: opts.name.clone(),
+                    expression: opts.expression.clone(),
+                    timezone: opts.timezone.clone(),
+                    paused: opts.paused.unwrap_or(false),
+                    paused_at: None,
+                    resumed_at: None,
+                    job: opts.job.clone(),
+                    next_enqueue_at,
+                    last_enqueue_at: None,
+                };
+
+                w.created_budgets = match plan_budgets(tx, ks, entry.job.budgets.iter(), now)? {
+                    BudgetPlan::Proceed(planned) => planned,
+                    BudgetPlan::Reject(e) => return Err(e),
+                };
+                w.puts.push((entry_key, rmp_serde::to_vec_named(&entry)?));
+                if let Some(next) = entry.next_enqueue_at {
+                    w.schedule.push((next, group.clone(), entry.name.clone()));
+                }
+                w.changed = true;
+
+                Ok((w, CronWritten::Entry(entry)))
+            }
+
+            CronChange::PutEntry { group, opts } => {
+                let group_key = make_cron_group_key(group);
+                let entry_key = make_cron_entry_key(group, &opts.name);
+
+                // Load or create group metadata. The group's timezone is
+                // needed to resolve the entry's effective timezone.
+                let group_meta: CronGroup = match tx.get(&ks.data, &group_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => {
+                        let group_meta = CronGroup::default();
+                        w.puts
+                            .push((group_key, rmp_serde::to_vec_named(&group_meta)?));
+                        group_meta
+                    }
+                };
+
+                let tz = opts.timezone.as_deref().or(group_meta.timezone.as_deref());
+                let next_enqueue_at = cron_next_after(&opts.expression, now, tz)?;
+
+                // Load existing entry for smart merge.
+                let old_entry: Option<CronEntry> = match tx.get(&ks.data, &entry_key)? {
+                    Some(bytes) => Some(rmp_serde::from_slice(&bytes)?),
+                    None => None,
+                };
+
+                // The group timezone is unchanged by this call, so the
+                // entry's old and new effective timezones resolve against
+                // the same group.
+                let entry = merge_cron_entry(
+                    opts.clone(),
+                    old_entry.as_ref(),
+                    next_enqueue_at,
+                    now,
+                    group_meta.timezone.as_deref(),
+                    group_meta.timezone.as_deref(),
+                );
+
+                w.created_budgets = match plan_budgets(tx, ks, entry.job.budgets.iter(), now)? {
+                    BudgetPlan::Proceed(planned) => planned,
+                    BudgetPlan::Reject(e) => return Err(e),
+                };
+                w.puts.push((entry_key, rmp_serde::to_vec_named(&entry)?));
+
+                if let Some(next) = old_entry.as_ref().and_then(|old| old.next_enqueue_at) {
+                    w.unschedule.push((next, group.clone(), entry.name.clone()));
+                }
+                if let Some(next) = entry.next_enqueue_at {
+                    w.schedule.push((next, group.clone(), entry.name.clone()));
+                }
+                w.changed = true;
+
+                Ok((w, CronWritten::Entry(entry)))
+            }
+
+            CronChange::PatchEntry {
+                group,
+                name,
+                paused,
+            } => {
+                let group_key = make_cron_group_key(group);
+                let entry_key = make_cron_entry_key(group, name);
+
+                if tx.get(&ks.data, &group_key)?.is_none() {
+                    return Ok((w, CronWritten::MaybeEntry(None)));
+                }
+                let mut entry: CronEntry = match tx.get(&ks.data, &entry_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => return Ok((w, CronWritten::MaybeEntry(None))),
+                };
+
+                if *paused != entry.paused {
+                    match (entry.paused, *paused) {
+                        (false, true) => entry.paused_at = Some(now),
+                        (true, false) => entry.resumed_at = Some(now),
+                        _ => {}
+                    }
+                    entry.paused = *paused;
+                    w.puts.push((entry_key, rmp_serde::to_vec_named(&entry)?));
+                    w.changed = true;
+                }
+
+                Ok((w, CronWritten::MaybeEntry(Some(entry))))
+            }
+
+            CronChange::DeleteEntry { group, name } => {
+                let group_key = make_cron_group_key(group);
+                let entry_key = make_cron_entry_key(group, name);
+
+                if tx.get(&ks.data, &group_key)?.is_none() {
+                    return Ok((w, CronWritten::Deleted(0)));
+                }
+                let entry: CronEntry = match tx.get(&ks.data, &entry_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => return Ok((w, CronWritten::Deleted(0))),
+                };
+
+                w.removes.push(entry_key);
+                if let Some(next) = entry.next_enqueue_at {
+                    w.unschedule.push((next, group.clone(), name.clone()));
+                }
+                w.changed = true;
+
+                Ok((w, CronWritten::Deleted(1)))
+            }
+
+            CronChange::PatchGroup { group, opts } => {
+                let group_key = make_cron_group_key(group);
+
+                let mut group_meta: CronGroup = match tx.get(&ks.data, &group_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => return Ok((w, CronWritten::MaybeGroup(None))),
+                };
+
+                let mut dirty = false;
+
+                if let Some(paused) = opts.paused
+                    && paused != group_meta.paused
+                {
+                    match (group_meta.paused, paused) {
+                        (false, true) => group_meta.paused_at = Some(now),
+                        (true, false) => group_meta.resumed_at = Some(now),
+                        _ => {}
+                    }
+                    group_meta.paused = paused;
+                    dirty = true;
+                }
+
+                let timezone_changed = match &opts.timezone {
+                    Some(tz) if *tz != group_meta.timezone => {
+                        group_meta.timezone = tz.clone();
+                        dirty = true;
+                        true
+                    }
+                    _ => false,
+                };
+
+                if !dirty {
+                    return Ok((w, CronWritten::MaybeGroup(Some(group_meta))));
+                }
+
+                w.puts
+                    .push((group_key, rmp_serde::to_vec_named(&group_meta)?));
+
+                // Reschedule entries that inherit the group's timezone.
+                // Their expressions are unchanged, but the wall-clock
+                // times those expressions denote have moved.
+                if timezone_changed {
+                    for mut entry in group_entries(tx, ks, group)?.into_values() {
+                        // An entry naming its own timezone ignores the
+                        // group's.
+                        if entry.timezone.is_some() {
+                            continue;
+                        }
+
+                        let next = cron_next_after(
+                            &entry.expression,
+                            now,
+                            group_meta.timezone.as_deref(),
+                        )?;
+                        if next == entry.next_enqueue_at {
+                            continue;
+                        }
+
+                        if let Some(old) = entry.next_enqueue_at {
+                            w.unschedule.push((old, group.clone(), entry.name.clone()));
+                        }
+                        if let Some(next) = next {
+                            w.schedule.push((next, group.clone(), entry.name.clone()));
+                        }
+                        entry.next_enqueue_at = next;
+                        w.puts.push((
+                            make_cron_entry_key(group, &entry.name),
+                            rmp_serde::to_vec_named(&entry)?,
+                        ));
+                    }
+                }
+                w.changed = true;
+
+                Ok((w, CronWritten::MaybeGroup(Some(group_meta))))
+            }
+
+            CronChange::DeleteGroup { group } => {
+                let group_key = make_cron_group_key(group);
+                let prefix = make_cron_group_prefix(group);
+
+                if tx.get(&ks.data, &group_key)?.is_none() {
+                    return Ok((w, CronWritten::Deleted(0)));
+                }
+
+                let mut range_end = prefix.clone();
+                *range_end.last_mut().unwrap() = 1;
+
+                for guard in tx.range::<Vec<u8>, _>(
+                    &ks.data,
+                    (Bound::Included(prefix.clone()), Bound::Excluded(range_end)),
+                ) {
+                    let (key, value) = guard.into_inner()?;
+                    // Everything goes — group metadata and all entries.
+                    // Entries also leave the schedule index (the group
+                    // key itself is the prefix, so shorter).
+                    if key.len() > prefix.len() {
+                        let entry: CronEntry = rmp_serde::from_slice(&value)?;
+                        if let Some(next) = entry.next_enqueue_at {
+                            w.unschedule.push((next, group.clone(), entry.name));
+                        }
+                    }
+                    w.removes.push(key.to_vec());
+                }
+                w.changed = true;
+
+                Ok((w, CronWritten::Deleted(1)))
+            }
+
+            CronChange::DeleteAllGroups => {
+                let start: Vec<u8> = vec![RecordKind::Cron as u8];
+                let end: Vec<u8> = vec![RecordKind::Cron as u8 + 1];
+                let mut groups_seen: HashSet<Vec<u8>> = HashSet::new();
+
+                for guard in
+                    tx.range::<Vec<u8>, _>(&ks.data, (Bound::Included(start), Bound::Excluded(end)))
+                {
+                    let (key, _) = guard.into_inner()?;
+                    let key_bytes = key.as_ref();
+
+                    // Key layout: C{group}\0... — deduped by the prefix up
+                    // to and including the first \0.
+                    let group_end = key_bytes[1..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map(|p| 1 + p)
+                        .unwrap_or(key_bytes.len());
+                    groups_seen.insert(key_bytes[..group_end].to_vec());
+                    w.removes.push(key_bytes.to_vec());
+                }
+
+                if !groups_seen.is_empty() {
+                    w.clear_index = true;
+                    w.changed = true;
+                }
+                Ok((w, CronWritten::Deleted(groups_seen.len())))
+            }
+
+            #[cfg(test)]
+            CronChange::SetExpressionUnvalidated {
+                group,
+                name,
+                expression,
+            } => {
+                let entry_key = make_cron_entry_key(group, name);
+                let mut entry: CronEntry = match tx.get(&ks.data, &entry_key)? {
+                    Some(bytes) => rmp_serde::from_slice(&bytes)?,
+                    None => {
+                        return Err(StoreError::InvalidOperation(format!(
+                            "no such cron entry: {group}/{name}"
+                        )));
+                    }
+                };
+                entry.expression = expression.clone();
+                w.puts.push((entry_key, rmp_serde::to_vec_named(&entry)?));
+                Ok((w, CronWritten::MaybeEntry(Some(entry))))
+            }
+        }
+    }
+}
+
+/// Every entry in a group, by name, read through the transaction. The
+/// group's own record shares the entries' prefix and is left out.
+fn group_entries(
+    tx: &fjall::SingleWriterWriteTx<'_>,
+    ks: &Keyspaces,
+    group: &str,
+) -> Result<std::collections::HashMap<String, CronEntry>, StoreError> {
+    let prefix = make_cron_group_prefix(group);
+    let mut range_end = prefix.clone();
+    *range_end.last_mut().unwrap() = 1; // \0 -> \1
+
+    tx.range::<Vec<u8>, _>(
+        &ks.data,
+        (Bound::Included(prefix.clone()), Bound::Excluded(range_end)),
+    )
+    .filter_map(|guard| match guard.into_inner() {
+        Ok((key, _)) if *key == *prefix => None,
+        Ok((_, value)) => Some(
+            rmp_serde::from_slice::<CronEntry>(&value)
+                .map(|entry| (entry.name.clone(), entry))
+                .map_err(StoreError::from),
+        ),
+        Err(e) => Some(Err(e.into())),
+    })
+    .collect()
+}
+
+impl JobWrite for CronOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        let decided = self.decide(tx, ks);
+        let mut applied = Applied::Nothing;
+        if let Ok((writes, _)) = &decided
+            && writes.writes_anything()
+        {
+            write_created_budgets(tx, ks, &writes.created_budgets)?;
+            for key in &writes.removes {
+                tx.remove(&ks.data, key);
+            }
+            for (key, value) in &writes.puts {
+                tx.insert(&ks.data, key, value);
+            }
+            applied = Applied::Wrote;
+        }
+        self.decided = Some(Box::new(decided));
+        Ok(applied)
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        let decided = self.decided.map_or_else(
+            || Err(StoreError::Internal("cron write never applied".into())),
+            |decided| *decided,
+        );
+        let written = decided.map(|(writes, written)| {
+            sync_created_budgets(&self.live, &writes.created_budgets, self.now);
+
+            if writes.clear_index {
+                self.cron_index.clear();
+            }
+            for (next, group, name) in &writes.unschedule {
+                self.cron_index.remove(*next, group, name);
+            }
+            for (next, group, name) in writes.schedule {
+                self.cron_index.insert(next, group, name);
+            }
+            if writes.changed {
+                let _ = cx.event_tx.send(StoreEvent::CronScheduleChanged);
+            }
+            written
+        });
+        let _ = self.reply.send(written.map(JobOutcome::Done));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
+/// A due cron entry's firing, prepared by its caller: the schedule
+/// advanced, and the entry's job enqueued unless it is paused.
+pub(in crate::store) struct CronPromoteOp {
+    group: String,
+    entry_name: String,
+    entry_key: Vec<u8>,
+    pre_bytes: Slice,
+    /// The entry as pre-read.
+    entry: CronEntry,
+    next: Option<u64>,
+    /// The job to enqueue, or `None` if the group or entry is paused.
+    prepared: Option<PreparedEnqueue>,
+    now: u64,
+    live: Arc<Budgets>,
+    cron_index: Arc<CronScheduleIndex>,
+    /// Filled in by `apply`: the entry advanced, once it is known
+    /// whether this tick fires.
+    advanced: Option<CronEntry>,
+    creations: Vec<(String, Budget)>,
+    enqueued: Option<EnqueueResult>,
+    staged: bool,
+    reply: JobReply<CronEntry>,
+}
+
+impl CronPromoteOp {
+    /// Pre-read the entry and its group, and prepare the job. `None` if
+    /// the entry is gone or not due.
+    fn prepare(
+        ks: &Keyspaces,
+        group: &str,
+        entry_name: &str,
+        now: u64,
+        live: Arc<Budgets>,
+        cron_index: Arc<CronScheduleIndex>,
+        reply: JobReply<CronEntry>,
+    ) -> Result<Option<Self>, StoreError> {
+        let entry_key = make_cron_entry_key(group, entry_name);
+        let Some(pre_bytes) = ks.data.get(&entry_key)? else {
+            return Ok(None); // Entry deleted.
+        };
+        let entry: CronEntry = rmp_serde::from_slice(&pre_bytes)?;
+
+        // Not due: either no future occurrence or not yet due.
+        match entry.next_enqueue_at {
+            None => return Ok(None),
+            Some(next) if next > now => return Ok(None),
+            _ => {}
+        }
+
+        // Check if group or entry is paused, and pick up the group's
+        // timezone for entries that do not name one.
+        let (group_paused, group_timezone) = match ks.data.get(make_cron_group_key(group))? {
+            Some(bytes) => {
+                let g: CronGroup = rmp_serde::from_slice(&bytes)?;
+                (g.paused, g.timezone)
+            }
+            None => (false, None),
+        };
+
+        // Compute next occurrence (None if no future occurrences).
+        let tz = entry.timezone.as_deref().or(group_timezone.as_deref());
+        let next = cron_next_after(&entry.expression, now, tz)?;
+
+        // Prepare the job enqueue (unless paused). Pure — the entry is not
+        // advanced until the budget pre-pass has said whether this tick
+        // actually fires.
+        let prepared = if group_paused || entry.paused {
+            None
+        } else {
+            Some(prepare_enqueue(entry.job.clone(), now)?)
+        };
+
+        Ok(Some(Self {
+            group: group.to_string(),
+            entry_name: entry_name.to_string(),
+            entry_key,
+            pre_bytes,
+            entry,
+            next,
+            prepared,
+            now,
+            live,
+            cron_index,
+            advanced: None,
+            creations: Vec::new(),
+            enqueued: None,
+            staged: false,
+            reply,
+        }))
+    }
+
+    /// The job this firing created, for the budget accounting.
+    fn fired(&self) -> Option<&Job> {
+        self.enqueued.as_ref().and_then(|r| match r {
+            EnqueueResult::Created(job) => Some(job),
+            EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
+        })
+    }
+}
+
+impl JobWrite for CronPromoteOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        if tx.get(&ks.data, &self.entry_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(Applied::Conflict);
+        }
+
+        // Cron fires through `apply_enqueue` directly rather than as an
+        // enqueue request, so it runs the budget pre-pass itself —
+        // otherwise a scheduled job would reference budgets nobody
+        // resolved, and a `create_with` on the template would never
+        // create anything.
+        //
+        // Resolution succeeding is an invariant, not a hope: an entry is
+        // validated before it enters a schedule, and a budget it
+        // references cannot be deleted or shrunk out from under it. A
+        // rejection here therefore means one of those protections has a
+        // hole, which is why it is logged as an error rather than treated
+        // as a normal outcome.
+        self.creations.clear();
+        let mut fires = self.prepared.is_some();
+        if let Some(p) = &self.prepared {
+            match plan_op_budgets(tx, ks, std::slice::from_ref(p))? {
+                BudgetPlan::Proceed(creations) => self.creations = creations,
+                BudgetPlan::Reject(e) => {
+                    // Skip the tick rather than failing the promotion.
+                    // Returning an error would discard the schedule
+                    // advance with it, leaving the entry perpetually due
+                    // and the scheduler spinning on it — a far worse way
+                    // to surface a bug than a gap and a log line.
+                    tracing::error!(
+                        group = %self.group,
+                        entry = %self.entry_name,
+                        error = %e,
+                        "cron entry references budgets that no longer resolve — \
+                         this should be impossible, as entries are validated on \
+                         install and their budgets protected from deletion and \
+                         shrinking. Skipping this tick."
+                    );
+                    fires = false;
+                }
+            }
+        }
+
+        // Advance the schedule (time moves forward regardless of pause,
+        // or of a tick that could not fire).
+        let mut entry = self.entry.clone();
+        if fires {
+            entry.last_enqueue_at = Some(self.now);
+        }
+        entry.next_enqueue_at = self.next;
+        tx.insert(&ks.data, &self.entry_key, rmp_serde::to_vec_named(&entry)?);
+
+        self.enqueued = match (fires, &self.prepared) {
+            (true, Some(p)) => {
+                write_created_budgets(tx, ks, &self.creations)?;
+                Some(apply_enqueue(tx, ks, p)?)
+            }
+            _ => None,
+        };
+
+        // Staged before the commit, while no other write can come between
+        // — see `stage_budgets`. Cron fires jobs like any other enqueue,
+        // so it needs the same protection against a budget being deleted
+        // in the gap between durability and accounting.
+        stage_budgets(&self.live, &self.creations, self.fired(), self.now);
+        self.staged = true;
+        self.advanced = Some(entry);
+        Ok(Applied::Wrote)
+    }
+
+    fn enqueued(&self) -> bool {
+        self.enqueued.is_some()
+    }
+
+    fn discard(&mut self) {
+        if std::mem::take(&mut self.staged) {
+            unstage_budgets(&self.live, &self.creations, self.fired());
+        }
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        if let Some(old) = self.entry.next_enqueue_at {
+            self.cron_index.remove(old, &self.group, &self.entry_name);
+        }
+        if let Some(next) = self.next {
+            self.cron_index
+                .insert(next, self.group.clone(), self.entry_name.clone());
+        }
+
+        if let Some(result) = &self.enqueued {
+            finalize_enqueue(result, &cx.dispatch, &cx.scheduled_index, &cx.event_tx);
+        }
+
+        let entry = self.advanced.unwrap_or(self.entry);
+        let _ = self.reply.send(Ok(JobOutcome::Done(entry)));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
 }
 
 /// Build a cron group metadata key: `C{group}\0`.
@@ -3019,10 +3210,160 @@ mod budget_tests {
     use super::super::super::options::{
         CronEntryOptions, EnqueueOptions, ListJobsOptions, ReplaceCronGroupOptions,
     };
-    use super::super::super::test_support::test_store;
+    use super::super::super::test_support::{run_job_ops, test_store};
+    use super::super::super::writer::{Applied, JobOutcome, JobWrite};
+    use super::{CronChange, CronOp, CronPromoteOp, CronWritten};
     use crate::store::{Store, StoreError};
 
     const NOW: u64 = 1_700_000_000_000;
+
+    type CronReply = tokio::sync::oneshot::Receiver<Result<JobOutcome<CronWritten>, StoreError>>;
+
+    /// `change`, as the store submits it to the writer.
+    fn cron_op(store: &Store, change: CronChange) -> (CronOp, CronReply) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = CronOp {
+            change,
+            now: NOW,
+            live: store.budgets.clone(),
+            cron_index: store.cron_index.clone(),
+            decided: None,
+            reply,
+        };
+        (op, rx)
+    }
+
+    /// A replace into a new group, whose entry names a budget that
+    /// doesn't exist, is refused before anything is written: the group
+    /// isn't created, though the pass it shares commits another change.
+    #[tokio::test]
+    async fn a_refused_replace_writes_nothing_in_a_shared_pass() {
+        let store = test_store();
+        let unresolvable = EnqueueOptions::new("t", "q", serde_json::json!(null))
+            .budget(BudgetBinding::new("missing"));
+        let (refused, refused_rx) = cron_op(
+            &store,
+            CronChange::ReplaceGroup {
+                group: "g".into(),
+                opts: ReplaceCronGroupOptions {
+                    paused: None,
+                    timezone: None,
+                    entries: vec![entry_with(unresolvable)],
+                },
+            },
+        );
+        let (other, other_rx) = cron_op(
+            &store,
+            CronChange::AddEntry {
+                group: "h".into(),
+                opts: entry_with(EnqueueOptions::new("t", "q", serde_json::json!(null))),
+            },
+        );
+
+        run_job_ops(&store, vec![refused.into(), other.into()]).await;
+
+        assert!(refused_rx.await.unwrap().is_err());
+        assert!(matches!(
+            other_rx.await.unwrap(),
+            Ok(JobOutcome::Done(CronWritten::Entry(_)))
+        ));
+        assert!(store.get_cron_group("g").await.unwrap().is_none());
+        assert!(
+            store
+                .get_cron_entry("h", "nightly")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Prepare the firing of `g/nightly` at `now`, as the store would.
+    fn promote_op(
+        store: &Store,
+        now: u64,
+    ) -> (
+        CronPromoteOp,
+        tokio::sync::oneshot::Receiver<Result<JobOutcome<super::CronEntry>, StoreError>>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = CronPromoteOp::prepare(
+            &store.ks,
+            "g",
+            "nightly",
+            now,
+            store.budgets.clone(),
+            store.cron_index.clone(),
+            reply,
+        )
+        .unwrap()
+        .expect("the entry should be due");
+        (op, rx)
+    }
+
+    /// A firing prepared before its entry changed (here, paused) is told
+    /// to retry, and enqueues nothing. Retried, it advances the paused
+    /// entry without firing it.
+    #[tokio::test]
+    async fn a_firing_of_a_changed_entry_conflicts_and_enqueues_nothing() {
+        let store = test_store();
+        install(
+            &store,
+            EnqueueOptions::new("t", "q", serde_json::json!(null)),
+        )
+        .await;
+        let later = NOW + 120_000;
+        let (op, rx) = promote_op(&store, later);
+
+        store
+            .patch_cron_entry("g", "nightly", true, later)
+            .await
+            .unwrap();
+        run_job_ops(&store, vec![Box::new(op).into()]).await;
+
+        assert!(matches!(rx.await.unwrap().unwrap(), JobOutcome::Conflict));
+        assert_eq!(store.dispatch.len(), 0);
+
+        let entry = store
+            .promote_cron_entry("g", "nightly", later)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(entry.last_enqueue_at.is_none());
+        assert!(entry.next_enqueue_at.unwrap() > later);
+        assert_eq!(store.dispatch.len(), 0);
+    }
+
+    /// A firing reports its enqueue, so the pass commits with the enqueue
+    /// commit mode, and, discarded after it applied, leaves no budget
+    /// accounting behind.
+    #[tokio::test]
+    async fn a_discarded_firing_leaves_no_accounting() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install(
+            &store,
+            EnqueueOptions::new("t", "q", serde_json::json!(null))
+                .budget(BudgetBinding::new("stripe")),
+        )
+        .await;
+        let (mut op, _rx) = promote_op(&store, NOW + 120_000);
+
+        let ks = store.ks.clone();
+        let live = store.budgets.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            assert_eq!(op.apply(&mut tx, &ks).unwrap(), Applied::Wrote);
+            assert!(op.enqueued());
+            assert_eq!(live.tracked("stripe"), 1);
+            op.discard();
+            assert_eq!(live.tracked("stripe"), 0);
+        })
+        .await
+        .unwrap();
+    }
 
     fn entry_with(job: EnqueueOptions) -> CronEntryOptions {
         CronEntryOptions {

@@ -28,15 +28,14 @@ use fjall::{SingleWriterTxDatabase, SingleWriterTxKeyspace};
 use tokio::sync::broadcast;
 
 use super::budget::Budgets;
-use super::complete::CompleteBatcher;
 use super::cron::CronScheduleIndex;
 use super::dispatch::Dispatch;
-use super::enqueue::EnqueueBatcher;
 use super::group_committer::GroupCommitter;
 use super::in_flight_index::InFlightIndex;
 use super::scheduled_index::ScheduledIndex;
 use super::storage_config::StorageConfig;
 use super::types::{BackoffConfig, CommitMode, StoreError};
+use super::writer::{Writer, WriterConfig, WriterContext};
 
 /// Events broadcast by the store when job state changes.
 ///
@@ -215,16 +214,11 @@ pub struct Store {
     /// when new work is available and to prune their in-flight tracking.
     pub(super) event_tx: broadcast::Sender<StoreEvent>,
 
-    /// Server-side auto-batcher for concurrent single-job enqueues.
-    /// Owned in an `Arc` so spawn_blocking tasks can cheaply clone the
-    /// handle without holding a `&Store` borrow across the .await.
-    /// Shut down by dropping (the inner `SyncSender` closes, the worker
-    /// drains queued ops and exits).
-    pub(super) enqueue_batcher: Arc<EnqueueBatcher>,
-
-    /// Server-side auto-batcher for concurrent completions (acks).
-    /// Mirrors `enqueue_batcher` in structure and lifecycle.
-    pub(super) complete_batcher: Arc<CompleteBatcher>,
+    /// The thread applying enqueues, takes and completions, gathered
+    /// into shared transactions. Owned in an `Arc` so spawn_blocking
+    /// tasks can cheaply clone the handle. Shut down by dropping: the
+    /// channel closes, and the thread finishes what is queued and exits.
+    pub(super) writer: Arc<Writer>,
 }
 
 /// Groups the fjall database handle and all disk keyspaces into a single
@@ -276,17 +270,49 @@ impl Keyspaces {
 
     /// Commit a transaction and block until durable.
     ///
-    /// Calls fjall's `tx.commit()` to buffer the write, then sends a sync
-    /// request to the group committer and blocks until it completes.
-    /// Since this is always called inside `spawn_blocking`, blocking is safe.
+    /// For tests that set up or corrupt state directly. The server
+    /// commits only through the writer, with `commit_deferred`.
+    #[cfg(test)]
     pub(super) fn commit(
         &self,
         tx: fjall::SingleWriterWriteTx<'_>,
         mode: CommitMode,
     ) -> Result<(), StoreError> {
+        self.commit_deferred(tx, mode)?.wait()
+    }
+
+    /// Commit a transaction and request that it be made durable, without
+    /// waiting for it to be. The returned handle waits.
+    ///
+    /// Lets the writer start its next pass while the last is persisted,
+    /// rather than idling through the wait with the lock unused.
+    pub(super) fn commit_deferred(
+        &self,
+        tx: fjall::SingleWriterWriteTx<'_>,
+        mode: CommitMode,
+    ) -> Result<Durable, StoreError> {
         tx.commit()?;
-        let rx = self.group_committer.persist(mode);
-        match rx.blocking_recv() {
+        Ok(Durable(self.group_committer.persist(mode)))
+    }
+}
+
+/// A committed transaction on its way to being durable.
+pub(super) struct Durable(tokio::sync::oneshot::Receiver<super::group_committer::SyncResult>);
+
+impl Durable {
+    /// A commit that becomes durable when the test says so.
+    #[cfg(test)]
+    pub(super) fn pending() -> (
+        tokio::sync::oneshot::Sender<super::group_committer::SyncResult>,
+        Self,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (tx, Self(rx))
+    }
+
+    /// Block until the commit is durable, or persisting it failed.
+    pub(super) fn wait(self) -> Result<(), StoreError> {
+        match self.0.blocking_recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(StoreError::Db(fjall::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -379,29 +405,25 @@ impl Store {
         let scheduled_index = Arc::new(ScheduledIndex::new());
         let in_flight_index = Arc::new(InFlightIndex::new());
 
-        // Start the enqueue auto-batcher — a dedicated OS thread that
-        // coalesces concurrent enqueue requests (singular + bulk) into
-        // one tx.commit(). Shuts down when this Store (and any
-        // spawn_blocking clones of the Arc) drops — the inner
-        // SyncSender closes, the worker drains remaining ops and exits.
-        let enqueue_batcher = Arc::new(EnqueueBatcher::start(
-            ks.clone(),
-            dispatch.clone(),
-            budgets.clone(),
-            scheduled_index.clone(),
-            event_tx.clone(),
-            config.enqueue_batch_size,
-        ));
-
-        // Start the complete auto-batcher — same shape as the enqueue
-        // batcher, coalesces concurrent completion (ack) requests.
-        let complete_batcher = Arc::new(CompleteBatcher::start(
-            ks.clone(),
-            dispatch.clone(),
-            in_flight_index.clone(),
-            event_tx.clone(),
-            config.default_completed_retention_ms,
-            config.complete_batch_size,
+        // Start the writer — a dedicated OS thread that gathers
+        // concurrent enqueues, takes and completions into shared
+        // transactions. Shuts down when this Store (and any
+        // spawn_blocking clones of the Arc) drops — the channel closes,
+        // the thread finishes what is queued and exits.
+        let writer = Arc::new(Writer::start(
+            WriterContext {
+                ks: ks.clone(),
+                dispatch: dispatch.clone(),
+                budgets: budgets.clone(),
+                scheduled_index: scheduled_index.clone(),
+                in_flight_index: in_flight_index.clone(),
+                event_tx: event_tx.clone(),
+            },
+            WriterConfig {
+                enqueue_batch_size: config.enqueue_batch_size,
+                write_batch_max_jobs: config.write_batch_max_jobs,
+                complete_batch_size: config.complete_batch_size,
+            },
         ));
 
         Ok(Self {
@@ -417,8 +439,7 @@ impl Store {
             default_backoff: config.default_backoff,
             index_ready: Arc::new(AtomicBool::new(true)),
             event_tx,
-            enqueue_batcher,
-            complete_batcher,
+            writer,
         })
     }
 

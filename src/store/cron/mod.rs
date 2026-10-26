@@ -12,7 +12,7 @@
 
 mod ops;
 
-pub(in crate::store) use ops::cron_budget_usage;
+pub(in crate::store) use ops::{CronOp, CronPromoteOp, cron_budget_usage};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
