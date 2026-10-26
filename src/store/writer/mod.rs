@@ -42,10 +42,12 @@
 
 pub(in crate::store) mod job;
 pub(in crate::store) mod take;
+mod timing;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, oneshot};
 
@@ -61,6 +63,7 @@ use super::types::{CommitMode, StoreError};
 use job::JobGroup;
 pub(in crate::store) use job::{Applied, JobOp, JobOutcome, JobReply, JobWrite};
 use take::{TakeGroup, TakeOp, TakeOutcome, TakeWrite};
+use timing::Stages;
 
 /// Most takes in one pass. Each take carries at most a worker's
 /// prefetch, so in practice this is bounded by how many take streams
@@ -123,12 +126,18 @@ impl Writer {
                 move || {
                     let mut carry = VecDeque::new();
                     let mut skipped_enqueues = false;
-                    while let Some(batch) = gather(&mut carry, &mut skipped_enqueues, &rx, &limits)
-                    {
-                        if let Some(pass) = run_pass(&cx, batch, &mut carry) {
+                    let mut stages = WriterStages::new(
+                        "writer",
+                        ["waiting", "applying", "committing", "handing_off"],
+                    );
+                    while let Some(batch) = stages.time(WAITING, || {
+                        gather(&mut carry, &mut skipped_enqueues, &rx, &limits)
+                    }) {
+                        if let Some(pass) = run_pass(&cx, batch, &mut carry, &mut stages) {
                             // Blocks while too many passes await durability.
-                            let _ = finish_tx.send(pass);
+                            let _ = stages.time(HANDING_OFF, || finish_tx.send(pass));
                         }
+                        stages.pass();
                     }
                 }
             })
@@ -195,8 +204,10 @@ fn run_pass(
     cx: &WriterContext,
     batch: Vec<WriteOp>,
     carry: &mut VecDeque<WriteOp>,
+    stages: &mut WriterStages,
 ) -> Option<Pass> {
     let ks = &cx.ks;
+    let applying = Instant::now();
 
     let (mut enqueues, mut completes, mut takes, mut jobs) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -283,7 +294,8 @@ fn run_pass(
         ks.default_commit_mode
     };
 
-    match ks.commit_deferred(tx, mode) {
+    stages.add(APPLYING, applying.elapsed());
+    match stages.time(COMMITTING, || ks.commit_deferred(tx, mode)) {
         Ok(durable) => {
             pass.durable = Some(durable);
             Some(pass)
@@ -299,10 +311,25 @@ fn run_pass(
 /// The finisher thread: finish each pass in the order the writer
 /// committed them, until the writer is gone.
 fn finish_passes(cx: &WriterContext, passes: Receiver<Pass>) {
-    while let Ok(pass) = passes.recv() {
-        pass.finish(cx);
+    let mut stages = Stages::new("writer-finish", ["waiting", "durability", "finishing"]);
+    while let Ok(mut pass) = stages.time(FINISH_WAITING, || passes.recv()) {
+        let durable = stages.time(FINISH_DURABILITY, || pass.wait_durable());
+        stages.time(FINISH_FINISHING, || pass.finish(cx, durable));
+        stages.pass();
     }
 }
+
+/// The finisher thread's stages, by index.
+const FINISH_WAITING: usize = 0;
+const FINISH_DURABILITY: usize = 1;
+const FINISH_FINISHING: usize = 2;
+
+/// The writer thread's stages, by index.
+type WriterStages = Stages<4>;
+const WAITING: usize = 0;
+const APPLYING: usize = 1;
+const COMMITTING: usize = 2;
+const HANDING_OFF: usize = 3;
 
 /// A committed pass, on its way to being durable.
 struct Pass {
@@ -315,14 +342,21 @@ struct Pass {
 }
 
 impl Pass {
+    /// Block until the pass's commit is durable. A pass that wrote
+    /// nothing has nothing to wait for.
+    fn wait_durable(&mut self) -> Result<(), StoreError> {
+        match self.durable.take() {
+            Some(durable) => durable.wait(),
+            None => Ok(()),
+        }
+    }
+
     /// Once durable, update the in-memory indexes, announce, and answer.
     /// Passes are finished in commit order, on the finisher thread, so
     /// jobs only become takeable, and callers are only answered, once
     /// their writes are durable.
-    fn finish(mut self, cx: &WriterContext) {
-        if let Some(durable) = self.durable.take()
-            && let Err(e) = durable.wait()
-        {
+    fn finish(self, cx: &WriterContext, durable: Result<(), StoreError>) {
+        if let Err(e) = durable {
             tracing::error!(error = %e, "writer: persisting a pass failed");
             self.fail(cx, &e.to_string());
             return;
@@ -836,8 +870,10 @@ mod tests {
             let cx = context(store);
             tokio::task::spawn_blocking(move || {
                 let mut carry = VecDeque::new();
-                if let Some(pass) = run_pass(&cx, batch, &mut carry) {
-                    pass.finish(&cx);
+                let mut stages = WriterStages::new("test", ["", "", "", ""]);
+                if let Some(mut pass) = run_pass(&cx, batch, &mut carry, &mut stages) {
+                    let durable = pass.wait_durable();
+                    pass.finish(&cx, durable);
                 }
                 carry
             })
