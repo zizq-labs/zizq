@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 This release changes how the server writes to its database. Every write
 (enqueues, workers taking and acknowledging jobs, and everything else)
