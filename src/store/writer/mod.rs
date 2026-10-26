@@ -276,7 +276,8 @@ fn run_pass(
         group.stage(&cx.budgets);
     }
 
-    let mode = if enqueue_writes > 0 {
+    let enqueued = enqueue_writes > 0 || pass.job.as_ref().is_some_and(JobGroup::enqueued);
+    let mode = if enqueued {
         stricter(ks.enqueue_commit_mode, ks.default_commit_mode)
     } else {
         ks.default_commit_mode

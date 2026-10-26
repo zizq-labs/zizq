@@ -19,7 +19,7 @@
 //! scan for matching jobs sees exactly the state its writes go into.
 
 use super::super::budget::{BudgetOp, JobBudgetOp, JobsBudgetOp};
-use super::super::cron::CronOp;
+use super::super::cron::{CronOp, CronPromoteOp};
 use super::super::delete::{BulkDeleteOp, PurgeOp, ReapOp};
 use super::super::fail::FailOp;
 use super::super::patch::{BulkPatchOp, PatchOp};
@@ -75,6 +75,12 @@ pub(in crate::store) trait JobWrite {
         1
     }
 
+    /// Whether what the op wrote includes an enqueue, so that the pass
+    /// commits as strictly as `--enqueue-commit-mode` asks.
+    fn enqueued(&self) -> bool {
+        false
+    }
+
     /// Once durable (or at once, if nothing was written): update the
     /// in-memory indexes, announce, and answer.
     fn finish(self, cx: &WriterContext);
@@ -88,6 +94,46 @@ pub(in crate::store) trait JobWrite {
     fn discard(&mut self) {}
 
     fn fail(self, msg: &str);
+}
+
+/// An op too large to hold inline, which would size every op in a pass to
+/// it, goes in [`JobOp`] boxed.
+impl<T: JobWrite> JobWrite for Box<T> {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        (**self).apply(tx, ks)
+    }
+
+    fn exclusive(&self) -> bool {
+        (**self).exclusive()
+    }
+
+    fn jobs(&self) -> usize {
+        (**self).jobs()
+    }
+
+    fn enqueued(&self) -> bool {
+        (**self).enqueued()
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        (*self).finish(cx)
+    }
+
+    fn discard(&mut self) {
+        (**self).discard()
+    }
+
+    fn conflict(self) {
+        (*self).conflict()
+    }
+
+    fn fail(self, msg: &str) {
+        (*self).fail(msg)
+    }
 }
 
 /// Declare [`JobOp`], with one variant per kind of write, and forward
@@ -127,6 +173,12 @@ macro_rules! job_ops {
             fn jobs(&self) -> usize {
                 match self {
                     $(JobOp::$variant(op) => op.jobs()),*
+                }
+            }
+
+            fn enqueued(&self) -> bool {
+                match self {
+                    $(JobOp::$variant(op) => op.enqueued()),*
                 }
             }
 
@@ -170,6 +222,7 @@ job_ops! {
     JobBudget(JobBudgetOp),
     JobsBudget(JobsBudgetOp),
     Cron(CronOp),
+    CronPromote(Box<CronPromoteOp>),
 }
 
 /// The one-at-a-time writes in one pass.
@@ -209,6 +262,14 @@ impl JobGroup {
             }
         }
         Ok(())
+    }
+
+    /// Whether an op in this pass wrote an enqueue.
+    pub(super) fn enqueued(&self) -> bool {
+        self.ops
+            .iter()
+            .zip(&self.applied)
+            .any(|(op, applied)| *applied == Applied::Wrote && op.enqueued())
     }
 
     /// How many ops in this pass wrote anything.

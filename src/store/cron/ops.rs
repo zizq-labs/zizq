@@ -19,13 +19,14 @@ use super::super::budget::{
     unstage_budgets, write_created_budgets,
 };
 use super::super::enqueue::{
-    apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue, validate_batch_config,
+    PreparedEnqueue, apply_enqueue, finalize_enqueue, plan_op_budgets, prepare_enqueue,
+    validate_batch_config,
 };
 use super::super::keys::RecordKind;
 use super::super::options::{CronEntryOptions, PatchCronGroupOptions, ReplaceCronGroupOptions};
 use super::super::results::EnqueueResult;
 use super::super::store::{Keyspaces, Store, StoreEvent};
-use super::super::types::StoreError;
+use super::super::types::{Job, StoreError};
 use super::super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
 use super::{CronEntry, CronGroup, CronScheduleIndex};
 
@@ -403,10 +404,10 @@ impl Store {
 
     /// Atomically advance a due cron entry's schedule and enqueue its job.
     ///
-    /// Pre-reads the entry and group outside the write tx, then uses
-    /// `fetch_update` to CAS the entry inside the tx. Retries if the
-    /// entry was modified concurrently. Returns early without writing
-    /// if the entry is paused, not actually due, or no longer exists.
+    /// Pre-reads the entry and group, then has the writer check the entry
+    /// is unchanged before advancing it. Retries if the entry was modified
+    /// concurrently. Returns early without writing if the entry is paused,
+    /// not actually due, or no longer exists.
     pub async fn promote_cron_entry(
         &self,
         group: &str,
@@ -414,162 +415,41 @@ impl Store {
         now: u64,
     ) -> Result<Option<CronEntry>, StoreError> {
         let ks = self.ks.clone();
+        let writer = self.writer.clone();
         let live = self.budgets.clone();
         let cron_index = self.cron_index.clone();
-        let dispatch = self.dispatch.clone();
-        let scheduled_index = self.scheduled_index.clone();
-        let event_tx = self.event_tx.clone();
         let group = group.to_string();
         let entry_name = entry_name.to_string();
 
+        // Prepared on a blocking thread, so the writer only checks and
+        // writes, and the reply is waited for there too: the cron
+        // scheduler holds one blocking thread while its promotion is
+        // written. A changed entry comes back as a conflict: pre-read
+        // again.
         task::spawn_blocking(move || -> Result<Option<CronEntry>, StoreError> {
-            let entry_key = make_cron_entry_key(&group, &entry_name);
-            let group_key = make_cron_group_key(&group);
-
             loop {
-                // ---- outside tx: pre-read ----
-                let pre_bytes = match ks.data.get(&entry_key)? {
-                    Some(bytes) => bytes,
-                    None => return Ok(None), // Entry deleted.
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                let Some(op) = CronPromoteOp::prepare(
+                    &ks,
+                    &group,
+                    &entry_name,
+                    now,
+                    live.clone(),
+                    cron_index.clone(),
+                    reply,
+                )?
+                else {
+                    return Ok(None);
                 };
-                let mut entry: CronEntry = rmp_serde::from_slice(&pre_bytes)?;
+                writer.submit_job(Box::new(op).into());
 
-                // Not due: either no future occurrence or not yet due.
-                match entry.next_enqueue_at {
-                    None => return Ok(None),
-                    Some(next) if next > now => return Ok(None),
-                    _ => {}
+                match rx
+                    .blocking_recv()
+                    .map_err(|_| StoreError::Internal("writer channel closed".into()))??
+                {
+                    JobOutcome::Done(entry) => return Ok(Some(entry)),
+                    JobOutcome::Conflict => continue,
                 }
-
-                // Check if group or entry is paused, and pick up the group's
-                // timezone for entries that do not name one.
-                let (group_paused, group_timezone) = match ks.data.get(&group_key)? {
-                    Some(bytes) => {
-                        let g: CronGroup = rmp_serde::from_slice(&bytes)?;
-                        (g.paused, g.timezone)
-                    }
-                    None => (false, None),
-                };
-                let is_paused = group_paused || entry.paused;
-
-                // Compute next occurrence (None if no future occurrences).
-                let tz = entry.timezone.as_deref().or(group_timezone.as_deref());
-                let next = cron_next_after(&entry.expression, now, tz)?;
-
-                // Prepare the job enqueue (unless paused). Pure — the
-                // entry is not mutated until the budget pre-pass below
-                // has said whether this tick actually fires.
-                let prepared = if !is_paused {
-                    Some(prepare_enqueue(entry.job.clone(), now)?)
-                } else {
-                    None
-                };
-
-                // ---- inside tx: CAS + enqueue ----
-                let mut tx = ks.write_tx();
-
-                // Cron fires through `apply_enqueue` directly rather
-                // than the batcher, so it runs the budget pre-pass
-                // itself — otherwise a scheduled job would reference
-                // budgets nobody resolved, and a `create_with` on the
-                // template would never create anything.
-                //
-                // Resolution succeeding is an invariant, not a hope: an
-                // entry is validated before it enters a schedule, and a
-                // budget it references cannot be deleted or shrunk out
-                // from under it. A rejection here therefore means one of
-                // those protections has a hole, which is why it is
-                // logged as an error rather than treated as a normal
-                // outcome.
-                let mut budget_creations: Vec<(String, Budget)> = Vec::new();
-                let mut fires = prepared.is_some();
-
-                if let Some(ref p) = prepared {
-                    match plan_op_budgets(&tx, &ks, std::slice::from_ref(p))? {
-                        BudgetPlan::Proceed(creations) => budget_creations = creations,
-                        BudgetPlan::Reject(e) => {
-                            // Skip the tick rather than failing the
-                            // promotion. Returning an error would
-                            // discard the schedule advance with it,
-                            // leaving the entry perpetually due and the
-                            // scheduler spinning on it — a far worse
-                            // way to surface a bug than a gap and a
-                            // log line.
-                            tracing::error!(
-                                group = %group,
-                                entry = %entry_name,
-                                error = %e,
-                                "cron entry references budgets that no longer resolve — \
-                                 this should be impossible, as entries are validated on \
-                                 install and their budgets protected from deletion and \
-                                 shrinking. Skipping this tick."
-                            );
-                            fires = false;
-                        }
-                    }
-                }
-
-                if fires {
-                    entry.last_enqueue_at = Some(now);
-                }
-
-                // Advance the schedule (time moves forward regardless of
-                // pause, or of a tick that could not fire).
-                let old_next = entry.next_enqueue_at;
-                entry.next_enqueue_at = next;
-
-                let updated_entry_bytes: Slice = rmp_serde::to_vec_named(&entry)?.into();
-
-                // CAS the cron entry — retry if it changed since pre-read.
-                let prev =
-                    tx.fetch_update(&ks.data, &entry_key, |_| Some(updated_entry_bytes.clone()))?;
-
-                if prev.as_deref() != Some(&*pre_bytes) {
-                    drop(tx);
-                    continue; // Entry changed — retry.
-                }
-
-                // Enqueue the job if this tick fires.
-                let enqueue_result = match (fires, prepared.as_ref()) {
-                    (true, Some(p)) => {
-                        write_created_budgets(&mut tx, &ks, &budget_creations)?;
-                        Some(apply_enqueue(&mut tx, &ks, p)?)
-                    }
-                    _ => None,
-                };
-
-                // Staged before the commit, while the write lock still
-                // excludes every other writer — see `stage_budgets`.
-                // Cron fires jobs like any other enqueue, so it needs
-                // the same protection against a budget being deleted in
-                // the gap between durability and accounting.
-                let fired = enqueue_result.as_ref().and_then(|r| match r {
-                    EnqueueResult::Created(job) => Some(job),
-                    EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
-                });
-                stage_budgets(&live, &budget_creations, fired, now);
-
-                if let Err(e) = ks.commit(tx, ks.enqueue_commit_mode) {
-                    unstage_budgets(&live, &budget_creations, fired);
-                    return Err(e);
-                }
-
-                // ---- outside tx: update in-memory indexes ----
-
-                // Update cron schedule index.
-                if let Some(old) = old_next {
-                    cron_index.remove(old, &group, &entry_name);
-                }
-                if let Some(next) = next {
-                    cron_index.insert(next, group.clone(), entry_name.clone());
-                }
-
-                // Finalize job enqueue (in-memory indexes + events).
-                if let Some(ref result) = enqueue_result {
-                    finalize_enqueue(result, &dispatch, &scheduled_index, &event_tx);
-                }
-
-                return Ok(Some(entry));
             }
         })
         .await?
@@ -1317,6 +1197,216 @@ impl JobWrite for CronOp {
             written
         });
         let _ = self.reply.send(written.map(JobOutcome::Done));
+    }
+
+    fn conflict(self) {
+        let _ = self.reply.send(Ok(JobOutcome::Conflict));
+    }
+
+    fn fail(self, msg: &str) {
+        let _ = self.reply.send(Err(StoreError::Internal(msg.to_string())));
+    }
+}
+
+/// A due cron entry's firing, prepared by its caller: the schedule
+/// advanced, and the entry's job enqueued unless it is paused.
+pub(in crate::store) struct CronPromoteOp {
+    group: String,
+    entry_name: String,
+    entry_key: Vec<u8>,
+    pre_bytes: Slice,
+    /// The entry as pre-read.
+    entry: CronEntry,
+    next: Option<u64>,
+    /// The job to enqueue, or `None` if the group or entry is paused.
+    prepared: Option<PreparedEnqueue>,
+    now: u64,
+    live: Arc<Budgets>,
+    cron_index: Arc<CronScheduleIndex>,
+    /// Filled in by `apply`: the entry advanced, once it is known
+    /// whether this tick fires.
+    advanced: Option<CronEntry>,
+    creations: Vec<(String, Budget)>,
+    enqueued: Option<EnqueueResult>,
+    staged: bool,
+    reply: JobReply<CronEntry>,
+}
+
+impl CronPromoteOp {
+    /// Pre-read the entry and its group, and prepare the job. `None` if
+    /// the entry is gone or not due.
+    fn prepare(
+        ks: &Keyspaces,
+        group: &str,
+        entry_name: &str,
+        now: u64,
+        live: Arc<Budgets>,
+        cron_index: Arc<CronScheduleIndex>,
+        reply: JobReply<CronEntry>,
+    ) -> Result<Option<Self>, StoreError> {
+        let entry_key = make_cron_entry_key(group, entry_name);
+        let Some(pre_bytes) = ks.data.get(&entry_key)? else {
+            return Ok(None); // Entry deleted.
+        };
+        let entry: CronEntry = rmp_serde::from_slice(&pre_bytes)?;
+
+        // Not due: either no future occurrence or not yet due.
+        match entry.next_enqueue_at {
+            None => return Ok(None),
+            Some(next) if next > now => return Ok(None),
+            _ => {}
+        }
+
+        // Check if group or entry is paused, and pick up the group's
+        // timezone for entries that do not name one.
+        let (group_paused, group_timezone) = match ks.data.get(make_cron_group_key(group))? {
+            Some(bytes) => {
+                let g: CronGroup = rmp_serde::from_slice(&bytes)?;
+                (g.paused, g.timezone)
+            }
+            None => (false, None),
+        };
+
+        // Compute next occurrence (None if no future occurrences).
+        let tz = entry.timezone.as_deref().or(group_timezone.as_deref());
+        let next = cron_next_after(&entry.expression, now, tz)?;
+
+        // Prepare the job enqueue (unless paused). Pure — the entry is not
+        // advanced until the budget pre-pass has said whether this tick
+        // actually fires.
+        let prepared = if group_paused || entry.paused {
+            None
+        } else {
+            Some(prepare_enqueue(entry.job.clone(), now)?)
+        };
+
+        Ok(Some(Self {
+            group: group.to_string(),
+            entry_name: entry_name.to_string(),
+            entry_key,
+            pre_bytes,
+            entry,
+            next,
+            prepared,
+            now,
+            live,
+            cron_index,
+            advanced: None,
+            creations: Vec::new(),
+            enqueued: None,
+            staged: false,
+            reply,
+        }))
+    }
+
+    /// The job this firing created, for the budget accounting.
+    fn fired(&self) -> Option<&Job> {
+        self.enqueued.as_ref().and_then(|r| match r {
+            EnqueueResult::Created(job) => Some(job),
+            EnqueueResult::Duplicate(_) | EnqueueResult::Folded(_) => None,
+        })
+    }
+}
+
+impl JobWrite for CronPromoteOp {
+    fn apply(
+        &mut self,
+        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        ks: &Keyspaces,
+    ) -> Result<Applied, StoreError> {
+        if tx.get(&ks.data, &self.entry_key)?.as_deref() != Some(&*self.pre_bytes) {
+            return Ok(Applied::Conflict);
+        }
+
+        // Cron fires through `apply_enqueue` directly rather than as an
+        // enqueue request, so it runs the budget pre-pass itself —
+        // otherwise a scheduled job would reference budgets nobody
+        // resolved, and a `create_with` on the template would never
+        // create anything.
+        //
+        // Resolution succeeding is an invariant, not a hope: an entry is
+        // validated before it enters a schedule, and a budget it
+        // references cannot be deleted or shrunk out from under it. A
+        // rejection here therefore means one of those protections has a
+        // hole, which is why it is logged as an error rather than treated
+        // as a normal outcome.
+        self.creations.clear();
+        let mut fires = self.prepared.is_some();
+        if let Some(p) = &self.prepared {
+            match plan_op_budgets(tx, ks, std::slice::from_ref(p))? {
+                BudgetPlan::Proceed(creations) => self.creations = creations,
+                BudgetPlan::Reject(e) => {
+                    // Skip the tick rather than failing the promotion.
+                    // Returning an error would discard the schedule
+                    // advance with it, leaving the entry perpetually due
+                    // and the scheduler spinning on it — a far worse way
+                    // to surface a bug than a gap and a log line.
+                    tracing::error!(
+                        group = %self.group,
+                        entry = %self.entry_name,
+                        error = %e,
+                        "cron entry references budgets that no longer resolve — \
+                         this should be impossible, as entries are validated on \
+                         install and their budgets protected from deletion and \
+                         shrinking. Skipping this tick."
+                    );
+                    fires = false;
+                }
+            }
+        }
+
+        // Advance the schedule (time moves forward regardless of pause,
+        // or of a tick that could not fire).
+        let mut entry = self.entry.clone();
+        if fires {
+            entry.last_enqueue_at = Some(self.now);
+        }
+        entry.next_enqueue_at = self.next;
+        tx.insert(&ks.data, &self.entry_key, rmp_serde::to_vec_named(&entry)?);
+
+        self.enqueued = match (fires, &self.prepared) {
+            (true, Some(p)) => {
+                write_created_budgets(tx, ks, &self.creations)?;
+                Some(apply_enqueue(tx, ks, p)?)
+            }
+            _ => None,
+        };
+
+        // Staged before the commit, while no other write can come between
+        // — see `stage_budgets`. Cron fires jobs like any other enqueue,
+        // so it needs the same protection against a budget being deleted
+        // in the gap between durability and accounting.
+        stage_budgets(&self.live, &self.creations, self.fired(), self.now);
+        self.staged = true;
+        self.advanced = Some(entry);
+        Ok(Applied::Wrote)
+    }
+
+    fn enqueued(&self) -> bool {
+        self.enqueued.is_some()
+    }
+
+    fn discard(&mut self) {
+        if std::mem::take(&mut self.staged) {
+            unstage_budgets(&self.live, &self.creations, self.fired());
+        }
+    }
+
+    fn finish(self, cx: &WriterContext) {
+        if let Some(old) = self.entry.next_enqueue_at {
+            self.cron_index.remove(old, &self.group, &self.entry_name);
+        }
+        if let Some(next) = self.next {
+            self.cron_index
+                .insert(next, self.group.clone(), self.entry_name.clone());
+        }
+
+        if let Some(result) = &self.enqueued {
+            finalize_enqueue(result, &cx.dispatch, &cx.scheduled_index, &cx.event_tx);
+        }
+
+        let entry = self.advanced.unwrap_or(self.entry);
+        let _ = self.reply.send(Ok(JobOutcome::Done(entry)));
     }
 
     fn conflict(self) {
@@ -3121,8 +3211,8 @@ mod budget_tests {
         CronEntryOptions, EnqueueOptions, ListJobsOptions, ReplaceCronGroupOptions,
     };
     use super::super::super::test_support::{run_job_ops, test_store};
-    use super::super::super::writer::JobOutcome;
-    use super::{CronChange, CronOp, CronWritten};
+    use super::super::super::writer::{Applied, JobOutcome, JobWrite};
+    use super::{CronChange, CronOp, CronPromoteOp, CronWritten};
     use crate::store::{Store, StoreError};
 
     const NOW: u64 = 1_700_000_000_000;
@@ -3185,6 +3275,94 @@ mod budget_tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Prepare the firing of `g/nightly` at `now`, as the store would.
+    fn promote_op(
+        store: &Store,
+        now: u64,
+    ) -> (
+        CronPromoteOp,
+        tokio::sync::oneshot::Receiver<Result<JobOutcome<super::CronEntry>, StoreError>>,
+    ) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let op = CronPromoteOp::prepare(
+            &store.ks,
+            "g",
+            "nightly",
+            now,
+            store.budgets.clone(),
+            store.cron_index.clone(),
+            reply,
+        )
+        .unwrap()
+        .expect("the entry should be due");
+        (op, rx)
+    }
+
+    /// A firing prepared before its entry changed (here, paused) is told
+    /// to retry, and enqueues nothing. Retried, it advances the paused
+    /// entry without firing it.
+    #[tokio::test]
+    async fn a_firing_of_a_changed_entry_conflicts_and_enqueues_nothing() {
+        let store = test_store();
+        install(
+            &store,
+            EnqueueOptions::new("t", "q", serde_json::json!(null)),
+        )
+        .await;
+        let later = NOW + 120_000;
+        let (op, rx) = promote_op(&store, later);
+
+        store
+            .patch_cron_entry("g", "nightly", true, later)
+            .await
+            .unwrap();
+        run_job_ops(&store, vec![Box::new(op).into()]).await;
+
+        assert!(matches!(rx.await.unwrap().unwrap(), JobOutcome::Conflict));
+        assert_eq!(store.dispatch.len(), 0);
+
+        let entry = store
+            .promote_cron_entry("g", "nightly", later)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(entry.last_enqueue_at.is_none());
+        assert!(entry.next_enqueue_at.unwrap() > later);
+        assert_eq!(store.dispatch.len(), 0);
+    }
+
+    /// A firing reports its enqueue, so the pass commits with the enqueue
+    /// commit mode, and, discarded after it applied, leaves no budget
+    /// accounting behind.
+    #[tokio::test]
+    async fn a_discarded_firing_leaves_no_accounting() {
+        let store = test_store();
+        store
+            .create_budget("stripe", 100, BudgetStrategy::WhileInFlight, NOW)
+            .await
+            .unwrap();
+        install(
+            &store,
+            EnqueueOptions::new("t", "q", serde_json::json!(null))
+                .budget(BudgetBinding::new("stripe")),
+        )
+        .await;
+        let (mut op, _rx) = promote_op(&store, NOW + 120_000);
+
+        let ks = store.ks.clone();
+        let live = store.budgets.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = ks.write_tx();
+            assert_eq!(op.apply(&mut tx, &ks).unwrap(), Applied::Wrote);
+            assert!(op.enqueued());
+            assert_eq!(live.tracked("stripe"), 1);
+            op.discard();
+            assert_eq!(live.tracked("stripe"), 0);
+        })
+        .await
+        .unwrap();
     }
 
     fn entry_with(job: EnqueueOptions) -> CronEntryOptions {
