@@ -239,7 +239,6 @@ impl Store {
                     Err(e) => {
                         // 4. Rollback — re-insert valid entries into the
                         //    ready index and notify workers.
-                        let _tx = ks.write_tx();
                         for pre in &valid {
                             dispatch.refund(&pre.job.budgets);
                             dispatch.insert(Placement::of(&pre.job));

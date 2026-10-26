@@ -23,6 +23,7 @@ use super::super::cron::{CronOp, CronPromoteOp};
 use super::super::delete::{BulkDeleteOp, PurgeOp, ReapOp};
 use super::super::fail::FailOp;
 use super::super::patch::{BulkPatchOp, PatchOp};
+use super::super::recover::RecoverOp;
 use super::super::requeue::RequeueOp;
 use super::super::scheduled::PromoteOp;
 use super::super::store::Keyspaces;
@@ -223,6 +224,7 @@ job_ops! {
     JobsBudget(JobsBudgetOp),
     Cron(CronOp),
     CronPromote(Box<CronPromoteOp>),
+    Recover(RecoverOp),
 }
 
 /// The one-at-a-time writes in one pass.

@@ -270,9 +270,9 @@ impl Keyspaces {
 
     /// Commit a transaction and block until durable.
     ///
-    /// Calls fjall's `tx.commit()` to buffer the write, then sends a sync
-    /// request to the group committer and blocks until it completes.
-    /// Since this is always called inside `spawn_blocking`, blocking is safe.
+    /// For tests that set up or corrupt state directly. The server
+    /// commits only through the writer, with `commit_deferred`.
+    #[cfg(test)]
     pub(super) fn commit(
         &self,
         tx: fjall::SingleWriterWriteTx<'_>,
