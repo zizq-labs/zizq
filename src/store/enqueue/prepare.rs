@@ -111,6 +111,14 @@ pub(in crate::store) struct PreparedEnqueue {
     pub(super) fold_payload_key_id: Option<String>,
 }
 
+impl PreparedEnqueue {
+    /// Whether the job draws on any budget, which resolving takes a scan
+    /// of the budget records.
+    pub(in crate::store) fn binds_budgets(&self) -> bool {
+        !self.budgets.is_empty()
+    }
+}
+
 /// Build a `PreparedEnqueue` from `EnqueueOptions` and the current time.
 ///
 /// Pure computation — no IO, no transaction needed.

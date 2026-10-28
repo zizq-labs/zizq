@@ -294,6 +294,17 @@ impl Keyspaces {
         tx.commit()?;
         Ok(Durable(self.group_committer.persist(mode)))
     }
+
+    /// Commit a write batch and request that it be made durable, without
+    /// waiting for it to be, as `commit_deferred` does a transaction.
+    pub(super) fn commit_batch_deferred(
+        &self,
+        batch: fjall::OwnedWriteBatch,
+        mode: CommitMode,
+    ) -> Result<Durable, StoreError> {
+        batch.commit()?;
+        Ok(Durable(self.group_committer.persist(mode)))
+    }
 }
 
 /// A committed transaction on its way to being durable.

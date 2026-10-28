@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Enqueueing is up to 24% faster, and draining and mixed workloads about
+  7-8% faster. The writer now commits enqueues, takes and
+  acknowledgements as plain write batches, rather than transactions, which
+  write every change twice: once into the transaction, and again when it
+  is committed. Since the writer is the only thing that writes, a
+  transaction's isolation is usually unnecessary overhead. Writes that
+  need more, such as those touching budgets or cron schedules, still use a
+  transaction. In benchmarks against 0.8.0 on an 8-core arm64 machine,
+  enqueueing with no workers running went from about 165K/sec to 205K/sec,
+  draining with 8 workers by 7%, and draining while jobs were enqueued
+  by 8%, with each run finishing 6-10% faster.
+
 ## 0.8.0
 
 This release changes how the server writes to its database. Every write

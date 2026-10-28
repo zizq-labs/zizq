@@ -32,6 +32,7 @@ use tokio::task;
 use super::super::cron::cron_budget_usage;
 use super::super::keys::RecordKind;
 use super::super::options::PatchBudgetOptions;
+use super::super::pass_write::PassWrite;
 use super::super::store::{Keyspaces, Store, StoreEvent};
 use super::super::types::{Job, StoreError};
 use super::super::writer::{Applied, JobOutcome, JobReply, JobWrite, WriterContext};
@@ -384,7 +385,7 @@ impl BudgetOp {
             } => {
                 let budget = Budget::new(*allocation, *strategy, now)?;
                 let budget_key = make_budget_key(key);
-                if tx.get(&ks.data, &budget_key)?.is_some() {
+                if Readable::get(&*tx, &ks.data, &budget_key)?.is_some() {
                     return Err(StoreError::Conflict(format!(
                         "budget '{key}' already exists"
                     )));
@@ -401,7 +402,7 @@ impl BudgetOp {
             } => {
                 let mut budget = Budget::new(*allocation, *strategy, now)?;
                 let budget_key = make_budget_key(key);
-                match tx.get(&ks.data, &budget_key)? {
+                match Readable::get(&*tx, &ks.data, &budget_key)? {
                     Some(bytes) => {
                         let existing: Budget = rmp_serde::from_slice(&bytes)?;
                         budget.created_at = existing.created_at;
@@ -417,7 +418,7 @@ impl BudgetOp {
 
             BudgetChange::Patch { key, opts } => {
                 let budget_key = make_budget_key(key);
-                let existing: Budget = match tx.get(&ks.data, &budget_key)? {
+                let existing: Budget = match Readable::get(&*tx, &ks.data, &budget_key)? {
                     Some(bytes) => rmp_serde::from_slice(&bytes)?,
                     None => return Ok(BudgetWritten::Nothing),
                 };
@@ -443,7 +444,7 @@ impl BudgetOp {
 
             BudgetChange::Delete { key } => {
                 let budget_key = make_budget_key(key);
-                if tx.get(&ks.data, &budget_key)?.is_none() {
+                if Readable::get(&*tx, &ks.data, &budget_key)?.is_none() {
                     return Ok(BudgetWritten::Nothing);
                 }
                 check_unreferenced(&*tx, ks, live, key)?;
@@ -798,8 +799,8 @@ where
 ///
 /// Paired with [`stage_budgets`], which brings the same creations into
 /// the live registry.
-pub(in crate::store) fn write_created_budgets(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
+pub(in crate::store) fn write_created_budgets<W: PassWrite>(
+    tx: &mut W,
     ks: &Keyspaces,
     created: &[(String, Budget)],
 ) -> Result<(), StoreError> {

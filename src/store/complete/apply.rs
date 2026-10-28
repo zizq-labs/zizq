@@ -6,10 +6,9 @@
 //! verification per item. Zero-retention completions delete the job;
 //! non-zero retention updates the status/purge keys.
 
-use fjall::Readable;
-
 use super::super::delete::apply_job_deletion;
 use super::super::keys::{make_job_key, make_unique_key};
+use super::super::pass_write::PassWrite;
 use super::super::store::Keyspaces;
 use super::super::types::{StoreError, UniqueWhile};
 use super::pre_read::PreparedComplete;
@@ -24,8 +23,8 @@ use super::pre_read::PreparedComplete;
 ///
 /// On success, every item has been applied to the tx; caller commits.
 /// Does NOT commit the transaction.
-pub(super) fn apply_complete_batch(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
+pub(super) fn apply_complete_batch<W: PassWrite>(
+    tx: &mut W,
     ks: &Keyspaces,
     prepared: &[PreparedComplete],
 ) -> Result<bool, StoreError> {

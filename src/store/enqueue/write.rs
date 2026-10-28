@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 
 use super::super::budget::{Budget, Budgets, stage_budgets, unstage_budgets};
 use super::super::dispatch::Dispatch;
+use super::super::pass_write::PassWrite;
 use super::super::results::EnqueueResult;
 use super::super::scheduled_index::ScheduledIndex;
 use super::super::store::{Keyspaces, StoreEvent};
@@ -54,15 +55,24 @@ impl EnqueueGroup {
 
     /// Apply every op into the pass's transaction. An error here (a
     /// corrupt unique-index entry, say) is for the whole group.
-    pub(in crate::store) fn apply(
+    pub(in crate::store) fn apply<W: PassWrite>(
         &mut self,
-        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        tx: &mut W,
         ks: &Keyspaces,
     ) -> Result<(), StoreError> {
         let (outcomes, created_budgets) = apply_enqueue_batch(tx, ks, &self.ops)?;
         self.outcomes = outcomes;
         self.created_budgets = created_budgets;
         Ok(())
+    }
+
+    /// Whether any job draws on a budget. Resolving one scans the budget
+    /// records, which only a transaction can do.
+    pub(in crate::store) fn binds_budgets(&self) -> bool {
+        self.ops
+            .iter()
+            .flatten()
+            .any(PreparedEnqueue::binds_budgets)
     }
 
     /// How many jobs this pass writes for enqueues. A `Duplicate` writes
