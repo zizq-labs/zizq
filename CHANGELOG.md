@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1
 
 - Enqueueing is up to 24% faster, and draining and mixed workloads about
   7-8% faster. The writer now commits enqueues, takes and
