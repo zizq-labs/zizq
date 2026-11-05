@@ -130,11 +130,11 @@ jobs:
             platform: windows-x86_64
             deps: sudo apt-get install -y gcc-mingw-w64-x86-64
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             platform: macos-arm64
             deps: ""
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             platform: macos-x86_64
             deps: ""
     steps:
@@ -221,12 +221,12 @@ jobs:
             platform: linux-x86_64
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
-          - runner: macos-14
+          - runner: macos-15
             platform: macos-arm64
           # GitHub's Intel macOS runners are being retired, so the Intel
           # binary runs under Rosetta. It still exercises the same
           # (arm64) kernel's TCP stack.
-          - runner: macos-14
+          - runner: macos-15
             platform: macos-x86_64
           - runner: windows-latest
             platform: windows-x86_64
