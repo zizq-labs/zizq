@@ -8,12 +8,11 @@
 
 use std::collections::HashMap;
 
-use fjall::Readable;
-
 use crate::batch::BatchExpr;
 
 use super::super::budget::{Budget, BudgetPlan, plan_budgets, write_created_budgets};
 use super::super::keys::{make_job_key, make_payload_key};
+use super::super::pass_write::PassWrite;
 use super::super::results::EnqueueResult;
 use super::super::store::Keyspaces;
 use super::super::types::{Job, JobStatus, StoreError};
@@ -26,8 +25,8 @@ use super::prepare::PreparedEnqueue;
 ///
 /// Does NOT commit the transaction — the caller is responsible for
 /// committing (possibly after adding other writes to the same tx).
-pub(in crate::store) fn apply_enqueue(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
+pub(in crate::store) fn apply_enqueue<W: PassWrite>(
+    tx: &mut W,
     ks: &Keyspaces,
     p: &PreparedEnqueue,
 ) -> Result<EnqueueResult, StoreError> {
@@ -96,8 +95,8 @@ pub(in crate::store) fn apply_enqueue(
 /// pending (stale — cleaned up here), or an existing pending batch
 /// whose `when` predicate returned false (sealed here so a fresh job
 /// takes over).
-fn try_apply_fold(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
+fn try_apply_fold<W: PassWrite>(
+    tx: &mut W,
     ks: &Keyspaces,
     p: &PreparedEnqueue,
 ) -> Result<Option<EnqueueResult>, StoreError> {
@@ -268,8 +267,8 @@ pub(super) type OpOutcome = Result<Vec<EnqueueResult>, StoreError>;
 ///
 /// Does NOT commit the transaction — the caller commits and runs
 /// `finalize_enqueue` per result post-commit.
-pub(super) fn apply_enqueue_batch(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
+pub(super) fn apply_enqueue_batch<W: PassWrite>(
+    tx: &mut W,
     ks: &Keyspaces,
     ops: &[Vec<PreparedEnqueue>],
 ) -> Result<(Vec<OpOutcome>, Vec<(String, Budget)>), StoreError> {
@@ -289,7 +288,7 @@ pub(super) fn apply_enqueue_batch(
     for (op_idx, prepared) in ops.iter().enumerate() {
         // Resolve budgets before writing anything for this op, so a
         // rejection leaves the transaction untouched.
-        match plan_op_budgets(tx, ks, prepared)? {
+        match tx.plan_enqueue_budgets(ks, prepared)? {
             BudgetPlan::Proceed(planned) => {
                 write_created_budgets(tx, ks, &planned)?;
                 created.extend(planned);

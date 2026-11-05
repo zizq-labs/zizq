@@ -15,6 +15,7 @@ mod index_id;
 mod keys;
 mod maintenance;
 mod options;
+mod pass_write;
 mod patch;
 mod read;
 mod ready_index;

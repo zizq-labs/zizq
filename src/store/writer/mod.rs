@@ -42,10 +42,12 @@
 
 pub(in crate::store) mod job;
 pub(in crate::store) mod take;
+mod timing;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, oneshot};
 
@@ -54,6 +56,7 @@ use super::complete::{CompleteGroup, CompleteOp};
 use super::dispatch::Dispatch;
 use super::enqueue::{EnqueueGroup, EnqueueOp, PreparedEnqueue};
 use super::in_flight_index::InFlightIndex;
+use super::pass_write::{BatchWrite, PassWrite};
 use super::results::EnqueueResult;
 use super::scheduled_index::ScheduledIndex;
 use super::store::{Durable, Keyspaces, StoreEvent};
@@ -61,6 +64,7 @@ use super::types::{CommitMode, StoreError};
 use job::JobGroup;
 pub(in crate::store) use job::{Applied, JobOp, JobOutcome, JobReply, JobWrite};
 use take::{TakeGroup, TakeOp, TakeOutcome, TakeWrite};
+use timing::Stages;
 
 /// Most takes in one pass. Each take carries at most a worker's
 /// prefetch, so in practice this is bounded by how many take streams
@@ -123,12 +127,18 @@ impl Writer {
                 move || {
                     let mut carry = VecDeque::new();
                     let mut skipped_enqueues = false;
-                    while let Some(batch) = gather(&mut carry, &mut skipped_enqueues, &rx, &limits)
-                    {
-                        if let Some(pass) = run_pass(&cx, batch, &mut carry) {
+                    let mut stages = WriterStages::new(
+                        "writer",
+                        ["waiting", "applying", "committing", "handing_off"],
+                    );
+                    while let Some(batch) = stages.time(WAITING, || {
+                        gather(&mut carry, &mut skipped_enqueues, &rx, &limits)
+                    }) {
+                        if let Some(pass) = run_pass(&cx, batch, &mut carry, &mut stages) {
                             // Blocks while too many passes await durability.
-                            let _ = finish_tx.send(pass);
+                            let _ = stages.time(HANDING_OFF, || finish_tx.send(pass));
                         }
+                        stages.pass();
                     }
                 }
             })
@@ -195,8 +205,10 @@ fn run_pass(
     cx: &WriterContext,
     batch: Vec<WriteOp>,
     carry: &mut VecDeque<WriteOp>,
+    stages: &mut WriterStages,
 ) -> Option<Pass> {
     let ks = &cx.ks;
+    let applying = Instant::now();
 
     let (mut enqueues, mut completes, mut takes, mut jobs) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -217,48 +229,123 @@ fn run_pass(
         durable: None,
     };
 
-    let mut tx = ks.write_tx();
+    // A pass of only enqueues, takes and completions that bind no budget
+    // is written as a plain write batch, which writes each key once where
+    // a transaction writes it twice. Any other pass needs a transaction:
+    // its ops may scan ranges, which the batch's overlay can't serve.
+    //
+    // A batch takes no lock, and reads the database directly beneath its
+    // overlay. That is only sound because the writer is the only thing
+    // that writes, one pass at a time. Tests that write directly through
+    // `Keyspaces::write_tx` must not race a batch pass.
+    let batched = pass.job.is_none()
+        && !pass
+            .enqueue
+            .as_ref()
+            .is_some_and(EnqueueGroup::binds_budgets);
 
+    if batched {
+        let mut batch = BatchWrite::new(ks);
+        if !apply_groups(&mut pass, &mut batch, ks, carry) {
+            return None;
+        }
+        commit_pass(cx, pass, stages, applying, |mode| {
+            ks.commit_batch_deferred(batch.into_batch(), mode)
+        })
+    } else {
+        let mut tx = ks.write_tx();
+        if !apply_groups(&mut pass, &mut tx, ks, carry) {
+            return None;
+        }
+        if let Some(group) = pass.job.as_mut()
+            && let Err(e) = group.apply(&mut tx, ks)
+        {
+            // The group failed only the op that hit the error.
+            tracing::error!(error = %e, "writer: applying a job write failed");
+            requeue(
+                carry,
+                pass.enqueue.take(),
+                pass.complete.take(),
+                pass.take.take(),
+                pass.job.take(),
+            );
+            return None;
+        }
+        commit_pass(cx, pass, stages, applying, |mode| {
+            ks.commit_deferred(tx, mode)
+        })
+    }
+}
+
+/// Apply the pass's enqueues, takes and completions through `writes`. On
+/// an error, fails that kind's ops, carries the rest to the next pass, and
+/// returns `false`: the writes are dropped with `writes`.
+fn apply_groups<W: PassWrite>(
+    pass: &mut Pass,
+    writes: &mut W,
+    ks: &Keyspaces,
+    carry: &mut VecDeque<WriteOp>,
+) -> bool {
     if let Some(group) = pass.enqueue.as_mut()
-        && let Err(e) = group.apply(&mut tx, ks)
+        && let Err(e) = group.apply(writes, ks)
     {
-        drop(tx);
         tracing::error!(error = %e, "writer: applying enqueues failed");
         pass.enqueue.take().unwrap().fail(&e.to_string());
-        requeue(carry, None, pass.complete, pass.take, pass.job);
-        return None;
+        requeue(
+            carry,
+            None,
+            pass.complete.take(),
+            pass.take.take(),
+            pass.job.take(),
+        );
+        return false;
     }
 
     if let Some(group) = pass.take.as_mut()
-        && let Err(e) = group.apply(&mut tx, ks)
+        && let Err(e) = group.apply(writes, ks)
     {
-        drop(tx);
         tracing::error!(error = %e, "writer: applying takes failed");
         pass.take.take().unwrap().fail(&e.to_string());
-        requeue(carry, pass.enqueue, pass.complete, None, pass.job);
-        return None;
+        requeue(
+            carry,
+            pass.enqueue.take(),
+            pass.complete.take(),
+            None,
+            pass.job.take(),
+        );
+        return false;
     }
 
     if let Some(group) = pass.complete.as_mut()
-        && let Err(e) = group.apply(&mut tx, ks)
+        && let Err(e) = group.apply(writes, ks)
     {
-        drop(tx);
         tracing::error!(error = %e, "writer: applying completions failed");
         pass.complete.take().unwrap().fail(&e.to_string());
-        requeue(carry, pass.enqueue, None, pass.take, pass.job);
-        return None;
+        requeue(
+            carry,
+            pass.enqueue.take(),
+            None,
+            pass.take.take(),
+            pass.job.take(),
+        );
+        return false;
     }
 
-    if let Some(group) = pass.job.as_mut()
-        && let Err(e) = group.apply(&mut tx, ks)
-    {
-        // The group failed only the op that hit the error.
-        drop(tx);
-        tracing::error!(error = %e, "writer: applying a job write failed");
-        requeue(carry, pass.enqueue, pass.complete, pass.take, pass.job);
-        return None;
-    }
+    true
+}
 
+/// Commit what an applied pass wrote, with `commit`, without waiting for
+/// it to be durable. A pass that wrote nothing isn't committed, but still
+/// goes to the finisher, so its answers don't overtake those of earlier
+/// passes still waiting to be durable.
+fn commit_pass(
+    cx: &WriterContext,
+    mut pass: Pass,
+    stages: &mut WriterStages,
+    applying: Instant,
+    commit: impl FnOnce(CommitMode) -> Result<Durable, StoreError>,
+) -> Option<Pass> {
+    let ks = &cx.ks;
     let enqueue_writes = pass.enqueue.as_ref().map_or(0, EnqueueGroup::writes);
     let writes = enqueue_writes
         + pass.take.as_ref().map_or(0, TakeGroup::writes)
@@ -266,9 +353,6 @@ fn run_pass(
         + pass.job.as_ref().map_or(0, JobGroup::writes);
 
     if writes == 0 {
-        // Still finished by the finisher, so its answers don't overtake
-        // those of earlier passes still waiting to be durable.
-        drop(tx);
         return Some(pass);
     }
 
@@ -283,7 +367,8 @@ fn run_pass(
         ks.default_commit_mode
     };
 
-    match ks.commit_deferred(tx, mode) {
+    stages.add(APPLYING, applying.elapsed());
+    match stages.time(COMMITTING, || commit(mode)) {
         Ok(durable) => {
             pass.durable = Some(durable);
             Some(pass)
@@ -299,10 +384,25 @@ fn run_pass(
 /// The finisher thread: finish each pass in the order the writer
 /// committed them, until the writer is gone.
 fn finish_passes(cx: &WriterContext, passes: Receiver<Pass>) {
-    while let Ok(pass) = passes.recv() {
-        pass.finish(cx);
+    let mut stages = Stages::new("writer-finish", ["waiting", "durability", "finishing"]);
+    while let Ok(mut pass) = stages.time(FINISH_WAITING, || passes.recv()) {
+        let durable = stages.time(FINISH_DURABILITY, || pass.wait_durable());
+        stages.time(FINISH_FINISHING, || pass.finish(cx, durable));
+        stages.pass();
     }
 }
+
+/// The finisher thread's stages, by index.
+const FINISH_WAITING: usize = 0;
+const FINISH_DURABILITY: usize = 1;
+const FINISH_FINISHING: usize = 2;
+
+/// The writer thread's stages, by index.
+type WriterStages = Stages<4>;
+const WAITING: usize = 0;
+const APPLYING: usize = 1;
+const COMMITTING: usize = 2;
+const HANDING_OFF: usize = 3;
 
 /// A committed pass, on its way to being durable.
 struct Pass {
@@ -315,14 +415,21 @@ struct Pass {
 }
 
 impl Pass {
+    /// Block until the pass's commit is durable. A pass that wrote
+    /// nothing has nothing to wait for.
+    fn wait_durable(&mut self) -> Result<(), StoreError> {
+        match self.durable.take() {
+            Some(durable) => durable.wait(),
+            None => Ok(()),
+        }
+    }
+
     /// Once durable, update the in-memory indexes, announce, and answer.
     /// Passes are finished in commit order, on the finisher thread, so
     /// jobs only become takeable, and callers are only answered, once
     /// their writes are durable.
-    fn finish(mut self, cx: &WriterContext) {
-        if let Some(durable) = self.durable.take()
-            && let Err(e) = durable.wait()
-        {
+    fn finish(self, cx: &WriterContext, durable: Result<(), StoreError>) {
+        if let Err(e) = durable {
             tracing::error!(error = %e, "writer: persisting a pass failed");
             self.fail(cx, &e.to_string());
             return;
@@ -811,13 +918,109 @@ mod tests {
         use super::super::*;
         use std::time::Duration;
 
+        use crate::store::budget::{BudgetBinding, BudgetStrategy};
         use crate::store::keys::{make_job_key, make_status_key, make_unique_key};
         use crate::store::options::EnqueueOptions;
         use crate::store::store::Durable;
         use crate::store::store::Store;
-        use crate::store::test_support::test_store;
+        use crate::store::test_support::{enqueue_and_take, test_store};
         use crate::store::types::JobStatus;
         use crate::time::now_millis;
+
+        /// Hold fjall's transaction lock on a blocking thread until the
+        /// returned sender fires or is dropped.
+        async fn hold_transaction_lock(
+            store: &Store,
+        ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+            let (locked_tx, locked_rx) = oneshot::channel();
+            let (release, released) = oneshot::channel::<()>();
+            let ks = store.ks.clone();
+            let holder = tokio::task::spawn_blocking(move || {
+                let _tx = ks.write_tx();
+                locked_tx.send(()).unwrap();
+                let _ = released.blocking_recv();
+            });
+            locked_rx.await.unwrap();
+            (release, holder)
+        }
+
+        /// Enqueues, takes and completions that bind no budget are written
+        /// as a batch, which never takes the transaction lock: they go
+        /// ahead while something else holds it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn hot_path_passes_write_without_the_transaction_lock() {
+            let store = test_store();
+            let (release, holder) = hold_transaction_lock(&store).await;
+            let within = Duration::from_secs(5);
+
+            tokio::time::timeout(
+                within,
+                store.enqueue(
+                    now_millis(),
+                    EnqueueOptions::new("t", "q", serde_json::json!(null)),
+                ),
+            )
+            .await
+            .expect("an enqueue shouldn't wait for the lock")
+            .unwrap();
+            let taken =
+                tokio::time::timeout(within, store.take_next_job(now_millis(), &HashSet::new()))
+                    .await
+                    .expect("a take shouldn't wait for the lock")
+                    .unwrap()
+                    .unwrap();
+            let completed = tokio::time::timeout(
+                within,
+                store.mark_completed_bulk(now_millis(), std::slice::from_ref(&taken.id)),
+            )
+            .await
+            .expect("a completion shouldn't wait for the lock")
+            .unwrap();
+            assert_eq!(completed.completed, vec![taken.id]);
+
+            release.send(()).unwrap();
+            holder.await.unwrap();
+        }
+
+        /// Any other pass goes through a transaction, because its ops may
+        /// scan ranges a batch's overlay can't serve: an enqueue binding a
+        /// budget, or a single-job write such as a requeue, waits for the
+        /// lock.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn other_passes_write_through_a_transaction() {
+            let store = std::sync::Arc::new(test_store());
+            store
+                .create_budget("stripe", 10, BudgetStrategy::WhileInFlight, now_millis())
+                .await
+                .unwrap();
+            let in_flight = enqueue_and_take(&store).await.id;
+
+            let (release, holder) = hold_transaction_lock(&store).await;
+            let budgeted = tokio::spawn({
+                let store = store.clone();
+                async move {
+                    let opts = EnqueueOptions::new("t", "q", serde_json::json!(null))
+                        .budget(BudgetBinding::new("stripe"));
+                    store.enqueue(now_millis(), opts).await
+                }
+            });
+            let requeue = tokio::spawn({
+                let store = store.clone();
+                async move { store.requeue(&in_flight).await }
+            });
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !budgeted.is_finished(),
+                "a budgeted enqueue went ahead of the lock"
+            );
+            assert!(!requeue.is_finished(), "a requeue went ahead of the lock");
+
+            release.send(()).unwrap();
+            holder.await.unwrap();
+            budgeted.await.unwrap().unwrap();
+            assert!(requeue.await.unwrap().unwrap());
+        }
 
         fn context(store: &Store) -> WriterContext {
             WriterContext {
@@ -836,8 +1039,10 @@ mod tests {
             let cx = context(store);
             tokio::task::spawn_blocking(move || {
                 let mut carry = VecDeque::new();
-                if let Some(pass) = run_pass(&cx, batch, &mut carry) {
-                    pass.finish(&cx);
+                let mut stages = WriterStages::new("test", ["", "", "", ""]);
+                if let Some(mut pass) = run_pass(&cx, batch, &mut carry, &mut stages) {
+                    let durable = pass.wait_durable();
+                    pass.finish(&cx, durable);
                 }
                 carry
             })

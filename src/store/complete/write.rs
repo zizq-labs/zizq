@@ -24,12 +24,12 @@
 
 use std::collections::HashSet;
 
-use fjall::Readable;
 use tokio::sync::broadcast;
 
 use super::super::dispatch::{Dispatch, Placement};
 use super::super::in_flight_index::InFlightIndex;
 use super::super::keys::make_job_key;
+use super::super::pass_write::PassWrite;
 use super::super::results::BulkCompleteResult;
 use super::super::store::{Keyspaces, StoreEvent};
 use super::super::types::StoreError;
@@ -99,9 +99,9 @@ impl CompleteGroup {
 
     /// Check and write each op into the pass's transaction. Reads go
     /// through the transaction, so writes earlier in the pass are seen.
-    pub(in crate::store) fn apply(
+    pub(in crate::store) fn apply<W: PassWrite>(
         &mut self,
-        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        tx: &mut W,
         ks: &Keyspaces,
     ) -> Result<(), StoreError> {
         for (op, conflicted) in self.ops.iter().zip(self.conflicted.iter_mut()) {

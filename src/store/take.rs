@@ -300,7 +300,9 @@ mod tests {
     use std::time::SystemTime;
 
     use super::super::keys::make_job_key;
-    use super::super::options::{BulkDeleteOptions, EnqueueOptions};
+    use super::super::options::{
+        BulkDeleteOptions, BulkPatchOptions, EnqueueOptions, JobFilter, PatchJobOptions,
+    };
     use super::super::store::StoreEvent;
     use super::super::test_support::test_store;
     use super::super::types::{Job, JobStatus};
@@ -1121,8 +1123,9 @@ mod tests {
 
     /// A job whose record changes after the take pre-read it is put back
     /// and taken again, from its new record. The test holds the write
-    /// lock so the writer can't apply the take until the record has
-    /// changed.
+    /// lock and gives the writer a bulk patch, which writes through a
+    /// transaction, so the writer waits on the lock with the take queued
+    /// behind it until the record has changed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn take_retries_a_job_changed_after_its_pre_read() {
         let store = Arc::new(test_store());
@@ -1154,6 +1157,21 @@ mod tests {
         });
         locked_rx.await.unwrap();
 
+        let wedge = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let matching_nothing = BulkPatchOptions {
+                    filter: JobFilter {
+                        queues: ["nothing".into()].into(),
+                        ..Default::default()
+                    },
+                    patch: PatchJobOptions::default(),
+                };
+                store.patch_jobs(matching_nothing).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         let take = tokio::spawn({
             let store = store.clone();
             async move {
@@ -1177,6 +1195,7 @@ mod tests {
 
         change_tx.send(()).unwrap();
         holder.await.unwrap();
+        wedge.await.unwrap().unwrap();
 
         let jobs = take.await.unwrap().unwrap();
         assert_eq!(jobs.len(), 1);

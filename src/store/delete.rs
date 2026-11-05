@@ -10,7 +10,7 @@
 //!   events so workers can release capacity for in-flight jobs deleted
 //!   out from under them.
 
-use fjall::{Readable, Slice};
+use fjall::Slice;
 use tokio::task;
 
 use super::budget::BudgetRef;
@@ -20,6 +20,7 @@ use super::keys::{
     make_status_key, make_type_key, make_unique_key,
 };
 use super::options::BulkDeleteOptions;
+use super::pass_write::PassWrite;
 use super::scan::{JobStream, apply_filters, build_id_stream, filter_needs_payload};
 use super::store::{Keyspaces, Store, StoreEvent};
 use super::types::{Job, JobStatus, ScanDirection, StoreError};
@@ -184,11 +185,7 @@ pub(super) fn prepare_job_deletion(job: &Job, status: JobStatus, ks: &Keyspaces)
 }
 
 /// Apply pre-computed deletion inside an open tx.
-pub(super) fn apply_job_deletion(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
-    del: &JobDeletion,
-    ks: &Keyspaces,
-) {
+pub(super) fn apply_job_deletion<W: PassWrite>(tx: &mut W, del: &JobDeletion, ks: &Keyspaces) {
     tx.remove(&ks.data, &make_job_key(&del.id));
     tx.remove_weak(&ks.data, &del.payload_key);
     tx.remove(&ks.index, &del.status_key);

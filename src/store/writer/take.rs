@@ -16,8 +16,9 @@
 //! transaction. Checks read through the pass's transaction, so they see
 //! writes made earlier in the same pass.
 
-use fjall::{Readable, Slice};
+use fjall::Slice;
 
+use super::super::pass_write::PassWrite;
 use super::super::store::Keyspaces;
 use super::super::types::StoreError;
 
@@ -77,9 +78,9 @@ impl TakeGroup {
     }
 
     /// Check and write every take into the pass's transaction.
-    pub(super) fn apply(
+    pub(super) fn apply<W: PassWrite>(
         &mut self,
-        tx: &mut fjall::SingleWriterWriteTx<'_>,
+        tx: &mut W,
         ks: &Keyspaces,
     ) -> Result<(), StoreError> {
         self.outcomes = self
@@ -119,8 +120,8 @@ impl TakeGroup {
 
 /// Check one take's jobs are all unchanged, then write them. Writes
 /// nothing if any has changed.
-fn apply_take(
-    tx: &mut fjall::SingleWriterWriteTx<'_>,
+fn apply_take<W: PassWrite>(
+    tx: &mut W,
     ks: &Keyspaces,
     writes: &[TakeWrite],
 ) -> Result<TakeOutcome, StoreError> {
