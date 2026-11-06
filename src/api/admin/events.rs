@@ -34,9 +34,6 @@ use crate::store::{self, StoreEvent};
 /// Default subscription window size.
 const DEFAULT_LIMIT: usize = 200;
 
-/// Maximum subscription window for free-tier connections.
-const FREE_TIER_CAP: usize = 10;
-
 /// Per-list subscription parameters. The dashboard addresses rows by
 /// job id, not by numeric offset — see `store::WindowAnchor` docs.
 #[derive(Clone)]
@@ -271,11 +268,6 @@ fn server_status(state: &AppState) -> ServerStatus {
         Some(tier) => tier.to_string(),
         None => "free".to_string(),
     };
-    let subscription_limit = if can_show_live_queue(state) {
-        None
-    } else {
-        Some(FREE_TIER_CAP)
-    };
     ServerStatus {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_ms: state.start_time.elapsed().as_millis() as u64,
@@ -283,45 +275,25 @@ fn server_status(state: &AppState) -> ServerStatus {
         total_ready: state.store.ready_count(),
         total_in_flight: state.store.in_flight_count(),
         total_scheduled: state.store.scheduled_count(),
-        subscription_limit,
+        subscription_limit: None,
     }
-}
-
-/// Check whether the server license permits live queue detail.
-fn can_show_live_queue(state: &AppState) -> bool {
-    let now_ms = (state.clock)();
-    state
-        .license
-        .read()
-        .unwrap()
-        .require(now_ms, crate::license::Feature::TopLiveQueue)
-        .is_ok()
 }
 
 /// Send the initial `JobSnapshot` covering all three lists (each
 /// anchored at `Head` by default) and build the connection state.
-///
-/// When the license does not permit live queue detail, the connection
-/// still exists but every list request comes back with the free-tier
-/// capped limit.
 async fn send_initial_snapshot(
     state: &AppState,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<ConnectionState, String> {
-    let live_queue = can_show_live_queue(state);
-    let make_sub = || {
-        if live_queue {
-            Subscription::default()
-        } else {
-            Subscription {
-                anchor: store::WindowAnchor::Head,
-                fallback: store::WindowFallback::Head,
-                limit: FREE_TIER_CAP,
-            }
-        }
-    };
-
-    send_snapshot_with_subs(state, sender, make_sub(), make_sub(), make_sub(), false).await
+    send_snapshot_with_subs(
+        state,
+        sender,
+        Subscription::default(),
+        Subscription::default(),
+        Subscription::default(),
+        false,
+    )
+    .await
 }
 
 /// Re-send a full snapshot using the existing connection's subscription
@@ -381,9 +353,6 @@ async fn send_snapshot_with_subs(
 }
 
 /// Process a store event, returning zero or more `AdminEvent`s to send.
-///
-/// In-flight events are always emitted. Ready and scheduled diffs are
-/// only emitted when `live_queue` is true (Pro license or higher).
 async fn process_store_event(
     store: &store::Store,
     event: StoreEvent,
@@ -477,11 +446,6 @@ async fn handle_subscribe(
     limit: usize,
 ) {
     let (store_anchor, store_fallback) = to_store_anchor(anchor);
-    let limit = if can_show_live_queue(state) {
-        limit
-    } else {
-        FREE_TIER_CAP
-    };
     let sub = Subscription {
         anchor: store_anchor,
         fallback: store_fallback,
@@ -1420,41 +1384,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn free_tier_snapshot_has_capped_job_lists() {
+    async fn free_tier_snapshot_is_not_capped() {
         let state = free_state();
         let now = now_millis();
 
-        // Enqueue jobs in all states.
-        state
-            .store
-            .enqueue(
-                now,
-                EnqueueOptions::new("ready_type", "q", serde_json::json!(null)),
-            )
-            .await
-            .unwrap();
-        state
-            .store
-            .take_next_job(now, &HashSet::new())
-            .await
-            .unwrap();
-        state
-            .store
-            .enqueue(
-                now,
-                EnqueueOptions::new("ready_type2", "q", serde_json::json!(null)),
-            )
-            .await
-            .unwrap();
-        state
-            .store
-            .enqueue(
-                now,
-                EnqueueOptions::new("sched_type", "q", serde_json::json!(null))
-                    .ready_at(now + 60_000),
-            )
-            .await
-            .unwrap();
+        for _ in 0..15 {
+            state
+                .store
+                .enqueue(
+                    now,
+                    EnqueueOptions::new("task", "q", serde_json::json!(null)),
+                )
+                .await
+                .unwrap();
+        }
 
         let (_addr, mut rx) = connect(state).await;
         let snapshot = next_json(&mut rx).await;
@@ -1462,19 +1405,13 @@ mod tests {
         assert_eq!(snapshot["event"], "job_snapshot");
         assert_server_status(&snapshot);
         assert_eq!(snapshot["server"]["tier"], "free");
-        assert_eq!(snapshot["server"]["subscription_limit"], FREE_TIER_CAP);
-        // Totals are still populated.
-        assert_eq!(snapshot["server"]["total_ready"], 1);
-        assert_eq!(snapshot["server"]["total_in_flight"], 1);
-        assert_eq!(snapshot["server"]["total_scheduled"], 1);
-        // All lists are now populated (capped to FREE_TIER_CAP).
-        assert_eq!(snapshot["in_flight"]["items"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["scheduled"]["items"].as_array().unwrap().len(), 1);
+        assert!(snapshot["server"]["subscription_limit"].is_null());
+        assert_eq!(snapshot["server"]["total_ready"], 15);
+        assert_eq!(snapshot["ready"]["items"].as_array().unwrap().len(), 15);
     }
 
     #[tokio::test]
-    async fn free_tier_streams_ready_events_within_cap() {
+    async fn free_tier_streams_ready_events() {
         let state = free_state();
         let now = now_millis();
 
@@ -1484,7 +1421,7 @@ mod tests {
         let snapshot = next_json(&mut rx).await;
         assert_eq!(snapshot["event"], "job_snapshot");
 
-        // Enqueue a job — free tier now receives ready events within the cap.
+        // Enqueue a job.
         state
             .store
             .enqueue(

@@ -57,8 +57,6 @@ impl std::fmt::Display for Tier {
 /// `min_tier()`, add a check in the relevant handler.
 #[derive(Debug, Clone, Copy)]
 pub enum Feature {
-    /// Live queue detail in the `zizq top` command.
-    TopLiveQueue,
     /// Example Pro feature for testing the gating machinery.
     ProExample,
     /// Example Enterprise feature for testing the gating machinery.
@@ -80,7 +78,6 @@ impl Feature {
     /// Minimum tier required for this feature.
     pub fn min_tier(self) -> Tier {
         match self {
-            Feature::TopLiveQueue => Tier::Pro,
             Feature::ProExample => Tier::Pro,
             Feature::EnterpriseExample => Tier::Enterprise,
             Feature::MutualTls => Tier::Pro,
@@ -95,7 +92,6 @@ impl Feature {
 impl std::fmt::Display for Feature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Feature::TopLiveQueue => write!(f, "live queue detail"),
             Feature::ProExample => write!(f, "pro example"),
             Feature::EnterpriseExample => write!(f, "enterprise example"),
             Feature::MutualTls => write!(f, "mutual TLS"),
