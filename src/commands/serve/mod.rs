@@ -303,6 +303,17 @@ pub struct Args {
     #[arg(long, default_value_t = false, env = "ZIZQ_NO_ADMIN")]
     no_admin: bool,
 
+    /// Host names, besides localhost and IP addresses, that browsers may
+    /// use to reach the admin API, separated by commas
+    /// (e.g. zizq-admin.example.com).
+    #[arg(
+        long,
+        value_name = "HOSTS",
+        value_delimiter = ',',
+        env = "ZIZQ_ADMIN_ALLOWED_HOSTS"
+    )]
+    admin_allowed_hosts: Vec<String>,
+
     /// Path to a PEM-encoded TLS certificate chain for the admin API.
     /// Must be used together with --admin-tls-key.
     #[arg(long, value_name = "PATH", env = "ZIZQ_ADMIN_TLS_CERT")]
@@ -495,7 +506,10 @@ async fn start_admin_api(
 
     let admin_state = state.clone();
     let admin_shutdown = state.shutdown.clone();
-    let admin_app = crate::api::admin::app(admin_state);
+    let admin_app = crate::api::admin::app(
+        admin_state,
+        crate::api::admin::AllowedHosts::new(&args.admin_allowed_hosts),
+    );
     let admin_tls_config = match (&args.admin_tls_cert, &args.admin_tls_key) {
         (Some(cert), Some(key)) => Some(tls::build_server_config(
             cert.as_ref(),

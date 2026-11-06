@@ -5,22 +5,31 @@
 //!
 //! Provides the router for the admin HTTP listener, which serves the
 //! WebSocket event stream and backup endpoint.
+//!
+//! Every route sits behind `origin::check_origin`, which stops web pages
+//! the operator visits from using the API through their browser.
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
 
+use super::origin::{self, AllowedHosts};
 use super::{backup, compact, events};
 use crate::api::middleware;
 use crate::state::AppState;
 
-/// Build the admin API router.
-pub fn app(state: Arc<AppState>) -> Router {
+/// Build the admin API router. `allowed_hosts` names the hosts, besides
+/// `localhost` and IP addresses, that web pages may reach it through.
+pub fn app(state: Arc<AppState>, allowed_hosts: AllowedHosts) -> Router {
     Router::new()
         .route("/events", get(events::event_stream))
         .route("/backup", post(backup::handle_backup))
         .route("/compact", post(compact::handle_compact))
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_hosts,
+            origin::check_origin,
+        ))
         .layer(axum::middleware::from_fn(middleware::admin_request_logging))
         .with_state(state)
 }
@@ -81,7 +90,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
 
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
             .await
@@ -113,7 +126,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
 
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
             .await
@@ -147,7 +164,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
 
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
             .await
@@ -191,7 +212,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
 
         let client = reqwest::Client::new();
         let res = client
@@ -242,7 +267,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
 
         let client = reqwest::Client::new();
         let bytes = client
@@ -304,7 +333,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app(state)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
 
         let client = reqwest::Client::new();
         let res = client
@@ -314,5 +347,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), 204);
+    }
+
+    fn compact_request(origin: Option<&str>) -> axum::http::Request<axum::body::Body> {
+        let mut req = axum::http::Request::post("/compact").header("host", "127.0.0.1:8901");
+        if let Some(origin) = origin {
+            req = req.header("origin", origin);
+        }
+        req.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_without_an_origin_are_permitted() {
+        use tower::ServiceExt;
+
+        let (_, state) = test_state();
+        let res = app(state, AllowedHosts::default())
+            .oneshot(compact_request(None))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn same_origin_requests_are_permitted() {
+        use tower::ServiceExt;
+
+        let (_, state) = test_state();
+        let res = app(state, AllowedHosts::default())
+            .oneshot(compact_request(Some("http://127.0.0.1:8901")))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_requests_are_forbidden() {
+        use tower::ServiceExt;
+
+        let (_, state) = test_state();
+        let res = app(state, AllowedHosts::default())
+            .oneshot(compact_request(Some("https://evil.example")))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_websocket_upgrades_are_forbidden() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (_, state) = test_state();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
+
+        let mut req = format!("ws://{addr}/events").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("origin", "https://evil.example".parse().unwrap());
+
+        match tokio_tungstenite::connect_async(req).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
+                assert_eq!(res.status(), 403);
+            }
+            other => panic!("expected a 403 response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_origin_websocket_upgrades_are_permitted() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (_, state) = test_state();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state, AllowedHosts::default()))
+                .await
+                .unwrap()
+        });
+
+        let mut req = format!("ws://{addr}/events").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("origin", format!("http://{addr}").parse().unwrap());
+
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (_, mut ws_rx) = ws.split();
+        consume_initial_snapshot(&mut ws_rx).await;
     }
 }

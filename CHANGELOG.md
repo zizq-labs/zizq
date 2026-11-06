@@ -4,6 +4,14 @@
 
 - `zizq top` now shows every job on the free tier. Without a Pro
   licence it used to show only the first 10 jobs in each list.
+- The admin API now refuses requests made by web pages served from
+  anywhere other than the admin API itself. Before, any website you
+  visited could use your browser to read jobs from a server on
+  `localhost` or your network, or to delete them. Web pages may reach the
+  admin API through `localhost` or an IP address. To use a host name,
+  list it with the new `--admin-allowed-hosts` flag
+  (`ZIZQ_ADMIN_ALLOWED_HOSTS`). Clients that are not browsers, such as
+  `zizq top`, are unaffected.
 
 ## 0.8.1
 
