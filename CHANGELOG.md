@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `zizq top` now shows every job on the free tier. Without a Pro
+  licence it used to show only the first 10 jobs in each list.
+
 ## 0.8.1
 
 - Enqueueing is up to 24% faster, and draining and mixed workloads about
