@@ -12,9 +12,11 @@ pub mod backup;
 pub mod compact;
 pub mod events;
 mod handlers;
+mod origin;
 mod types;
 
 pub use handlers::app;
+pub use origin::AllowedHosts;
 pub use types::{
     AdminBackoff, AdminEvent, AdminJob, AdminMessage, AdminRetention, ClientMessage, Direction,
     Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus,

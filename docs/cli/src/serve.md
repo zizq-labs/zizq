@@ -288,6 +288,7 @@ Admin API:
 * `--admin-tls-cert`, `ZIZQ_ADMIN_TLS_CERT`
 * `--admin-tls-key`, `ZIZQ_ADMIN_TLS_KEY`
 * `--admin-tls-client-ca`, `ZIZQ_ADMIN_TLS_CLIENT_CA`
+* `--admin-allowed-hosts`, `ZIZQ_ADMIN_ALLOWED_HOSTS`
 
 ``` shell
 zizq serve \
@@ -306,6 +307,23 @@ zizq serve \
 > Don't forget to configure `zizq top` and `zizq backup` to use HTTPS with
 > `--url https://127.0.0.1:8901` and optionally to provide the `--client-cert`
 > and `--client-key` for Mutual TLS.
+
+### Browser Access to the Admin API
+
+The Admin API refuses requests made by web pages, unless the page was served
+by the Admin API itself. This stops any website you visit from using your
+browser to reach a server on `localhost` or on your network.
+
+Web pages may reach the Admin API through `localhost` or an IP address. To
+use a host name instead, list it with `--admin-allowed-hosts`, separating
+several names with commas.
+
+``` shell
+zizq serve --admin-allowed-hosts zizq-admin.example.com
+```
+
+This does not affect `zizq top`, `zizq backup` or any other client that is not
+a web browser.
 
 ## Detecting Vanished Workers
 
