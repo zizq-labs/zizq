@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zizq Web</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body data-conn="connecting">
+  <header class="bar">
+    <span class="brand">zizq</span>
+    <span class="conn"><span class="dot"></span><span id="conn-text">connecting</span></span>
+    <span class="host" id="host"></span>
+  </header>
+
+  <main>
+    <section aria-labelledby="jobs-heading">
+      <h2 id="jobs-heading">Jobs</h2>
+      <dl class="totals">
+        <div class="in-flight"><dt>in flight</dt><dd id="total-in-flight">-</dd></div>
+        <div class="ready"><dt>ready</dt><dd id="total-ready">-</dd></div>
+        <div class="scheduled"><dt>scheduled</dt><dd id="total-scheduled">-</dd></div>
+      </dl>
+    </section>
+
+    <section aria-labelledby="server-heading">
+      <h2 id="server-heading">Server</h2>
+      <dl class="props">
+        <dt>version</dt><dd id="version">-</dd>
+        <dt>tier</dt><dd id="tier">-</dd>
+        <dt>uptime</dt><dd id="uptime">-</dd>
+      </dl>
+    </section>
+  </main>
+</body>
+</html>

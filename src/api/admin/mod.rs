@@ -4,9 +4,9 @@
 //! Admin API for the Zizq dashboard.
 //!
 //! Provides a separate HTTP listener for monitoring and management.
-//! Clients connect via WebSocket to `/events` for live updates.
-//! The admin API is available on all tiers — only the TUI client
-//! that connects to it requires a license.
+//! Clients connect via WebSocket to `/events` for live updates, and a
+//! browser pointed at the listener gets the web UI that does the same.
+//! The admin API is available on all tiers.
 
 pub mod backup;
 pub mod compact;
@@ -14,6 +14,7 @@ pub mod events;
 mod handlers;
 mod origin;
 mod types;
+mod web;
 
 pub use handlers::app;
 pub use origin::AllowedHosts;
