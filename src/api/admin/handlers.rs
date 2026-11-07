@@ -4,7 +4,8 @@
 //! Admin API request handlers.
 //!
 //! Provides the router for the admin HTTP listener, which serves the
-//! WebSocket event stream and backup endpoint.
+//! WebSocket event stream, the backup and compact endpoints, and the web
+//! UI.
 //!
 //! Every route sits behind `origin::check_origin`, which stops web pages
 //! the operator visits from using the API through their browser.
@@ -15,7 +16,7 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use super::origin::{self, AllowedHosts};
-use super::{backup, compact, events};
+use super::{backup, compact, events, web};
 use crate::api::middleware;
 use crate::state::AppState;
 
@@ -26,6 +27,7 @@ pub fn app(state: Arc<AppState>, allowed_hosts: AllowedHosts) -> Router {
         .route("/events", get(events::event_stream))
         .route("/backup", post(backup::handle_backup))
         .route("/compact", post(compact::handle_compact))
+        .merge(web::routes())
         .layer(axum::middleware::from_fn_with_state(
             allowed_hosts,
             origin::check_origin,
@@ -394,6 +396,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn the_web_ui_is_served_at_the_root() {
+        use tower::ServiceExt;
+
+        let (_, state) = test_state();
+        let req = axum::http::Request::get("/")
+            .header("host", "127.0.0.1:8901")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app(state, AllowedHosts::default())
+            .oneshot(req)
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/html; charset=utf-8");
     }
 
     #[tokio::test]
