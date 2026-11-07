@@ -151,6 +151,7 @@ mod tests {
         for (path, content_type) in [
             ("/app.js", "text/javascript; charset=utf-8"),
             ("/app.css", "text/css; charset=utf-8"),
+            ("/preact.js", "text/javascript; charset=utf-8"),
         ] {
             assert!(
                 index.contains(&format!("\"{}\"", &path[1..])),
@@ -208,5 +209,35 @@ mod tests {
         assert!(!accepts("br, deflate"));
         assert!(!accepts("gzip; q=0"));
         assert!(!accepts("x-gzip-ish"));
+    }
+
+    /// Every package that a file in `web/` names on an `@license` line
+    /// must have a `<name> <version>` heading in `THIRD_PARTY_LICENSES`,
+    /// which ships alongside the binary.
+    #[test]
+    fn vendored_packages_are_credited() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let notices = std::fs::read_to_string(root.join("THIRD_PARTY_LICENSES")).unwrap();
+        let mut credited = 0;
+
+        for entry in std::fs::read_dir(root.join("web")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (_, rest) in text.lines().filter_map(|l| l.split_once("@license ")) {
+                let package: Vec<&str> = rest.split_whitespace().take(2).collect();
+                let heading = package.join(" ");
+                assert!(
+                    notices.lines().any(|l| l == heading),
+                    "{} names {heading:?}, which THIRD_PARTY_LICENSES does not credit",
+                    path.display()
+                );
+                credited += 1;
+            }
+        }
+
+        assert!(credited > 0, "expected @license lines in web/");
     }
 }
