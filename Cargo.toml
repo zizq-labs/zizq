@@ -66,6 +66,9 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 [target.'cfg(any(target_env = "musl", target_os = "macos"))'.dependencies]
 mimalloc = "0.1"
 
+[build-dependencies]
+flate2 = "1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 http-body-util = "0.1"
