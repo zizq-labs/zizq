@@ -8,6 +8,7 @@
 
 import { formatClock, formatDue, formatElapsed } from "./format.js";
 import { applyMessage, emptyLists } from "./lists.js";
+import { marker } from "./overview.js";
 import { html, render, useEffect, useRef, useState } from "./preact.js";
 
 const MIN_RETRY_MS = 1000;
@@ -185,17 +186,21 @@ function Header({ conn, server, receivedAt }) {
 function ListTabs({ server, selected, onSelect }) {
   return html`
     <div class="tabs" role="tablist" aria-label="Job lists">
-      ${Object.entries(LISTS).map(
-        ([name, list]) => html`
+      ${Object.keys(LISTS).map(
+        (name) => html`
           <button
             key=${name}
+            id="tab-${name}"
             class="tab ${name}"
             role="tab"
             aria-selected=${name === selected}
+            aria-controls="list-panel"
             onClick=${() => onSelect(name)}
           >
-            <span class="tab-label">${list.label}</span>
-            <span class="tab-total">${server ? numbers.format(server[list.total]) : "-"}</span>
+            <span class="tab-label">${LISTS[name].label}</span>
+            <span class="tab-total">
+              ${server ? numbers.format(server[LISTS[name].total]) : "-"}
+            </span>
           </button>
         `,
       )}
@@ -203,16 +208,51 @@ function ListTabs({ server, selected, onSelect }) {
   `;
 }
 
-function JobTable({ name, list, total }) {
+// All three lists in queue order, sized by their share of every job, with a
+// marker under the rows shown. Decorative: the tabs carry the same totals.
+function Overview({ server, lists, selected }) {
+  const list = lists[selected];
+  const shown =
+    server && marker(server[LISTS[selected].total], list.firstPosition, list.items.length);
+
+  // Each segment grows in proportion to its list's count, from a minimum
+  // width set in the stylesheet, so even an empty list keeps its place.
+  return html`
+    <div class="overview" aria-hidden="true">
+      ${Object.entries(LISTS).map(
+        ([name, { total }]) => html`
+          <span
+            key=${name}
+            class="segment ${name}"
+            data-selected=${name === selected}
+            style=${{ flexGrow: server ? server[total] : 0 }}
+          >
+            ${name === selected &&
+            shown &&
+            html`
+              <span
+                class="marker"
+                style=${{ left: `${shown.start * 100}%`, width: `${shown.width * 100}%` }}
+              ></span>
+            `}
+          </span>
+        `,
+      )}
+    </div>
+  `;
+}
+
+function JobTable({ name, list }) {
   useTick(1000);
-  const { timeHeading, time } = LISTS[name];
+  const { label, timeHeading, time } = LISTS[name];
   const now = Date.now();
-  const first = list.firstPosition + 1;
-  const last = list.firstPosition + list.items.length;
-  const range = `${numbers.format(first)}–${numbers.format(last)}`;
+
+  if (list.items.length === 0) {
+    return html`<div class="table-scroll"><p class="empty">No jobs ${label}.</p></div>`;
+  }
 
   return html`
-    <div class="table-scroll ${name}" role="tabpanel">
+    <div class="table-scroll">
       <table class="jobs">
         <thead>
           <tr>
@@ -239,13 +279,6 @@ function JobTable({ name, list, total }) {
           )}
         </tbody>
       </table>
-      ${list.items.length === 0
-        ? html`<p class="empty">No jobs ${LISTS[name].label}.</p>`
-        : html`
-            <p class="range">
-              showing ${range} of ${numbers.format(Math.max(total, last))}
-            </p>
-          `}
     </div>
   `;
 }
@@ -254,17 +287,38 @@ function retryClass(attempts) {
   return attempts === 0 ? "" : attempts === 1 ? "retried" : "retried-again";
 }
 
+function ListPanel({ server, lists, selected }) {
+  const list = lists[selected];
+  const total = server ? server[LISTS[selected].total] : 0;
+  const first = list.firstPosition + 1;
+  const last = list.firstPosition + list.items.length;
+  const range = `${numbers.format(first)}–${numbers.format(last)}`;
+
+  return html`
+    <section
+      id="list-panel"
+      class="panel ${selected}"
+      role="tabpanel"
+      aria-labelledby="tab-${selected}"
+    >
+      <${Overview} server=${server} lists=${lists} selected=${selected} />
+      <${JobTable} name=${selected} list=${list} />
+      ${list.items.length > 0 &&
+      html`<p class="range">rows ${range} of ${numbers.format(Math.max(total, last))}</p>`}
+    </section>
+  `;
+}
+
 function App() {
   const { conn, server, receivedAt, lists } = useAdminStream();
   const [selected, select] = useSelectedList();
-  const total = server ? server[LISTS[selected].total] : 0;
 
   return html`
     <div class="app" data-conn=${conn.state}>
       <${Header} conn=${conn} server=${server} receivedAt=${receivedAt} />
       <main>
         <${ListTabs} server=${server} selected=${selected} onSelect=${select} />
-        <${JobTable} name=${selected} list=${lists[selected]} total=${total} />
+        <${ListPanel} server=${server} lists=${lists} selected=${selected} />
       </main>
     </div>
   `;
