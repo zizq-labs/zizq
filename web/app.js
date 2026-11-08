@@ -1,51 +1,80 @@
 // Live view of a Zizq server, fed by the admin API's `/events` WebSocket.
 //
-// Every message on that socket carries the server's current status, so the
-// page only needs to keep the latest one and render it. Messages can arrive
-// far faster than the screen refreshes on a busy server, so state updates
-// are coalesced into animation frames.
+// Every message on that socket carries the server's current status, and
+// job messages keep local copies of the server's job lists up to date (see
+// lists.js). Messages can arrive far faster than the screen refreshes on a
+// busy server, so they are applied as they arrive but rendered at most once
+// per animation frame.
 
-import { html, render, useEffect, useState } from "./preact.js";
+import { formatClock, formatDue, formatElapsed } from "./format.js";
+import { applyMessage, emptyLists } from "./lists.js";
+import { html, render, useEffect, useRef, useState } from "./preact.js";
 
 const MIN_RETRY_MS = 1000;
 const MAX_RETRY_MS = 10000;
 
 const numbers = new Intl.NumberFormat();
 
-// Connects to `/events`, reconnecting with backoff, and returns the
-// connection state plus the most recent `ServerStatus` and when it
-// arrived, so uptime can keep counting between messages.
-function useServerStatus() {
-  const [view, setView] = useState({
+// How each list is presented. `time` fills the one column that differs.
+const LISTS = {
+  in_flight: {
+    label: "in flight",
+    total: "total_in_flight",
+    timeHeading: "duration",
+    time: (job, now) => formatElapsed(job.dequeued_at, now),
+  },
+  ready: {
+    label: "ready",
+    total: "total_ready",
+    timeHeading: "delay",
+    time: (job, now) => formatElapsed(job.ready_at, now),
+  },
+  scheduled: {
+    label: "scheduled",
+    total: "total_scheduled",
+    timeHeading: "due",
+    time: (job, now) => formatDue(job.ready_at, now),
+  },
+};
+
+// Connects to `/events`, reconnecting with backoff. Returns the connection
+// state, the most recent `ServerStatus` and when it arrived (so uptime can
+// keep counting between messages), and the job lists.
+function useAdminStream() {
+  const [, setVersion] = useState(0);
+  const stream = useRef(null);
+  stream.current ??= {
     conn: { state: "connecting" },
     server: null,
     receivedAt: 0,
-  });
+    lists: emptyLists(),
+  };
 
   useEffect(() => {
+    const s = stream.current;
     let ws = null;
     let retryTimer = 0;
     let frame = 0;
     let retryMs = MIN_RETRY_MS;
-    let latest = null;
     let stopped = false;
 
-    const setConn = (conn) => setView((v) => ({ ...v, conn }));
-
+    const rerender = () => setVersion((v) => v + 1);
     const flush = () => {
       frame = 0;
-      setView((v) => ({ ...v, server: latest.server, receivedAt: latest.at }));
+      rerender();
     };
 
     const connect = () => {
-      setConn({ state: "connecting" });
+      s.conn = { state: "connecting" };
+      rerender();
 
       const scheme = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(`${scheme}//${location.host}/events`);
 
       ws.onopen = () => {
         retryMs = MIN_RETRY_MS;
-        setConn({ state: "connected" });
+        s.conn = { state: "connected" };
+        rerender();
       };
 
       ws.onmessage = (event) => {
@@ -56,18 +85,23 @@ function useServerStatus() {
           return;
         }
         if (message.server) {
-          latest = { server: message.server, at: performance.now() };
-          frame ||= requestAnimationFrame(flush);
+          s.server = message.server;
+          s.receivedAt = performance.now();
         }
+        applyMessage(s.lists, message);
+        frame ||= requestAnimationFrame(flush);
       };
 
       // Also follows a failed connection attempt, so this is the only
-      // place that needs to retry.
+      // place that needs to retry. The next connection starts with a
+      // fresh snapshot, so the lists are cleared rather than left stale.
       ws.onclose = () => {
         if (stopped) {
           return;
         }
-        setConn({ state: "disconnected", retryMs });
+        s.conn = { state: "disconnected", retryMs };
+        s.lists = emptyLists();
+        rerender();
         retryTimer = setTimeout(connect, retryMs);
         retryMs = Math.min(retryMs * 2, MAX_RETRY_MS);
       };
@@ -83,7 +117,7 @@ function useServerStatus() {
     };
   }, []);
 
-  return view;
+  return stream.current;
 }
 
 // Re-renders the calling component every `ms` milliseconds.
@@ -95,97 +129,145 @@ function useTick(ms) {
   }, [ms]);
 }
 
-function Header({ conn }) {
+// The selected list, kept in the URL fragment so a reload or a shared link
+// opens the same one.
+function useSelectedList() {
+  const fromHash = () => {
+    const name = location.hash.slice(1);
+    return name in LISTS ? name : "in_flight";
+  };
+  const [selected, setSelected] = useState(fromHash);
+
+  useEffect(() => {
+    const onHashChange = () => setSelected(fromHash());
+    addEventListener("hashchange", onHashChange);
+    return () => removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const select = (name) => {
+    history.replaceState(null, "", `#${name}`);
+    setSelected(name);
+  };
+  return [selected, select];
+}
+
+function Header({ conn, server, receivedAt }) {
+  useTick(1000);
+
   const text =
     conn.state === "disconnected"
       ? `disconnected, retrying in ${conn.retryMs / 1000}s`
       : conn.state;
+
+  // Uptime stops counting while disconnected, since the server may not be
+  // up at all.
+  const connected = conn.state === "connected";
+  const uptime =
+    server && formatClock(server.uptime_ms + (connected ? performance.now() - receivedAt : 0));
 
   return html`
     <header class="bar">
       <span class="brand">zizq</span>
       <span class="conn"><span class="dot"></span>${text}</span>
       <span class="host">${location.host}</span>
+      ${server &&
+      html`
+        <span class="server">
+          <span>v${server.version}</span>
+          <span>${server.tier}</span>
+          <span>up ${uptime}</span>
+        </span>
+      `}
     </header>
   `;
 }
 
-function Totals({ server }) {
-  const total = (key) => (server ? numbers.format(server[key]) : "-");
-
+function ListTabs({ server, selected, onSelect }) {
   return html`
-    <section aria-labelledby="jobs-heading">
-      <h2 id="jobs-heading">Jobs</h2>
-      <dl class="totals">
-        <div class="in-flight">
-          <dt>in flight</dt>
-          <dd>${total("total_in_flight")}</dd>
-        </div>
-        <div class="ready">
-          <dt>ready</dt>
-          <dd>${total("total_ready")}</dd>
-        </div>
-        <div class="scheduled">
-          <dt>scheduled</dt>
-          <dd>${total("total_scheduled")}</dd>
-        </div>
-      </dl>
-    </section>
-  `;
-}
-
-function ServerInfo({ server, receivedAt, connected }) {
-  useTick(1000);
-
-  // Uptime stops counting while disconnected, since the server may not be
-  // up at all.
-  const uptime = server
-    ? formatDuration(server.uptime_ms + (connected ? performance.now() - receivedAt : 0))
-    : "-";
-
-  return html`
-    <section aria-labelledby="server-heading">
-      <h2 id="server-heading">Server</h2>
-      <dl class="props">
-        <dt>version</dt>
-        <dd>${server?.version ?? "-"}</dd>
-        <dt>tier</dt>
-        <dd>${server?.tier ?? "-"}</dd>
-        <dt>uptime</dt>
-        <dd>${uptime}</dd>
-      </dl>
-    </section>
-  `;
-}
-
-function App() {
-  const { conn, server, receivedAt } = useServerStatus();
-
-  return html`
-    <div class="app" data-conn=${conn.state}>
-      <${Header} conn=${conn} />
-      <main>
-        <${Totals} server=${server} />
-        <${ServerInfo}
-          server=${server}
-          receivedAt=${receivedAt}
-          connected=${conn.state === "connected"}
-        />
-      </main>
+    <div class="tabs" role="tablist" aria-label="Job lists">
+      ${Object.entries(LISTS).map(
+        ([name, list]) => html`
+          <button
+            key=${name}
+            class="tab ${name}"
+            role="tab"
+            aria-selected=${name === selected}
+            onClick=${() => onSelect(name)}
+          >
+            <span class="tab-label">${list.label}</span>
+            <span class="tab-total">${server ? numbers.format(server[list.total]) : "-"}</span>
+          </button>
+        `,
+      )}
     </div>
   `;
 }
 
-function formatDuration(ms) {
-  const total = Math.floor(ms / 1000);
-  const days = Math.floor(total / 86400);
-  const pad = (n) => String(n).padStart(2, "0");
-  const hms = [
-    pad(Math.floor((total % 86400) / 3600)),
-    pad(Math.floor((total % 3600) / 60)),
-    pad(total % 60),
-  ].join(":");
-  return days > 0 ? `${days}d ${hms}` : hms;
+function JobTable({ name, list, total }) {
+  useTick(1000);
+  const { timeHeading, time } = LISTS[name];
+  const now = Date.now();
+  const first = list.firstPosition + 1;
+  const last = list.firstPosition + list.items.length;
+  const range = `${numbers.format(first)}–${numbers.format(last)}`;
+
+  return html`
+    <div class="table-scroll ${name}" role="tabpanel">
+      <table class="jobs">
+        <thead>
+          <tr>
+            <th class="num">id</th>
+            <th class="num">priority</th>
+            <th>queue</th>
+            <th class="num">${timeHeading}</th>
+            <th class="num">attempts</th>
+            <th>type</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${list.items.map(
+            (job) => html`
+              <tr key=${job.id} class=${retryClass(job.attempts)}>
+                <td class="num id">${job.id}</td>
+                <td class="num priority">${job.priority}</td>
+                <td>${job.queue}</td>
+                <td class="num">${time(job, now)}</td>
+                <td class="num attempts">${job.attempts}</td>
+                <td class="type">${job.job_type}</td>
+              </tr>
+            `,
+          )}
+        </tbody>
+      </table>
+      ${list.items.length === 0
+        ? html`<p class="empty">No jobs ${LISTS[name].label}.</p>`
+        : html`
+            <p class="range">
+              showing ${range} of ${numbers.format(Math.max(total, last))}
+            </p>
+          `}
+    </div>
+  `;
+}
+
+function retryClass(attempts) {
+  return attempts === 0 ? "" : attempts === 1 ? "retried" : "retried-again";
+}
+
+function App() {
+  const { conn, server, receivedAt, lists } = useAdminStream();
+  const [selected, select] = useSelectedList();
+  const total = server ? server[LISTS[selected].total] : 0;
+
+  return html`
+    <div class="app" data-conn=${conn.state}>
+      <${Header} conn=${conn} server=${server} receivedAt=${receivedAt} />
+      <main>
+        <${ListTabs} server=${server} selected=${selected} onSelect=${select} />
+        <${JobTable} name=${selected} list=${lists[selected]} total=${total} />
+      </main>
+    </div>
+  `;
 }
 
 render(html`<${App} />`, document.getElementById("root"));
