@@ -44,3 +44,16 @@ export function needsFetch(list, top, rows, total) {
   const nearEnd = shownEnd + rows > end && end < total;
   return nearStart || nearEnd;
 }
+
+// The position to show when the scrollbar thumb is dragged so that the
+// point grabbed (`grab` pixels below the thumb's top) is at `pointerY`. The
+// thumb's top travels over `space` pixels from the track's top at `trackY`,
+// covering positions 0 to `total - rows`.
+export function topFromPointer(pointerY, { trackY, grab, space }, total, rows) {
+  const last = Math.max(0, total - rows);
+  if (space <= 0) {
+    return 0;
+  }
+  const travel = Math.max(0, Math.min(1, (pointerY - trackY - grab) / space));
+  return Math.round(travel * last);
+}

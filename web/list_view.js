@@ -3,9 +3,9 @@
 // the rows shown relate to the window of rows fetched from the server.
 
 import { formatDue, formatElapsed } from "./format.js";
-import { marker } from "./overview.js";
+import { marker, scrubTarget, topAtFraction } from "./overview.js";
 import { html, useEffect, useRef, useState } from "./preact.js";
-import { clampTop, needsFetch, visibleRows, wantedWindow } from "./view.js";
+import { clampTop, needsFetch, topFromPointer, visibleRows, wantedWindow } from "./view.js";
 
 // Every table row, headings included, is this tall, so the number of rows
 // that fit can be worked out from the table's height.
@@ -223,14 +223,64 @@ function useTouchRows(moveBy) {
 
 // All three lists in queue order, sized by their share of every job, with a
 // marker under the rows shown. Decorative: the tabs carry the same totals.
-function Overview({ server, selected, shown }) {
+// Pressing on the bar, and dragging along it, scrubs through the whole
+// queue: the list under the pointer is selected and shown at that point,
+// switching lists as the pointer crosses into another segment. That is a
+// pointer convenience, so the bar stays hidden from assistive technology,
+// which has the tabs and the scrollbar.
+function Overview({ server, selected, shown, onScrub }) {
+  const barRef = useRef();
+  const scrubbing = useRef(null);
+
+  const scrubTo = (x) => {
+    const segments = [...barRef.current.children].map((el) => {
+      const box = el.getBoundingClientRect();
+      return { name: el.dataset.list, left: box.left, width: box.width };
+    });
+    const target = scrubTarget(x, segments);
+    if (target) {
+      onScrub(target.name, target.fraction);
+    }
+  };
+
+  const onPointerDown = (event) => {
+    if (!server || event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    scrubbing.current = event.pointerId;
+    barRef.current.setPointerCapture(event.pointerId);
+    scrubTo(event.clientX);
+  };
+
+  const onPointerMove = (event) => {
+    if (scrubbing.current === event.pointerId) {
+      scrubTo(event.clientX);
+    }
+  };
+
+  const onPointerEnd = (event) => {
+    if (scrubbing.current === event.pointerId) {
+      scrubbing.current = null;
+    }
+  };
+
   return html`
-    <div class="overview" aria-hidden="true">
+    <div
+      ref=${barRef}
+      class="overview"
+      aria-hidden="true"
+      onPointerDown=${onPointerDown}
+      onPointerMove=${onPointerMove}
+      onPointerUp=${onPointerEnd}
+      onPointerCancel=${onPointerEnd}
+    >
       ${LIST_ORDER.map(
         (name) => html`
           <span
             key=${name}
             class="segment ${name}"
+            data-list=${name}
             data-selected=${name === selected}
             style=${{ flexGrow: server ? server[LISTS[name].total] : 0 }}
           >
@@ -295,15 +345,59 @@ function retryClass(attempts) {
 
 // Shows where the rows on screen sit in the whole list. The thumb has a
 // minimum height, so its position is a share of the track it can move in.
-function Scrollbar({ top, rows, total }) {
+//
+// Dragging the thumb moves through the list, keeping the point grabbed under
+// the pointer. Pressing elsewhere on the track centres the thumb there, then
+// drags from that point, as native scrollbars do.
+function Scrollbar({ top, rows, total, onMove }) {
+  const trackRef = useRef();
+  const drag = useRef(null);
+
   const size = total > rows ? rows / total : 1;
   const travel = total > rows ? top / (total - rows) : 0;
   const thumbHeight = `max(24px, ${size * 100}%)`;
   const first = Math.min(top + 1, total);
   const last = Math.min(top + rows, total);
 
+  const onPointerDown = (event) => {
+    const thumb = trackRef.current.querySelector(".thumb");
+    if (!thumb || event.button !== 0) {
+      return;
+    }
+    // A touch here is for the scrollbar, not a swipe through the list.
+    event.stopPropagation();
+    event.preventDefault();
+
+    const track = trackRef.current.getBoundingClientRect();
+    const box = thumb.getBoundingClientRect();
+    const onThumb = event.target === thumb;
+    drag.current = {
+      id: event.pointerId,
+      trackY: track.top,
+      grab: onThumb ? event.clientY - box.top : box.height / 2,
+      space: track.height - box.height,
+    };
+    trackRef.current.setPointerCapture(event.pointerId);
+    if (!onThumb) {
+      onMove(topFromPointer(event.clientY, drag.current, total, rows));
+    }
+  };
+
+  const onPointerMove = (event) => {
+    if (drag.current?.id === event.pointerId) {
+      onMove(topFromPointer(event.clientY, drag.current, total, rows));
+    }
+  };
+
+  const onPointerEnd = (event) => {
+    if (drag.current?.id === event.pointerId) {
+      drag.current = null;
+    }
+  };
+
   return html`
     <div
+      ref=${trackRef}
       class="scrollbar"
       role="scrollbar"
       aria-controls="list-rows"
@@ -312,6 +406,10 @@ function Scrollbar({ top, rows, total }) {
       aria-valuemax=${Math.max(0, total - rows)}
       aria-valuenow=${top}
       aria-valuetext="rows ${first} to ${last} of ${total}"
+      onPointerDown=${onPointerDown}
+      onPointerMove=${onPointerMove}
+      onPointerUp=${onPointerEnd}
+      onPointerCancel=${onPointerEnd}
     >
       ${total > rows &&
       html`
@@ -340,6 +438,13 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
   const moveBy = (step) =>
     setTop(selected, (current) => clampTop(clampTop(current, total, rows) + step, total, rows));
   const scrollSideways = (step) => bodyRef.current.scrollBy({ left: step });
+  const scrub = (name, fraction) => {
+    const listTotal = server[LISTS[name].total];
+    setTop(name, () => topAtFraction(fraction, listTotal, rows));
+    if (name !== selected) {
+      onSelect(name);
+    }
+  };
   useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect });
   const onWheel = useWheelRows(moveBy, rows);
   const touchHandlers = useTouchRows(moveBy);
@@ -361,6 +466,7 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
         server=${server}
         selected=${selected}
         shown=${server && marker(total, top, shown.length)}
+        onScrub=${scrub}
       />
       <div class="list-body" onWheel=${onWheel} ...${touchHandlers}>
         <div class="table-scroll" id="list-rows" ref=${bodyRef}>
@@ -368,7 +474,7 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
             ? html`<p class="empty">No jobs ${LISTS[selected].label}.</p>`
             : html`<${JobRows} name=${selected} rows=${shown} />`}
         </div>
-        <${Scrollbar} top=${top} rows=${rows} total=${total} />
+        <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
       </div>
       ${shown.length > 0 &&
       html`<p class="range">rows ${range} of ${numbers.format(total)}</p>`}

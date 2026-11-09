@@ -229,14 +229,19 @@ main {
   display: flex;
   flex: none;
   gap: 2px;
-  margin: 12px 16px 14px;
+  margin: 8px 16px 10px;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
 }
 
+/* Drawn 8px tall, but with room above and below to click. */
 .segment {
   position: relative;
   flex: 0 0 8px;
-  height: 8px;
-  background: var(--accent);
+  height: 16px;
+  padding: 4px 0;
+  background: var(--accent) content-box;
   opacity: 0.35;
 }
 
@@ -244,9 +249,17 @@ main {
   opacity: 1;
 }
 
+.segment:hover {
+  opacity: 0.7;
+}
+
+.segment[data-selected="true"]:hover {
+  opacity: 1;
+}
+
 .marker {
   position: absolute;
-  top: calc(100% + 2px);
+  top: calc(100% - 2px);
   min-width: 4px;
   height: 3px;
   background: var(--fg);
@@ -278,6 +291,16 @@ main {
   width: 10px;
   margin: var(--row-height) 6px 6px 0;
   background: var(--chrome);
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+}
+
+/* Wide enough to hold with a finger. */
+@media (pointer: coarse) {
+  .scrollbar {
+    width: 18px;
+  }
 }
 
 .thumb {
