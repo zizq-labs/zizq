@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  clampToWindow,
   clampTop,
   needsFetch,
   settleTop,
@@ -159,4 +160,16 @@ test("settleTop leaves any other position clamped", () => {
 
 test("settleTop does not follow a list that fits on one screen", () => {
   assert.equal(settleTop(5, 10, 20), 0);
+});
+
+test("clampToWindow keeps a frozen list within the rows it holds", () => {
+  const list = windowAt(100, 60);
+
+  assert.equal(clampToWindow(120, list, 20), 120, "already inside");
+  assert.equal(clampToWindow(0, list, 20), 100, "before the window");
+  assert.equal(clampToWindow(500, list, 20), 140, "after the window");
+});
+
+test("clampToWindow shows a short window from its start", () => {
+  assert.equal(clampToWindow(30, windowAt(10, 5), 20), 10);
 });

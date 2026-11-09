@@ -58,7 +58,8 @@ class Zizq {
     this.process.stdout.on("data", record);
     this.process.stderr.on("data", record);
 
-    for (let i = 0; i < 100; i++) {
+    // Generous, since a debug build on a busy machine can be slow to start.
+    for (let i = 0; i < 300; i++) {
       try {
         if ((await fetch(`${this.api}/jobs/count`)).ok) {
           return;

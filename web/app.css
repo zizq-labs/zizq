@@ -105,6 +105,54 @@ body {
   color: var(--red);
 }
 
+/* Freezes the job list. Styled as a link, muted like the rest of the
+   footer, and bright while the list is frozen, so it is clear that what is
+   on screen has stopped updating. */
+.freeze {
+  margin-left: auto;
+  flex: none;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.freeze:hover {
+  color: var(--fg);
+}
+
+.freeze:hover .label {
+  text-decoration: underline;
+}
+
+.freeze .icon {
+  display: inline-block;
+  width: 9px;
+  height: 10px;
+  margin-right: 6px;
+}
+
+.freeze .pause {
+  border-right: 3px solid currentColor;
+  border-left: 3px solid currentColor;
+}
+
+.freeze .play {
+  background: currentColor;
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+}
+
+.freeze:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+.freeze[aria-pressed="true"] {
+  color: var(--fg);
+}
+
 .server {
   display: flex;
   gap: 16px;
@@ -394,8 +442,7 @@ main {
   color: var(--red);
 }
 
-.empty,
-.range {
+.empty {
   margin: 0;
   padding: 8px 12px;
   color: var(--muted);
@@ -405,7 +452,18 @@ main {
   color: var(--accent);
 }
 
-.range {
+/* A frozen list can't be moved through. */
+[data-frozen="true"] :is(.overview, .scrollbar) {
+  cursor: default;
+}
+
+/* Which rows are shown on the left, and freezing them on the right. */
+.list-footer {
+  display: flex;
   flex: none;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
   border-top: 1px solid var(--rule);
+  color: var(--muted);
 }
