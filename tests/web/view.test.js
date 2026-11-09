@@ -3,7 +3,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { clampTop, needsFetch, visibleRows, wantedWindow } from "../../web/view.js";
+import {
+  clampTop,
+  needsFetch,
+  topFromPointer,
+  visibleRows,
+  wantedWindow,
+} from "../../web/view.js";
 
 // A window of `length` jobs starting at `firstPosition`, with ids naming
 // their positions.
@@ -81,4 +87,24 @@ test("a list shorter than a screen needs no fetch once loaded", () => {
 
 test("an empty list needs no fetch", () => {
   assert.equal(needsFetch(windowAt(0, 0), 0, 20, 0), false);
+});
+
+test("topFromPointer maps the thumb's travel onto the list", () => {
+  const track = { trackY: 100, grab: 10, space: 200 };
+
+  assert.equal(topFromPointer(110, track, 1000, 20), 0, "thumb at the top");
+  assert.equal(topFromPointer(210, track, 1000, 20), 490, "halfway");
+  assert.equal(topFromPointer(310, track, 1000, 20), 980, "thumb at the bottom");
+});
+
+test("topFromPointer stops at either end of the track", () => {
+  const track = { trackY: 100, grab: 10, space: 200 };
+
+  assert.equal(topFromPointer(0, track, 1000, 20), 0);
+  assert.equal(topFromPointer(900, track, 1000, 20), 980);
+});
+
+test("topFromPointer is zero when the list fits or the thumb fills the track", () => {
+  assert.equal(topFromPointer(150, { trackY: 100, grab: 0, space: 200 }, 10, 20), 0);
+  assert.equal(topFromPointer(150, { trackY: 100, grab: 0, space: 0 }, 1000, 20), 0);
 });
