@@ -137,10 +137,11 @@ function useSelectedList() {
 function Header({ conn, server, receivedAt }) {
   useTick(1000);
 
-  const text =
-    conn.state === "disconnected"
-      ? `disconnected, retrying in ${conn.retryMs / 1000}s`
-      : conn.state;
+  const text = {
+    connecting: "Connecting",
+    connected: "Connected",
+    disconnected: `Disconnected, retrying in ${conn.retryMs / 1000}s`,
+  }[conn.state];
 
   // Uptime stops counting while disconnected, since the server may not be
   // up at all.
@@ -150,15 +151,15 @@ function Header({ conn, server, receivedAt }) {
 
   return html`
     <header class="bar">
-      <span class="brand">zizq</span>
+      <img class="brand" src="logo.svg" alt="Zizq" />
       <span class="conn"><span class="dot"></span>${text}</span>
       <span class="host">${location.host}</span>
       ${server &&
       html`
         <span class="server">
           <span>v${server.version}</span>
-          <span>${server.tier}</span>
-          <span>up ${uptime}</span>
+          ${server.tier !== "free" && html`<span>${server.tier}</span>`}
+          <span>Uptime ${uptime}</span>
         </span>
       `}
     </header>
@@ -166,8 +167,13 @@ function Header({ conn, server, receivedAt }) {
 }
 
 function ListTabs({ server, selected, onSelect }) {
+  const jobs = server
+    ? Object.values(LISTS).reduce((sum, list) => sum + server[list.total], 0)
+    : null;
+
   return html`
-    <div class="tabs" role="tablist" aria-label="Job lists">
+    <div class="tab-bar">
+      <div class="tabs" role="tablist" aria-label="Job lists">
       ${Object.keys(LISTS).map(
         (name) => html`
           <button
@@ -186,6 +192,9 @@ function ListTabs({ server, selected, onSelect }) {
           </button>
         `,
       )}
+      </div>
+      ${jobs !== null &&
+      html`<span class="jobs-total">${numbers.format(jobs)} ${jobs === 1 ? "job" : "jobs"}</span>`}
     </div>
   `;
 }

@@ -29,6 +29,13 @@
   --ready: var(--blue);
   --scheduled: var(--magenta);
 
+  /* Spacing shared so the header, tabs, depth bar and job total line up:
+     the page's own padding, how far the tabs sit in from the panel's
+     edge, and a tab's horizontal padding (where its text starts). */
+  --page-pad: 16px;
+  --tab-inset: 8px;
+  --tab-pad: 16px;
+
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
     "Liberation Mono", monospace;
 }
@@ -60,15 +67,16 @@ body {
 .bar {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: 0 24px;
-  padding: 12px 16px;
+  padding: 12px calc(var(--page-pad) + var(--tab-inset));
   border-bottom: 1px solid var(--rule);
   background: var(--chrome);
 }
 
 .brand {
-  font-weight: 700;
+  display: block;
+  height: 28px;
 }
 
 .host {
@@ -119,7 +127,7 @@ main {
   flex-direction: column;
   width: 100%;
   min-height: 0;
-  padding: 16px;
+  padding: var(--page-pad);
   transition: opacity 0.2s;
 }
 
@@ -142,10 +150,24 @@ main {
 
 /* Tabs sit on the panel's top edge. The selected one takes the panel's
    background and covers the edge beneath it, so it opens into the panel. */
+/* The tabs on the left, and the total of every job at the far right. */
+.tab-bar {
+  display: flex;
+  align-items: baseline;
+}
+
 .tabs {
   display: flex;
   gap: 4px;
-  padding-left: 8px;
+  padding-left: var(--tab-inset);
+}
+
+/* Inset as if it were the text of a tab at the right-hand end. */
+.jobs-total {
+  margin-left: auto;
+  padding-right: calc(var(--tab-inset) + var(--tab-pad) + 1px);
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .tab {
@@ -154,7 +176,7 @@ main {
   align-items: baseline;
   gap: 12px;
   margin-bottom: -1px;
-  padding: 8px 16px 12px;
+  padding: 8px var(--tab-pad) 12px;
   border: 1px solid var(--rule);
   border-bottom-color: transparent;
   background: var(--tab);
@@ -179,9 +201,9 @@ main {
 .tab[aria-selected="true"]::after {
   content: "";
   position: absolute;
-  right: 16px;
+  right: var(--tab-pad);
   bottom: 5px;
-  left: 16px;
+  left: var(--tab-pad);
   height: 2px;
   background: var(--accent);
 }
@@ -197,19 +219,22 @@ main {
 }
 
 @media (max-width: 600px) {
+  :root {
+    --tab-inset: 0px;
+    --tab-pad: 10px;
+  }
+
   .tabs {
     gap: 2px;
-    padding-left: 0;
+  }
+
+  /* The tabs fill the row on a narrow screen. */
+  .jobs-total {
+    display: none;
   }
 
   .tab {
     gap: 8px;
-    padding: 8px 10px 12px;
-  }
-
-  .tab[aria-selected="true"]::after {
-    right: 10px;
-    left: 10px;
   }
 }
 
@@ -222,47 +247,44 @@ main {
   background: var(--panel);
 }
 
-/* The queue overview: every list in order, the selected one bright, with
-   a line under the rows shown. Each segment has a minimum width, and its
-   flex-grow (set inline) is its list's count. */
+/* The queue overview: every list in order, with a translucent window over
+   the rows shown. Each segment has a minimum width, and its flex-grow (set
+   inline) is its list's count. */
 .overview {
   display: flex;
   flex: none;
   gap: 2px;
-  margin: 8px 16px 10px;
+  /* Lined up with the text of the tabs. The panel's border sits where the
+     tabs' borders do, so the two cancel out. */
+  margin: 12px calc(var(--tab-inset) + var(--tab-pad));
   cursor: pointer;
   touch-action: none;
   user-select: none;
 }
 
-/* Drawn 8px tall, but with room above and below to click. */
+/* As tall as a line of text, so it reads as a chart of the queue rather
+   than a scrollbar. */
 .segment {
   position: relative;
   flex: 0 0 8px;
-  height: 16px;
-  padding: 4px 0;
-  background: var(--accent) content-box;
-  opacity: 0.35;
-}
-
-.segment[data-selected="true"] {
-  opacity: 1;
+  height: 28px;
+  background: var(--accent);
 }
 
 .segment:hover {
-  opacity: 0.7;
+  filter: brightness(1.15);
 }
 
-.segment[data-selected="true"]:hover {
-  opacity: 1;
-}
-
+/* Edged on both sides and standing proud of the bar, so even a thin slice
+   of a long list stays visible. */
 .marker {
   position: absolute;
-  top: calc(100% - 2px);
+  top: -4px;
+  bottom: -4px;
   min-width: 4px;
-  height: 3px;
-  background: var(--fg);
+  border-right: 1px solid var(--fg);
+  border-left: 1px solid var(--fg);
+  background: rgba(255, 255, 255, 0.35);
 }
 
 /* The table shows only the rows that fit, so it never scrolls vertically;

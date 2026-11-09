@@ -24,19 +24,22 @@ const numbers = new Intl.NumberFormat();
 // How each list is presented. `time` fills the one column that differs.
 export const LISTS = {
   in_flight: {
-    label: "in flight",
+    label: "In-Flight",
+    empty: "No jobs in flight.",
     total: "total_in_flight",
     timeHeading: "duration",
     time: (job, now) => formatElapsed(job.dequeued_at, now),
   },
   ready: {
-    label: "ready",
+    label: "Ready",
+    empty: "No jobs ready.",
     total: "total_ready",
     timeHeading: "delay",
     time: (job, now) => formatElapsed(job.ready_at, now),
   },
   scheduled: {
-    label: "scheduled",
+    label: "Scheduled",
+    empty: "No jobs scheduled.",
     total: "total_scheduled",
     timeHeading: "due",
     time: (job, now) => formatDue(job.ready_at, now),
@@ -222,7 +225,7 @@ function useTouchRows(moveBy) {
 }
 
 // All three lists in queue order, sized by their share of every job, with a
-// marker under the rows shown. Decorative: the tabs carry the same totals.
+// window over the rows shown. Decorative: the tabs carry the same totals.
 // Pressing on the bar, and dragging along it, scrubs through the whole
 // queue: the list under the pointer is selected and shown at that point,
 // switching lists as the pointer crosses into another segment. That is a
@@ -281,7 +284,6 @@ function Overview({ server, selected, shown, onScrub }) {
             key=${name}
             class="segment ${name}"
             data-list=${name}
-            data-selected=${name === selected}
             style=${{ flexGrow: server ? server[LISTS[name].total] : 0 }}
           >
             ${name === selected &&
@@ -471,13 +473,13 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
       <div class="list-body" onWheel=${onWheel} ...${touchHandlers}>
         <div class="table-scroll" id="list-rows" ref=${bodyRef}>
           ${total === 0
-            ? html`<p class="empty">No jobs ${LISTS[selected].label}.</p>`
+            ? html`<p class="empty">${LISTS[selected].empty}</p>`
             : html`<${JobRows} name=${selected} rows=${shown} />`}
         </div>
         <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
       </div>
       ${shown.length > 0 &&
-      html`<p class="range">rows ${range} of ${numbers.format(total)}</p>`}
+      html`<p class="range">Rows ${range} of ${numbers.format(total)}</p>`}
     </section>
   `;
 }

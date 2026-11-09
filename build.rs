@@ -53,6 +53,7 @@ fn main() {
             Some("html") => "text/html; charset=utf-8",
             Some("css") => "text/css; charset=utf-8",
             Some("js") => "text/javascript; charset=utf-8",
+            Some("svg") => "image/svg+xml",
             _ => panic!("web/{name}: no content type is known for this file"),
         };
         let route = match name {
