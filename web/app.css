@@ -401,6 +401,10 @@ main {
   color: var(--muted);
 }
 
+.range .following {
+  color: var(--accent);
+}
+
 .range {
   flex: none;
   border-top: 1px solid var(--rule);

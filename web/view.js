@@ -13,6 +13,15 @@ export function clampTop(top, total, rows) {
   return Math.max(0, Math.min(top, total - rows));
 }
 
+// Where a move to `top` should leave a list. Reaching the last screen of a
+// list longer than one screen follows the end from then on, as `Infinity`,
+// which `clampTop` turns into the last screen however the list changes.
+// Moving back up from there gives an ordinary position again.
+export function settleTop(top, total, rows) {
+  const clamped = clampTop(top, total, rows);
+  return total > rows && clamped >= total - rows ? Infinity : clamped;
+}
+
 // The rows to show, from position `top`: each with its position in the list
 // and its job, or `null` while that row has not been fetched yet.
 export function visibleRows(list, top, rows, total) {
@@ -56,4 +65,19 @@ export function topFromPointer(pointerY, { trackY, grab, space }, total, rows) {
   }
   const travel = Math.max(0, Math.min(1, (pointerY - trackY - grab) / space));
   return Math.round(travel * last);
+}
+
+// The rows to show while following the end of the list: the last of those
+// fetched, positioned from the end. The server keeps a window anchored to
+// the end up to date as the list grows, but its changes don't say how far
+// the window's start has moved, so these are counted back from the total
+// rather than forward from `list.firstPosition`.
+export function tailRows(list, rows, total) {
+  const count = Math.max(0, Math.min(rows, total));
+  const missing = Math.max(0, count - list.items.length);
+  const jobs = list.items.slice(list.items.length - (count - missing));
+  return Array.from({ length: count }, (_, i) => ({
+    position: total - count + i,
+    job: i < missing ? null : jobs[i - missing],
+  }));
 }
