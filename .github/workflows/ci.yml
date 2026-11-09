@@ -729,22 +729,65 @@ jobs:
 
   # --- Integration gate (stable check name for branch protection) ---
 
+  # --- Admin web UI in real browsers, against the release binary ---
+  #
+  # Runs integration/web: Chromium, Firefox and WebKit (the nearest to
+  # Safari on Linux) drive the UI served by the release binary. The
+  # Playwright image carries the browsers and the libraries they need.
+
+  integration-web:
+    name: Integration (Web UI)
+    needs: release-binary
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.65.0-noble
+      options: --ipc=host
+    env:
+      # Firefox refuses to start with a HOME owned by another user.
+      HOME: /root
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: zizq-binary-v${{ needs.release-binary.outputs.version }}
+          path: server
+
+      - name: Unpack server binary
+        run: tar -xzf server/zizq-${{ needs.release-binary.outputs.version }}-linux-x86_64.tar.gz -C server
+
+      - name: Run web UI unit tests
+        run: node --test "tests/web/*.test.js"
+
+      - name: Run browser tests
+        run: ./integration/web/run.sh --binary server/zizq
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-test-results
+          path: integration/web/test-results
+          retention-days: 7
+
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    needs: [integration-node, integration-ruby, integration-rust, integration-elixir]
+    needs: [integration-node, integration-ruby, integration-rust, integration-elixir, integration-web]
     if: always()
     steps:
       - run: |
           if [ "${{ needs.integration-node.result }}" != "success" ] || \
              [ "${{ needs.integration-ruby.result }}" != "success" ] || \
              [ "${{ needs.integration-rust.result }}" != "success" ] || \
-             [ "${{ needs.integration-elixir.result }}" != "success" ]; then
+             [ "${{ needs.integration-elixir.result }}" != "success" ] || \
+             [ "${{ needs.integration-web.result }}" != "success" ]; then
             echo "Integration tests failed or were skipped."
             echo "  Node: ${{ needs.integration-node.result }}"
             echo "  Ruby: ${{ needs.integration-ruby.result }}"
             echo "  Rust: ${{ needs.integration-rust.result }}"
             echo "  Elixir: ${{ needs.integration-elixir.result }}"
+            echo "  Web UI: ${{ needs.integration-web.result }}"
             exit 1
           fi
           echo "All integration tests passed."
