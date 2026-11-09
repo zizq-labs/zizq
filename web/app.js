@@ -211,6 +211,27 @@ function App() {
   const setTop = (name, update) =>
     setTops((current) => ({ ...current, [name]: update(current[name]) }));
 
+  // While frozen, the lists shown are a copy taken at the moment of
+  // freezing, with each list's total then. The live lists carry on following
+  // the server out of sight, so unfreezing shows them as they are now, with
+  // nothing to catch up.
+  const [frozen, setFrozen] = useState(null);
+  const toggleFreeze = () =>
+    setFrozen((current) =>
+      current
+        ? null
+        : Object.fromEntries(
+            Object.entries(stream.lists).map(([name, list]) => [
+              name,
+              {
+                ...list,
+                items: [...list.items],
+                total: stream.server ? stream.server[LISTS[name].total] : list.items.length,
+              },
+            ]),
+          ),
+    );
+
   return html`
     <div class="app" data-conn=${conn.state}>
       <${Header} conn=${conn} server=${server} receivedAt=${receivedAt} />
@@ -218,6 +239,9 @@ function App() {
         <${ListTabs} server=${server} selected=${selected} onSelect=${select} />
         <${ListPanel}
           stream=${stream}
+          lists=${frozen ?? stream.lists}
+          frozen=${frozen !== null}
+          onToggleFreeze=${toggleFreeze}
           selected=${selected}
           onSelect=${select}
           tops=${tops}

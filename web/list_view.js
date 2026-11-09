@@ -6,6 +6,7 @@ import { formatDue, formatElapsed } from "./format.js";
 import { marker, scrubTarget, topAtFraction } from "./overview.js";
 import { html, useEffect, useRef, useState } from "./preact.js";
 import {
+  clampToWindow,
   clampTop,
   needsFetch,
   settleTop,
@@ -86,9 +87,9 @@ function useRowsThatFit(ref) {
 // While following the end of the list, that is a window anchored to the end,
 // which the server keeps up to date as the list grows. Otherwise it is a
 // window at an offset, replaced as the rows shown near its edges.
-function useWindowFetch(stream, name, list, top, rows, total, following) {
+function useWindowFetch(stream, name, list, top, rows, total, following, frozen) {
   useEffect(() => {
-    if (!stream.server || rows === 0) {
+    if (frozen || !stream.server || rows === 0) {
       return;
     }
     const sent = stream.fetches[name];
@@ -112,9 +113,9 @@ function useWindowFetch(stream, name, list, top, rows, total, following) {
 // Keyboard shortcuts for the list, wherever focus is, other than in a text
 // field. They follow `zizq top`, except that Shift+←/→ switch lists, since
 // Tab moves focus in a browser.
-function useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect }) {
+function useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect, onToggleFreeze }) {
   const latest = useRef();
-  latest.current = { rows, moveBy, moveTo, scrollSideways, selected, onSelect };
+  latest.current = { rows, moveBy, moveTo, scrollSideways, selected, onSelect, onToggleFreeze };
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -147,6 +148,7 @@ function useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect 
             End: () => k.moveTo(Infinity),
             ArrowLeft: () => k.scrollSideways(-SIDEWAYS_STEP),
             ArrowRight: () => k.scrollSideways(SIDEWAYS_STEP),
+            p: () => k.onToggleFreeze(),
             1: () => k.onSelect(LIST_ORDER[0]),
             2: () => k.onSelect(LIST_ORDER[1]),
             3: () => k.onSelect(LIST_ORDER[2]),
@@ -454,31 +456,70 @@ function Scrollbar({ top, rows, total, onMove }) {
   `;
 }
 
-export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
-  const { server, lists } = stream;
+// Freezes and unfreezes the job lists, from the list footer. The pause and play icons are drawn
+// in CSS: fonts disagree too much on the Unicode symbols, and iOS draws them
+// as emoji.
+function FreezeButton({ frozen, onToggle }) {
+  return html`
+    <button
+      class="freeze"
+      aria-pressed=${frozen}
+      title=${frozen ? "Resume live updates (p)" : "Freeze the job lists (p)"}
+      onClick=${onToggle}
+    >
+      <span class="icon ${frozen ? "play" : "pause"}" aria-hidden="true"></span>
+      <span class="label">${frozen ? "Resume" : "Freeze"}</span>
+    </button>
+  `;
+}
+
+// `lists` are the live lists, or while `frozen`, a copy taken when they were
+// frozen. A frozen list can't be moved through, and shows only the rows it
+// held, with its total as it was then.
+export function ListPanel({
+  stream,
+  lists,
+  frozen,
+  onToggleFreeze,
+  selected,
+  onSelect,
+  tops,
+  setTop,
+}) {
+  const { server } = stream;
   const list = lists[selected];
-  const total = server ? server[LISTS[selected].total] : 0;
+  const total = frozen ? list.total : server ? server[LISTS[selected].total] : 0;
 
   const bodyRef = useRef();
   const rows = useRowsThatFit(bodyRef);
-  const top = clampTop(tops[selected], total, rows);
   const following = tops[selected] === Infinity && total > rows;
+  const top = frozen && !following
+    ? clampToWindow(clampTop(tops[selected], total, rows), list, rows)
+    : clampTop(tops[selected], total, rows);
 
   useTick(1000);
-  useWindowFetch(stream, selected, list, top, rows, total, following);
+  useWindowFetch(stream, selected, list, top, rows, total, following, frozen);
 
-  const moveTo = (position) => setTop(selected, () => settleTop(position, total, rows));
+  const move = (update) => {
+    if (!frozen) {
+      setTop(selected, update);
+    }
+  };
+  const moveTo = (position) => move(() => settleTop(position, total, rows));
   const moveBy = (step) =>
-    setTop(selected, (current) => settleTop(clampTop(current, total, rows) + step, total, rows));
+    move((current) => settleTop(clampTop(current, total, rows) + step, total, rows));
   const scrollSideways = (step) => bodyRef.current.scrollBy({ left: step });
   const scrub = (name, fraction) => {
+    if (frozen) {
+      return;
+    }
     const listTotal = server[LISTS[name].total];
     setTop(name, () => settleTop(topAtFraction(fraction, listTotal, rows), listTotal, rows));
     if (name !== selected) {
       onSelect(name);
     }
   };
-  useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect });
+  useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect, onToggleFreeze });
   const onWheel = useWheelRows(moveBy, rows);
   const touchHandlers = useTouchRows(moveBy);
 
@@ -491,6 +532,7 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
     <section
       id="list-panel"
       class="panel ${selected}"
+      data-frozen=${frozen}
       role="tabpanel"
       aria-labelledby="tab-${selected}"
       style=${{ "--row-height": `${ROW_HEIGHT}px` }}
@@ -509,13 +551,16 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
         </div>
         <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
       </div>
-      ${shown.length > 0 &&
-      html`
-        <p class="range">
-          Rows ${range} of ${numbers.format(total)}
-          ${following && html`<span class="following"> · following</span>`}
-        </p>
-      `}
+      <footer class="list-footer">
+        ${shown.length > 0 &&
+        html`
+          <span class="range">
+            Rows ${range} of ${numbers.format(total)}
+            ${following && html`<span class="following"> · following</span>`}
+          </span>
+        `}
+        <${FreezeButton} frozen=${frozen} onToggle=${onToggleFreeze} />
+      </footer>
     </section>
   `;
 }

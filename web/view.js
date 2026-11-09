@@ -81,3 +81,11 @@ export function tailRows(list, rows, total) {
     job: i < missing ? null : jobs[i - missing],
   }));
 }
+
+// Where to show a frozen list: as near `top` as the rows it holds allow,
+// since nothing more can be fetched until it is unfrozen.
+export function clampToWindow(top, list, rows) {
+  const first = list.firstPosition;
+  const last = first + Math.max(0, list.items.length - rows);
+  return Math.max(first, Math.min(top, last));
+}

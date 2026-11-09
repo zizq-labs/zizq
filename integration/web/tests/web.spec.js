@@ -125,3 +125,42 @@ test("reconnects after the server restarts", async ({ page, zizq }) => {
   await expect(page.locator(".conn")).toHaveText("Connected", { timeout: 20_000 });
   await expect(rows(page)).toHaveCount(3);
 });
+
+test("freezing holds the list still while the totals keep updating", async ({ page, zizq }) => {
+  await zizq.enqueue(jobs(3, { priority: 500 }));
+  await page.goto(`${zizq.url}#ready`);
+  await expect(rows(page)).toHaveCount(3);
+
+  await page.keyboard.press("p");
+  await expect(page.locator(".freeze")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".list-footer .freeze")).toHaveText("Resume");
+
+  await zizq.enqueue(jobs(2, { priority: 10, type: "arrived_frozen" }));
+  await expect(page.locator("#tab-ready .tab-total")).toHaveText("5");
+  await expect(rows(page)).toHaveCount(3);
+  await expect(rows(page).locator(".type")).not.toContainText(["arrived_frozen"]);
+  await expect(footer(page)).toContainText("of 3");
+
+  await page.locator(".freeze").click();
+  await expect(page.locator(".freeze")).toHaveAttribute("aria-pressed", "false");
+  await expect(rows(page)).toHaveCount(5);
+  await expect(rows(page).first().locator(".type")).toHaveText("arrived_frozen");
+});
+
+test("a frozen list can't be moved through", async ({ page, zizq }) => {
+  await zizq.enqueue(jobs(1000));
+  await page.goto(`${zizq.url}#ready`);
+  await expect(footer(page)).toContainText("Rows 1–");
+
+  await page.keyboard.press("p");
+  await page.keyboard.press("PageDown");
+  await page.keyboard.press("End");
+  await page.mouse.move(400, 400);
+  await page.mouse.wheel(0, 600);
+  await page.waitForTimeout(500);
+  await expect(footer(page)).toContainText("Rows 1–");
+
+  await page.keyboard.press("p");
+  await page.keyboard.press("PageDown");
+  await expect(footer(page)).not.toContainText("Rows 1–");
+});
