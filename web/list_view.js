@@ -58,14 +58,26 @@ const LIST_ORDER = Object.keys(LISTS);
 
 // The number of table rows that fit in the element `ref` points at, less
 // one for the headings.
+//
+// The new count is applied on the next frame. Applied straight away, the
+// rows it renders can add a horizontal scrollbar, resizing the element
+// again in the same frame, which WebKit reports as an error.
 function useRowsThatFit(ref) {
   const [rows, setRows] = useState(0);
   useEffect(() => {
+    let frame = 0;
     const observer = new ResizeObserver(([entry]) => {
-      setRows(Math.max(1, Math.floor(entry.contentRect.height / ROW_HEIGHT) - 1));
+      const height = entry.contentRect.height;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        setRows(Math.max(1, Math.floor(height / ROW_HEIGHT) - 1));
+      });
     });
     observer.observe(ref.current);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
   }, []);
   return rows;
 }
