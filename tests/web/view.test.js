@@ -6,6 +6,8 @@ import { test } from "node:test";
 import {
   clampTop,
   needsFetch,
+  settleTop,
+  tailRows,
   topFromPointer,
   visibleRows,
   wantedWindow,
@@ -107,4 +109,54 @@ test("topFromPointer stops at either end of the track", () => {
 test("topFromPointer is zero when the list fits or the thumb fills the track", () => {
   assert.equal(topFromPointer(150, { trackY: 100, grab: 0, space: 200 }, 10, 20), 0);
   assert.equal(topFromPointer(150, { trackY: 100, grab: 0, space: 0 }, 1000, 20), 0);
+});
+
+test("tailRows takes the last rows of the window, positioned from the end", () => {
+  // A window whose first position is out of date: it claims 900, but the
+  // list has grown and the window now holds what were positions 905-964.
+  const list = { items: windowAt(905, 60).items, firstPosition: 900 };
+  const rows = tailRows(list, 3, 965);
+
+  assert.deepEqual(
+    rows.map((r) => [r.position, r.job.id]),
+    [
+      [962, "job-962"],
+      [963, "job-963"],
+      [964, "job-964"],
+    ],
+  );
+});
+
+test("tailRows leaves rows empty until enough are fetched", () => {
+  const rows = tailRows(windowAt(0, 2), 4, 100);
+
+  assert.deepEqual(
+    rows.map((r) => [r.position, r.job?.id ?? null]),
+    [
+      [96, null],
+      [97, null],
+      [98, "job-0"],
+      [99, "job-1"],
+    ],
+  );
+});
+
+test("tailRows shows the whole list when it fits", () => {
+  assert.equal(tailRows(windowAt(0, 3), 10, 3).length, 3);
+  assert.equal(tailRows(windowAt(0, 0), 10, 0).length, 0);
+});
+
+test("settleTop follows the end once the last screen is reached", () => {
+  assert.equal(settleTop(980, 1000, 20), Infinity);
+  assert.equal(settleTop(5000, 1000, 20), Infinity);
+  assert.equal(settleTop(Infinity, 1000, 20), Infinity);
+});
+
+test("settleTop leaves any other position clamped", () => {
+  assert.equal(settleTop(979, 1000, 20), 979);
+  assert.equal(settleTop(-3, 1000, 20), 0);
+});
+
+test("settleTop does not follow a list that fits on one screen", () => {
+  assert.equal(settleTop(5, 10, 20), 0);
 });

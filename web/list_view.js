@@ -5,7 +5,15 @@
 import { formatDue, formatElapsed } from "./format.js";
 import { marker, scrubTarget, topAtFraction } from "./overview.js";
 import { html, useEffect, useRef, useState } from "./preact.js";
-import { clampTop, needsFetch, topFromPointer, visibleRows, wantedWindow } from "./view.js";
+import {
+  clampTop,
+  needsFetch,
+  settleTop,
+  tailRows,
+  topFromPointer,
+  visibleRows,
+  wantedWindow,
+} from "./view.js";
 
 // Every table row, headings included, is this tall, so the number of rows
 // that fit can be worked out from the table's height.
@@ -63,19 +71,29 @@ function useRowsThatFit(ref) {
 }
 
 // Asks the server for a new window of `name` when the rows shown need one.
-function useWindowFetch(stream, name, list, top, rows, total) {
+// While following the end of the list, that is a window anchored to the end,
+// which the server keeps up to date as the list grows. Otherwise it is a
+// window at an offset, replaced as the rows shown near its edges.
+function useWindowFetch(stream, name, list, top, rows, total, following) {
   useEffect(() => {
-    if (!stream.server || rows === 0 || !needsFetch(list, top, rows, total)) {
+    if (!stream.server || rows === 0) {
+      return;
+    }
+    const sent = stream.fetches[name];
+    const wanted = following
+      ? sent?.anchor !== "tail"
+      : sent?.anchor === "tail" || needsFetch(list, top, rows, total);
+    if (!wanted) {
       return;
     }
     const now = performance.now();
-    const sent = stream.fetches[name];
     if (sent && (sent.waiting ? now - sent.at < FETCH_TIMEOUT_MS : now - sent.at < FETCH_INTERVAL_MS)) {
       return;
     }
     const { offset, limit } = wantedWindow(top, rows);
-    stream.fetches[name] = { at: now, waiting: true };
-    stream.send({ type: "subscribe", list: name, anchor: { kind: "offset", offset }, limit });
+    const anchor = following ? { kind: "tail" } : { kind: "offset", offset };
+    stream.fetches[name] = { at: now, waiting: true, anchor: anchor.kind };
+    stream.send({ type: "subscribe", list: name, anchor, limit });
   });
 }
 
@@ -432,17 +450,18 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
   const bodyRef = useRef();
   const rows = useRowsThatFit(bodyRef);
   const top = clampTop(tops[selected], total, rows);
+  const following = tops[selected] === Infinity && total > rows;
 
   useTick(1000);
-  useWindowFetch(stream, selected, list, top, rows, total);
+  useWindowFetch(stream, selected, list, top, rows, total, following);
 
-  const moveTo = (position) => setTop(selected, () => clampTop(position, total, rows));
+  const moveTo = (position) => setTop(selected, () => settleTop(position, total, rows));
   const moveBy = (step) =>
-    setTop(selected, (current) => clampTop(clampTop(current, total, rows) + step, total, rows));
+    setTop(selected, (current) => settleTop(clampTop(current, total, rows) + step, total, rows));
   const scrollSideways = (step) => bodyRef.current.scrollBy({ left: step });
   const scrub = (name, fraction) => {
     const listTotal = server[LISTS[name].total];
-    setTop(name, () => topAtFraction(fraction, listTotal, rows));
+    setTop(name, () => settleTop(topAtFraction(fraction, listTotal, rows), listTotal, rows));
     if (name !== selected) {
       onSelect(name);
     }
@@ -451,7 +470,7 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
   const onWheel = useWheelRows(moveBy, rows);
   const touchHandlers = useTouchRows(moveBy);
 
-  const shown = visibleRows(list, top, rows, total);
+  const shown = following ? tailRows(list, rows, total) : visibleRows(list, top, rows, total);
   const range = shown.length
     ? `${numbers.format(top + 1)}–${numbers.format(top + shown.length)}`
     : "";
@@ -479,7 +498,12 @@ export function ListPanel({ stream, selected, onSelect, tops, setTop }) {
         <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
       </div>
       ${shown.length > 0 &&
-      html`<p class="range">Rows ${range} of ${numbers.format(total)}</p>`}
+      html`
+        <p class="range">
+          Rows ${range} of ${numbers.format(total)}
+          ${following && html`<span class="following"> · following</span>`}
+        </p>
+      `}
     </section>
   `;
 }
