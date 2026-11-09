@@ -6,9 +6,9 @@
 // busy server, so they are applied as they arrive but rendered at most once
 // per animation frame.
 
-import { formatClock, formatDue, formatElapsed } from "./format.js";
+import { formatClock } from "./format.js";
+import { LISTS, ListPanel, useTick } from "./list_view.js";
 import { applyMessage, emptyLists } from "./lists.js";
-import { marker } from "./overview.js";
 import { html, render, useEffect, useRef, useState } from "./preact.js";
 
 const MIN_RETRY_MS = 1000;
@@ -16,31 +16,10 @@ const MAX_RETRY_MS = 10000;
 
 const numbers = new Intl.NumberFormat();
 
-// How each list is presented. `time` fills the one column that differs.
-const LISTS = {
-  in_flight: {
-    label: "in flight",
-    total: "total_in_flight",
-    timeHeading: "duration",
-    time: (job, now) => formatElapsed(job.dequeued_at, now),
-  },
-  ready: {
-    label: "ready",
-    total: "total_ready",
-    timeHeading: "delay",
-    time: (job, now) => formatElapsed(job.ready_at, now),
-  },
-  scheduled: {
-    label: "scheduled",
-    total: "total_scheduled",
-    timeHeading: "due",
-    time: (job, now) => formatDue(job.ready_at, now),
-  },
-};
-
 // Connects to `/events`, reconnecting with backoff. Returns the connection
 // state, the most recent `ServerStatus` and when it arrived (so uptime can
-// keep counting between messages), and the job lists.
+// keep counting between messages), the job lists, `send` for messages to the
+// server, and `fetches`, the last window requested for each list.
 function useAdminStream() {
   const [, setVersion] = useState(0);
   const stream = useRef(null);
@@ -49,6 +28,8 @@ function useAdminStream() {
     server: null,
     receivedAt: 0,
     lists: emptyLists(),
+    fetches: {},
+    send: () => {},
   };
 
   useEffect(() => {
@@ -75,6 +56,8 @@ function useAdminStream() {
       ws.onopen = () => {
         retryMs = MIN_RETRY_MS;
         s.conn = { state: "connected" };
+        s.fetches = {};
+        s.send = (message) => ws.send(JSON.stringify(message));
         rerender();
       };
 
@@ -90,6 +73,13 @@ function useAdminStream() {
           s.receivedAt = performance.now();
         }
         applyMessage(s.lists, message);
+        // The server answers a window request with a snapshot of every
+        // list, so any snapshot ends the wait for one.
+        if (message.event === "job_snapshot") {
+          for (const fetch of Object.values(s.fetches)) {
+            fetch.waiting = false;
+          }
+        }
         frame ||= requestAnimationFrame(flush);
       };
 
@@ -102,6 +92,7 @@ function useAdminStream() {
         }
         s.conn = { state: "disconnected", retryMs };
         s.lists = emptyLists();
+        s.send = () => {};
         rerender();
         retryTimer = setTimeout(connect, retryMs);
         retryMs = Math.min(retryMs * 2, MAX_RETRY_MS);
@@ -119,15 +110,6 @@ function useAdminStream() {
   }, []);
 
   return stream.current;
-}
-
-// Re-renders the calling component every `ms` milliseconds.
-function useTick(ms) {
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const timer = setInterval(() => setTick((n) => n + 1), ms);
-    return () => clearInterval(timer);
-  }, [ms]);
 }
 
 // The selected list, kept in the URL fragment so a reload or a shared link
@@ -208,117 +190,30 @@ function ListTabs({ server, selected, onSelect }) {
   `;
 }
 
-// All three lists in queue order, sized by their share of every job, with a
-// marker under the rows shown. Decorative: the tabs carry the same totals.
-function Overview({ server, lists, selected }) {
-  const list = lists[selected];
-  const shown =
-    server && marker(server[LISTS[selected].total], list.firstPosition, list.items.length);
-
-  // Each segment grows in proportion to its list's count, from a minimum
-  // width set in the stylesheet, so even an empty list keeps its place.
-  return html`
-    <div class="overview" aria-hidden="true">
-      ${Object.entries(LISTS).map(
-        ([name, { total }]) => html`
-          <span
-            key=${name}
-            class="segment ${name}"
-            data-selected=${name === selected}
-            style=${{ flexGrow: server ? server[total] : 0 }}
-          >
-            ${name === selected &&
-            shown &&
-            html`
-              <span
-                class="marker"
-                style=${{ left: `${shown.start * 100}%`, width: `${shown.width * 100}%` }}
-              ></span>
-            `}
-          </span>
-        `,
-      )}
-    </div>
-  `;
-}
-
-function JobTable({ name, list }) {
-  useTick(1000);
-  const { label, timeHeading, time } = LISTS[name];
-  const now = Date.now();
-
-  if (list.items.length === 0) {
-    return html`<div class="table-scroll"><p class="empty">No jobs ${label}.</p></div>`;
-  }
-
-  return html`
-    <div class="table-scroll">
-      <table class="jobs">
-        <thead>
-          <tr>
-            <th class="num">id</th>
-            <th class="num">priority</th>
-            <th>queue</th>
-            <th class="num">${timeHeading}</th>
-            <th class="num">attempts</th>
-            <th>type</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${list.items.map(
-            (job) => html`
-              <tr key=${job.id} class=${retryClass(job.attempts)}>
-                <td class="num id">${job.id}</td>
-                <td class="num priority">${job.priority}</td>
-                <td>${job.queue}</td>
-                <td class="num">${time(job, now)}</td>
-                <td class="num attempts">${job.attempts}</td>
-                <td class="type">${job.job_type}</td>
-              </tr>
-            `,
-          )}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-function retryClass(attempts) {
-  return attempts === 0 ? "" : attempts === 1 ? "retried" : "retried-again";
-}
-
-function ListPanel({ server, lists, selected }) {
-  const list = lists[selected];
-  const total = server ? server[LISTS[selected].total] : 0;
-  const first = list.firstPosition + 1;
-  const last = list.firstPosition + list.items.length;
-  const range = `${numbers.format(first)}–${numbers.format(last)}`;
-
-  return html`
-    <section
-      id="list-panel"
-      class="panel ${selected}"
-      role="tabpanel"
-      aria-labelledby="tab-${selected}"
-    >
-      <${Overview} server=${server} lists=${lists} selected=${selected} />
-      <${JobTable} name=${selected} list=${list} />
-      ${list.items.length > 0 &&
-      html`<p class="range">rows ${range} of ${numbers.format(Math.max(total, last))}</p>`}
-    </section>
-  `;
-}
-
 function App() {
-  const { conn, server, receivedAt, lists } = useAdminStream();
+  const stream = useAdminStream();
+  const { conn, server, receivedAt } = stream;
   const [selected, select] = useSelectedList();
+
+  // Each list's position, kept while another list is selected. `setTop`
+  // takes a function of the current position, since several moves (a burst
+  // of wheel or touch events) can arrive before the next render.
+  const [tops, setTops] = useState({ in_flight: 0, ready: 0, scheduled: 0 });
+  const setTop = (name, update) =>
+    setTops((current) => ({ ...current, [name]: update(current[name]) }));
 
   return html`
     <div class="app" data-conn=${conn.state}>
       <${Header} conn=${conn} server=${server} receivedAt=${receivedAt} />
       <main>
         <${ListTabs} server=${server} selected=${selected} onSelect=${select} />
-        <${ListPanel} server=${server} lists=${lists} selected=${selected} />
+        <${ListPanel}
+          stream=${stream}
+          selected=${selected}
+          onSelect=${select}
+          tops=${tops}
+          setTop=${setTop}
+        />
       </main>
     </div>
   `;
