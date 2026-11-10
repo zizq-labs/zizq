@@ -24,15 +24,23 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 
+use super::types::status_name;
 use super::{
-    AdminEvent, AdminJob, AdminMessage, ClientMessage, Direction, Fallback, FindAnchor,
-    JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus, SubscribeAnchor,
+    AdminEvent, AdminJob, AdminJobError, AdminMessage, ClientMessage, Direction, Fallback,
+    FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus, SubscribeAnchor,
 };
 use crate::state::AppState;
 use crate::store::{self, StoreEvent};
 
 /// Default subscription window size.
 const DEFAULT_LIMIT: usize = 200;
+
+/// How many of a job's failures a `JobDetail` carries, newest first, and
+/// how many a `GetErrors` page holds unless the request asks otherwise.
+const ERROR_PAGE_SIZE: usize = 10;
+
+/// The most failures one `GetErrors` page can hold.
+const MAX_ERROR_PAGE_SIZE: usize = 50;
 
 /// Per-list subscription parameters. The dashboard addresses rows by
 /// job id, not by numeric offset — see `store::WindowAnchor` docs.
@@ -145,6 +153,30 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             // connected client (including this one).
                             if let Err(e) = send_state.store.delete_job(&id).await {
                                 tracing::warn!(%e, %id, "admin ws: delete_job failed");
+                            }
+                        }
+                        Some(ClientMessage::GetJob { id }) => {
+                            let msg = AdminMessage {
+                                server: server_status(&send_state),
+                                event: handle_get_job(&send_state, id).await,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(ClientMessage::GetErrors { id, before, limit }) => {
+                            let limit = limit.unwrap_or(ERROR_PAGE_SIZE).clamp(1, MAX_ERROR_PAGE_SIZE);
+                            let (errors, more) = list_errors(&send_state, &id, before, limit).await;
+                            let msg = AdminMessage {
+                                server: server_status(&send_state),
+                                event: AdminEvent::JobErrors { id, errors, more },
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                         Some(ClientMessage::Find {
@@ -473,6 +505,65 @@ async fn handle_subscribe(
     };
     if let Ok(json) = serde_json::to_string(&snapshot) {
         let _ = sender.send(Message::Text(json.into())).await;
+    }
+}
+
+/// Look up one job in full, with its most recent failures, for a
+/// `GetJob` request. A job that no longer exists comes back without
+/// `job` or `status`; so does one that can't be read, which is logged.
+async fn handle_get_job(state: &AppState, id: String) -> AdminEvent {
+    let job = match state.store.get_job((state.clock)(), &id).await {
+        Ok(job) => job,
+        Err(e) => {
+            tracing::warn!(%e, %id, "admin ws: get_job failed");
+            None
+        }
+    };
+
+    let (errors, more_errors) = if job.is_some() {
+        list_errors(state, &id, None, ERROR_PAGE_SIZE).await
+    } else {
+        (Vec::new(), false)
+    };
+
+    let status = job
+        .as_ref()
+        .and_then(|job| store::JobStatus::try_from(job.status).ok())
+        .map(|status| status_name(status).to_string());
+
+    AdminEvent::JobDetail {
+        id,
+        job: job.map(|job| AdminJob::from_store(job, true)),
+        status,
+        errors,
+        more_errors,
+    }
+}
+
+/// A page of `id`'s failures, newest first, from the one before attempt
+/// `before` (or the newest), and whether there are older ones. A failure to
+/// read them is logged and treated as there being none.
+async fn list_errors(
+    state: &AppState,
+    id: &str,
+    before: Option<u32>,
+    limit: usize,
+) -> (Vec<AdminJobError>, bool) {
+    let mut opts = store::ListErrorsOptions::new(id)
+        .direction(store::ScanDirection::Desc)
+        .limit(limit);
+    if let Some(attempt) = before {
+        opts = opts.from(attempt);
+    }
+    match state.store.list_errors(opts).await {
+        Ok(page) => (
+            page.errors.into_iter().map(AdminJobError::from).collect(),
+            page.next.is_some(),
+        ),
+        Err(e) => {
+            tracing::warn!(%e, %id, "admin ws: list_errors failed");
+            (Vec::new(), false)
+        }
     }
 }
 
@@ -1542,5 +1633,309 @@ mod tests {
         assert_eq!(msg["event"], "job_changed");
         assert_eq!(msg["status"], "in_flight");
         assert_eq!(msg["server"]["tier"], "free");
+    }
+
+    /// Connect a WebSocket client that can send as well as receive, and
+    /// consume the initial snapshot.
+    async fn connect_both(
+        state: Arc<AppState>,
+    ) -> (
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio_tungstenite::tungstenite::Message,
+        >,
+        futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, super::super::app(state, Default::default()))
+                .await
+                .unwrap();
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
+            .await
+            .unwrap();
+        let (tx, mut rx) = ws.split();
+        assert_eq!(next_json(&mut rx).await["event"], "job_snapshot");
+        (tx, rx)
+    }
+
+    /// Send `request` and return the first `event` that comes back,
+    /// skipping any other events that arrive first.
+    async fn request_event(
+        tx: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio_tungstenite::tungstenite::Message,
+        >,
+        rx: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+        request: serde_json::Value,
+        event: &str,
+    ) -> serde_json::Value {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        tx.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        loop {
+            let msg = next_json(rx).await;
+            if msg["event"] == event {
+                return msg;
+            }
+        }
+    }
+
+    fn attempts(errors: &serde_json::Value) -> Vec<u64> {
+        errors
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["attempt"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// Take the next job and fail it with `message`, making it ready again
+    /// at once, as the scheduler would when its retry falls due.
+    async fn take_and_fail(state: &AppState, message: &str) -> String {
+        let now = now_millis();
+        let job = state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .expect("a job to take");
+        let failed = state
+            .store
+            .record_failure(
+                now,
+                &job.id,
+                crate::store::FailureOptions {
+                    message: message.into(),
+                    error_type: Some("ForkError".into()),
+                    backtrace: None,
+                    retry_at: Some(now),
+                    kill: false,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the failed job");
+        state.store.promote_scheduled(&failed).await.unwrap();
+        job.id
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_the_job_in_full_with_its_failures() {
+        let state = free_state();
+        state
+            .store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("spawn", "q", serde_json::json!({ "cmd": "ls" })),
+            )
+            .await
+            .unwrap();
+        let id = take_and_fail(&state, "first failure").await;
+        take_and_fail(&state, "second failure").await;
+
+        let (mut tx, mut rx) = connect_both(state).await;
+        let detail = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_job", "id": id }),
+            "job_detail",
+        )
+        .await;
+
+        assert_server_status(&detail);
+        assert_eq!(detail["id"], id);
+        assert_eq!(detail["status"], "ready");
+        assert_eq!(detail["job"]["job_type"], "spawn");
+        assert_eq!(detail["job"]["payload"], serde_json::json!({ "cmd": "ls" }));
+        assert_eq!(detail["job"]["attempts"], 2);
+
+        let errors = detail["errors"].as_array().unwrap();
+        let attempts: Vec<_> = errors
+            .iter()
+            .map(|e| e["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(attempts, vec![2, 1], "newest first");
+        assert_eq!(errors[0]["message"], "second failure");
+        assert_eq!(errors[0]["error_type"], "ForkError");
+        assert!(errors[0]["failed_at"].as_u64().unwrap() > 0);
+        assert_eq!(detail["more_errors"], false);
+    }
+
+    #[tokio::test]
+    async fn get_job_for_a_missing_job_has_no_job_or_status() {
+        let (mut tx, mut rx) = connect_both(free_state()).await;
+        let detail = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_job", "id": "no-such-job" }),
+            "job_detail",
+        )
+        .await;
+
+        assert_eq!(detail["id"], "no-such-job");
+        assert!(detail.get("job").is_none());
+        assert!(detail.get("status").is_none());
+        assert_eq!(detail["errors"], serde_json::json!([]));
+        assert_eq!(detail["more_errors"], false);
+    }
+
+    #[tokio::test]
+    async fn get_job_says_when_there_are_more_failures_than_it_sent() {
+        let state = free_state();
+        let id = job_failed_times(&state, ERROR_PAGE_SIZE + 1).await;
+
+        let (mut tx, mut rx) = connect_both(state).await;
+        let detail = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_job", "id": id }),
+            "job_detail",
+        )
+        .await;
+
+        let errors = detail["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), ERROR_PAGE_SIZE);
+        assert_eq!(errors[0]["attempt"], ERROR_PAGE_SIZE + 1);
+        assert_eq!(detail["more_errors"], true);
+    }
+
+    #[tokio::test]
+    async fn get_job_finds_a_completed_job_while_it_is_retained() {
+        let state = free_state();
+        state
+            .store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("spawn", "q", serde_json::json!(null)).retention(
+                    crate::store::RetentionConfig {
+                        completed_ms: Some(60_000),
+                        dead_ms: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let now = now_millis();
+        let job = state
+            .store
+            .take_next_job(now, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        state.store.mark_completed(now, &job.id).await.unwrap();
+
+        let (mut tx, mut rx) = connect_both(state).await;
+        let detail = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_job", "id": job.id }),
+            "job_detail",
+        )
+        .await;
+
+        assert_eq!(detail["status"], "completed");
+        assert_eq!(detail["job"]["id"], job.id);
+    }
+
+    /// Enqueue a job that can fail `n` times without dying, and fail it
+    /// that many times.
+    async fn job_failed_times(state: &AppState, n: usize) -> String {
+        state
+            .store
+            .enqueue(
+                now_millis(),
+                EnqueueOptions::new("spawn", "q", serde_json::json!(null)).retry_limit(100),
+            )
+            .await
+            .unwrap();
+        let mut id = String::new();
+        for attempt in 1..=n {
+            id = take_and_fail(state, &format!("failure {attempt}")).await;
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn get_errors_pages_back_beyond_the_job_detail() {
+        let state = free_state();
+        let id = job_failed_times(&state, 13).await;
+
+        let (mut tx, mut rx) = connect_both(state).await;
+        let detail = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_job", "id": id }),
+            "job_detail",
+        )
+        .await;
+        assert_eq!(
+            attempts(&detail["errors"]),
+            (4..=13).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(detail["more_errors"], true);
+
+        let page = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_errors", "id": id, "before": 4 }),
+            "job_errors",
+        )
+        .await;
+        assert_server_status(&page);
+        assert_eq!(page["id"], id);
+        assert_eq!(attempts(&page["errors"]), vec![3, 2, 1]);
+        assert_eq!(page["errors"][0]["message"], "failure 3");
+        assert_eq!(page["more"], false);
+    }
+
+    #[tokio::test]
+    async fn get_errors_pages_are_ten_long_unless_asked_and_at_most_fifty() {
+        let state = free_state();
+        let id = job_failed_times(&state, 60).await;
+
+        let (mut tx, mut rx) = connect_both(state).await;
+        let default = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_errors", "id": id }),
+            "job_errors",
+        )
+        .await;
+        assert_eq!(
+            attempts(&default["errors"]),
+            (51..=60).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(default["more"], true);
+
+        let capped = request_event(
+            &mut tx,
+            &mut rx,
+            serde_json::json!({ "type": "get_errors", "id": id, "limit": 1000 }),
+            "job_errors",
+        )
+        .await;
+        assert_eq!(
+            capped["errors"].as_array().unwrap().len(),
+            MAX_ERROR_PAGE_SIZE
+        );
+        assert_eq!(capped["more"], true);
     }
 }

@@ -54,6 +54,34 @@ pub enum AdminEvent {
         job: Option<AdminJob>,
     },
 
+    /// Response to a `ClientMessage::GetJob` request: the job in full,
+    /// with its payload and other detail fields, its status, and its most
+    /// recent failures, newest first. `job` and `status` are absent when
+    /// the job no longer exists.
+    JobDetail {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        job: Option<AdminJob>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default)]
+        errors: Vec<AdminJobError>,
+        /// Whether the job has failed more often than `errors` shows.
+        #[serde(default)]
+        more_errors: bool,
+    },
+
+    /// Response to a `ClientMessage::GetErrors` request: a page of a job's
+    /// failures, newest first.
+    JobErrors {
+        id: String,
+        #[serde(default)]
+        errors: Vec<AdminJobError>,
+        /// Whether the job has older failures than these.
+        #[serde(default)]
+        more: bool,
+    },
+
     /// Response to a `ClientMessage::Find` request.
     ///
     /// Carries the matched job's absolute position within the unfiltered
@@ -110,6 +138,25 @@ pub enum ClientMessage {
     },
     SetDetailLevel {
         detail: bool,
+    },
+    /// Ask for one job in full, with its most recent failures. The server
+    /// answers with `AdminEvent::JobDetail`.
+    GetJob {
+        id: String,
+    },
+    /// Ask for a page of a job's failures, newest first, for paging back
+    /// beyond those in `JobDetail`. The server answers with
+    /// `AdminEvent::JobErrors`.
+    GetErrors {
+        id: String,
+        /// Start from the failure before this attempt. Absent starts from
+        /// the newest.
+        #[serde(default)]
+        before: Option<u32>,
+        /// How many failures to send. Absent uses the server's page size;
+        /// larger requests are capped.
+        #[serde(default)]
+        limit: Option<usize>,
     },
     /// Request deletion of a single job. The server doesn't ack — the
     /// resulting `JobDeleted` store event flows back through the normal
@@ -286,6 +333,44 @@ pub struct AdminJob {
     pub unique_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unique_while: Option<String>,
+}
+
+/// One failed attempt of a job, as recorded when a worker reported it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminJobError {
+    /// Which attempt failed, counting from 1.
+    pub attempt: u32,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backtrace: Option<String>,
+    pub dequeued_at: u64,
+    pub failed_at: u64,
+}
+
+impl From<store::ErrorRecord> for AdminJobError {
+    fn from(record: store::ErrorRecord) -> Self {
+        Self {
+            attempt: record.attempt,
+            message: record.message,
+            error_type: record.error_type,
+            backtrace: record.backtrace,
+            dequeued_at: record.dequeued_at,
+            failed_at: record.failed_at,
+        }
+    }
+}
+
+/// The name of a job status, in the primary API.
+pub fn status_name(status: store::JobStatus) -> &'static str {
+    match status {
+        store::JobStatus::Scheduled => "scheduled",
+        store::JobStatus::Ready => "ready",
+        store::JobStatus::InFlight => "in_flight",
+        store::JobStatus::Completed => "completed",
+        store::JobStatus::Dead => "dead",
+    }
 }
 
 /// Backoff configuration for the admin API (human-readable field names).
