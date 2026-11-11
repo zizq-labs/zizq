@@ -19,7 +19,7 @@ mod web;
 pub use handlers::app;
 pub use origin::AllowedHosts;
 pub use types::{
-    AdminBackoff, AdminEvent, AdminJob, AdminMessage, AdminRetention, ClientMessage, Direction,
-    Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus,
-    SubscribeAnchor,
+    AdminBackoff, AdminEvent, AdminJob, AdminJobError, AdminMessage, AdminRetention, ClientMessage,
+    Direction, Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery,
+    ServerStatus, SubscribeAnchor,
 };

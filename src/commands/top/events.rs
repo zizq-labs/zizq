@@ -393,6 +393,9 @@ fn parse_ws_message(text: &str) -> Option<Event> {
             matched_position,
             window,
         }),
+        // `top` never sends `GetJob` or `GetErrors`, so never receives an
+        // answer to either.
+        AdminEvent::JobDetail { .. } | AdminEvent::JobErrors { .. } => None,
     }
 }
 

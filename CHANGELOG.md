@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed paging through a job's errors newest first.
+  `GET /jobs/{id}/errors?order=desc` returned the newest errors again on
+  every page after the first, instead of moving on to older ones. The
+  `prev` link of every page was wrong in the same way, in either order.
+
 - `zizq top` now shows every job on the free tier. Without a Pro
   licence it used to show only the first 10 jobs in each list.
 - The admin API now refuses requests made by web pages served from

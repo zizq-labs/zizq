@@ -419,11 +419,21 @@ impl Store {
             end_sentinel.extend_from_slice(opts.job_id.as_bytes());
             end_sentinel.push(1);
 
-            let start = match opts.from {
-                Some(cursor) => Bound::Excluded(make_error_key(&opts.job_id, cursor)),
-                None => Bound::Included(prefix),
+            // The cursor bounds the side the scan moves away from: the
+            // bottom of the range when ascending, the top when descending.
+            let cursor = opts
+                .from
+                .map(|attempt| Bound::Excluded(make_error_key(&opts.job_id, attempt)));
+            let (start, end) = match opts.direction {
+                ScanDirection::Asc => (
+                    cursor.unwrap_or(Bound::Included(prefix)),
+                    Bound::Excluded(end_sentinel),
+                ),
+                ScanDirection::Desc => (
+                    Bound::Included(prefix),
+                    cursor.unwrap_or(Bound::Excluded(end_sentinel)),
+                ),
             };
-            let end = Bound::Excluded(end_sentinel);
 
             let mut rows = Vec::with_capacity(fetch.min(1024));
 
@@ -2519,6 +2529,69 @@ mod tests {
         assert_eq!(page2.errors.len(), 1);
         assert_eq!(page2.errors[0].message, "error three");
         assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_errors_paginates_newest_first() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let retaken = fail_and_retake(&store, &job.id, "error one").await;
+        let retaken = fail_and_retake(&store, &retaken.id, "error two").await;
+        let mut opts = test_failure_opts();
+        opts.message = "error three".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        let page = store
+            .list_errors(
+                ListErrorsOptions::new(&job.id)
+                    .direction(ScanDirection::Desc)
+                    .limit(2),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.errors.len(), 2);
+        assert_eq!(page.errors[0].message, "error three");
+        assert_eq!(page.errors[1].message, "error two");
+        assert!(page.next.is_some());
+
+        let page2 = store.list_errors(page.next.unwrap()).await.unwrap();
+
+        assert_eq!(page2.errors.len(), 1);
+        assert_eq!(page2.errors[0].message, "error one");
+        assert!(page2.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_errors_previous_page_returns_to_the_page_before() {
+        let store = test_store();
+        let job = enqueue_and_take(&store).await;
+
+        let retaken = fail_and_retake(&store, &job.id, "error one").await;
+        let retaken = fail_and_retake(&store, &retaken.id, "error two").await;
+        let mut opts = test_failure_opts();
+        opts.message = "error three".into();
+        store
+            .record_failure(now_millis(), &retaken.id, opts)
+            .await
+            .unwrap();
+
+        let page = store
+            .list_errors(ListErrorsOptions::new(&job.id).limit(2))
+            .await
+            .unwrap();
+        let page2 = store.list_errors(page.next.unwrap()).await.unwrap();
+        assert_eq!(page2.errors[0].message, "error three");
+
+        // The previous page reads back the other way, from the cursor.
+        let back = store.list_errors(page2.prev.unwrap()).await.unwrap();
+
+        let messages: Vec<_> = back.errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["error two", "error one"]);
     }
 
     #[tokio::test]
