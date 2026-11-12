@@ -4,7 +4,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { formatClock, formatDue, formatDuration, formatElapsed } from "../../web/format.js";
+import {
+  formatClock,
+  formatDue,
+  formatDuration,
+  formatElapsed,
+  formatTimestamp,
+} from "../../web/format.js";
 
 test("formatDuration", () => {
   assert.equal(formatDuration(0), "0ms");
@@ -43,4 +49,10 @@ test("formatClock", () => {
   assert.equal(formatClock(0), "00:00:00");
   assert.equal(formatClock(3_723_000), "01:02:03");
   assert.equal(formatClock(90_061_000), "1d 01:01:01");
+});
+
+test("formatTimestamp", () => {
+  const ms = new Date(2026, 10, 11, 14, 3, 22).getTime();
+  assert.equal(formatTimestamp(ms), "2026-11-11 14:03:22");
+  assert.equal(formatTimestamp(new Date(2026, 0, 5, 9, 7, 1).getTime()), "2026-01-05 09:07:01");
 });

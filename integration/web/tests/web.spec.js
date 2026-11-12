@@ -164,3 +164,52 @@ test("a frozen list can't be moved through", async ({ page, zizq }) => {
   await page.keyboard.press("PageDown");
   await expect(footer(page)).not.toContainText("Rows 1–");
 });
+
+test("clicking a job opens its details, with its payload and failures", async ({ page, zizq }) => {
+  await zizq.enqueue([job({ type: "spawn", queue: "work", payload: { cmd: "convert" } })]);
+  const [taken] = await zizq.take("work", 1);
+  await zizq.fail(taken.id, {
+    message: "fork failed: cannot allocate memory",
+    error_type: "ForkError",
+    backtrace: "worker.sh:12",
+    retry_at: Date.now() + 3_600_000,
+  });
+
+  await page.goto(`${zizq.url}#scheduled`);
+  await rows(page).first().click();
+
+  const detail = page.locator(".detail");
+  await expect(detail.locator(".detail-id")).toHaveText(taken.id);
+  await expect(detail.locator(".status")).toHaveText("Scheduled");
+  await expect(detail.locator(".payload")).toContainText('"cmd": "convert"');
+  await expect(detail.locator(".failures li")).toHaveCount(1);
+  await expect(detail.locator(".failures li").first()).toContainText("ForkError");
+  await expect(detail.locator(".failure-detail")).toContainText("cannot allocate memory");
+  await expect(detail.locator(".backtrace")).toHaveText("worker.sh:12");
+  await expect(rows(page).first()).toHaveClass(/selected/);
+
+  await page.keyboard.press("Escape");
+  await expect(detail).toHaveCount(0);
+});
+
+test("a job's details follow it as it changes", async ({ page, zizq }) => {
+  await zizq.enqueue([job({ queue: "work" })]);
+  await page.goto(`${zizq.url}#ready`);
+  await rows(page).first().click();
+  await expect(page.locator(".detail .status")).toHaveText("Ready");
+
+  await zizq.take("work", 1);
+
+  await expect(page.locator(".detail .status")).toHaveText("In-Flight");
+  await expect(page.locator(".detail .attributes")).toContainText("Taken");
+});
+
+test("clicking the open job again closes its details", async ({ page, zizq }) => {
+  await zizq.enqueue(jobs(2));
+  await page.goto(`${zizq.url}#ready`);
+
+  await rows(page).first().click();
+  await expect(page.locator(".detail")).toHaveCount(1);
+  await rows(page).first().click();
+  await expect(page.locator(".detail")).toHaveCount(0);
+});
