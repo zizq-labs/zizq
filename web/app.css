@@ -286,6 +286,7 @@ main {
   }
 }
 
+/* Layouts inside respond to the panel's own width, not the window's. */
 .panel {
   display: flex;
   flex: 1;
@@ -293,6 +294,7 @@ main {
   min-height: 0;
   border: 1px solid var(--rule);
   background: var(--panel);
+  container-type: inline-size;
 }
 
 /* The queue overview: every list in order, with a translucent window over
@@ -343,9 +345,201 @@ main {
 .list-body {
   display: flex;
   flex: 1;
+  min-width: 0;
   min-height: 0;
   touch-action: pan-x;
+}
+
+/* The list, and the open job's details: below the list by default, beside
+   it when the panel is wide, and over it when the panel is narrow. */
+.list-area {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
   border-top: 1px solid var(--rule);
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  max-height: 50%;
+  min-height: 0;
+  border-top: 1px solid var(--rule);
+  background: var(--panel);
+}
+
+@container (min-width: 1000px) {
+  .list-area {
+    flex-direction: row;
+  }
+
+  .detail {
+    flex: none;
+    width: clamp(360px, 40%, 600px);
+    max-height: none;
+    border-top: none;
+    border-left: 1px solid var(--rule);
+  }
+}
+
+@container (max-width: 600px) {
+  .detail {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    max-height: none;
+    border-top: none;
+  }
+}
+
+.detail-heading {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px 8px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--chrome);
+}
+
+.detail-id {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The status takes its list's colour; finished jobs green or red. */
+.status {
+  color: var(--accent);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status.completed {
+  --accent: var(--green);
+}
+
+.status.dead {
+  --accent: var(--red);
+}
+
+.close {
+  margin-left: auto;
+  padding: 0 6px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.close:hover {
+  color: var(--fg);
+}
+
+.detail-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 16px 16px;
+}
+
+.detail h3 {
+  margin: 16px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.attributes {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 16px;
+  margin: 0;
+}
+
+.attributes dt {
+  color: var(--muted);
+}
+
+.attributes dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail pre {
+  margin: 0;
+  padding: 8px 10px;
+  overflow-x: auto;
+  background: rgba(0, 0, 0, 0.25);
+  font: inherit;
+}
+
+.gone,
+.none {
+  margin: 0;
+  color: var(--muted);
+}
+
+.failures {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.failures li + li {
+  border-top: 1px solid var(--rule);
+}
+
+.failure-summary {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  padding: 6px 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.failure-summary .attempt,
+.failure-summary .when {
+  flex: none;
+  color: var(--muted);
+}
+
+.failure-summary .what {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failures .open .what {
+  color: var(--red);
+}
+
+.failure-detail {
+  display: grid;
+  gap: 6px;
+  padding-bottom: 10px;
+}
+
+.failure-detail p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.failure-detail .backtrace {
+  color: var(--muted);
 }
 
 .table-scroll {
@@ -415,8 +609,18 @@ main {
   width: 100%;
 }
 
+.jobs tbody tr {
+  cursor: pointer;
+}
+
 .jobs tbody tr:hover {
   background: var(--chrome);
+}
+
+/* The row whose details are open. */
+.jobs tbody tr.selected {
+  background: var(--tab);
+  box-shadow: inset 3px 0 var(--accent);
 }
 
 .jobs .pending td {

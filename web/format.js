@@ -55,3 +55,13 @@ export function formatDue(readyAtMs, nowMs) {
   }
   return readyAtMs >= nowMs ? formatDuration(diff) : `${formatDuration(diff)} ago`;
 }
+
+// A timestamp in the viewer's local time, e.g. "2026-11-11 14:03:22".
+export function formatTimestamp(ms) {
+  const date = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}

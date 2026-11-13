@@ -105,8 +105,8 @@ class Zizq {
     }
   }
 
-  // Takes `n` jobs from `queue` and holds them in flight until the server
-  // stops.
+  // Takes `n` jobs from `queue`, holds them in flight until the server
+  // stops, and returns them.
   async take(queue, n) {
     const controller = new AbortController();
     this.takes.push(controller);
@@ -115,9 +115,9 @@ class Zizq {
       signal: controller.signal,
     });
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-    let taken = 0;
+    const taken = [];
     let buffer = "";
-    while (taken < n) {
+    while (taken.length < n) {
       const { value, done } = await reader.read();
       if (done) {
         break;
@@ -125,8 +125,14 @@ class Zizq {
       buffer += value;
       const lines = buffer.split("\n");
       buffer = lines.pop();
-      taken += lines.filter((line) => line.trim()).length;
+      taken.push(...lines.filter((line) => line.trim()).map((line) => JSON.parse(line)));
     }
+    return taken;
+  }
+
+  // Reports a failure of in-flight job `id`, e.g. `{ message, error_type }`.
+  async fail(id, failure) {
+    await this.post(`/jobs/${id}/failure`, failure);
   }
 }
 

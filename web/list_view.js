@@ -2,6 +2,7 @@
 // and a scrollbar for moving through the whole list. See view.js for how
 // the rows shown relate to the window of rows fetched from the server.
 
+import { JobDetail } from "./detail.js";
 import { formatDue, formatElapsed } from "./format.js";
 import { marker, scrubTarget, topAtFraction } from "./overview.js";
 import { html, useEffect, useRef, useState } from "./preact.js";
@@ -113,9 +114,9 @@ function useWindowFetch(stream, name, list, top, rows, total, following, frozen)
 // Keyboard shortcuts for the list, wherever focus is, other than in a text
 // field. They follow `zizq top`, except that Shift+←/→ switch lists, since
 // Tab moves focus in a browser.
-function useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect, onToggleFreeze }) {
+function useListKeys(keys) {
   const latest = useRef();
-  latest.current = { rows, moveBy, moveTo, scrollSideways, selected, onSelect, onToggleFreeze };
+  latest.current = keys;
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -149,6 +150,7 @@ function useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect,
             ArrowLeft: () => k.scrollSideways(-SIDEWAYS_STEP),
             ArrowRight: () => k.scrollSideways(SIDEWAYS_STEP),
             p: () => k.onToggleFreeze(),
+            Escape: () => k.onCloseDetail(),
             1: () => k.onSelect(LIST_ORDER[0]),
             2: () => k.onSelect(LIST_ORDER[1]),
             3: () => k.onSelect(LIST_ORDER[2]),
@@ -333,7 +335,9 @@ function Overview({ server, selected, shown, onScrub }) {
   `;
 }
 
-function JobRows({ name, rows }) {
+// Clicking a row opens its job's details, and clicking it again closes
+// them. The open job's row is marked wherever it moves to.
+function JobRows({ name, rows, openJob, onOpen }) {
   const { timeHeading, time } = LISTS[name];
   const now = Date.now();
 
@@ -353,7 +357,12 @@ function JobRows({ name, rows }) {
         ${rows.map(({ position, job }) =>
           job
             ? html`
-                <tr key=${job.id} class=${retryClass(job.attempts)}>
+                <tr
+                  key=${job.id}
+                  class="${retryClass(job.attempts)} ${job.id === openJob ? "selected" : ""}"
+                  aria-selected=${job.id === openJob}
+                  onClick=${() => onOpen(job.id === openJob ? null : job.id)}
+                >
                   <td class="num id">${job.id}</td>
                   <td class="num priority">${job.priority}</td>
                   <td>${job.queue}</td>
@@ -519,7 +528,17 @@ export function ListPanel({
       onSelect(name);
     }
   };
-  useListKeys({ rows, moveBy, moveTo, scrollSideways, selected, onSelect, onToggleFreeze });
+  const closeDetail = () => stream.selected && stream.select(null);
+  useListKeys({
+    rows,
+    moveBy,
+    moveTo,
+    scrollSideways,
+    selected,
+    onSelect,
+    onToggleFreeze,
+    onCloseDetail: closeDetail,
+  });
   const onWheel = useWheelRows(moveBy, rows);
   const touchHandlers = useTouchRows(moveBy);
 
@@ -543,13 +562,24 @@ export function ListPanel({
         shown=${server && marker(total, top, shown.length)}
         onScrub=${scrub}
       />
-      <div class="list-body" onWheel=${onWheel} ...${touchHandlers}>
-        <div class="table-scroll" id="list-rows" ref=${bodyRef}>
-          ${total === 0
-            ? html`<p class="empty">${LISTS[selected].empty}</p>`
-            : html`<${JobRows} name=${selected} rows=${shown} />`}
+      <div class="list-area" data-detail=${stream.selected !== null}>
+        <div class="list-body" onWheel=${onWheel} ...${touchHandlers}>
+          <div class="table-scroll" id="list-rows" ref=${bodyRef}>
+            ${total === 0
+              ? html`<p class="empty">${LISTS[selected].empty}</p>`
+              : html`
+                  <${JobRows}
+                    name=${selected}
+                    rows=${shown}
+                    openJob=${stream.selected}
+                    onOpen=${stream.select}
+                  />
+                `}
+          </div>
+          <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
         </div>
-        <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
+        ${stream.selected &&
+        html`<${JobDetail} id=${stream.selected} detail=${stream.detail} onClose=${closeDetail} />`}
       </div>
       <footer class="list-footer">
         ${shown.length > 0 &&

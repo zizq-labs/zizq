@@ -19,7 +19,8 @@ const numbers = new Intl.NumberFormat();
 // Connects to `/events`, reconnecting with backoff. Returns the connection
 // state, the most recent `ServerStatus` and when it arrived (so uptime can
 // keep counting between messages), the job lists, `send` for messages to the
-// server, and `fetches`, the last window requested for each list.
+// server, `fetches`, the last window requested for each list, and the job
+// whose details are open, with `select` to change it.
 function useAdminStream() {
   const [, setVersion] = useState(0);
   const stream = useRef(null);
@@ -30,6 +31,11 @@ function useAdminStream() {
     lists: emptyLists(),
     fetches: {},
     send: () => {},
+    // The job whose details are open, and the server's latest account of
+    // it (a `job_detail` message), once it arrives.
+    selected: null,
+    detail: null,
+    select: () => {},
   };
 
   useEffect(() => {
@@ -41,6 +47,20 @@ function useAdminStream() {
     let stopped = false;
 
     const rerender = () => setVersion((v) => v + 1);
+
+    const requestDetail = () => {
+      if (s.selected) {
+        s.send({ type: "get_job", id: s.selected });
+      }
+    };
+
+    // Opens the details of job `id`, or closes them when it is null.
+    s.select = (id) => {
+      s.selected = id;
+      s.detail = null;
+      requestDetail();
+      rerender();
+    };
     const flush = () => {
       frame = 0;
       rerender();
@@ -58,6 +78,7 @@ function useAdminStream() {
         s.conn = { state: "connected" };
         s.fetches = {};
         s.send = (message) => ws.send(JSON.stringify(message));
+        requestDetail();
         rerender();
       };
 
@@ -73,6 +94,14 @@ function useAdminStream() {
           s.receivedAt = performance.now();
         }
         applyMessage(s.lists, message);
+        // Answers about a job no longer selected are dropped, so a slow
+        // reply can't replace the details of a job opened since. Any change
+        // to the selected job asks for its details again.
+        if (message.event === "job_detail" && message.id === s.selected) {
+          s.detail = message;
+        } else if (message.event === "job_changed" && message.id === s.selected) {
+          requestDetail();
+        }
         // The server answers a window request with a snapshot of every
         // list, so any snapshot ends the wait for one.
         if (message.event === "job_snapshot") {
