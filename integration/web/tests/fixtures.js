@@ -134,6 +134,14 @@ class Zizq {
   async fail(id, failure) {
     await this.post(`/jobs/${id}/failure`, failure);
   }
+
+  // Closes every take stream opened so far. Any job still in flight on one
+  // goes back to its queue; one whose failure was reported already doesn't.
+  releaseTakes() {
+    for (const take of this.takes.splice(0)) {
+      take.abort();
+    }
+  }
 }
 
 export const test = base.extend({

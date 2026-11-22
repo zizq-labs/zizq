@@ -542,6 +542,26 @@ main {
   color: var(--muted);
 }
 
+/* Styled as a link, like the freeze control. */
+.older {
+  margin-top: 8px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.older:hover:not(:disabled) {
+  color: var(--fg);
+  text-decoration: underline;
+}
+
+.older:disabled {
+  cursor: default;
+}
+
 .table-scroll {
   flex: 1;
   min-width: 0;
