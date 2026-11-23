@@ -112,11 +112,28 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     job_table::render_active(app, frame, table_area, table_body_height);
 
-    if let Some(area) = detail_area {
-        detail_panel::render(app, frame, area, detail_panel::Placement::Below);
+    // The scroll position belongs to one job; another starts at the top.
+    let selected = app.selected_job_id();
+    if app.detail_view.job != selected {
+        app.detail_view.job = selected;
+        app.detail_view.scroll = 0;
     }
-    if let Some(area) = side_area {
-        detail_panel::render(app, frame, area, detail_panel::Placement::Beside);
+    let panel = detail_area
+        .map(|area| (area, detail_panel::Placement::Below))
+        .or(side_area.map(|area| (area, detail_panel::Placement::Beside)));
+    // A terminal too short for the panel leaves focus with the list.
+    if panel.is_none() {
+        app.detail_view.focused = false;
+    }
+    if let Some((area, placement)) = panel {
+        // Below the table the panel's headings stay put as it scrolls.
+        app.detail_view.page = match placement {
+            detail_panel::Placement::Below => area.height.saturating_sub(1),
+            detail_panel::Placement::Beside => area.height,
+        } as usize;
+        if let Some(scroll) = detail_panel::render(app, frame, area, placement) {
+            app.detail_view.scroll = scroll;
+        }
     }
 
     if let Some(cap) = subscription_limit {
@@ -163,9 +180,16 @@ pub(super) const fn tab_fg() -> Color {
     Color::Black
 }
 
-/// Background color shared by the active tab and the table header row.
-pub(super) const fn header_bg() -> Color {
-    Color::Green
+/// Background color of headings: the active tab and the table header row,
+/// or the detail panel's section headings. Green marks the pane with focus
+/// (the one the movement keys act on), yellow the other.
+pub(super) const fn header_bg(focused: bool) -> Color {
+    if focused { Color::Green } else { Color::Yellow }
+}
+
+/// Whether the job list has focus, rather than the detail panel.
+pub(super) fn list_has_focus(app: &App) -> bool {
+    !(app.show_detail && app.detail_view.focused)
 }
 
 #[cfg(test)]
@@ -240,6 +264,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         }
     }
 
@@ -365,6 +390,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -401,6 +427,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -528,6 +555,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         }
     }
 
@@ -696,6 +724,94 @@ mod tests {
         assert_ui_snapshot!(render_to_string(&app, 200, 40));
     }
 
+    /// `detail_app`, with the panel focused and scrolled `scroll` lines,
+    /// and a payload long enough to need it.
+    fn focused_detail_app(scroll: usize) -> App {
+        let mut app = detail_app(three_failures(), false);
+        let job = app.job_detail.as_mut().unwrap().job.as_mut().unwrap();
+        job.payload = Some(serde_json::json!({
+            "recipients": (1..=30).map(|n| format!("user{n}@example.com")).collect::<Vec<_>>(),
+        }));
+        app.detail_view.focused = true;
+        app.detail_view.scroll = scroll;
+        app.detail_view.job = Some(app.in_flight_jobs[0].id.clone());
+        app
+    }
+
+    #[test]
+    fn render_focused_detail_panel_beside_the_table_shows_everything() {
+        // Scrolled past the attributes to the payload, which is uncapped,
+        // down to every failure in full.
+        let app = focused_detail_app(30);
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    #[test]
+    fn render_focused_detail_panel_below_the_table_scrolls_under_its_headings() {
+        let app = focused_detail_app(4);
+        assert_ui_snapshot!(render_to_string(&app, 160, 40));
+    }
+
+    #[test]
+    fn scrolling_the_detail_panel_stops_at_its_end() {
+        let mut app = focused_detail_app(usize::MAX);
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+
+        // Scrolled so the panel's last line is on its bottom row: further
+        // would only leave rows blank.
+        let last_row = 40 - 2;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let mut at_end = app.clone();
+        let frame = terminal.draw(|f| render(&mut at_end, f)).unwrap();
+        let last_line: String = (130..200)
+            .map(|x| frame.buffer[(x, last_row)].symbol())
+            .collect();
+        assert_eq!(
+            last_line.trim(),
+            "worker.sh:40 in run",
+            "the oldest backtrace"
+        );
+        assert_eq!(at_end.detail_view.scroll, app.detail_view.scroll);
+    }
+
+    #[test]
+    fn another_job_starts_the_detail_panel_at_the_top() {
+        let mut app = focused_detail_app(10);
+        app.detail_view.job = Some("another".into());
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+
+        assert_eq!(app.detail_view.scroll, 0);
+    }
+
+    #[test]
+    fn green_headings_mark_the_pane_with_focus() {
+        use ratatui::style::Color;
+
+        // The active tab's label and the panel's first heading.
+        let colours = |app: &App| {
+            let mut app = app.clone();
+            let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+            let frame = terminal.draw(|f| render(&mut app, f)).unwrap();
+            let buf = &frame.buffer;
+            let tab = (0..200)
+                .map(|x| &buf[(x, 7)])
+                .find(|c| c.symbol() == "I")
+                .unwrap()
+                .bg;
+            let panel = buf[(132, 8)].bg;
+            (tab, panel)
+        };
+
+        let mut app = focused_detail_app(0);
+        assert_eq!(colours(&app), (Color::Yellow, Color::Green));
+        app.detail_view.focused = false;
+        assert_eq!(colours(&app), (Color::Green, Color::Yellow));
+    }
+
     #[test]
     fn render_detail_panel_while_loading() {
         let mut app = sample_app(Tab::InFlight);
@@ -735,6 +851,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -771,6 +888,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -829,6 +947,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
     }
@@ -887,6 +1006,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));
     }

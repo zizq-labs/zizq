@@ -206,6 +206,21 @@ const PREFETCH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// holding an arrow key doesn't ask about every job it passes.
 const DETAIL_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How the detail panel is being viewed: whether it has focus (so the
+/// movement keys scroll it rather than moving the cursor), and how far it
+/// is scrolled.
+#[derive(Clone, Default)]
+pub struct DetailView {
+    pub focused: bool,
+    /// Lines scrolled past. Rendering clamps it to the content.
+    pub scroll: usize,
+    /// The panel's visible height as last rendered, for paging.
+    pub page: usize,
+    /// The job the scroll position belongs to. Showing another job starts
+    /// again from the top.
+    pub job: Option<String>,
+}
+
 /// One job in full, as the server last described it in answer to `GetJob`.
 #[derive(Clone)]
 pub struct JobDetail {
@@ -282,6 +297,7 @@ pub struct App {
     pub job_detail: Option<JobDetail>,
     /// The job last asked for with `GetJob`, and when.
     pub detail_request: Option<(String, Instant)>,
+    pub detail_view: DetailView,
 }
 
 impl Clone for App {
@@ -316,6 +332,7 @@ impl Clone for App {
             modal_mode_flag: self.modal_mode_flag.clone(),
             job_detail: self.job_detail.clone(),
             detail_request: self.detail_request.clone(),
+            detail_view: self.detail_view.clone(),
         }
     }
 }
@@ -352,6 +369,7 @@ impl App {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: DetailView::default(),
         }
     }
 
@@ -618,7 +636,7 @@ impl App {
 
     /// Return the id of the job under the cursor in the active tab,
     /// or `None` if the buffer doesn't cover that row.
-    fn selected_job_id(&self) -> Option<String> {
+    pub fn selected_job_id(&self) -> Option<String> {
         let ls = &self.list_states[self.active_tab.idx()];
         let idx = ls.cursor.checked_sub(ls.buffer_offset)?;
         let jobs = match self.active_tab {
@@ -744,6 +762,27 @@ impl App {
                 let i = self.active_tab.idx();
                 self.h_scroll[i] = self.h_scroll[i].saturating_add(4);
             }
+            // While the detail panel has focus, the movement keys scroll
+            // it; rendering clamps the result to its content.
+            Event::ScrollUp
+            | Event::ScrollDown
+            | Event::PageUp
+            | Event::PageDown
+            | Event::GoToStart
+            | Event::GoToEnd
+                if self.detail_view.focused =>
+            {
+                let view = &mut self.detail_view;
+                let page = view.page.max(1);
+                view.scroll = match event {
+                    Event::ScrollUp => view.scroll.saturating_sub(1),
+                    Event::ScrollDown => view.scroll.saturating_add(1),
+                    Event::PageUp => view.scroll.saturating_sub(page),
+                    Event::PageDown => view.scroll.saturating_add(page),
+                    Event::GoToStart => 0,
+                    _ => usize::MAX,
+                };
+            }
             Event::ScrollUp => {
                 self.scroll_up();
             }
@@ -764,6 +803,15 @@ impl App {
             }
             Event::ToggleDetail => {
                 self.show_detail = !self.show_detail;
+                if !self.show_detail {
+                    self.detail_view.focused = false;
+                }
+            }
+            Event::ToggleFocus => {
+                self.detail_view.focused = !self.detail_view.focused;
+                if self.detail_view.focused {
+                    self.show_detail = true;
+                }
             }
             Event::RequestDelete => {
                 if let Some(id) = self.selected_job_id() {
@@ -812,6 +860,11 @@ impl App {
                         query,
                     );
                 }
+            }
+            // Esc leaves the detail panel when it has focus, and otherwise
+            // drops a pinned search result.
+            Event::Unpin if self.detail_view.focused => {
+                self.detail_view.focused = false;
             }
             Event::Unpin => {
                 self.pinned_job_id = None;
@@ -2203,6 +2256,79 @@ mod tests {
 
         let detail = app.job_detail.as_ref().expect("detail");
         assert_eq!(detail.id, "j1");
+    }
+
+    // ── Detail panel focus ──────────────────────────────────────────
+
+    #[test]
+    fn focusing_the_panel_opens_it() {
+        let mut app = App::new("127.0.0.1:8901".into());
+
+        app.handle_event(Event::ToggleFocus);
+
+        assert!(app.show_detail);
+        assert!(app.detail_view.focused);
+    }
+
+    #[test]
+    fn with_focus_the_movement_keys_scroll_the_panel_not_the_cursor() {
+        let (mut app, _rx) = seed_detail(&["j1", "j2", "j3"]);
+        app.detail_view.page = 10;
+        app.handle_event(Event::ToggleFocus);
+
+        app.handle_event(Event::ScrollDown);
+        app.handle_event(Event::ScrollDown);
+        assert_eq!(app.detail_view.scroll, 2);
+        app.handle_event(Event::PageDown);
+        assert_eq!(app.detail_view.scroll, 12);
+        app.handle_event(Event::ScrollUp);
+        assert_eq!(app.detail_view.scroll, 11);
+        app.handle_event(Event::PageUp);
+        assert_eq!(app.detail_view.scroll, 1);
+        app.handle_event(Event::GoToEnd);
+        assert_eq!(app.detail_view.scroll, usize::MAX, "clamped when rendered");
+        app.handle_event(Event::GoToStart);
+        assert_eq!(app.detail_view.scroll, 0);
+
+        assert_eq!(app.list_states[Tab::Ready.idx()].cursor, 0);
+    }
+
+    #[test]
+    fn toggling_focus_again_moves_the_cursor_again() {
+        let (mut app, _rx) = seed_detail(&["j1", "j2"]);
+        app.handle_event(Event::ToggleFocus);
+
+        app.handle_event(Event::ToggleFocus);
+        app.handle_event(Event::ScrollDown);
+
+        assert!(app.show_detail, "the panel stays open");
+        assert_eq!(app.list_states[Tab::Ready.idx()].cursor, 1);
+        assert_eq!(app.detail_view.scroll, 0);
+    }
+
+    #[test]
+    fn esc_leaves_the_panel_before_unpinning() {
+        let (mut app, _rx) = seed_detail(&["j1"]);
+        app.pinned_job_id = Some("j1".into());
+        app.handle_event(Event::ToggleFocus);
+
+        app.handle_event(Event::Unpin);
+        assert!(!app.detail_view.focused);
+        assert_eq!(app.pinned_job_id.as_deref(), Some("j1"));
+
+        app.handle_event(Event::Unpin);
+        assert_eq!(app.pinned_job_id, None);
+    }
+
+    #[test]
+    fn closing_the_panel_gives_focus_back_to_the_list() {
+        let (mut app, _rx) = seed_detail(&["j1"]);
+        app.handle_event(Event::ToggleFocus);
+
+        app.handle_event(Event::ToggleDetail);
+
+        assert!(!app.show_detail);
+        assert!(!app.detail_view.focused);
     }
 
     #[test]

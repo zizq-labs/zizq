@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 672
+assertion_line: 700
 expression: "render_to_string(&app, 160, 30)"
 ---
   Zizq 0.1.0
@@ -26,10 +26,10 @@ expression: "render_to_string(&app, 160, 30)"
 
 
 
-  ATTRIBUTES                                                   PAYLOAD                            FAILURES
-  ID                      0195b70a2bb46e1f07a0c908d7a2bb40     {                                  #10    10m ago  ForkError
-  Queue                   default                                "subject": "Welcome!",                boom
-  Type                    generate_annual_report_email           "to": "user@example.com",             worker.sh:12 in spawn
-  Priority                0                                      "urgent": true                   #9     11m ago  ForkError: boom
-  Status                  in_flight                            }                                  … older failures not shown
- TabChange Tab iInfo pPause /Find DDelete qQuit
+  ATTRIBUTES                                                    PAYLOAD                                          FAILURES
+  ID                      0195b70a2bb46e1f07a0c908d7a2bb40      {                                                #10    10m ago  ForkError
+  Queue                   default                                 "subject": "Welcome!",                              boom
+  Type                    generate_annual_report_email            "to": "user@example.com",                           worker.sh:12 in spawn
+  Priority                0                                       "urgent": true                                 #9     11m ago  ForkError: boom
+  … Enter to see all                                            }                                                … older failures not shown
+ TabChange Tab iInfo EnterDetails pPause /Find DDelete qQuit

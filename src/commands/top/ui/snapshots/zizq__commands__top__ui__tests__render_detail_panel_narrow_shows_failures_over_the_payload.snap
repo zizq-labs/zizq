@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 656
+assertion_line: 684
 expression: "render_to_string(&app, 130, 30)"
 ---
   Zizq 0.1.0
@@ -31,5 +31,5 @@ expression: "render_to_string(&app, 130, 30)"
   Queue                   default                                       fork failed: cannot allocate memory
   Type                    generate_annual_report_email                  while spawning `convert`
   Priority                0                                        #2      9m ago  ForkError: fork failed: cannot allocate memory
-  Status                  in_flight                                #1     14m ago  ForkError: process exited with status 141
- TabChange Tab iInfo pPause /Find DDelete qQuit
+  … Enter to see all                                               #1     14m ago  ForkError: process exited with status 141
+ TabChange Tab iInfo EnterDetails pPause /Find DDelete qQuit

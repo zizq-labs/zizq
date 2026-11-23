@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 696
+assertion_line: 724
 expression: "render_to_string(&app, 200, 40)"
 ---
   Zizq 0.1.0
@@ -29,7 +29,10 @@ expression: "render_to_string(&app, 200, 40)"
                                                                                                                                       "recipients": [
                                                                                                                                         "user1@example.com",
                                                                                                                                         "user2@example.com",
-                                                                                                                                    …
+                                                                                                                                        "user3@example.com",
+                                                                                                                                        "user4@example.com",
+                                                                                                                                        "user5@example.com",
+                                                                                                                                    … Enter to see all
 
                                                                                                                                     FAILURES
                                                                                                                                     #3      2m ago  ForkError
@@ -39,7 +42,4 @@ expression: "render_to_string(&app, 200, 40)"
                                                                                                                                          worker.sh:40 in run
                                                                                                                                     #2      9m ago  ForkError: fork failed: cannot allocate memory
                                                                                                                                     #1     14m ago  ForkError: process exited with status 141
-
-
-
- TabChange Tab iInfo pPause /Find DDelete qQuit
+ TabChange Tab iInfo EnterDetails pPause /Find DDelete qQuit

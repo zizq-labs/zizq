@@ -67,6 +67,16 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
         help_spans.push(Span::styled("i", key_style));
         help_spans.push(Span::styled("Info", label_style));
     }
+    // With the panel open, Enter moves focus between it and the list.
+    if app.show_detail {
+        let (key, label) = if app.detail_view.focused {
+            (" Enter", "List")
+        } else {
+            (" Enter", "Details")
+        };
+        help_spans.push(Span::styled(key, key_style));
+        help_spans.push(Span::styled(label, label_style));
+    }
     help_spans.extend([
         Span::styled(" p", key_style),
         Span::styled(pause_label, label_style),

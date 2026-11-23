@@ -1,0 +1,45 @@
+---
+source: src/commands/top/ui/mod.rs
+assertion_line: 752
+expression: "render_to_string(&app, 160, 40)"
+---
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 2m
+  Queue: 2 in-flight, 2 ready, 2 scheduled
+        ▼
+  Depth[││││││                                                                                                 6 jobs]
+        ▲
+   In-Flight   Ready   Scheduled
+                         ID   PRIORITY QUEUE                        DURATION   ATTEMPTS TYPE
+70a2bb46e1f07a0c908d7a2bb40          0 default                            3s          1 generate_annual_report_email
+70a1aa35d0e06b0b807c691aa30          0 billing                         2m30s          3 charge_subscription
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ATTRIBUTES                                                    PAYLOAD                                          FAILURES
+  Status                  in_flight                                 "user3@example.com",                              worker.sh:40 in run
+  Ready At                2023-11-15 09:13:10 +11:00                "user4@example.com",                         #2      9m ago  ForkError
+  Dequeued At             2023-11-15 09:13:16 +11:00                "user5@example.com",                              fork failed: cannot allocate memory
+  Attempts / Retry Limit  1/25                                      "user6@example.com",                              worker.sh:12 in spawn
+  Backoff                 base=15000,exponent=4,jitter=30000        "user7@example.com",                              worker.sh:40 in run
+  Retention Policy        completed=7d, dead=30d                    "user8@example.com",                         #1     14m ago  ForkError
+  Unique Key              active report:annual:2026                 "user9@example.com",                              process exited with status 141
+                                                                    "user10@example.com",                             worker.sh:12 in spawn
+ TabChange Tab iInfo EnterList pPause /Find DDelete qQuit
