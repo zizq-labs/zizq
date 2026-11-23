@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::commands::top::app::{App, Tab};
 
-use super::{header_bg, tab_fg};
+use super::{header_bg, list_has_focus, tab_fg};
 
 pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
     let tab_labels = [
@@ -22,7 +22,9 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
         (Tab::Scheduled, " Scheduled "),
     ];
 
-    let header_style = Style::default().fg(tab_fg()).bg(header_bg());
+    let header_style = Style::default()
+        .fg(tab_fg())
+        .bg(header_bg(list_has_focus(app)));
     let inactive_tab_style = Style::default().fg(tab_fg()).bg(Color::Blue);
 
     let mut tab_spans: Vec<Span> = Vec::new();

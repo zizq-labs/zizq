@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 622
+assertion_line: 678
 expression: "render_to_string(&app, 160, 30)"
 ---
   Zizq 0.1.0
@@ -26,10 +26,10 @@ expression: "render_to_string(&app, 160, 30)"
 
 
 
-  ATTRIBUTES                                                  PAYLOAD                            FAILURES
-  ID                      0195b70a2bb46e1f07a0c908d7a2bb40    {                                  #3      2m ago  ForkError: fork failed: cannot allocate memory
-  Queue                   default                               "subject": "Welcome!",                while spawning `convert`
-  Type                    generate_annual_report_email          "to": "user@example.com",             worker.sh:12 in spawn
-  Priority                0                                     "urgent": true                   #2      9m ago  ForkError: fork failed: cannot allocate memory
-  Status                  in_flight                           }                                  #1     14m ago  ForkError: process exited with status 141
- TabChange Tab iInfo pPause /Find DDelete qQuit
+  ATTRIBUTES                                                    PAYLOAD                                          FAILURES
+  ID                      0195b70a2bb46e1f07a0c908d7a2bb40      {                                                #3      2m ago  ForkError
+  Queue                   default                                 "subject": "Welcome!",                              fork failed: cannot allocate memory
+  Type                    generate_annual_report_email            "to": "user@example.com",                           while spawning `convert`
+  Priority                0                                       "urgent": true                                 #2      9m ago  ForkError: fork failed: cannot
+  … Enter to see all                                            }                                                #1     14m ago  ForkError: process exited with
+ TabChange Tab iInfo EnterDetails pPause /Find DDelete qQuit

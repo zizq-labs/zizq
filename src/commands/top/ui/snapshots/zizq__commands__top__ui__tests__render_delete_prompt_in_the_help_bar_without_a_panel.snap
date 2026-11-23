@@ -1,5 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
+assertion_line: 292
 expression: "render_to_string(&app, 80, 10)"
 ---
   Zizq 0.1.0
@@ -11,4 +12,4 @@ expression: "render_to_string(&app, 80, 10)"
 
    In-Flight   Ready   Scheduled
                          ID   PRIORITY QUEUE              DURATION   ATTEMPTS TY
- Delete job j_abc123? y Yes  n No
+ Delete this job (j_abc123)? This can't be undone.  y Delete  n Cancel

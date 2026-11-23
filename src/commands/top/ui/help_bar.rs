@@ -14,7 +14,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::commands::top::app::{App, SearchField, SearchPrompt, Tab};
 
-pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
+/// `panel_shown` says whether the detail panel is on screen, in which case
+/// it holds any delete confirmation, keys and all, and the help bar is left
+/// empty meanwhile.
+pub(super) fn render(app: &App, frame: &mut Frame, area: Rect, panel_shown: bool) {
     let key_style = Style::default();
     let label_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
 
@@ -26,24 +29,13 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // When a delete confirmation is pending, the help bar becomes a modal
-    // prompt — replaces the shortcuts entirely so the user is never in
-    // doubt about what `y` and `n` will do.
+    // While a delete awaits confirmation only its `y` and `n` do anything,
+    // so the shortcuts go. The question is at the foot of the detail panel,
+    // under the job, or here when there's no room for one.
     if let Some(id) = &app.pending_delete {
-        // Full red bar, white text. Keys (y / n) are bold; the job id
-        // is bold; everything else is regular white on red.
-        let base = Style::default().fg(Color::White).bg(Color::Red);
-        let strong = base.add_modifier(Modifier::BOLD);
-        let prompt = Paragraph::new(Line::from(vec![
-            Span::styled(" Delete job ", base),
-            Span::styled(id.as_str(), strong),
-            Span::styled("? ", base),
-            Span::styled("y", strong),
-            Span::styled(" Yes  ", base),
-            Span::styled("n", strong),
-            Span::styled(" No ", base),
-        ]));
-        frame.render_widget(prompt, area);
+        if !panel_shown {
+            frame.render_widget(delete_prompt(Some(id)), area);
+        }
         return;
     }
 
@@ -66,6 +58,16 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         help_spans.push(Span::styled("i", key_style));
         help_spans.push(Span::styled("Info", label_style));
+    }
+    // With the panel open, Enter moves focus between it and the list.
+    if app.show_detail {
+        let (key, label) = if app.detail_view.focused {
+            (" Enter", "List")
+        } else {
+            (" Enter", "Details")
+        };
+        help_spans.push(Span::styled(key, key_style));
+        help_spans.push(Span::styled(label, label_style));
     }
     help_spans.extend([
         Span::styled(" p", key_style),
@@ -198,4 +200,25 @@ fn render_search_prompt(prompt: &SearchPrompt, frame: &mut Frame, area: Rect) {
     if let Some(cx) = cursor_x {
         frame.set_cursor_position((cx, area.y));
     }
+}
+
+/// The delete confirmation: white on red, the keys in bold. It names the job
+/// when given its id, for where the job itself isn't on screen.
+pub(super) fn delete_prompt(id: Option<&str>) -> Paragraph<'_> {
+    let base = Style::default().fg(Color::White).bg(Color::Red);
+    let strong = base.add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(" Delete this job", base)];
+    if let Some(id) = id {
+        spans.push(Span::styled(" (", base));
+        spans.push(Span::styled(id, strong));
+        spans.push(Span::styled(")", base));
+    }
+    spans.extend([
+        Span::styled("? This can't be undone.  ", base),
+        Span::styled("y", strong),
+        Span::styled(" Delete  ", base),
+        Span::styled("n", strong),
+        Span::styled(" Cancel ", base),
+    ]);
+    Paragraph::new(Line::from(spans)).style(base)
 }

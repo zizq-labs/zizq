@@ -42,6 +42,9 @@ pub enum Event {
     GoToEnd,
     /// Toggle the detail panel.
     ToggleDetail,
+    /// Move focus between the job list and the detail panel, opening the
+    /// panel if need be. With focus, the movement keys scroll the panel.
+    ToggleFocus,
     /// Toggle paused state — freeze/unfreeze the live job lists.
     TogglePause,
     /// Begin a delete-confirmation prompt for the cursor row.
@@ -130,6 +133,7 @@ impl Event {
                 | Event::ScrollLeft
                 | Event::ScrollRight
                 | Event::ToggleDetail
+                | Event::ToggleFocus
                 | Event::TogglePause
                 | Event::RequestDelete
                 | Event::ConfirmDelete
@@ -256,6 +260,9 @@ pub fn read_terminal_events(
                     (KeyCode::Char('i'), _) => {
                         let _ = tx.blocking_send(Event::ToggleDetail);
                     }
+                    (KeyCode::Enter, _) => {
+                        let _ = tx.blocking_send(Event::ToggleFocus);
+                    }
                     (KeyCode::Char('p'), _) => {
                         let _ = tx.blocking_send(Event::TogglePause);
                     }
@@ -282,7 +289,8 @@ pub fn read_terminal_events(
                     }
                     (KeyCode::Esc, _) => {
                         // Multiplexed: cancel a delete prompt if one is
-                        // pending, otherwise unpin the current search
+                        // pending, otherwise leave the detail panel if it
+                        // has focus, otherwise unpin the current search
                         // result. The App decides based on its state.
                         let _ = tx.blocking_send(Event::CancelDelete);
                         let _ = tx.blocking_send(Event::Unpin);

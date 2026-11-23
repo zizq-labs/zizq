@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 634
+assertion_line: 690
 expression: "render_to_string(&app, 130, 30)"
 ---
   Zizq 0.1.0
@@ -26,10 +26,10 @@ expression: "render_to_string(&app, 130, 30)"
 
 
 
-  ATTRIBUTES                                                      PAYLOAD
-  ID                      0195b70a2bb46e1f07a0c908d7a2bb40        {
-  Queue                   default                                   "subject": "Welcome!",
-  Type                    generate_annual_report_email              "to": "user@example.com",
-  Priority                0                                         "urgent": true
-  Status                  in_flight                               }
- TabChange Tab iInfo pPause /Find DDelete qQuit
+  ATTRIBUTES                                                       PAYLOAD
+  ID                      0195b70a2bb46e1f07a0c908d7a2bb40         {
+  Queue                   default                                    "subject": "Welcome!",
+  Type                    generate_annual_report_email               "to": "user@example.com",
+  Priority                0                                          "urgent": true
+  … Enter to see all                                               }
+ TabChange Tab iInfo EnterDetails pPause /Find DDelete qQuit

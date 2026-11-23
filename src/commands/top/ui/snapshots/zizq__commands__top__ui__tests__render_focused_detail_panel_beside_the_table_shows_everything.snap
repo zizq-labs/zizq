@@ -1,0 +1,45 @@
+---
+source: src/commands/top/ui/mod.rs
+assertion_line: 746
+expression: "render_to_string(&app, 200, 40)"
+---
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 2m
+  Queue: 2 in-flight, 2 ready, 2 scheduled
+        ▼
+  Depth[││││││                                                                                                 6 jobs]
+        ▲
+   In-Flight   Ready   Scheduled
+                         ID   PRIORITY QUEUE                DURATION   ATTEMPTS TYPE                                                    "user15@example.com",
+70a2bb46e1f07a0c908d7a2bb40          0 default                    3s          1 generate_annual_report_email                            "user16@example.com",
+70a1aa35d0e06b0b807c691aa30          0 billing                 2m30s          3 charge_subscription                                     "user17@example.com",
+                                                                                                                                        "user18@example.com",
+                                                                                                                                        "user19@example.com",
+                                                                                                                                        "user20@example.com",
+                                                                                                                                        "user21@example.com",
+                                                                                                                                        "user22@example.com",
+                                                                                                                                        "user23@example.com",
+                                                                                                                                        "user24@example.com",
+                                                                                                                                        "user25@example.com",
+                                                                                                                                        "user26@example.com",
+                                                                                                                                        "user27@example.com",
+                                                                                                                                        "user28@example.com",
+                                                                                                                                        "user29@example.com",
+                                                                                                                                        "user30@example.com"
+                                                                                                                                      ]
+                                                                                                                                    }
+
+                                                                                                                                    FAILURES
+                                                                                                                                    #3      2m ago  ForkError
+                                                                                                                                         fork failed: cannot allocate memory
+                                                                                                                                         while spawning `convert`
+                                                                                                                                         worker.sh:12 in spawn
+                                                                                                                                         worker.sh:40 in run
+                                                                                                                                    #2      9m ago  ForkError
+                                                                                                                                         fork failed: cannot allocate memory
+                                                                                                                                         worker.sh:12 in spawn
+                                                                                                                                         worker.sh:40 in run
+                                                                                                                                    #1     14m ago  ForkError
+                                                                                                                                         process exited with status 141
+ TabChange Tab iInfo EnterList pPause /Find DDelete qQuit

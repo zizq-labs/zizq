@@ -16,7 +16,7 @@ use crate::api::admin::AdminJob;
 use crate::commands::top::app::{App, Tab};
 
 use super::format::{format_due, format_elapsed};
-use super::{MIN_TABLE_WIDTH, header_bg, tab_fg};
+use super::{MIN_TABLE_WIDTH, header_bg, list_has_focus, tab_fg};
 
 /// Render the table for the active tab into `area`. Slices the buffer
 /// down to the visible window, picks the right table builder for the
@@ -39,6 +39,7 @@ pub(super) fn render_active(app: &App, frame: &mut Frame, area: Rect, table_body
     };
 
     // Determine which row in the visible slice is the cursor.
+    let focused = list_has_focus(app);
     let cursor_in_view =
         if ls.cursor >= ls.scroll_pos && ls.cursor < ls.scroll_pos + table_body_height {
             Some(ls.cursor - ls.scroll_pos)
@@ -47,9 +48,9 @@ pub(super) fn render_active(app: &App, frame: &mut Frame, area: Rect, table_body
         };
 
     let table = match app.active_tab {
-        Tab::Ready => job_table_ready(visible, app.now_ms, cursor_in_view),
-        Tab::InFlight => job_table_in_flight(visible, app.now_ms, cursor_in_view),
-        Tab::Scheduled => job_table_scheduled(visible, app.now_ms, cursor_in_view),
+        Tab::Ready => job_table_ready(visible, app.now_ms, cursor_in_view, focused),
+        Tab::InFlight => job_table_in_flight(visible, app.now_ms, cursor_in_view, focused),
+        Tab::Scheduled => job_table_scheduled(visible, app.now_ms, cursor_in_view, focused),
     };
     let tab_scroll = app.h_scroll[app.active_tab.idx()];
     render_scrollable(frame, table, area, tab_scroll);
@@ -140,6 +141,7 @@ pub(super) fn job_table_ready<'a>(
     jobs: &'a [AdminJob],
     now_ms: u64,
     cursor_row: Option<usize>,
+    focused: bool,
 ) -> Table<'a> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
@@ -149,7 +151,7 @@ pub(super) fn job_table_ready<'a>(
         Cell::from(Line::from("ATTEMPTS").alignment(Alignment::Right)),
         Cell::from("TYPE"),
     ])
-    .style(Style::default().fg(tab_fg()).bg(header_bg()))
+    .style(Style::default().fg(tab_fg()).bg(header_bg(focused)))
     .bottom_margin(0);
 
     let rows: Vec<Row> = jobs
@@ -200,6 +202,7 @@ pub(super) fn job_table_in_flight<'a>(
     jobs: &'a [AdminJob],
     now_ms: u64,
     cursor_row: Option<usize>,
+    focused: bool,
 ) -> Table<'a> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
@@ -209,7 +212,7 @@ pub(super) fn job_table_in_flight<'a>(
         Cell::from(Line::from("ATTEMPTS").alignment(Alignment::Right)),
         Cell::from("TYPE"),
     ])
-    .style(Style::default().fg(tab_fg()).bg(header_bg()))
+    .style(Style::default().fg(tab_fg()).bg(header_bg(focused)))
     .bottom_margin(0);
 
     let rows: Vec<Row> = jobs
@@ -261,6 +264,7 @@ pub(super) fn job_table_scheduled<'a>(
     jobs: &'a [AdminJob],
     now_ms: u64,
     cursor_row: Option<usize>,
+    focused: bool,
 ) -> Table<'a> {
     let header = Row::new([
         Cell::from(Line::from("ID").alignment(Alignment::Right)),
@@ -270,7 +274,7 @@ pub(super) fn job_table_scheduled<'a>(
         Cell::from(Line::from("ATTEMPTS").alignment(Alignment::Right)),
         Cell::from("TYPE"),
     ])
-    .style(Style::default().fg(tab_fg()).bg(header_bg()))
+    .style(Style::default().fg(tab_fg()).bg(header_bg(focused)))
     .bottom_margin(0);
 
     let rows: Vec<Row> = jobs

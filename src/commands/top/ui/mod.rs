@@ -43,8 +43,19 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     tabs::render(app, frame, chunks[1]);
 
-    // Content area — render only the active tab's table.
-    let content_area = chunks[2];
+    // Content area — render only the active tab's table, with the detail
+    // panel beside it at full height when the terminal is wide enough.
+    let side_width = side_panel_width(chunks[2].width).filter(|_| app.show_detail);
+    let (content_area, side_area) = match side_width {
+        Some(width) => {
+            let [table, panel] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(width)])
+                    .spacing(1)
+                    .areas(chunks[2]);
+            (table, Some(panel))
+        }
+        None => (chunks[2], None),
+    };
 
     let subscription_limit = if matches!(app.status, ConnectionStatus::Connected) {
         app.subscription_limit
@@ -56,8 +67,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Panel height: min(DETAIL_PANEL_MAX, 30% of content area).
     // Suppressed if the table would get fewer than MIN_TABLE_ROWS body rows.
     let detail_height = DETAIL_PANEL_MAX.min((content_area.height * 30 / 100).max(1));
-    let show_detail_panel =
-        app.show_detail && content_area.height > detail_height + MIN_TABLE_ROWS + 1;
+    let show_detail_panel = app.show_detail
+        && side_area.is_none()
+        && content_area.height > detail_height + MIN_TABLE_ROWS + 1;
 
     let (table_area, detail_area, msg_area) = {
         let mut constraints = vec![Constraint::Min(0)]; // table always first
@@ -100,8 +112,28 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     job_table::render_active(app, frame, table_area, table_body_height);
 
-    if let Some(area) = detail_area {
-        detail_panel::render(app, frame, area);
+    // The scroll position belongs to one job; another starts at the top.
+    let selected = app.selected_job_id();
+    if app.detail_view.job != selected {
+        app.detail_view.job = selected;
+        app.detail_view.scroll = 0;
+    }
+    let panel = detail_area
+        .map(|area| (area, detail_panel::Placement::Below))
+        .or(side_area.map(|area| (area, detail_panel::Placement::Beside)));
+    // A terminal too short for the panel leaves focus with the list.
+    if panel.is_none() {
+        app.detail_view.focused = false;
+    }
+    if let Some((area, placement)) = panel {
+        // Below the table the panel's headings stay put as it scrolls.
+        app.detail_view.page = match placement {
+            detail_panel::Placement::Below => area.height.saturating_sub(1),
+            detail_panel::Placement::Beside => area.height,
+        } as usize;
+        if let Some(scroll) = detail_panel::render(app, frame, area, placement) {
+            app.detail_view.scroll = scroll;
+        }
     }
 
     if let Some(cap) = subscription_limit {
@@ -116,13 +148,26 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         frame.render_widget(msg, msg_area.unwrap());
     }
 
-    help_bar::render(app, frame, chunks[3]);
+    help_bar::render(app, frame, chunks[3], panel.is_some());
 }
 
 /// Minimum width for the table content area. When the viewport is narrower,
 /// the table renders at this width and the visible portion is determined by
 /// the horizontal scroll offset.
 pub(super) const MIN_TABLE_WIDTH: u16 = 120;
+
+/// The narrowest a detail panel beside the table can be.
+const SIDE_PANEL_MIN_WIDTH: u16 = 50;
+
+/// The width of a detail panel beside the table, or `None` when the
+/// terminal is too narrow to fit one and the table at `MIN_TABLE_WIDTH`, so
+/// the panel goes below the table instead. About a third of the width,
+/// within those limits.
+fn side_panel_width(width: u16) -> Option<u16> {
+    // One column separates the table from the panel.
+    let room = width.checked_sub(MIN_TABLE_WIDTH + 1)?;
+    (room >= SIDE_PANEL_MIN_WIDTH).then(|| (width * 35 / 100).clamp(SIDE_PANEL_MIN_WIDTH, room))
+}
 
 /// Maximum height of the detail panel (heading + all possible fields).
 const DETAIL_PANEL_MAX: u16 = 13;
@@ -135,9 +180,16 @@ pub(super) const fn tab_fg() -> Color {
     Color::Black
 }
 
-/// Background color shared by the active tab and the table header row.
-pub(super) const fn header_bg() -> Color {
-    Color::Green
+/// Background color of headings: the active tab and the table header row,
+/// or the detail panel's section headings. Green marks the pane with focus
+/// (the one the movement keys act on), yellow the other.
+pub(super) const fn header_bg(focused: bool) -> Color {
+    if focused { Color::Green } else { Color::Yellow }
+}
+
+/// Whether the job list has focus, rather than the detail panel.
+pub(super) fn list_has_focus(app: &App) -> bool {
+    !(app.show_detail && app.detail_view.focused)
 }
 
 #[cfg(test)]
@@ -175,6 +227,13 @@ mod tests {
         ($($arg:tt)*) => {{
             let mut settings = insta::Settings::clone_current();
             settings.add_filter(r"Zizq \d+\.\d+\.\d+", "Zizq 0.1.0");
+            // Timestamps are shown in the local time zone, which differs
+            // between machines. The placeholder keeps the same width so the
+            // columns after it stay put.
+            settings.add_filter(
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}",
+                "YYYY-MM-DD HH:MM:SS +HH:MM",
+            );
             settings.bind(|| {
                 insta::assert_snapshot!($($arg)*);
             });
@@ -212,6 +271,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         }
     }
 
@@ -229,8 +289,10 @@ mod tests {
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
 
+    /// Too short a terminal for the detail panel asks in the help bar,
+    /// naming the job, since it isn't on screen.
     #[test]
-    fn render_delete_prompt_replaces_help_bar() {
+    fn render_delete_prompt_in_the_help_bar_without_a_panel() {
         let mut app = new_app();
         app.status = ConnectionStatus::Connected;
         app.pending_delete = Some("j_abc123".into());
@@ -337,6 +399,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -373,6 +436,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -500,6 +564,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         }
     }
 
@@ -645,6 +710,147 @@ mod tests {
     }
 
     #[test]
+    fn side_panel_width_leaves_the_table_its_minimum() {
+        assert_eq!(side_panel_width(170), None);
+        assert_eq!(side_panel_width(171), Some(50));
+        assert_eq!(side_panel_width(200), Some(70));
+        assert_eq!(side_panel_width(250), Some(87));
+    }
+
+    #[test]
+    fn render_detail_panel_beside_the_table() {
+        let app = detail_app(three_failures(), false);
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    #[test]
+    fn render_detail_panel_beside_the_table_with_a_long_payload() {
+        let mut app = detail_app(three_failures(), false);
+        let job = app.job_detail.as_mut().unwrap().job.as_mut().unwrap();
+        job.payload = Some(serde_json::json!({
+            "recipients": (1..=30).map(|n| format!("user{n}@example.com")).collect::<Vec<_>>(),
+        }));
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    /// `detail_app`, with the panel focused and scrolled `scroll` lines,
+    /// and a payload long enough to need it.
+    fn focused_detail_app(scroll: usize) -> App {
+        let mut app = detail_app(three_failures(), false);
+        let job = app.job_detail.as_mut().unwrap().job.as_mut().unwrap();
+        job.payload = Some(serde_json::json!({
+            "recipients": (1..=30).map(|n| format!("user{n}@example.com")).collect::<Vec<_>>(),
+        }));
+        app.detail_view.focused = true;
+        app.detail_view.scroll = scroll;
+        app.detail_view.job = Some(app.in_flight_jobs[0].id.clone());
+        app
+    }
+
+    #[test]
+    fn render_focused_detail_panel_beside_the_table_shows_everything() {
+        // Scrolled past the attributes to the payload, which is uncapped,
+        // down to every failure in full.
+        let app = focused_detail_app(30);
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    #[test]
+    fn render_focused_detail_panel_below_the_table_scrolls_under_its_headings() {
+        let app = focused_detail_app(4);
+        assert_ui_snapshot!(render_to_string(&app, 160, 40));
+    }
+
+    #[test]
+    fn scrolling_the_detail_panel_stops_at_its_end() {
+        let mut app = focused_detail_app(usize::MAX);
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+
+        // Scrolled so the panel's last line is on its bottom row: further
+        // would only leave rows blank.
+        let last_row = 40 - 2;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let mut at_end = app.clone();
+        let frame = terminal.draw(|f| render(&mut at_end, f)).unwrap();
+        let last_line: String = (130..200)
+            .map(|x| frame.buffer[(x, last_row)].symbol())
+            .collect();
+        assert_eq!(
+            last_line.trim(),
+            "worker.sh:40 in run",
+            "the oldest backtrace"
+        );
+        assert_eq!(at_end.detail_view.scroll, app.detail_view.scroll);
+    }
+
+    #[test]
+    fn another_job_starts_the_detail_panel_at_the_top() {
+        let mut app = focused_detail_app(10);
+        app.detail_view.job = Some("another".into());
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+
+        assert_eq!(app.detail_view.scroll, 0);
+    }
+
+    #[test]
+    fn green_headings_mark_the_pane_with_focus() {
+        use ratatui::style::Color;
+
+        // The active tab's label and the panel's first heading.
+        let colours = |app: &App| {
+            let mut app = app.clone();
+            let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+            let frame = terminal.draw(|f| render(&mut app, f)).unwrap();
+            let buf = &frame.buffer;
+            let tab = (0..200)
+                .map(|x| &buf[(x, 7)])
+                .find(|c| c.symbol() == "I")
+                .unwrap()
+                .bg;
+            let panel = buf[(132, 8)].bg;
+            (tab, panel)
+        };
+
+        let mut app = focused_detail_app(0);
+        assert_eq!(colours(&app), (Color::Yellow, Color::Green));
+        app.detail_view.focused = false;
+        assert_eq!(colours(&app), (Color::Green, Color::Yellow));
+    }
+
+    #[test]
+    fn render_delete_prompt_in_the_detail_panel() {
+        let mut app = detail_app(three_failures(), false);
+        app.pending_delete = Some(app.in_flight_jobs[0].id.clone());
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    #[test]
+    fn render_delete_prompt_in_the_detail_panel_below_the_table() {
+        let mut app = detail_app(three_failures(), false);
+        app.pending_delete = Some(app.in_flight_jobs[0].id.clone());
+        assert_ui_snapshot!(render_to_string(&app, 160, 30));
+    }
+
+    #[test]
+    fn the_delete_prompt_is_red_across_the_panel() {
+        use ratatui::style::Color;
+
+        let mut app = detail_app(three_failures(), false);
+        app.pending_delete = Some(app.in_flight_jobs[0].id.clone());
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let frame = terminal.draw(|f| render(&mut app, f)).unwrap();
+
+        // The panel's last row, above the help bar, from end to end.
+        let row = 40 - 2;
+        assert!((130..200).all(|x| frame.buffer[(x, row)].bg == Color::Red));
+        assert_eq!(frame.buffer[(129, row)].bg, Color::Reset, "not the table");
+    }
+
+    #[test]
     fn render_detail_panel_while_loading() {
         let mut app = sample_app(Tab::InFlight);
         app.show_detail = true;
@@ -683,6 +889,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -719,6 +926,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -777,6 +985,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
     }
@@ -835,6 +1044,7 @@ mod tests {
             modal_mode_flag: None,
             job_detail: None,
             detail_request: None,
+            detail_view: Default::default(),
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));
     }
