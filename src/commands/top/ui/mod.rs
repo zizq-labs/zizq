@@ -148,7 +148,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         frame.render_widget(msg, msg_area.unwrap());
     }
 
-    help_bar::render(app, frame, chunks[3]);
+    help_bar::render(app, frame, chunks[3], panel.is_some());
 }
 
 /// Minimum width for the table content area. When the viewport is narrower,
@@ -282,8 +282,10 @@ mod tests {
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
 
+    /// Too short a terminal for the detail panel asks in the help bar,
+    /// naming the job, since it isn't on screen.
     #[test]
-    fn render_delete_prompt_replaces_help_bar() {
+    fn render_delete_prompt_in_the_help_bar_without_a_panel() {
         let mut app = new_app();
         app.status = ConnectionStatus::Connected;
         app.pending_delete = Some("j_abc123".into());
@@ -810,6 +812,35 @@ mod tests {
         assert_eq!(colours(&app), (Color::Yellow, Color::Green));
         app.detail_view.focused = false;
         assert_eq!(colours(&app), (Color::Green, Color::Yellow));
+    }
+
+    #[test]
+    fn render_delete_prompt_in_the_detail_panel() {
+        let mut app = detail_app(three_failures(), false);
+        app.pending_delete = Some(app.in_flight_jobs[0].id.clone());
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    #[test]
+    fn render_delete_prompt_in_the_detail_panel_below_the_table() {
+        let mut app = detail_app(three_failures(), false);
+        app.pending_delete = Some(app.in_flight_jobs[0].id.clone());
+        assert_ui_snapshot!(render_to_string(&app, 160, 30));
+    }
+
+    #[test]
+    fn the_delete_prompt_is_red_across_the_panel() {
+        use ratatui::style::Color;
+
+        let mut app = detail_app(three_failures(), false);
+        app.pending_delete = Some(app.in_flight_jobs[0].id.clone());
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let frame = terminal.draw(|f| render(&mut app, f)).unwrap();
+
+        // The panel's last row, above the help bar, from end to end.
+        let row = 40 - 2;
+        assert!((130..200).all(|x| frame.buffer[(x, row)].bg == Color::Red));
+        assert_eq!(frame.buffer[(129, row)].bg, Color::Reset, "not the table");
     }
 
     #[test]

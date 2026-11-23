@@ -68,6 +68,16 @@ pub(super) fn render(
     let focused = app.detail_view.focused;
     let heading = heading_style(focused);
 
+    // A delete awaiting confirmation asks at the foot of the panel.
+    let area = if app.pending_delete.is_some() {
+        let [body, prompt] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        frame.render_widget(super::help_bar::delete_prompt(None), prompt);
+        body
+    } else {
+        area
+    };
+
     let ls = &app.list_states[app.active_tab.idx()];
     let jobs = match app.active_tab {
         Tab::Ready => &app.ready_jobs,

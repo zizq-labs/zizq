@@ -219,6 +219,9 @@ pub struct DetailView {
     /// The job the scroll position belongs to. Showing another job starts
     /// again from the top.
     pub job: Option<String>,
+    /// Whether the panel was opened to confirm a delete, so it closes
+    /// again once the prompt is answered.
+    pub opened_for_delete: bool,
 }
 
 /// One job in full, as the server last described it in answer to `GetJob`.
@@ -664,6 +667,7 @@ impl App {
         self.ready_jobs.retain(|j| j.id != id);
         self.in_flight_jobs.retain(|j| j.id != id);
         self.scheduled_jobs.retain(|j| j.id != id);
+        self.close_panel_opened_for_delete();
     }
 
     /// Cancel the pending delete prompt and drop out of modal mode so
@@ -671,6 +675,14 @@ impl App {
     fn close_delete_prompt(&mut self) {
         self.pending_delete = None;
         self.set_modal_mode(false);
+        self.close_panel_opened_for_delete();
+    }
+
+    fn close_panel_opened_for_delete(&mut self) {
+        if std::mem::take(&mut self.detail_view.opened_for_delete) {
+            self.show_detail = false;
+            self.detail_view.focused = false;
+        }
     }
 
     /// Apply server status fields from any message.
@@ -813,10 +825,14 @@ impl App {
                     self.show_detail = true;
                 }
             }
+            // The prompt is shown in the detail panel, under the job it
+            // would delete, so the panel opens for it if need be.
             Event::RequestDelete => {
                 if let Some(id) = self.selected_job_id() {
                     self.pending_delete = Some(id);
                     self.set_modal_mode(true);
+                    self.detail_view.opened_for_delete = !self.show_detail;
+                    self.show_detail = true;
                 }
             }
             // Outside of an active prompt these are no-ops — the prompt
@@ -2399,6 +2415,32 @@ mod tests {
         let mut app = seed_ready_with_cursor("j1");
         app.handle_event(Event::RequestDelete);
         assert_eq!(app.pending_delete.as_deref(), Some("j1"));
+    }
+
+    #[test]
+    fn the_delete_prompt_opens_the_panel_until_it_is_answered() {
+        for answer in [Event::CancelDelete, Event::ConfirmDelete] {
+            let mut app = seed_ready_with_cursor("j1");
+
+            app.handle_event(Event::RequestDelete);
+            assert!(app.show_detail, "opened to show the prompt");
+
+            app.handle_event(answer);
+            assert!(!app.show_detail, "closed again");
+        }
+    }
+
+    #[test]
+    fn the_delete_prompt_leaves_an_open_panel_open() {
+        for answer in [Event::CancelDelete, Event::ConfirmDelete] {
+            let mut app = seed_ready_with_cursor("j1");
+            app.handle_event(Event::ToggleDetail);
+
+            app.handle_event(Event::RequestDelete);
+            app.handle_event(answer);
+
+            assert!(app.show_detail);
+        }
     }
 
     #[test]
