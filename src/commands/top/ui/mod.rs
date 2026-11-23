@@ -210,6 +210,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         }
     }
 
@@ -333,6 +335,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -367,6 +371,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 60, 10));
     }
@@ -492,6 +498,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         }
     }
 
@@ -604,6 +612,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -638,6 +648,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 8));
     }
@@ -694,6 +706,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 80, 20));
     }
@@ -750,6 +764,8 @@ mod tests {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         };
         assert_ui_snapshot!(render_to_string(&app, 120, 12));
     }

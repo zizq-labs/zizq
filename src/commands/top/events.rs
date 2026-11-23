@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 use crate::api::admin::{
-    AdminEvent, AdminJob, AdminMessage, ClientMessage, Direction, FindAnchor, JobChangeStatus,
-    JobWindow, ListName, SearchQuery, ServerStatus,
+    AdminEvent, AdminJob, AdminJobError, AdminMessage, ClientMessage, Direction, FindAnchor,
+    JobChangeStatus, JobWindow, ListName, SearchQuery, ServerStatus,
 };
 
 /// Unified event type for the TUI event loop.
@@ -104,6 +104,16 @@ pub enum Event {
         list: crate::api::admin::ListName,
         matched_position: Option<usize>,
         window: JobWindow,
+    },
+    /// One job in full, with its most recent failures, in answer to a
+    /// `GetJob`. `job` is `None` when the job no longer exists.
+    ServerJobDetail {
+        server: ServerStatus,
+        id: String,
+        job: Option<AdminJob>,
+        status: Option<String>,
+        errors: Vec<AdminJobError>,
+        more_errors: bool,
     },
     /// Server connection lost.
     ServerDisconnected,
@@ -393,15 +403,29 @@ fn parse_ws_message(text: &str) -> Option<Event> {
             matched_position,
             window,
         }),
-        // `top` never sends `GetJob` or `GetErrors`, so never receives an
-        // answer to either.
-        AdminEvent::JobDetail { .. } | AdminEvent::JobErrors { .. } => None,
+        AdminEvent::JobDetail {
+            id,
+            job,
+            status,
+            errors,
+            more_errors,
+        } => Some(Event::ServerJobDetail {
+            server: msg.server,
+            id,
+            job,
+            status,
+            errors,
+            more_errors,
+        }),
+        // `top` doesn't page back through older failures, so never sends
+        // `GetErrors`, and never receives an answer to one.
+        AdminEvent::JobErrors { .. } => None,
     }
 }
 
-/// Serialize a detail-level message for sending over WebSocket.
-pub fn detail_level_message(detail: bool) -> String {
-    serde_json::to_string(&ClientMessage::SetDetailLevel { detail })
+/// Serialize a get-job message for sending over WebSocket.
+pub fn get_job_message(id: String) -> String {
+    serde_json::to_string(&ClientMessage::GetJob { id })
         .expect("ClientMessage serialization cannot fail")
 }
 

@@ -32,7 +32,12 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let buf_idx = ls.cursor.checked_sub(ls.buffer_offset);
-    let job = buf_idx.and_then(|i| jobs.get(i));
+    let row = buf_idx.and_then(|i| jobs.get(i));
+
+    // The server's full answer for the row's job, once it has arrived.
+    // Until then the row itself is shown, which has no payload.
+    let detail = row.and_then(|row| app.job_detail.as_ref().filter(|d| d.id == row.id));
+    let job = detail.and_then(|d| d.job.as_ref()).or(row);
 
     let Some(job) = job else {
         // Heading bar even when no job selected.
@@ -63,11 +68,14 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
         heading_style,
     ));
 
-    let status = match app.active_tab {
-        Tab::Ready => "ready",
-        Tab::InFlight => "in_flight",
-        Tab::Scheduled => "scheduled",
-    };
+    // The job may have moved on since the row was fetched.
+    let status = detail
+        .and_then(|d| d.status.as_deref())
+        .unwrap_or(match app.active_tab {
+            Tab::Ready => "ready",
+            Tab::InFlight => "in_flight",
+            Tab::Scheduled => "scheduled",
+        });
 
     let attempts_value = match job.retry_limit {
         Some(limit) => format!("{}/{}", job.attempts, limit),
@@ -155,8 +163,11 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
                 serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
             payload_lines.extend(pretty.lines().map(|l| Line::raw(format!(" {l}"))));
         }
+        None if detail.is_some() => {
+            payload_lines.push(Line::styled(" (this job no longer exists)", dim));
+        }
         None => {
-            payload_lines.push(Line::styled(" (not loaded)", dim));
+            payload_lines.push(Line::styled(" (loading…)", dim));
         }
     }
 

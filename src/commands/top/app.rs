@@ -11,8 +11,8 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::api::admin::{
-    AdminJob, Direction, Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName, SearchQuery,
-    ServerStatus, SubscribeAnchor,
+    AdminJob, AdminJobError, Direction, Fallback, FindAnchor, JobChangeStatus, JobWindow, ListName,
+    SearchQuery, ServerStatus, SubscribeAnchor,
 };
 use crate::license::Tier;
 
@@ -202,6 +202,23 @@ impl Default for ListState {
 /// dedup no longer helps. This throttle covers those cases.
 const PREFETCH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Minimum interval between `GetJob` requests as the cursor moves, so
+/// holding an arrow key doesn't ask about every job it passes.
+const DETAIL_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One job in full, as the server last described it in answer to `GetJob`.
+#[derive(Clone)]
+pub struct JobDetail {
+    pub id: String,
+    /// `None` when the job no longer exists.
+    pub job: Option<AdminJob>,
+    pub status: Option<String>,
+    /// The job's most recent failures, newest first.
+    pub errors: Vec<AdminJobError>,
+    /// Whether the job has failed more often than `errors` shows.
+    pub more_errors: bool,
+}
+
 /// Top-level application state for the TUI.
 pub struct App {
     pub host: String,
@@ -261,6 +278,10 @@ pub struct App {
     /// "exit the app", and killing the reader would strand the user
     /// with no keyboard input for the rest of the session.
     pub modal_mode_flag: Option<InputModeFlag>,
+    /// The detail panel's job in full, once the server has answered for it.
+    pub job_detail: Option<JobDetail>,
+    /// The job last asked for with `GetJob`, and when.
+    pub detail_request: Option<(String, Instant)>,
 }
 
 impl Clone for App {
@@ -293,6 +314,8 @@ impl Clone for App {
             pinned_locate_pending: self.pinned_locate_pending,
             search_mode_flag: self.search_mode_flag.clone(),
             modal_mode_flag: self.modal_mode_flag.clone(),
+            job_detail: self.job_detail.clone(),
+            detail_request: self.detail_request.clone(),
         }
     }
 }
@@ -327,6 +350,8 @@ impl App {
             pinned_locate_pending: false,
             search_mode_flag: None,
             modal_mode_flag: None,
+            job_detail: None,
+            detail_request: None,
         }
     }
 
@@ -486,12 +511,26 @@ impl App {
         self.send_subscribe(tab, anchor, new_limit);
     }
 
-    /// Send the current detail level to the server.
-    fn send_detail_level(&self) {
-        if let Some(tx) = &self.ws_tx {
-            let msg = events::detail_level_message(self.show_detail);
-            let _ = tx.try_send(msg);
+    /// Asks the server for the cursor job in full while the detail panel
+    /// is open, unless it was the last job asked for. Called each time
+    /// round the main loop; asks at most once per `DETAIL_MIN_INTERVAL`,
+    /// so the job the cursor settles on is the one fetched.
+    pub fn maybe_request_detail(&mut self, now: Instant) {
+        if !self.show_detail {
+            return;
         }
+        let Some(id) = self.selected_job_id() else {
+            return;
+        };
+        if let Some((asked, asked_at)) = &self.detail_request
+            && (*asked == id || now.duration_since(*asked_at) < DETAIL_MIN_INTERVAL)
+        {
+            return;
+        }
+        if let Some(tx) = &self.ws_tx {
+            let _ = tx.try_send(events::get_job_message(id.clone()));
+        }
+        self.detail_request = Some((id, now));
     }
 
     /// Send a `Find` over the WebSocket. `limit` is derived from the
@@ -724,13 +763,7 @@ impl App {
                 self.go_to_end();
             }
             Event::ToggleDetail => {
-                // Detail level can't be changed while paused — the visible
-                // payloads are whatever was in the frozen snapshot.
-                if self.paused {
-                    return false;
-                }
                 self.show_detail = !self.show_detail;
-                self.send_detail_level();
             }
             Event::RequestDelete => {
                 if let Some(id) = self.selected_job_id() {
@@ -806,11 +839,8 @@ impl App {
             Event::ServerConnected { url } => {
                 self.status = ConnectionStatus::Connected;
                 self.host = url;
-                // Resend detail level so the server knows our preference
-                // after a reconnect.
-                if self.show_detail {
-                    self.send_detail_level();
-                }
+                // Ask again for the panel's job on the new connection.
+                self.detail_request = None;
             }
             Event::ServerHeartbeat { server } => {
                 self.apply_server_status(server);
@@ -850,6 +880,11 @@ impl App {
                 job,
             } => {
                 self.apply_server_status(server);
+                // The panel's job changed, so ask for it again, paused or
+                // not.
+                if self.job_detail.as_ref().is_some_and(|d| d.id == id) {
+                    self.detail_request = None;
+                }
                 if self.paused {
                     return false;
                 }
@@ -955,6 +990,23 @@ impl App {
                         self.pinned_job_id = None;
                     }
                 }
+            }
+            Event::ServerJobDetail {
+                server,
+                id,
+                job,
+                status,
+                errors,
+                more_errors,
+            } => {
+                self.apply_server_status(server);
+                self.job_detail = Some(JobDetail {
+                    id,
+                    job,
+                    status,
+                    errors,
+                    more_errors,
+                });
             }
             Event::ServerDisconnected => {
                 self.status = ConnectionStatus::Disconnected;
@@ -2068,16 +2120,138 @@ mod tests {
         assert_eq!(ls.cursor, 110);
     }
 
-    #[test]
-    fn paused_toggle_detail_is_noop() {
+    // ── Job details ─────────────────────────────────────────────────
+
+    /// Seed the app with ready jobs, the cursor on the first, the detail
+    /// panel open, and the messages it sends captured.
+    fn seed_detail(ids: &[&str]) -> (App, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
         let mut app = App::new("127.0.0.1:8901".into());
-        assert!(!app.show_detail);
+        app.set_ws_tx(tx);
+        app.viewport_height = 20;
+        app.active_tab = Tab::Ready;
+        app.total_ready = ids.len();
+        app.ready_jobs = ids.iter().map(|id| job(id, 0, None)).collect();
+        app.handle_event(Event::ToggleDetail);
+        (app, rx)
+    }
+
+    fn sent(rx: &mut mpsc::Receiver<String>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn detail_answer(id: &str) -> Event {
+        Event::ServerJobDetail {
+            server: default_server(),
+            id: id.into(),
+            job: Some(job(id, 0, None)),
+            status: Some("ready".into()),
+            errors: Vec::new(),
+            more_errors: false,
+        }
+    }
+
+    #[test]
+    fn opening_the_detail_panel_asks_for_the_cursor_job() {
+        let (mut app, mut rx) = seed_detail(&["j1", "j2"]);
+
+        app.maybe_request_detail(Instant::now());
+
+        let sent = sent(&mut rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("\"type\":\"get_job\"") && sent[0].contains("j1"));
+    }
+
+    #[test]
+    fn the_same_job_is_not_asked_for_twice() {
+        let (mut app, mut rx) = seed_detail(&["j1"]);
+        let now = Instant::now();
+
+        app.maybe_request_detail(now);
+        app.maybe_request_detail(now + Duration::from_secs(1));
+
+        assert_eq!(sent(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn moving_the_cursor_asks_for_the_job_it_settles_on() {
+        let (mut app, mut rx) = seed_detail(&["j1", "j2", "j3"]);
+        let start = Instant::now();
+        app.maybe_request_detail(start);
+
+        app.handle_event(Event::ScrollDown);
+        app.maybe_request_detail(start + Duration::from_millis(30));
+        app.handle_event(Event::ScrollDown);
+        app.maybe_request_detail(start + Duration::from_millis(60));
+        app.maybe_request_detail(start + Duration::from_millis(150));
+
+        let sent = sent(&mut rx);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[0].contains("j1"));
+        assert!(
+            sent[1].contains("j3"),
+            "skips j2, passed within the interval"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_kept_for_the_panel() {
+        let (mut app, _rx) = seed_detail(&["j1"]);
+        app.maybe_request_detail(Instant::now());
+
+        app.handle_event(detail_answer("j1"));
+
+        let detail = app.job_detail.as_ref().expect("detail");
+        assert_eq!(detail.id, "j1");
+    }
+
+    #[test]
+    fn a_change_to_the_panel_job_asks_again_even_while_paused() {
+        let (mut app, mut rx) = seed_detail(&["j1"]);
+        let start = Instant::now();
+        app.maybe_request_detail(start);
+        app.handle_event(detail_answer("j1"));
+        app.handle_event(Event::TogglePause);
+        sent(&mut rx);
+
+        app.handle_event(Event::ServerJobChanged {
+            server: default_server(),
+            id: "j1".into(),
+            status: JobChangeStatus::InFlight,
+            job: Some(job("j1", 0, Some(1))),
+        });
+        app.maybe_request_detail(start + Duration::from_secs(1));
+
+        let sent = sent(&mut rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("get_job") && sent[0].contains("j1"));
+    }
+
+    #[test]
+    fn the_detail_panel_opens_while_paused() {
+        let mut app = App::new("127.0.0.1:8901".into());
         app.handle_event(Event::TogglePause);
 
         app.handle_event(Event::ToggleDetail);
 
-        // Detail level didn't change because the snapshot was frozen.
-        assert!(!app.show_detail);
+        assert!(app.show_detail);
+    }
+
+    #[test]
+    fn reconnecting_asks_again_for_the_panel_job() {
+        let (mut app, mut rx) = seed_detail(&["j1"]);
+        let start = Instant::now();
+        app.maybe_request_detail(start);
+        sent(&mut rx);
+
+        app.handle_event(Event::ServerConnected {
+            url: "http://127.0.0.1:8901".into(),
+        });
+        app.maybe_request_detail(start + Duration::from_secs(1));
+
+        let sent = sent(&mut rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("get_job") && sent[0].contains("j1"));
     }
 
     // ── Delete prompt ───────────────────────────────────────────────
