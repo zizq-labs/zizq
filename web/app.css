@@ -568,6 +568,62 @@ main {
   --accent: var(--red);
 }
 
+/* Deleting is set apart in red, and asks first. */
+.delete {
+  margin-left: auto;
+  padding: 0 4px;
+  border: none;
+  background: none;
+  color: var(--red);
+  font: inherit;
+  cursor: pointer;
+}
+
+.delete:hover {
+  text-decoration: underline;
+}
+
+.delete + .close {
+  margin-left: 0;
+}
+
+/* At the foot of the panel, so asking doesn't push the details down. */
+.confirm {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--rule);
+  background: rgba(255, 107, 122, 0.12);
+}
+
+.confirm span {
+  margin-right: auto;
+}
+
+.confirm button {
+  padding: 2px 10px;
+  border: 1px solid var(--rule);
+  background: var(--tab);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.confirm button:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 1px;
+}
+
+.confirm .confirm-delete {
+  border-color: var(--red);
+  background: var(--red);
+  color: var(--bg);
+  font-weight: 700;
+}
+
 .close {
   margin-left: auto;
   padding: 0 6px;

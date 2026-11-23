@@ -598,6 +598,8 @@ export function ListPanel({
             older=${stream.older}
             onLoadOlder=${stream.loadOlder}
             onClose=${closeDetail}
+            deleting=${stream.deleting?.id === stream.selected}
+            onDelete=${stream.deleteSelected}
           />
         `}
       </div>

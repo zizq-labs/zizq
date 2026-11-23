@@ -337,3 +337,62 @@ test("the search opens from its icon and closes when left empty", async ({ page,
   await page.waitForTimeout(400);
   await expect(search).toHaveAttribute("data-open", "true");
 });
+
+test("deleting a job asks first, then removes it", async ({ page, zizq }) => {
+  await zizq.enqueue([job({ type: "doomed" }), job({ type: "spared" })]);
+  await page.goto(`${zizq.url}#ready`);
+  await rows(page).filter({ hasText: "doomed" }).click();
+
+  await page.locator(".detail .delete").click();
+  await expect(page.locator(".confirm")).toContainText("Delete this job?");
+  await page.locator(".confirm button", { hasText: "Cancel" }).click();
+  await expect(page.locator(".confirm")).toHaveCount(0);
+  await expect(rows(page)).toHaveCount(2);
+
+  await page.locator(".detail .delete").click();
+  await page.locator(".confirm-delete").click();
+
+  await expect(page.locator(".detail .gone")).toHaveText("This job was deleted.");
+  await expect(rows(page).locator(".type")).toHaveText(["spared"]);
+  await expect(page.locator("#tab-ready .tab-total")).toHaveText("1");
+});
+
+const cancelButton = (page) => page.locator(".confirm button", { hasText: "Cancel" });
+
+test("D and y delete from the keyboard; Esc only cancels", async ({ page, zizq }) => {
+  await zizq.enqueue([job({ type: "doomed" })]);
+  await page.goto(`${zizq.url}#ready`);
+  await rows(page).first().click();
+  // `D` does nothing until the job's details have loaded.
+  await expect(page.locator(".detail .delete")).toBeVisible();
+
+  await page.keyboard.press("Shift+D");
+  await expect(page.locator(".confirm")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".confirm")).toHaveCount(0);
+  await expect(page.locator(".detail")).toHaveCount(1);
+
+  await page.keyboard.press("Shift+D");
+  await expect(cancelButton(page)).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".confirm")).toHaveCount(0);
+  await expect(rows(page)).toHaveCount(1);
+
+  await page.keyboard.press("Shift+D");
+  await expect(cancelButton(page)).toBeFocused();
+  await page.keyboard.press("y");
+  await expect(page.locator(".detail .gone")).toHaveText("This job was deleted.");
+  await expect(page.locator(".empty")).toHaveText("No jobs ready.");
+});
+
+test("deleting a job reports it while another list is shown", async ({ page, zizq }) => {
+  await zizq.enqueue([job({ queue: "work", type: "doomed" })]);
+  await page.goto(`${zizq.url}#ready`);
+  await rows(page).first().click();
+  await page.locator("#tab-scheduled").click();
+
+  await page.locator(".detail .delete").click();
+  await page.locator(".confirm-delete").click();
+
+  await expect(page.locator(".detail .gone")).toHaveText("This job was deleted.");
+});
