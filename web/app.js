@@ -11,6 +11,7 @@ import { LISTS, ListPanel, useTick } from "./list_view.js";
 import { combineFailures, oldestAttempt } from "./failures.js";
 import { applyMessage, emptyLists } from "./lists.js";
 import { html, render, useEffect, useRef, useState } from "./preact.js";
+import { SearchBar } from "./search.js";
 
 // The most failures one `get_errors` request may ask for.
 const MAX_FAILURES_PAGE = 50;
@@ -45,6 +46,10 @@ function useAdminStream() {
     older: null,
     select: () => {},
     loadOlder: () => {},
+    // The answer to the last search: the matched job's position and id,
+    // with `position` null when nothing matched. `seq` tells answers apart.
+    found: null,
+    find: () => {},
   };
 
   useEffect(() => {
@@ -81,6 +86,16 @@ function useAdminStream() {
       }
       s.older = { errors: [], more: true, ...s.older, loading: "append" };
       s.send({ type: "get_errors", id: s.selected, before });
+      rerender();
+    };
+
+    // Searches `list` from `anchor` in `direction` (see SearchBar). The
+    // window the server sends around a match isn't one it keeps up to date,
+    // so only the match is taken from it; the list then moves to it.
+    let findSeq = 0;
+    s.find = ({ list, anchor, direction, query }) => {
+      s.found = null;
+      s.send({ type: "find", list, anchor, direction, query, limit: 30 });
       rerender();
     };
 
@@ -143,6 +158,15 @@ function useAdminStream() {
         if (message.event === "job_detail" && message.id === s.selected) {
           s.detail = message;
           refreshOlder();
+        } else if (message.event === "find_result") {
+          const { list, matched_position: position, window } = message;
+          const match = position === null ? null : window.items[position - window.first_position];
+          s.found = {
+            seq: ++findSeq,
+            list,
+            position: match ? position : null,
+            id: match?.id ?? null,
+          };
         } else if (message.event === "job_errors" && message.id === s.selected && s.older) {
           const errors =
             s.older.loading === "refresh" ? message.errors : [...s.older.errors, ...message.errors];
@@ -243,7 +267,7 @@ function Header({ conn, server, receivedAt }) {
   `;
 }
 
-function ListTabs({ server, selected, onSelect }) {
+function ListTabs({ stream, server, selected, onSelect, frozen }) {
   const jobs = server
     ? Object.values(LISTS).reduce((sum, list) => sum + server[list.total], 0)
     : null;
@@ -270,6 +294,7 @@ function ListTabs({ server, selected, onSelect }) {
         `,
       )}
       </div>
+      <${SearchBar} stream=${stream} list=${selected} frozen=${frozen} />
       ${jobs !== null &&
       html`<span class="jobs-total">${numbers.format(jobs)} ${jobs === 1 ? "job" : "jobs"}</span>`}
     </div>
@@ -313,7 +338,13 @@ function App() {
     <div class="app" data-conn=${conn.state}>
       <${Header} conn=${conn} server=${server} receivedAt=${receivedAt} />
       <main>
-        <${ListTabs} server=${server} selected=${selected} onSelect=${select} />
+        <${ListTabs}
+          stream=${stream}
+          server=${server}
+          selected=${selected}
+          onSelect=${select}
+          frozen=${frozen !== null}
+        />
         <${ListPanel}
           stream=${stream}
           lists=${frozen ?? stream.lists}

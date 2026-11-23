@@ -204,6 +204,122 @@ main {
   align-items: baseline;
 }
 
+/* Search beside the tabs, between them and the job total. */
+.search {
+  display: flex;
+  align-items: center;
+  margin-left: 24px;
+  color: var(--muted);
+}
+
+.search-toggle {
+  display: flex;
+  align-items: center;
+  padding: 4px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.search-toggle:hover,
+.search[data-open="true"] .search-toggle {
+  color: var(--fg);
+}
+
+/* The fields slide open from the magnifying glass, and shut again. */
+.search-fields {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition:
+    max-width 0.2s ease,
+    opacity 0.2s ease;
+}
+
+.search[data-open="true"] .search-fields {
+  max-width: 48rem;
+  padding-left: 4px;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search-fields {
+    transition: none;
+  }
+}
+
+.search label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.search input {
+  width: 16ch;
+  padding: 2px 6px;
+  border: 1px solid var(--rule);
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+}
+
+.search input:focus {
+  border-color: var(--cyan);
+  outline: none;
+}
+
+.search :disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.search .step {
+  padding: 0 4px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.search .step:hover:not(:disabled) {
+  color: var(--fg);
+}
+
+.no-match {
+  color: var(--yellow);
+  white-space: nowrap;
+}
+
+/* A magnifying glass: a ring, and a handle at 45 degrees. */
+.find-icon {
+  position: relative;
+  flex: none;
+  width: 11px;
+  height: 11px;
+  margin-right: 2px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+}
+
+/* The handle runs out at 45 degrees from the middle of the ring's stroke,
+   so the two meet squarely. Its centre sits 3.5px (half its length) along
+   that diagonal from where it starts, inside the ring's 2px border. */
+.find-icon::after {
+  content: "";
+  position: absolute;
+  top: 5.5px;
+  left: 8px;
+  width: 2px;
+  height: 7px;
+  background: currentColor;
+  transform: rotate(-45deg);
+}
+
 .tabs {
   display: flex;
   gap: 4px;
@@ -276,7 +392,33 @@ main {
     gap: 2px;
   }
 
-  /* The tabs fill the row on a narrow screen. */
+  /* The tabs fill the row on a narrow screen, so the search takes a row of
+     its own above them (below, it would part the tabs from their panel),
+     and the job total is left out. */
+  .tab-bar {
+    flex-wrap: wrap;
+  }
+
+  .search {
+    order: -1;
+    flex-basis: 100%;
+    margin: 0 0 8px;
+  }
+
+  .search[data-open="true"] .search-fields {
+    flex: 1;
+  }
+
+  .search input {
+    width: 0;
+    flex: 1;
+  }
+
+  .search label {
+    flex: 1;
+    min-width: 0;
+  }
+
   .jobs-total {
     display: none;
   }
