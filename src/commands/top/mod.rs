@@ -170,6 +170,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         app.now_ms = crate::time::now_millis();
+        app.maybe_request_detail(std::time::Instant::now());
         terminal.draw(|f| ui::render(&mut app, f))?;
     }
 
