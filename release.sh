@@ -2,6 +2,9 @@
 
 # Build a release binary for the Zizq CLI for a single target.
 #
+# Each archive holds the binary, zizq's own LICENSE, and
+# THIRD_PARTY_LICENSES for the software built into it.
+#
 # Produces:
 #   target/release/zizq-<version>-<platform>.tar.gz        (unix)
 #   target/release/zizq-<version>-<platform>.tar.gz.sha256
@@ -248,16 +251,29 @@ fi
 OUT_DIR="target/release"
 mkdir -p "$OUT_DIR"
 
+# The licences ship beside the binary. Releasing without them would breach
+# the terms of software built into it, so their absence stops the release.
+LICENSE_FILES=(LICENSE THIRD_PARTY_LICENSES)
+for file in "${LICENSE_FILES[@]}"; do
+    if [[ ! -s "$file" ]]; then
+        echo "Error: ${file} is missing or empty; it must ship in the archive." >&2
+        exit 1
+    fi
+done
+
 if [[ "$TARGET" == *-windows-* ]]; then
     # Windows: zip (preserves nothing special, but it's what Windows users expect).
     ARCHIVE="zizq-${VERSION}-${PLATFORM}.zip"
     echo "    Packaging ${ARCHIVE}..."
-    zip -j "${OUT_DIR}/${ARCHIVE}" "$CARGO_BIN"
+    rm -f "${OUT_DIR}/${ARCHIVE}"
+    zip -j "${OUT_DIR}/${ARCHIVE}" "$CARGO_BIN" "${LICENSE_FILES[@]}"
 else
     # Unix: tar.gz preserves the executable permission bit.
     ARCHIVE="zizq-${VERSION}-${PLATFORM}.tar.gz"
     echo "    Packaging ${ARCHIVE}..."
-    tar -czf "${OUT_DIR}/${ARCHIVE}" -C "$(dirname "$CARGO_BIN")" "$(basename "$CARGO_BIN")"
+    tar -czf "${OUT_DIR}/${ARCHIVE}" \
+        -C "$(dirname "$CARGO_BIN")" "$(basename "$CARGO_BIN")" \
+        -C "$SCRIPT_DIR" "${LICENSE_FILES[@]}"
 fi
 
 # --- Checksum ---

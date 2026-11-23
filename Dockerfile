@@ -64,8 +64,13 @@ RUN set -eu; \
     ARCHIVE="zizq-${ZIZQ_VERSION}-${PLATFORM}.tar.gz"; \
     cd /dist; \
     sha256sum -c "${ARCHIVE}.sha256"; \
-    mkdir -p /rootfs/usr/local/bin /rootfs/etc /rootfs/var/lib/zizq /rootfs/tmp; \
+    mkdir -p /rootfs/usr/local/bin /rootfs/usr/share/licenses/zizq \
+        /rootfs/etc /rootfs/var/lib/zizq /rootfs/tmp; \
     tar -xzf "${ARCHIVE}" -C /rootfs/usr/local/bin zizq; \
+    tar -xzf "${ARCHIVE}" -C /rootfs/usr/share/licenses/zizq LICENSE THIRD_PARTY_LICENSES; \
+    # Owned by root, not by whichever user built the archive, who could
+    # otherwise be the image's own `zizq` and able to replace its binary.
+    chown -R 0:0 /rootfs/usr/local/bin/zizq /rootfs/usr/share/licenses/zizq; \
     echo 'zizq:x:1000:1000:zizq:/var/lib/zizq:/sbin/nologin' > /rootfs/etc/passwd; \
     echo 'zizq:x:1000:' > /rootfs/etc/group; \
     chmod 1777 /rootfs/tmp
@@ -89,6 +94,7 @@ RUN apk add --no-cache curl jq \
     && adduser -u 1000 -G zizq -h /var/lib/zizq -s /sbin/nologin -D zizq
 
 COPY --from=unpack /rootfs/usr/local/bin/zizq /usr/local/bin/zizq
+COPY --from=unpack /rootfs/usr/share/licenses/zizq /usr/share/licenses/zizq
 
 ENV ZIZQ_ROOT_DIR=/var/lib/zizq \
     ZIZQ_HOST=0.0.0.0
@@ -124,6 +130,7 @@ COPY --from=unpack /rootfs/etc/passwd /rootfs/etc/group /etc/
 COPY --from=unpack /rootfs/tmp /tmp
 COPY --from=unpack --chown=1000:1000 /rootfs/var/lib/zizq /var/lib/zizq
 COPY --from=unpack /rootfs/usr/local/bin/zizq /usr/local/bin/zizq
+COPY --from=unpack /rootfs/usr/share/licenses/zizq /usr/share/licenses/zizq
 
 ENV ZIZQ_ROOT_DIR=/var/lib/zizq \
     ZIZQ_HOST=0.0.0.0
