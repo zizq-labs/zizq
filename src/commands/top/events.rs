@@ -118,6 +118,14 @@ pub enum Event {
         errors: Vec<AdminJobError>,
         more_errors: bool,
     },
+    /// A page of a job's failures, newest first, in answer to a
+    /// `GetErrors`. `more` says whether it has older failures still.
+    ServerJobErrors {
+        server: ServerStatus,
+        id: String,
+        errors: Vec<AdminJobError>,
+        more: bool,
+    },
     /// Server connection lost.
     ServerDisconnected,
 }
@@ -425,9 +433,12 @@ fn parse_ws_message(text: &str) -> Option<Event> {
             errors,
             more_errors,
         }),
-        // `top` doesn't page back through older failures, so never sends
-        // `GetErrors`, and never receives an answer to one.
-        AdminEvent::JobErrors { .. } => None,
+        AdminEvent::JobErrors { id, errors, more } => Some(Event::ServerJobErrors {
+            server: msg.server,
+            id,
+            errors,
+            more,
+        }),
     }
 }
 
@@ -435,6 +446,17 @@ fn parse_ws_message(text: &str) -> Option<Event> {
 pub fn get_job_message(id: String) -> String {
     serde_json::to_string(&ClientMessage::GetJob { id })
         .expect("ClientMessage serialization cannot fail")
+}
+
+/// Serialize a get-errors message for sending over WebSocket: up to `limit`
+/// of a job's failures before attempt `before`, or the server's page size.
+pub fn get_errors_message(id: String, before: u32, limit: Option<usize>) -> String {
+    serde_json::to_string(&ClientMessage::GetErrors {
+        id,
+        before: Some(before),
+        limit,
+    })
+    .expect("ClientMessage serialization cannot fail")
 }
 
 /// Serialize a delete-job message for sending over WebSocket.

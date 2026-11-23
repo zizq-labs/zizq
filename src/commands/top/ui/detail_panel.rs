@@ -57,14 +57,14 @@ pub(super) enum Placement {
 /// degrades to a heading + "No job selected" placeholder so the user
 /// still sees where the panel would be.
 ///
-/// Returns how far the panel is scrolled once clamped to its content, while
-/// it has focus.
+/// Returns, while it has focus, how far the panel is scrolled once clamped
+/// to its content, and whether that's to its end.
 pub(super) fn render(
     app: &App,
     frame: &mut Frame,
     area: Rect,
     placement: Placement,
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     let focused = app.detail_view.focused;
     let heading = heading_style(focused);
 
@@ -103,17 +103,18 @@ pub(super) fn render(
             ]),
             area,
         );
-        return focused.then_some(0);
+        return focused.then_some((0, false));
     };
     let scroll = if focused { app.detail_view.scroll } else { 0 };
 
     // Beside the table the panel scrolls as one document.
     if placement == Placement::Beside {
         let lines = stacked_lines(app, job, detail, area, focused);
-        let scroll = scroll.min(lines.len().saturating_sub(area.height as usize));
+        let end = lines.len().saturating_sub(area.height as usize);
+        let scroll = scroll.min(end);
         let lines: Vec<_> = lines.into_iter().skip(scroll).collect();
         frame.render_widget(Paragraph::new(lines), area);
-        return focused.then_some(scroll);
+        return focused.then_some((scroll, scroll == end));
     }
 
     let has_failures = detail.is_some_and(|d| !d.errors.is_empty());
@@ -154,7 +155,8 @@ pub(super) fn render(
         .iter()
         .map(|lines| lines.len().saturating_sub(1))
         .max();
-    let scroll = scroll.min(longest.unwrap_or(0).saturating_sub(body_height));
+    let end = longest.unwrap_or(0).saturating_sub(body_height);
+    let scroll = scroll.min(end);
 
     for (mut lines, area) in contents.into_iter().zip(areas.iter()) {
         if !focused && lines.len() > area.height as usize {
@@ -166,7 +168,7 @@ pub(super) fn render(
         let lines: Vec<_> = heading.into_iter().chain(lines.skip(scroll)).collect();
         frame.render_widget(Paragraph::new(lines), *area);
     }
-    focused.then_some(scroll)
+    focused.then_some((scroll, scroll == end))
 }
 
 /// Metadata, payload and failures one above another, for a panel beside
@@ -373,7 +375,8 @@ fn failure_lines(
         lines.push(Line::styled("  (loading…)", dim()));
         return lines;
     };
-    let Some((newest, older)) = detail.errors.split_first() else {
+    let (errors, more) = detail.failures();
+    let Some((newest, older)) = errors.split_first() else {
         lines.push(Line::styled("  None", dim()));
         return lines;
     };
@@ -404,12 +407,15 @@ fn failure_lines(
     };
 
     let Some(height) = height else {
-        for (i, error) in detail.errors.iter().enumerate() {
+        for (i, error) in errors.iter().enumerate() {
             lines.push(summary(error, true, i == 0));
             lines.extend(failure_body(error));
         }
-        if detail.more_errors {
-            lines.push(Line::styled("  … older failures not shown", dim()));
+        // Older failures load once the panel is scrolled to its end.
+        if detail.loading_older() {
+            lines.push(Line::styled("  Loading older failures…", dim()));
+        } else if more {
+            lines.push(Line::styled("  … scroll for older failures", dim()));
         }
         return lines;
     };
@@ -418,7 +424,6 @@ fn failure_lines(
     // after a line for every other failure (and one for the note of more),
     // or half of what's below its own line, whichever is more.
     let rows = height.saturating_sub(1) as usize;
-    let more = detail.more_errors;
     let below_newest = rows.saturating_sub(1);
     let others = older.len() + usize::from(more);
     let room = below_newest.saturating_sub(others).max(below_newest / 2);

@@ -17,6 +17,7 @@ use crate::api::admin::{
 use crate::license::Tier;
 
 use super::events::{self, Event, InputModeFlag};
+use crate::api::admin::events::{ERROR_PAGE_SIZE, MAX_ERROR_PAGE_SIZE};
 
 /// Which of the two search prompt fields currently receives input.
 /// Type takes focus first — it's the more common initial filter.
@@ -219,6 +220,9 @@ pub struct DetailView {
     /// The job the scroll position belongs to. Showing another job starts
     /// again from the top.
     pub job: Option<String>,
+    /// Whether the panel was last rendered scrolled to its end, which is
+    /// when older failures are loaded.
+    pub at_end: bool,
     /// Whether the panel was opened to confirm a delete, so it closes
     /// again once the prompt is answered.
     pub opened_for_delete: bool,
@@ -235,6 +239,48 @@ pub struct JobDetail {
     pub errors: Vec<AdminJobError>,
     /// Whether the job has failed more often than `errors` shows.
     pub more_errors: bool,
+    /// Failures older than `errors`, once any have been asked for.
+    pub older: Option<OlderFailures>,
+}
+
+impl JobDetail {
+    /// Every failure loaded, newest first, each attempt once, and whether
+    /// the job has older failures still. Where both the newest page and the
+    /// older ones hold an attempt, the newest page's copy wins.
+    pub fn failures(&self) -> (Vec<&AdminJobError>, bool) {
+        let mut by_attempt = std::collections::BTreeMap::new();
+        let older = self.older.iter().flat_map(|o| &o.errors);
+        for error in older.chain(&self.errors) {
+            by_attempt.insert(error.attempt, error);
+        }
+        let more = self.older.as_ref().map_or(self.more_errors, |o| o.more);
+        (by_attempt.into_values().rev().collect(), more)
+    }
+
+    /// Whether older failures have been asked for and not yet arrived.
+    pub fn loading_older(&self) -> bool {
+        self.older.as_ref().is_some_and(|o| o.loading.is_some())
+    }
+}
+
+/// A job's failures older than its `JobDetail` holds, loaded a page at a
+/// time with `GetErrors` as the focused panel reaches its end.
+#[derive(Clone, Default)]
+pub struct OlderFailures {
+    /// Newest first.
+    pub errors: Vec<AdminJobError>,
+    /// Whether the job has older failures than these.
+    pub more: bool,
+    /// What a `GetErrors` awaiting its answer was asked for.
+    pub loading: Option<OlderLoad>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OlderLoad {
+    /// The next page, to add after those loaded.
+    Next,
+    /// All of those loaded again, to replace them.
+    Refresh,
 }
 
 /// Top-level application state for the TUI.
@@ -540,6 +586,7 @@ impl App {
         if !self.show_detail {
             return;
         }
+        self.maybe_request_older_failures();
         let Some(id) = self.selected_job_id() else {
             return;
         };
@@ -552,6 +599,36 @@ impl App {
             let _ = tx.try_send(events::get_job_message(id.clone()));
         }
         self.detail_request = Some((id, now));
+    }
+
+    /// Ask for the next page of the panel's job's failures, once the
+    /// focused panel is scrolled to its end, if there are more and none are
+    /// already on their way.
+    fn maybe_request_older_failures(&mut self) {
+        if !(self.detail_view.focused && self.detail_view.at_end) {
+            return;
+        }
+        let selected = self.selected_job_id();
+        let Some(detail) = self
+            .job_detail
+            .as_mut()
+            .filter(|d| Some(&d.id) == selected.as_ref())
+        else {
+            return;
+        };
+        let (errors, more) = detail.failures();
+        let oldest = errors.last().map(|e| e.attempt);
+        let (Some(before), true, false) = (oldest, more, detail.loading_older()) else {
+            return;
+        };
+        if let Some(tx) = &self.ws_tx {
+            let _ = tx.try_send(events::get_errors_message(detail.id.clone(), before, None));
+        }
+        let older = detail.older.get_or_insert_with(|| OlderFailures {
+            more: true,
+            ..Default::default()
+        });
+        older.loading = Some(OlderLoad::Next);
     }
 
     /// Send a `Find` over the WebSocket. `limit` is derived from the
@@ -908,8 +985,12 @@ impl App {
             Event::ServerConnected { url } => {
                 self.status = ConnectionStatus::Connected;
                 self.host = url;
-                // Ask again for the panel's job on the new connection.
+                // Ask again for the panel's job on the new connection. Any
+                // answer awaited on the old one won't come.
                 self.detail_request = None;
+                if let Some(older) = self.job_detail.as_mut().and_then(|d| d.older.as_mut()) {
+                    older.loading = None;
+                }
             }
             Event::ServerHeartbeat { server } => {
                 self.apply_server_status(server);
@@ -1069,13 +1150,57 @@ impl App {
                 more_errors,
             } => {
                 self.apply_server_status(server);
+                // Older failures loaded for this job stay with it. The new
+                // page may no longer meet them, if the job failed again
+                // meanwhile, so they're asked for again in one request: as
+                // many as there were, and a page more to close any gap.
+                let older = self
+                    .job_detail
+                    .take()
+                    .filter(|d| d.id == id)
+                    .and_then(|d| d.older)
+                    .filter(|o| !o.errors.is_empty());
+                let oldest = errors.last().map(|e| e.attempt);
+                let older = older.zip(oldest).map(|(mut older, before)| {
+                    let limit = (older.errors.len() + ERROR_PAGE_SIZE).min(MAX_ERROR_PAGE_SIZE);
+                    if let Some(tx) = &self.ws_tx {
+                        let msg = events::get_errors_message(id.clone(), before, Some(limit));
+                        let _ = tx.try_send(msg);
+                    }
+                    older.loading = Some(OlderLoad::Refresh);
+                    older
+                });
                 self.job_detail = Some(JobDetail {
                     id,
                     job,
                     status,
                     errors,
                     more_errors,
+                    older,
                 });
+            }
+            Event::ServerJobErrors {
+                server,
+                id,
+                errors,
+                more,
+            } => {
+                self.apply_server_status(server);
+                let older = self
+                    .job_detail
+                    .as_mut()
+                    .filter(|d| d.id == id)
+                    .and_then(|d| d.older.as_mut());
+                // Only an answer that's awaited, for the panel's job.
+                if let Some(older) = older
+                    && let Some(load) = older.loading.take()
+                {
+                    match load {
+                        OlderLoad::Next => older.errors.extend(errors),
+                        OlderLoad::Refresh => older.errors = errors,
+                    }
+                    older.more = more;
+                }
             }
             Event::ServerDisconnected => {
                 self.status = ConnectionStatus::Disconnected;
@@ -2272,6 +2397,179 @@ mod tests {
 
         let detail = app.job_detail.as_ref().expect("detail");
         assert_eq!(detail.id, "j1");
+    }
+
+    // ── Older failures ──────────────────────────────────────────────
+
+    /// Failure records for `attempts`, newest first.
+    fn failures(attempts: std::ops::RangeInclusive<u32>) -> Vec<AdminJobError> {
+        attempts
+            .rev()
+            .map(|attempt| AdminJobError {
+                attempt,
+                message: format!("failure {attempt}"),
+                error_type: None,
+                backtrace: None,
+                dequeued_at: 0,
+                failed_at: 0,
+            })
+            .collect()
+    }
+
+    fn attempts(detail: &JobDetail) -> Vec<u32> {
+        detail.failures().0.iter().map(|e| e.attempt).collect()
+    }
+
+    /// The panel focused and scrolled to its end, on job `j1`, whose newest
+    /// failures are attempts 12 down to 3 of 12.
+    fn at_the_end_of_failures() -> (App, mpsc::Receiver<String>) {
+        let (mut app, mut rx) = seed_detail(&["j1"]);
+        app.maybe_request_detail(Instant::now());
+        app.handle_event(job_failures("j1", failures(3..=12), true));
+        app.handle_event(Event::ToggleFocus);
+        app.detail_view.at_end = true;
+        sent(&mut rx);
+        (app, rx)
+    }
+
+    fn job_failures(id: &str, errors: Vec<AdminJobError>, more_errors: bool) -> Event {
+        Event::ServerJobDetail {
+            server: default_server(),
+            id: id.into(),
+            job: Some(job(id, 0, None)),
+            status: Some("scheduled".into()),
+            errors,
+            more_errors,
+        }
+    }
+
+    fn older_page(id: &str, errors: Vec<AdminJobError>, more: bool) -> Event {
+        Event::ServerJobErrors {
+            server: default_server(),
+            id: id.into(),
+            errors,
+            more,
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_panel_asks_for_failures_before_the_oldest_shown() {
+        let (mut app, mut rx) = at_the_end_of_failures();
+
+        app.maybe_request_detail(Instant::now());
+        app.maybe_request_detail(Instant::now());
+
+        let sent = sent(&mut rx);
+        assert_eq!(sent.len(), 1, "once, until answered: {sent:?}");
+        let msg: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            msg,
+            serde_json::json!({"type": "get_errors", "id": "j1", "before": 3, "limit": null})
+        );
+        assert!(app.job_detail.as_ref().unwrap().loading_older());
+    }
+
+    #[test]
+    fn older_failures_are_not_asked_for_short_of_the_end_or_without_focus() {
+        let (mut app, mut rx) = at_the_end_of_failures();
+        app.detail_view.at_end = false;
+        app.maybe_request_detail(Instant::now());
+
+        app.detail_view.at_end = true;
+        app.handle_event(Event::ToggleFocus);
+        app.maybe_request_detail(Instant::now());
+
+        assert_eq!(sent(&mut rx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn older_failures_are_not_asked_for_when_there_are_none() {
+        let (mut app, mut rx) = seed_detail(&["j1"]);
+        app.maybe_request_detail(Instant::now());
+        app.handle_event(job_failures("j1", failures(1..=3), false));
+        app.handle_event(Event::ToggleFocus);
+        app.detail_view.at_end = true;
+        sent(&mut rx);
+
+        app.maybe_request_detail(Instant::now());
+
+        assert_eq!(sent(&mut rx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_page_of_older_failures_follows_those_shown() {
+        let (mut app, mut rx) = at_the_end_of_failures();
+        app.maybe_request_detail(Instant::now());
+
+        app.handle_event(older_page("j1", failures(1..=2), false));
+
+        let detail = app.job_detail.as_ref().unwrap();
+        assert_eq!(attempts(detail), (1..=12).rev().collect::<Vec<_>>());
+        assert!(!detail.failures().1, "none older");
+        assert!(!detail.loading_older());
+
+        sent(&mut rx);
+        app.maybe_request_detail(Instant::now());
+        assert_eq!(sent(&mut rx), Vec::<String>::new(), "none more to ask for");
+    }
+
+    #[test]
+    fn fresh_details_ask_again_for_the_older_failures_loaded() {
+        let (mut app, mut rx) = at_the_end_of_failures();
+        app.maybe_request_detail(Instant::now());
+        app.handle_event(older_page("j1", failures(1..=2), false));
+        sent(&mut rx);
+
+        // The job failed twice more: its newest page is now 14 down to 5.
+        app.handle_event(job_failures("j1", failures(5..=14), true));
+
+        let sent = sent(&mut rx);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let msg: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(
+            msg,
+            serde_json::json!({"type": "get_errors", "id": "j1", "before": 5, "limit": 12})
+        );
+
+        app.handle_event(older_page("j1", failures(1..=4), false));
+        let detail = app.job_detail.as_ref().unwrap();
+        assert_eq!(attempts(detail), (1..=14).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn another_jobs_details_drop_the_older_failures() {
+        let (mut app, _rx) = at_the_end_of_failures();
+        app.maybe_request_detail(Instant::now());
+        app.handle_event(older_page("j1", failures(1..=2), false));
+
+        app.handle_event(job_failures("j2", failures(1..=1), false));
+
+        assert!(app.job_detail.as_ref().unwrap().older.is_none());
+    }
+
+    #[test]
+    fn an_unawaited_page_of_failures_is_ignored() {
+        let (mut app, _rx) = at_the_end_of_failures();
+
+        app.handle_event(older_page("j1", failures(1..=2), false));
+
+        let detail = app.job_detail.as_ref().unwrap();
+        assert_eq!(attempts(detail), (3..=12).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reconnecting_asks_again_for_older_failures() {
+        let (mut app, mut rx) = at_the_end_of_failures();
+        app.maybe_request_detail(Instant::now());
+        sent(&mut rx);
+
+        app.handle_event(Event::ServerConnected {
+            url: "http://127.0.0.1:8901".into(),
+        });
+        app.maybe_request_detail(Instant::now());
+
+        let sent = sent(&mut rx);
+        assert!(sent.iter().any(|m| m.contains("get_errors")), "{sent:?}");
     }
 
     // ── Detail panel focus ──────────────────────────────────────────

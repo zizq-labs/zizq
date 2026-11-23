@@ -131,9 +131,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             detail_panel::Placement::Below => area.height.saturating_sub(1),
             detail_panel::Placement::Beside => area.height,
         } as usize;
-        if let Some(scroll) = detail_panel::render(app, frame, area, placement) {
+        let scrolled = detail_panel::render(app, frame, area, placement);
+        if let Some((scroll, _)) = scrolled {
             app.detail_view.scroll = scroll;
         }
+        app.detail_view.at_end = scrolled.is_some_and(|(_, at_end)| at_end);
     }
 
     if let Some(cap) = subscription_limit {
@@ -665,6 +667,7 @@ mod tests {
             status: Some("in_flight".to_string()),
             errors,
             more_errors,
+            older: None,
         });
         app
     }
@@ -783,6 +786,47 @@ mod tests {
             "the oldest backtrace"
         );
         assert_eq!(at_end.detail_view.scroll, app.detail_view.scroll);
+    }
+
+    #[test]
+    fn the_detail_panel_says_when_it_is_scrolled_to_its_end() {
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        let mut app = focused_detail_app(0);
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+        assert!(!app.detail_view.at_end);
+
+        app.detail_view.scroll = usize::MAX;
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+        assert!(app.detail_view.at_end);
+
+        app.detail_view.focused = false;
+        terminal.draw(|f| render(&mut app, f)).unwrap();
+        assert!(!app.detail_view.at_end, "only with focus");
+    }
+
+    #[test]
+    fn render_focused_detail_panel_loading_older_failures() {
+        use crate::commands::top::app::{OlderFailures, OlderLoad};
+
+        // Attempts 5 and 4 came with the details, 3 with an older page, and
+        // the page before that is on its way.
+        let mut app = detail_app(
+            vec![
+                failure(5, 1, "out of memory"),
+                failure(4, 2, "out of memory"),
+            ],
+            true,
+        );
+        app.job_detail.as_mut().unwrap().older = Some(OlderFailures {
+            errors: vec![failure(3, 3, "disk full")],
+            more: true,
+            loading: Some(OlderLoad::Next),
+        });
+        app.detail_view.focused = true;
+        app.detail_view.scroll = usize::MAX;
+        app.detail_view.job = Some(app.in_flight_jobs[0].id.clone());
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
     }
 
     #[test]
