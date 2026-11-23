@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 821
+assertion_line: 828
 expression: "render_to_string(&app, 200, 40)"
 ---
   Zizq 0.1.0
@@ -17,8 +17,8 @@ expression: "render_to_string(&app, 200, 40)"
                                                                                                                                     Type                    generate_annual_report_email
                                                                                                                                     Priority                0
                                                                                                                                     Status                  in_flight
-                                                                                                                                    Ready At                2023-11-15 09:13:10 +11:00
-                                                                                                                                    Dequeued At             2023-11-15 09:13:16 +11:00
+                                                                                                                                    Ready At                YYYY-MM-DD HH:MM:SS +HH:MM
+                                                                                                                                    Dequeued At             YYYY-MM-DD HH:MM:SS +HH:MM
                                                                                                                                     Attempts / Retry Limit  1/25
                                                                                                                                     Backoff                 base=15000,exponent=4,jitter=30000
                                                                                                                                     Retention Policy        completed=7d, dead=30d

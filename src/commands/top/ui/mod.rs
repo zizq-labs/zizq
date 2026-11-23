@@ -227,6 +227,13 @@ mod tests {
         ($($arg:tt)*) => {{
             let mut settings = insta::Settings::clone_current();
             settings.add_filter(r"Zizq \d+\.\d+\.\d+", "Zizq 0.1.0");
+            // Timestamps are shown in the local time zone, which differs
+            // between machines. The placeholder keeps the same width so the
+            // columns after it stay put.
+            settings.add_filter(
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}",
+                "YYYY-MM-DD HH:MM:SS +HH:MM",
+            );
             settings.bind(|| {
                 insta::assert_snapshot!($($arg)*);
             });

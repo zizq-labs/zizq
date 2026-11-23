@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 752
+assertion_line: 761
 expression: "render_to_string(&app, 160, 40)"
 ---
   Zizq 0.1.0
@@ -35,8 +35,8 @@ expression: "render_to_string(&app, 160, 40)"
 
   ATTRIBUTES                                                    PAYLOAD                                          FAILURES
   Status                  in_flight                                 "user3@example.com",                              worker.sh:40 in run
-  Ready At                2023-11-15 09:13:10 +11:00                "user4@example.com",                         #2      9m ago  ForkError
-  Dequeued At             2023-11-15 09:13:16 +11:00                "user5@example.com",                              fork failed: cannot allocate memory
+  Ready At                YYYY-MM-DD HH:MM:SS +HH:MM                "user4@example.com",                         #2      9m ago  ForkError
+  Dequeued At             YYYY-MM-DD HH:MM:SS +HH:MM                "user5@example.com",                              fork failed: cannot allocate memory
   Attempts / Retry Limit  1/25                                      "user6@example.com",                              worker.sh:12 in spawn
   Backoff                 base=15000,exponent=4,jitter=30000        "user7@example.com",                              worker.sh:40 in run
   Retention Policy        completed=7d, dead=30d                    "user8@example.com",                         #1     14m ago  ForkError
