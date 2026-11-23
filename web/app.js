@@ -46,6 +46,9 @@ function useAdminStream() {
     older: null,
     select: () => {},
     loadOlder: () => {},
+    // The job being deleted, until the server confirms it's gone.
+    deleting: null,
+    deleteSelected: () => {},
     // The answer to the last search: the matched job's position and id,
     // with `position` null when nothing matched. `seq` tells answers apart.
     found: null,
@@ -62,8 +65,12 @@ function useAdminStream() {
 
     const rerender = () => setVersion((v) => v + 1);
 
+    // Details requests not yet answered. The server answers them in order.
+    let detailsAwaited = 0;
+
     const requestDetail = () => {
       if (s.selected) {
+        detailsAwaited++;
         s.send({ type: "get_job", id: s.selected });
       }
     };
@@ -73,7 +80,22 @@ function useAdminStream() {
       s.selected = id;
       s.detail = null;
       s.older = null;
+      s.deleting = null;
       requestDetail();
+      rerender();
+    };
+
+    // Deletes the open job. The server doesn't answer a delete, so its
+    // details are asked for straight after: it handles a connection's
+    // messages in order, so that answer comes once the job is gone, after
+    // the answers to any requests sent before it.
+    s.deleteSelected = () => {
+      if (!s.selected) {
+        return;
+      }
+      s.send({ type: "delete_job", id: s.selected });
+      requestDetail();
+      s.deleting = { id: s.selected, answersLeft: detailsAwaited };
       rerender();
     };
 
@@ -133,6 +155,8 @@ function useAdminStream() {
         s.conn = { state: "connected" };
         s.fetches = {};
         s.send = (message) => ws.send(JSON.stringify(message));
+        detailsAwaited = 0;
+        s.deleting = null;
         if (s.older) {
           s.older.loading = null;
         }
@@ -155,8 +179,22 @@ function useAdminStream() {
         // Answers about a job no longer selected are dropped, so a slow
         // reply can't replace the details of a job opened since. Any change
         // to the selected job asks for its details again.
+        // Every answer counts down to the one sent with a delete, whichever
+        // job it's about, since the server answers them all in order.
+        let deleteAnswered = false;
+        if (message.event === "job_detail") {
+          detailsAwaited = Math.max(0, detailsAwaited - 1);
+          if (s.deleting && --s.deleting.answersLeft === 0) {
+            deleteAnswered = s.deleting.id === message.id;
+            s.deleting = null;
+          }
+        }
         if (message.event === "job_detail" && message.id === s.selected) {
-          s.detail = message;
+          // Once known to be deleted, later answers that the job doesn't
+          // exist (such as one prompted by its removal from a list) keep
+          // saying so.
+          const wasDeleted = s.detail?.deleted && s.detail.id === message.id;
+          s.detail = { ...message, deleted: (deleteAnswered || wasDeleted) && !message.job };
           refreshOlder();
         } else if (message.event === "find_result") {
           const { list, matched_position: position, window } = message;

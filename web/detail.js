@@ -3,7 +3,7 @@
 
 import { combineFailures } from "./failures.js";
 import { formatDue, formatDuration, formatElapsed, formatTimestamp } from "./format.js";
-import { html, useEffect, useState } from "./preact.js";
+import { html, useEffect, useRef, useState } from "./preact.js";
 
 const STATUSES = {
   scheduled: "Scheduled",
@@ -16,8 +16,56 @@ const STATUSES = {
 // Waiting for the details shows the job's id and nothing else, so the
 // panel doesn't flash an empty state before they arrive.
 // `older` holds failures loaded beyond those in `detail`, if any.
-export function JobDetail({ id, detail, older, onLoadOlder, onClose }) {
+// `deleting` is true while a delete of this job awaits the server.
+export function JobDetail({ id, detail, older, onLoadOlder, onClose, deleting, onDelete }) {
   const job = detail?.job;
+  const [confirming, setConfirming] = useState(false);
+  const cancelRef = useRef();
+
+  useEffect(() => setConfirming(false), [id]);
+  useEffect(() => {
+    if (confirming) {
+      cancelRef.current?.focus();
+    }
+  }, [confirming]);
+
+  const confirmDelete = () => {
+    setConfirming(false);
+    onDelete();
+  };
+
+  // `D` asks to delete, as in `zizq top`; then `y` deletes, and `n` or Esc
+  // cancels. Enter is left to press the focused button, which starts as
+  // Cancel, so a stray Enter is harmless. Listening in the capture phase
+  // puts these ahead of the list's keys, so Esc only cancels rather than
+  // closing the panel too.
+  const latest = useRef();
+  latest.current = { canDelete: !!job && !deleting, confirming, confirmDelete };
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      const k = latest.current;
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      if (event.target.closest?.("input, textarea, select, [contenteditable]")) {
+        return;
+      }
+      if (k.confirming) {
+        const answer = { y: true, n: false, Escape: false }[event.key];
+        if (answer !== undefined) {
+          event.preventDefault();
+          event.stopPropagation();
+          answer ? k.confirmDelete() : setConfirming(false);
+        }
+      } else if (event.key === "D" && k.canDelete) {
+        event.preventDefault();
+        event.stopPropagation();
+        setConfirming(true);
+      }
+    };
+    addEventListener("keydown", onKeyDown, true);
+    return () => removeEventListener("keydown", onKeyDown, true);
+  }, []);
 
   return html`
     <aside class="detail" aria-label="Job details">
@@ -25,14 +73,26 @@ export function JobDetail({ id, detail, older, onLoadOlder, onClose }) {
         <span class="detail-id">${id}</span>
         ${detail?.status &&
         html`<span class="status ${detail.status}">${STATUSES[detail.status]}</span>`}
+        ${job &&
+        !deleting &&
+        !confirming &&
+        html`
+          <button class="delete" title="Delete this job (D)" onClick=${() => setConfirming(true)}>
+            Delete
+          </button>
+        `}
         <button class="close" title="Close (Esc)" aria-label="Close" onClick=${onClose}>
           ✕
         </button>
       </div>
       <div class="detail-body">
-        ${!detail
+        ${deleting
+          ? html`<p class="gone">Deleting…</p>`
+          : !detail
           ? null
-          : !job
+          : detail.deleted
+            ? html`<p class="gone">This job was deleted.</p>`
+            : !job
             ? html`<p class="gone">This job no longer exists.</p>`
             : html`
                 <${Attributes} job=${job} status=${detail.status} />
@@ -47,6 +107,14 @@ export function JobDetail({ id, detail, older, onLoadOlder, onClose }) {
                 />
               `}
       </div>
+      ${confirming &&
+      html`
+        <div class="confirm" role="alertdialog" aria-label="Delete this job?">
+          <span>Delete this job? This can't be undone.</span>
+          <button class="confirm-delete" onClick=${confirmDelete}>Delete</button>
+          <button ref=${cancelRef} onClick=${() => setConfirming(false)}>Cancel</button>
+        </div>
+      `}
     </aside>
   `;
 }
