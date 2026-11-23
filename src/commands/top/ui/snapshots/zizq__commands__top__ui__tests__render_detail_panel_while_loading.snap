@@ -1,6 +1,6 @@
 ---
 source: src/commands/top/ui/mod.rs
-assertion_line: 651
+assertion_line: 703
 expression: "render_to_string(&app, 160, 30)"
 ---
   Zizq 0.1.0
@@ -26,8 +26,8 @@ expression: "render_to_string(&app, 160, 30)"
 
 
 
-  ATTRIBUTES                                                  PAYLOAD                            FAILURES
-  ID                      0195b70a2bb46e1f07a0c908d7a2bb40    (loading…)                         (loading…)
+  ATTRIBUTES                                                   PAYLOAD                            FAILURES
+  ID                      0195b70a2bb46e1f07a0c908d7a2bb40     (loading…)                         (loading…)
   Queue                   default
   Type                    generate_annual_report_email
   Priority                0

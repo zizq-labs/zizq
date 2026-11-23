@@ -43,8 +43,19 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     tabs::render(app, frame, chunks[1]);
 
-    // Content area — render only the active tab's table.
-    let content_area = chunks[2];
+    // Content area — render only the active tab's table, with the detail
+    // panel beside it at full height when the terminal is wide enough.
+    let side_width = side_panel_width(chunks[2].width).filter(|_| app.show_detail);
+    let (content_area, side_area) = match side_width {
+        Some(width) => {
+            let [table, panel] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(width)])
+                    .spacing(1)
+                    .areas(chunks[2]);
+            (table, Some(panel))
+        }
+        None => (chunks[2], None),
+    };
 
     let subscription_limit = if matches!(app.status, ConnectionStatus::Connected) {
         app.subscription_limit
@@ -56,8 +67,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Panel height: min(DETAIL_PANEL_MAX, 30% of content area).
     // Suppressed if the table would get fewer than MIN_TABLE_ROWS body rows.
     let detail_height = DETAIL_PANEL_MAX.min((content_area.height * 30 / 100).max(1));
-    let show_detail_panel =
-        app.show_detail && content_area.height > detail_height + MIN_TABLE_ROWS + 1;
+    let show_detail_panel = app.show_detail
+        && side_area.is_none()
+        && content_area.height > detail_height + MIN_TABLE_ROWS + 1;
 
     let (table_area, detail_area, msg_area) = {
         let mut constraints = vec![Constraint::Min(0)]; // table always first
@@ -101,7 +113,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     job_table::render_active(app, frame, table_area, table_body_height);
 
     if let Some(area) = detail_area {
-        detail_panel::render(app, frame, area);
+        detail_panel::render(app, frame, area, detail_panel::Placement::Below);
+    }
+    if let Some(area) = side_area {
+        detail_panel::render(app, frame, area, detail_panel::Placement::Beside);
     }
 
     if let Some(cap) = subscription_limit {
@@ -123,6 +138,19 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 /// the table renders at this width and the visible portion is determined by
 /// the horizontal scroll offset.
 pub(super) const MIN_TABLE_WIDTH: u16 = 120;
+
+/// The narrowest a detail panel beside the table can be.
+const SIDE_PANEL_MIN_WIDTH: u16 = 50;
+
+/// The width of a detail panel beside the table, or `None` when the
+/// terminal is too narrow to fit one and the table at `MIN_TABLE_WIDTH`, so
+/// the panel goes below the table instead. About a third of the width,
+/// within those limits.
+fn side_panel_width(width: u16) -> Option<u16> {
+    // One column separates the table from the panel.
+    let room = width.checked_sub(MIN_TABLE_WIDTH + 1)?;
+    (room >= SIDE_PANEL_MIN_WIDTH).then(|| (width * 35 / 100).clamp(SIDE_PANEL_MIN_WIDTH, room))
+}
 
 /// Maximum height of the detail panel (heading + all possible fields).
 const DETAIL_PANEL_MAX: u16 = 13;
@@ -642,6 +670,30 @@ mod tests {
             .collect();
         let app = detail_app(errors, true);
         assert_ui_snapshot!(render_to_string(&app, 160, 30));
+    }
+
+    #[test]
+    fn side_panel_width_leaves_the_table_its_minimum() {
+        assert_eq!(side_panel_width(170), None);
+        assert_eq!(side_panel_width(171), Some(50));
+        assert_eq!(side_panel_width(200), Some(70));
+        assert_eq!(side_panel_width(250), Some(87));
+    }
+
+    #[test]
+    fn render_detail_panel_beside_the_table() {
+        let app = detail_app(three_failures(), false);
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
+    }
+
+    #[test]
+    fn render_detail_panel_beside_the_table_with_a_long_payload() {
+        let mut app = detail_app(three_failures(), false);
+        let job = app.job_detail.as_mut().unwrap().job.as_mut().unwrap();
+        job.payload = Some(serde_json::json!({
+            "recipients": (1..=30).map(|n| format!("user{n}@example.com")).collect::<Vec<_>>(),
+        }));
+        assert_ui_snapshot!(render_to_string(&app, 200, 40));
     }
 
     #[test]

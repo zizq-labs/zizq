@@ -4,10 +4,13 @@
 //! Detail panel — the lower split that shows the metadata, payload and
 //! failures of the cursor row when `app.show_detail` is on.
 //!
-//! On a wide enough terminal all three are columns side by side. On a
-//! narrower one there are two: the metadata, and the failures if the job
-//! has any, or its payload if not, since failures are usually what's
-//! being looked for.
+//! Beside the table, on a wide terminal, the three are stacked: metadata,
+//! then the payload, then the failures in whatever height is left.
+//!
+//! Below the table, on a wide enough terminal, all three are columns side
+//! by side. On a narrower one there are two: the metadata, and the
+//! failures if the job has any, or its payload if not, since failures are
+//! usually what's being looked for.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -28,10 +31,19 @@ const DETAIL_LABEL_WIDTH: usize = 26;
 /// side. Narrower panels show two of them.
 const THREE_COLUMN_WIDTH: u16 = 150;
 
+/// Where the panel is, which decides how its parts are arranged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Placement {
+    /// Below the table: the parts side by side.
+    Below,
+    /// Beside the table: the parts stacked.
+    Beside,
+}
+
 /// Render the detail panel into `area`. If no row is selected the panel
 /// degrades to a heading + "No job selected" placeholder so the user
 /// still sees where the panel would be.
-pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
+pub(super) fn render(app: &App, frame: &mut Frame, area: Rect, placement: Placement) {
     let ls = &app.list_states[app.active_tab.idx()];
     let jobs = match app.active_tab {
         Tab::Ready => &app.ready_jobs,
@@ -63,6 +75,11 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
         return;
     };
 
+    if placement == Placement::Beside {
+        frame.render_widget(Paragraph::new(stacked_lines(app, job, detail, area)), area);
+        return;
+    }
+
     let has_failures = detail.is_some_and(|d| !d.errors.is_empty());
     let columns: &[(Column, u16)] = if area.width >= THREE_COLUMN_WIDTH {
         &[
@@ -86,6 +103,38 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
         };
         frame.render_widget(Paragraph::new(lines), *area);
     }
+}
+
+/// Metadata, payload and failures one above another, for a panel beside
+/// the table. The payload gets up to a third of the height below the
+/// metadata, so a long one can't crowd out the failures, which get the rest.
+fn stacked_lines(
+    app: &App,
+    job: &AdminJob,
+    detail: Option<&JobDetail>,
+    area: Rect,
+) -> Vec<Line<'static>> {
+    let mut lines = metadata_lines(app, job, detail, area.width);
+    lines.push(Line::default());
+
+    let below = (area.height as usize).saturating_sub(lines.len());
+    let payload_room = (below / 3).max(3);
+    let mut payload = payload_lines(job, detail, area.width);
+    if payload.len() > payload_room {
+        payload.truncate(payload_room.saturating_sub(1));
+        payload.push(Line::styled("  …", dim()));
+    }
+    lines.extend(payload);
+    lines.push(Line::default());
+
+    let failures_height = (area.height as usize).saturating_sub(lines.len());
+    lines.extend(failure_lines(
+        detail,
+        app.now_ms,
+        area.width,
+        failures_height as u16,
+    ));
+    lines
 }
 
 /// The columns the panel can show.
@@ -200,20 +249,20 @@ fn metadata_lines(
 /// The job's payload, pretty-printed.
 fn payload_lines(job: &AdminJob, detail: Option<&JobDetail>, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        pad_to(" PAYLOAD", width),
+        pad_to("  PAYLOAD", width),
         heading_style(),
     ))];
     match &job.payload {
         Some(payload) => {
             let pretty =
                 serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
-            lines.extend(pretty.lines().map(|l| Line::raw(format!(" {l}"))));
+            lines.extend(pretty.lines().map(|l| Line::raw(format!("  {l}"))));
         }
         None if detail.is_some() => {
-            lines.push(Line::styled(" (this job no longer exists)", dim()));
+            lines.push(Line::styled("  (this job no longer exists)", dim()));
         }
         None => {
-            lines.push(Line::styled(" (loading…)", dim()));
+            lines.push(Line::styled("  (loading…)", dim()));
         }
     }
     lines
@@ -230,21 +279,25 @@ fn failure_lines(
     height: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        pad_to(" FAILURES", width),
+        pad_to("  FAILURES", width),
         heading_style(),
     ))];
     let Some(detail) = detail else {
-        lines.push(Line::styled(" (loading…)", dim()));
+        lines.push(Line::styled("  (loading…)", dim()));
         return lines;
     };
     let Some((newest, older)) = detail.errors.split_first() else {
-        lines.push(Line::styled(" None", dim()));
+        lines.push(Line::styled("  None", dim()));
         return lines;
     };
 
+    // The newest failure's summary names only its type, when it has one,
+    // so its whole message follows beneath, where a long first line isn't
+    // cut short by the type before it.
     let summary = |error: &AdminJobError, newest: bool| {
         let first_line = error.message.lines().next().unwrap_or("");
         let what = match &error.error_type {
+            Some(error_type) if newest => error_type.clone(),
             Some(error_type) => format!("{error_type}: {first_line}"),
             None => first_line.to_string(),
         };
@@ -254,7 +307,7 @@ fn failure_lines(
             Style::default()
         };
         Line::from(vec![
-            Span::styled(format!(" #{:<3}", error.attempt), dim()),
+            Span::styled(format!("  #{:<3}", error.attempt), dim()),
             Span::styled(
                 format!("{:>6} ago  ", format_elapsed(error.failed_at, now_ms)),
                 dim(),
@@ -273,16 +326,17 @@ fn failure_lines(
     let room = below_newest.saturating_sub(others).max(below_newest / 2);
 
     lines.push(summary(newest, true));
+    let message_shown_above = usize::from(newest.error_type.is_none());
     let rest_of_message = newest
         .message
         .lines()
-        .skip(1)
-        .map(|l| Line::raw(format!("      {l}")));
+        .skip(message_shown_above)
+        .map(|l| Line::raw(format!("       {l}")));
     let backtrace = newest
         .backtrace
         .iter()
         .flat_map(|b| b.lines())
-        .map(|l| Line::styled(format!("      {l}"), dim()));
+        .map(|l| Line::styled(format!("       {l}"), dim()));
     lines.extend(rest_of_message.chain(backtrace).take(room));
 
     // The rest get a line each while they fit. If they don't all fit,
@@ -296,7 +350,7 @@ fn failure_lines(
     };
     lines.extend(older.iter().take(older_fit).map(|e| summary(e, false)));
     if !all_fit && remaining > 0 {
-        lines.push(Line::styled(" … older failures not shown", dim()));
+        lines.push(Line::styled("  … older failures not shown", dim()));
     }
     lines
 }
