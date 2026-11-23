@@ -2,11 +2,18 @@
 
 ## Unreleased
 
+- Release archives now include `LICENSE` and `THIRD_PARTY_LICENSES`
+  beside the `zizq` executable, and the Docker images carry them in
+  `/usr/share/licenses/zizq/`. `THIRD_PARTY_LICENSES` holds the
+  licences of third-party software bundled in Zizq, which for now is the
+  JavaScript the admin web UI is built with.
+- The `zizq` executable in the Docker images is now owned by root. It
+  took its owner from the user that built the release archive instead,
+  which wasn't any user in the image.
 - Fixed paging through a job's errors newest first.
   `GET /jobs/{id}/errors?order=desc` returned the newest errors again on
   every page after the first, instead of moving on to older ones. The
   `prev` link of every page was wrong in the same way, in either order.
-
 - `zizq top` now shows every job on the free tier. Without a Pro
   licence it used to show only the first 10 jobs in each list.
 - The admin API now refuses requests made by web pages served from

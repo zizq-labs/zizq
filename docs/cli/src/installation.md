@@ -19,8 +19,9 @@ Once you have downloaded a release it will need to be extracted.
 
 ## Extracting the Binary
 
-Release binaries are gzipped and contain the version number. Extract the file
-from the archive and it should be executable.
+Release archives are gzipped and named with the version number. Extracting one
+gives the `zizq` executable, alongside `LICENSE` and `THIRD_PARTY_LICENSES`,
+the licences for Zizq and for the software built into it.
 
 ```shell
 tar -xvzf zizq-0.8.1-linux-x86_64.tar.gz
