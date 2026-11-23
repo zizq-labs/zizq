@@ -213,3 +213,54 @@ test("clicking the open job again closes its details", async ({ page, zizq }) =>
   await rows(page).first().click();
   await expect(page.locator(".detail")).toHaveCount(0);
 });
+
+// Enqueues a job on `queue` and fails it `n` times, each due for a retry
+// at once, so the server makes it ready again for the next. Each take
+// stream is closed once its failure is reported, or the server could hand
+// the job back to it rather than to the next.
+async function failedTimes(zizq, queue, n) {
+  await zizq.enqueue([job({ queue, retry_limit: 1000 })]);
+  let id;
+  for (let attempt = 1; attempt <= n; attempt++) {
+    const [taken] = await zizq.take(queue, 1);
+    id = taken.id;
+    await zizq.fail(id, { message: `failure ${attempt}`, retry_at: Date.now() });
+    zizq.releaseTakes();
+  }
+  return id;
+}
+
+const failureAttempts = (page) => page.locator(".failures .attempt");
+
+test("pages back through older failures", async ({ page, zizq }) => {
+  await failedTimes(zizq, "work", 25);
+  await page.goto(`${zizq.url}#ready`);
+  await rows(page).first().click();
+
+  await expect(failureAttempts(page)).toHaveCount(10);
+  await expect(failureAttempts(page).first()).toHaveText("#25");
+
+  await page.locator(".older").click();
+  await expect(failureAttempts(page)).toHaveCount(20);
+
+  await page.locator(".older").click();
+  await expect(failureAttempts(page)).toHaveCount(25);
+  await expect(failureAttempts(page).last()).toHaveText("#1");
+  await expect(page.locator(".older")).toHaveCount(0);
+});
+
+test("older failures stay joined up when the job fails again", async ({ page, zizq }) => {
+  await failedTimes(zizq, "work", 25);
+  await page.goto(`${zizq.url}#ready`);
+  await rows(page).first().click();
+  await expect(failureAttempts(page)).toHaveCount(10);
+  await page.locator(".older").click();
+  await expect(failureAttempts(page)).toHaveCount(20);
+
+  const [taken] = await zizq.take("work", 1);
+  await zizq.fail(taken.id, { message: "failure 26", retry_at: Date.now() + 3_600_000 });
+
+  await expect(failureAttempts(page)).toHaveCount(26);
+  const shown = await failureAttempts(page).allTextContents();
+  expect(shown).toEqual(Array.from({ length: 26 }, (_, i) => `#${26 - i}`));
+});

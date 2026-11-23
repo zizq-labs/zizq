@@ -8,8 +8,14 @@
 
 import { formatClock } from "./format.js";
 import { LISTS, ListPanel, useTick } from "./list_view.js";
+import { combineFailures, oldestAttempt } from "./failures.js";
 import { applyMessage, emptyLists } from "./lists.js";
 import { html, render, useEffect, useRef, useState } from "./preact.js";
+
+// The most failures one `get_errors` request may ask for.
+const MAX_FAILURES_PAGE = 50;
+// The server's page of failures, in `job_detail` and by default.
+const FAILURES_PAGE = 10;
 
 const MIN_RETRY_MS = 1000;
 const MAX_RETRY_MS = 10000;
@@ -31,11 +37,14 @@ function useAdminStream() {
     lists: emptyLists(),
     fetches: {},
     send: () => {},
-    // The job whose details are open, and the server's latest account of
-    // it (a `job_detail` message), once it arrives.
+    // The job whose details are open, the server's latest account of it
+    // (a `job_detail` message) once it arrives, and any older failures
+    // loaded since: `{ errors, more, loading }`, or null.
     selected: null,
     detail: null,
+    older: null,
     select: () => {},
+    loadOlder: () => {},
   };
 
   useEffect(() => {
@@ -58,8 +67,39 @@ function useAdminStream() {
     s.select = (id) => {
       s.selected = id;
       s.detail = null;
+      s.older = null;
       requestDetail();
       rerender();
+    };
+
+    // Asks for the failures before the oldest shown, to add after them.
+    s.loadOlder = () => {
+      const shown = combineFailures(s.detail?.errors ?? [], s.older?.errors ?? []);
+      const before = oldestAttempt(shown);
+      if (!s.selected || before === undefined || s.older?.loading) {
+        return;
+      }
+      s.older = { errors: [], more: true, ...s.older, loading: "append" };
+      s.send({ type: "get_errors", id: s.selected, before });
+      rerender();
+    };
+
+    // A fresh `job_detail` has its own newest page, which may no longer
+    // meet the older failures loaded before it (if the job failed again in
+    // between). Those are fetched again in one request, as many as there
+    // were plus a page, to close any gap.
+    const refreshOlder = () => {
+      const before = oldestAttempt(s.detail.errors);
+      if (!s.older?.errors.length || before === undefined) {
+        return;
+      }
+      s.older.loading = "refresh";
+      s.send({
+        type: "get_errors",
+        id: s.selected,
+        before,
+        limit: Math.min(MAX_FAILURES_PAGE, s.older.errors.length + FAILURES_PAGE),
+      });
     };
     const flush = () => {
       frame = 0;
@@ -78,6 +118,9 @@ function useAdminStream() {
         s.conn = { state: "connected" };
         s.fetches = {};
         s.send = (message) => ws.send(JSON.stringify(message));
+        if (s.older) {
+          s.older.loading = null;
+        }
         requestDetail();
         rerender();
       };
@@ -99,6 +142,11 @@ function useAdminStream() {
         // to the selected job asks for its details again.
         if (message.event === "job_detail" && message.id === s.selected) {
           s.detail = message;
+          refreshOlder();
+        } else if (message.event === "job_errors" && message.id === s.selected && s.older) {
+          const errors =
+            s.older.loading === "refresh" ? message.errors : [...s.older.errors, ...message.errors];
+          s.older = { errors, more: message.more, loading: null };
         } else if (message.event === "job_changed" && message.id === s.selected) {
           requestDetail();
         }

@@ -1,6 +1,7 @@
 // The details of one job: its attributes, payload and failures, as the
 // server reports them in answer to `get_job`.
 
+import { combineFailures } from "./failures.js";
 import { formatDue, formatDuration, formatElapsed, formatTimestamp } from "./format.js";
 import { html, useEffect, useState } from "./preact.js";
 
@@ -14,7 +15,8 @@ const STATUSES = {
 
 // Waiting for the details shows the job's id and nothing else, so the
 // panel doesn't flash an empty state before they arrive.
-export function JobDetail({ id, detail, onClose }) {
+// `older` holds failures loaded beyond those in `detail`, if any.
+export function JobDetail({ id, detail, older, onLoadOlder, onClose }) {
   const job = detail?.job;
 
   return html`
@@ -36,7 +38,13 @@ export function JobDetail({ id, detail, onClose }) {
                 <${Attributes} job=${job} status=${detail.status} />
                 <h3>Payload</h3>
                 <pre class="payload">${JSON.stringify(job.payload ?? null, null, 2)}</pre>
-                <${Failures} id=${id} errors=${detail.errors} more=${detail.more_errors} />
+                <${Failures}
+                  id=${id}
+                  errors=${combineFailures(detail.errors, older?.errors ?? [])}
+                  more=${older ? older.more : detail.more_errors}
+                  loading=${older?.loading === "append"}
+                  onLoadOlder=${onLoadOlder}
+                />
               `}
       </div>
     </aside>
@@ -84,7 +92,7 @@ function retention({ completed_ms, dead_ms }) {
 // Newest first. The newest is open, since it's nearly always the one
 // that matters, including when a new failure arrives while watching; the
 // rest show one line each until opened.
-function Failures({ id, errors, more }) {
+function Failures({ id, errors, more, loading, onLoadOlder }) {
   const [open, setOpen] = useState(() => new Set());
   const newest = errors[0]?.attempt;
 
@@ -132,7 +140,12 @@ function Failures({ id, errors, more }) {
         `;
       })}
     </ol>
-    ${more && html`<p class="none">Older failures aren't shown yet.</p>`}
+    ${more &&
+    html`
+      <button class="older" disabled=${loading} onClick=${onLoadOlder}>
+        ${loading ? "Loading…" : "Show older failures"}
+      </button>
+    `}
   `;
 }
 

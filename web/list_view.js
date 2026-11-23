@@ -579,7 +579,15 @@ export function ListPanel({
           <${Scrollbar} top=${top} rows=${rows} total=${total} onMove=${moveTo} />
         </div>
         ${stream.selected &&
-        html`<${JobDetail} id=${stream.selected} detail=${stream.detail} onClose=${closeDetail} />`}
+        html`
+          <${JobDetail}
+            id=${stream.selected}
+            detail=${stream.detail}
+            older=${stream.older}
+            onLoadOlder=${stream.loadOlder}
+            onClose=${closeDetail}
+          />
+        `}
       </div>
       <footer class="list-footer">
         ${shown.length > 0 &&
