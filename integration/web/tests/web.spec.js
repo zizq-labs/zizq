@@ -264,3 +264,76 @@ test("older failures stay joined up when the job fails again", async ({ page, zi
   const shown = await failureAttempts(page).allTextContents();
   expect(shown).toEqual(Array.from({ length: 26 }, (_, i) => `#${26 - i}`));
 });
+
+const queueField = (page) => page.locator(".search input").nth(0);
+const typeField = (page) => page.locator(".search input").nth(1);
+const openType = (page) => page.locator(".detail .attributes");
+// The open job's queue: the first value in its attributes.
+const openQueue = (page) => page.locator(".detail .attributes dd").first();
+
+test("searching jumps to the first match and opens it", async ({ page, zizq }) => {
+  await zizq.enqueue(jobs(300, { priority: 100 }));
+  await zizq.enqueue([job({ type: "the_one", priority: 200 })]);
+  await page.goto(`${zizq.url}#ready`);
+  await expect(footer(page)).toContainText("of 301");
+
+  await page.keyboard.press("/");
+  await typeField(page).fill("the_one");
+  await page.keyboard.press("Enter");
+
+  await expect(openType(page)).toContainText("the_one");
+  await expect(page.locator(".jobs tr.selected .type")).toHaveText("the_one");
+  await expect(footer(page)).not.toContainText("Rows 1–");
+});
+
+test("n and N step through matches, and a search with none says so", async ({ page, zizq }) => {
+  await zizq.enqueue([
+    job({ type: "match", queue: "a", priority: 10 }),
+    job({ type: "other", priority: 20 }),
+    job({ type: "match", queue: "b", priority: 30 }),
+  ]);
+  await page.goto(`${zizq.url}#ready`);
+
+  await page.keyboard.press("/");
+  await typeField(page).fill("match");
+  await typeField(page).press("Enter");
+  await expect(openQueue(page)).toHaveText("a");
+
+  await page.locator(".jobs").click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press("n");
+  await expect(openQueue(page)).toHaveText("b");
+  await page.keyboard.press("Shift+N");
+  await expect(openQueue(page)).toHaveText("a");
+
+  await queueField(page).fill("nowhere");
+  await queueField(page).press("Enter");
+  await expect(page.locator(".no-match")).toHaveText("No more matches");
+});
+
+test("search is unavailable while the list is frozen", async ({ page, zizq }) => {
+  await page.goto(`${zizq.url}#ready`);
+  await page.keyboard.press("p");
+
+  await expect(typeField(page)).toBeDisabled();
+  await page.keyboard.press("p");
+  await expect(typeField(page)).toBeEnabled();
+});
+
+test("the search opens from its icon and closes when left empty", async ({ page, zizq }) => {
+  const search = page.locator(".search");
+  await page.goto(zizq.url);
+  await expect(search).toHaveAttribute("data-open", "false");
+
+  await page.locator(".search-toggle").click();
+  await expect(search).toHaveAttribute("data-open", "true");
+  await expect(queueField(page)).toBeFocused();
+
+  await page.locator(".panel").click({ position: { x: 5, y: 5 } });
+  await expect(search).toHaveAttribute("data-open", "false");
+
+  await page.keyboard.press("/");
+  await typeField(page).fill("something");
+  await page.locator(".panel").click({ position: { x: 5, y: 5 } });
+  await page.waitForTimeout(400);
+  await expect(search).toHaveAttribute("data-open", "true");
+});

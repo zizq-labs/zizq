@@ -529,6 +529,18 @@ export function ListPanel({
     }
   };
   const closeDetail = () => stream.selected && stream.select(null);
+
+  // A search match is centred in the list and opened (see SearchBar).
+  const found = stream.found;
+  useEffect(() => {
+    if (found?.position == null || frozen) {
+      return;
+    }
+    const listTotal = server ? server[LISTS[found.list].total] : 0;
+    const centred = found.position - Math.floor(rows / 2);
+    setTop(found.list, () => settleTop(centred, listTotal, rows));
+    stream.select(found.id);
+  }, [found?.seq]);
   useListKeys({
     rows,
     moveBy,
