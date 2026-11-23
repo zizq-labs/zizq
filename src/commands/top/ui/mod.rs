@@ -143,7 +143,7 @@ pub(super) const fn header_bg() -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::admin::AdminJob;
+    use crate::api::admin::{AdminJob, AdminJobError};
     use crate::commands::top::app::Tab;
     use crate::license::Tier;
     use ratatui::Terminal;
@@ -553,32 +553,101 @@ mod tests {
         assert_ui_snapshot!(render_to_string(&app, 80, 12));
     }
 
-    #[test]
-    fn render_detail_panel() {
+    /// A failure of the sample jobs, `minutes_ago` before the fixtures' now.
+    fn failure(attempt: u32, minutes_ago: u64, message: &str) -> AdminJobError {
+        let failed_at = 1_700_000_000_000u64 - minutes_ago * 60_000;
+        AdminJobError {
+            attempt,
+            message: message.to_string(),
+            error_type: Some("ForkError".to_string()),
+            backtrace: Some("worker.sh:12 in spawn\nworker.sh:40 in run".to_string()),
+            dequeued_at: failed_at - 5_000,
+            failed_at,
+        }
+    }
+
+    /// The sample app on the in-flight tab with the detail panel open on
+    /// its first job, as the server describes it with `errors`.
+    fn detail_app(errors: Vec<AdminJobError>, more_errors: bool) -> App {
         use crate::api::admin::{AdminBackoff, AdminRetention};
+        use crate::commands::top::app::JobDetail;
 
         let mut app = sample_app(Tab::InFlight);
         app.show_detail = true;
 
-        // Give the first in-flight job full detail fields.
-        app.in_flight_jobs[0].payload = Some(serde_json::json!({
+        let mut job = app.in_flight_jobs[0].clone();
+        job.payload = Some(serde_json::json!({
             "to": "user@example.com",
             "subject": "Welcome!",
             "urgent": true,
         }));
-        app.in_flight_jobs[0].retry_limit = Some(25);
-        app.in_flight_jobs[0].backoff = Some(AdminBackoff {
+        job.retry_limit = Some(25);
+        job.backoff = Some(AdminBackoff {
             base_ms: 15000,
             exponent: 4.0,
             jitter_ms: 30000,
         });
-        app.in_flight_jobs[0].retention = Some(AdminRetention {
+        job.retention = Some(AdminRetention {
             completed_ms: Some(604_800_000),
             dead_ms: Some(2_592_000_000),
         });
-        app.in_flight_jobs[0].unique_key = Some("report:annual:2026".to_string());
-        app.in_flight_jobs[0].unique_while = Some("active".to_string());
+        job.unique_key = Some("report:annual:2026".to_string());
+        job.unique_while = Some("active".to_string());
 
+        app.job_detail = Some(JobDetail {
+            id: job.id.clone(),
+            job: Some(job),
+            status: Some("in_flight".to_string()),
+            errors,
+            more_errors,
+        });
+        app
+    }
+
+    fn three_failures() -> Vec<AdminJobError> {
+        vec![
+            failure(
+                3,
+                2,
+                "fork failed: cannot allocate memory\nwhile spawning `convert`",
+            ),
+            failure(2, 9, "fork failed: cannot allocate memory"),
+            failure(1, 14, "process exited with status 141"),
+        ]
+    }
+
+    #[test]
+    fn render_detail_panel() {
+        let app = detail_app(three_failures(), false);
+        assert_ui_snapshot!(render_to_string(&app, 160, 30));
+    }
+
+    #[test]
+    fn render_detail_panel_narrow_shows_failures_over_the_payload() {
+        let app = detail_app(three_failures(), false);
+        assert_ui_snapshot!(render_to_string(&app, 130, 30));
+    }
+
+    #[test]
+    fn render_detail_panel_narrow_without_failures_shows_the_payload() {
+        let app = detail_app(Vec::new(), false);
+        assert_ui_snapshot!(render_to_string(&app, 130, 30));
+    }
+
+    #[test]
+    fn render_detail_panel_with_more_failures_than_fit() {
+        let errors = (1..=10)
+            .rev()
+            .map(|n| failure(n, 20 - n as u64, "boom"))
+            .collect();
+        let app = detail_app(errors, true);
+        assert_ui_snapshot!(render_to_string(&app, 160, 30));
+    }
+
+    #[test]
+    fn render_detail_panel_while_loading() {
+        let mut app = sample_app(Tab::InFlight);
+        app.show_detail = true;
         assert_ui_snapshot!(render_to_string(&app, 160, 30));
     }
 
