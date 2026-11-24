@@ -1,0 +1,45 @@
+---
+source: src/commands/top/ui/mod.rs
+assertion_line: 826
+expression: "render_to_string(&app, 200, 40)"
+---
+  Zizq 0.1.0
+● Connected 127.0.0.1:8901
+  Server version: 1.0.0, Uptime: 2m
+  Queue: 2 in-flight, 2 ready, 2 scheduled
+        ▼
+  Depth[││││││                                                                                                 6 jobs]
+        ▲
+   In-Flight   Ready   Scheduled
+                         ID   PRIORITY QUEUE                DURATION   ATTEMPTS TYPE                                                Type                    generate_annual_report_email
+70a2bb46e1f07a0c908d7a2bb40          0 default                    3s          1 generate_annual_report_email                        Priority                0
+70a1aa35d0e06b0b807c691aa30          0 billing                 2m30s          3 charge_subscription                                 Status                  in_flight
+                                                                                                                                    Ready At                YYYY-MM-DD HH:MM:SS +HH:MM
+                                                                                                                                    Dequeued At             YYYY-MM-DD HH:MM:SS +HH:MM
+                                                                                                                                    Attempts / Retry Limit  1/25
+                                                                                                                                    Backoff                 base=15000,exponent=4,jitter=30000
+                                                                                                                                    Retention Policy        completed=7d, dead=30d
+                                                                                                                                    Unique Key              active report:annual:2026
+
+                                                                                                                                    PAYLOAD
+                                                                                                                                    {
+                                                                                                                                      "subject": "Welcome!",
+                                                                                                                                      "to": "user@example.com",
+                                                                                                                                      "urgent": true
+                                                                                                                                    }
+
+                                                                                                                                    FAILURES
+                                                                                                                                    #5      1m ago  ForkError
+                                                                                                                                         out of memory
+                                                                                                                                         worker.sh:12 in spawn
+                                                                                                                                         worker.sh:40 in run
+                                                                                                                                    #4      2m ago  ForkError
+                                                                                                                                         out of memory
+                                                                                                                                         worker.sh:12 in spawn
+                                                                                                                                         worker.sh:40 in run
+                                                                                                                                    #3      3m ago  ForkError
+                                                                                                                                         disk full
+                                                                                                                                         worker.sh:12 in spawn
+                                                                                                                                         worker.sh:40 in run
+                                                                                                                                    Loading older failures…
+ TabChange Tab iInfo EnterList pPause /Find DDelete qQuit

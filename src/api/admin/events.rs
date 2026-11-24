@@ -37,10 +37,10 @@ const DEFAULT_LIMIT: usize = 200;
 
 /// How many of a job's failures a `JobDetail` carries, newest first, and
 /// how many a `GetErrors` page holds unless the request asks otherwise.
-const ERROR_PAGE_SIZE: usize = 10;
+pub(crate) const ERROR_PAGE_SIZE: usize = 10;
 
 /// The most failures one `GetErrors` page can hold.
-const MAX_ERROR_PAGE_SIZE: usize = 50;
+pub(crate) const MAX_ERROR_PAGE_SIZE: usize = 50;
 
 /// Per-list subscription parameters. The dashboard addresses rows by
 /// job id, not by numeric offset — see `store::WindowAnchor` docs.
