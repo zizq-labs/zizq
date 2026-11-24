@@ -1,7 +1,71 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
+This is the web UI release. Zizq now comes with a web UI for watching
+and managing your queues live in a browser, built into the `zizq`
+executable and served by the admin API, so there's nothing extra to
+install or run. `zizq top` also has feature parity, with failure
+details, a layout that suits wider terminals, and a detail panel you
+can scroll.
+
+### The web UI
+
+Open the admin API's address in a browser: by default
+<http://127.0.0.1:8901/>. It's available on every tier.
+
+- The In-Flight, Ready and Scheduled lists update as jobs move through
+  them, at any length. A depth bar beside each list shows where you are
+  in it, and can be dragged to move through it quickly.
+- At the end of a list, the view follows new jobs as they arrive. Freeze
+  the lists to hold them still while you look at something.
+- Find jobs by type, queue or both, moving forwards and backwards
+  through the matches.
+- Selecting a job shows its attributes, its payload, and its failures,
+  newest first, each with its message and backtrace. Older failures can
+  be loaded a page at a time.
+- Delete a job from its details, after confirming.
+- The keyboard shortcuts largely follow `zizq top`'s, and it works on
+  phones and tablets, with touch scrolling.
+- It's served compressed from inside the `zizq` executable, and uses
+  the same admin API connection as `zizq top`, so the admin API's TLS
+  and mutual TLS settings apply to it too. With mutual TLS, your browser
+  needs the client certificate to connect. `--no-admin` turns it off
+  along with the rest of the admin API.
+
+### `zizq top`
+
+- The detail panel (`i`) now shows a job's failures beside its
+  attributes and payload: the newest with its whole message and
+  backtrace, and older ones a line each.
+- On terminals at least 171 columns wide, the detail panel sits beside
+  the job list, at full height, instead of below it.
+- Press Enter to move into the detail panel, and Enter or Esc to move
+  back to the list. While the panel has focus the movement keys scroll
+  it, and it shows everything: the whole payload, and every failure in
+  full, loading older ones as you reach the end. Headings are green in
+  whichever of the two has focus.
+- The panel gives the payload more room when it doesn't have focus, and
+  says when something has been cut short.
+- Deleting a job (`D`) asks for confirmation at the foot of the detail
+  panel, under the job being deleted, opening the panel if it's closed.
+- `zizq top` now shows every job on the free tier. Without a Pro
+  licence it used to show only the first 10 jobs in each list.
+
+### Other changes
+
+- The admin API now refuses requests made by web pages served from
+  anywhere other than the admin API itself. Before, any website you
+  visited could use your browser to read jobs from a server on
+  `localhost` or your network, or to delete them. Web pages may reach the
+  admin API through `localhost` or an IP address. To use a host name,
+  list it with the new `--admin-allowed-hosts` flag
+  (`ZIZQ_ADMIN_ALLOWED_HOSTS`). Clients that are not browsers, such as
+  `zizq top`, are unaffected.
+- The admin API's WebSocket can now fetch a single job in full, with its
+  most recent failures (`get_job`), and page back through older failures
+  (`get_errors`). These are what the web UI and `zizq top` use for their
+  detail panels.
 - Release archives now include `LICENSE` and `THIRD_PARTY_LICENSES`
   beside the `zizq` executable, and the Docker images carry them in
   `/usr/share/licenses/zizq/`. `THIRD_PARTY_LICENSES` holds the
@@ -14,16 +78,6 @@
   `GET /jobs/{id}/errors?order=desc` returned the newest errors again on
   every page after the first, instead of moving on to older ones. The
   `prev` link of every page was wrong in the same way, in either order.
-- `zizq top` now shows every job on the free tier. Without a Pro
-  licence it used to show only the first 10 jobs in each list.
-- The admin API now refuses requests made by web pages served from
-  anywhere other than the admin API itself. Before, any website you
-  visited could use your browser to read jobs from a server on
-  `localhost` or your network, or to delete them. Web pages may reach the
-  admin API through `localhost` or an IP address. To use a host name,
-  list it with the new `--admin-allowed-hosts` flag
-  (`ZIZQ_ADMIN_ALLOWED_HOSTS`). Clients that are not browsers, such as
-  `zizq top`, are unaffected.
 
 ## 0.8.1
 
