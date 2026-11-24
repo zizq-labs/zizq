@@ -271,13 +271,21 @@ const openType = (page) => page.locator(".detail .attributes");
 // The open job's queue: the first value in its attributes.
 const openQueue = (page) => page.locator(".detail .attributes dd").first();
 
+// Opens the search with `/`, which focuses its Queue field a frame later.
+// Typing into another field waits for that, or the focus could move away
+// mid-fill and take the rest of the text with it.
+async function openSearch(page) {
+  await page.keyboard.press("/");
+  await expect(queueField(page)).toBeFocused();
+}
+
 test("searching jumps to the first match and opens it", async ({ page, zizq }) => {
   await zizq.enqueue(jobs(300, { priority: 100 }));
   await zizq.enqueue([job({ type: "the_one", priority: 200 })]);
   await page.goto(`${zizq.url}#ready`);
   await expect(footer(page)).toContainText("of 301");
 
-  await page.keyboard.press("/");
+  await openSearch(page);
   await typeField(page).fill("the_one");
   await page.keyboard.press("Enter");
 
@@ -294,7 +302,7 @@ test("n and N step through matches, and a search with none says so", async ({ pa
   ]);
   await page.goto(`${zizq.url}#ready`);
 
-  await page.keyboard.press("/");
+  await openSearch(page);
   await typeField(page).fill("match");
   await typeField(page).press("Enter");
   await expect(openQueue(page)).toHaveText("a");
@@ -331,7 +339,7 @@ test("the search opens from its icon and closes when left empty", async ({ page,
   await page.locator(".panel").click({ position: { x: 5, y: 5 } });
   await expect(search).toHaveAttribute("data-open", "false");
 
-  await page.keyboard.press("/");
+  await openSearch(page);
   await typeField(page).fill("something");
   await page.locator(".panel").click({ position: { x: 5, y: 5 } });
   await page.waitForTimeout(400);
